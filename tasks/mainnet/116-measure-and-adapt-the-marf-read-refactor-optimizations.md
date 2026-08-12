@@ -2,13 +2,14 @@
 id: "116"
 group: mainnet
 title: "Measure and adapt the marf-read-refactor optimizations"
-status: in-progress
+status: completed
 priority: medium
 effort: medium
 dependencies: ["110", "114"]
 tags: ["mainnet", "performance", "marf", "storage", "conformance"]
 created_at: 2026-08-11
 type: feature
+completed_at: 2026-08-12
 ---
 
 # Measure and adapt the marf-read-refactor optimizations
@@ -64,22 +65,63 @@ stacks-core-specific: nano skips `TrieNodePatch` by design (plan W5).
       matrix for exactly this) on the same machine, and record the read-path
       speedup it actually delivers, mmap on and off. This bounds what any
       port can be worth.
-- [ ] **Profile nano-marf's read path** on the task-110/114 harness
+- [x] **Profile nano-marf's read path** on the task-110/114 harness
       (mainnet capture replay on a reflink of `mainnet-pristine`): how much
       wall time is node fetch + decode vs allocation vs SQLite, now that
       the arena and 16 KiB pages are in. Name the top allocation sites in
       the walk (perf or heaptrack; `scripts/bench-phases-report.py` for the
       phase split).
-- [ ] **Adapt what the numbers justify**, in evidence order — likely the
+- [x] **Adapt what the numbers justify**, in evidence order — likely the
       inline `NodePath` (kill per-node path `Vec`s), borrowed reads from
       the arena instead of `Arc`-clone-then-clone-node, and reference-taking
       batch insert. A blob/mmap layout is in scope only if the profile
       shows SQLite row fetch itself (not decode or allocation) dominating
       and the branch's own numbers show mmap paying for the layout change.
-- [ ] **Re-run the replay benchmark** before/after each adopted change and
+- [x] **Re-run the replay benchmark** before/after each adopted change and
       record the numbers here; drop anything under noise.
-- [ ] Record the explicit adopt/reject decision per optimization, with the
+- [x] Record the explicit adopt/reject decision per optimization, with the
       measurement that decided it.
+
+## Result — measured rejection, not a speculative port
+
+Two feature-gated instrumented replays sealed the same 4,149 captured
+mainnet blocks through 8,669,750 and accepted every header root. The first
+ran in 244.26 s wall; the refined run in 284.65 s under different host I/O
+contention. Counts were identical, which is the evidence used below:
+
+- 8,040,108 node-cache hits and 128,558 compulsory misses (98.43% hits).
+- SQLite node-row fetch: 25.92–38.20 s; decode: 1.99–2.01 s.
+- 626,817 copy-on-write node clones moved 4.105 GB but consumed only 2.653 s.
+- 22,158 path allocations held only 629,036 bytes; root clones cost 30.1 ms.
+- The node-hash cache answered the whole replay without one SQLite read.
+
+Decisions, one per idea:
+
+1. **mmap/blob layout — reject.** The fork's mmap improves its already-flat
+   read path by 20%, but applying that whole gain to nano's measured SQLite
+   fetch time saves only about 2–3% of the replay. Replacing the
+   consensus-critical SQLite node store with a blob format is not justified
+   by that ceiling.
+2. **Reusable referential reads — reject.** Nano already reuses `Arc`-backed
+   cached nodes at a 98.43% hit rate. The remaining misses are first reads,
+   and all measured COW clones together cost under 1% of replay wall time.
+3. **Inline `NodePath` — reject.** The entire replay allocated 629 KiB of
+   paths. Removing those allocations cannot be measured against run noise.
+4. **Scratch patch representation — reject.** Nano has no `TrieNodePatch`;
+   its direct COW path is the measured 2.653 s above. Porting the fork's
+   470-line scratch machinery would add a second representation to solve no
+   observed bottleneck.
+5. **Reference-taking batch insert — reject.** Nano exposes individual
+   borrowed-key inserts rather than stacks-core's clone-owning `insert_batch`.
+   There is no corresponding batch clone to remove, and the whole relevant
+   clone path is already below 1%.
+
+No MARF optimization was adopted, so there is no before/after production
+variant to bless: the honest outcome is less code. The profiling-only branch
+keeps its counters and exact logs; the plan branch keeps only the general
+offline-replay fix that resolves a winning commitment through the capture's
+existing historical leader-key registry. Both full profiling replays used
+fresh distinct-inode reflinks and left the pristine source stamps unchanged.
 
 ## Consensus safety
 
