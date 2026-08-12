@@ -385,10 +385,13 @@ impl ComplexWord for RestrictAssets {
         // Set and make sure we are not overwriting an existing allowance context local
         let former_allowance_ctx = ALLOWANCE_CONTEXT.replace(Some(*allowance_ref_local));
 
+        let allowance_list = allowances.match_list().ok_or(GeneratorError::TypeError(
+            "restrict-assets?'s allowances should be a list".to_owned(),
+        ))?;
+        // Thanks to static type check we know we have less than 128 allowances
+        self.charge(generator, builder, allowance_list.len() as u32)?;
         // Register each allowance (e.g. with-stx, with-stacking).
-        for allowance in allowances.match_list().ok_or_else(|| {
-            GeneratorError::TypeError("restrict-assets?'s allowances should be a list".to_owned())
-        })? {
+        for allowance in allowance_list {
             generator.traverse_expr(builder, allowance)?;
         }
 
@@ -581,8 +584,6 @@ impl ComplexWord for WithNft {
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 3, args.len(), ArgumentCountCheck::Exact);
 
-        // TODO: add cost tracking #783
-
         let token_contract = args.get_expr(0)?;
         let token_name = args.get_expr(1)?;
         let allowance = args.get_expr(2)?;
@@ -639,8 +640,6 @@ impl ComplexWord for WithStacking {
         args: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 1, args.len(), ArgumentCountCheck::Exact);
-
-        // TODO: add cost tracking #783
 
         let allowance = args.get_expr(0)?;
 
@@ -726,8 +725,6 @@ impl ComplexWord for WithStx {
         args: &[SymbolicExpression],
     ) -> Result<(), GeneratorError> {
         check_args!(generator, builder, 1, args.len(), ArgumentCountCheck::Exact);
-
-        // TODO: add cost tracking #783
 
         let allowance = args.get_expr(0)?;
 
@@ -1027,8 +1024,7 @@ impl SimpleWord for ContractHash {
             ArgumentCountCheck::Exact
         );
 
-        // TODO: add cost tests after the costs are implemented (see issue #783)
-        // self.charge(generator, builder, 0)?;
+        self.charge(generator, builder, 0)?;
 
         // Reserve space for the return value (response (buff 32) uint)
         let (return_offset, return_size) =
@@ -1689,6 +1685,8 @@ mod tests {
         assert_eq!(val.unwrap(), Value::Int(-123));
     }
 
+    // Not run in v1 because at that point traits could not be used in all the places where a built-in type could
+    #[cfg(not(feature = "test-clarity-v1"))]
     #[test]
     fn multi_dynamic_define_impl_call() {
         let foo_trait = "
@@ -1720,7 +1718,7 @@ mod tests {
             (call-do-it (some .foo-impl))
             ";
 
-        crosscheck_multi_contract(
+        crate::tools::crosscheck_multi_contract(
             &[
                 (ContractName::from_literal("foo"), foo_trait),
                 (ContractName::from_literal("foo-impl"), foo_impl),
@@ -1732,6 +1730,8 @@ mod tests {
 
     /// This is the same test as [multi_dynamic_define_impl_call], but it checks that it still works
     /// when we deal with the linked functions defined in stacks-core (duplication issue).
+    // Not run in v1 because at that point traits could not be used in all the places where a built-in type could
+    #[cfg(not(feature = "test-clarity-v1"))]
     #[test]
     fn multi_dynamic_define_impl_call_duplication_issue() {
         let foo_trait = "
@@ -1763,7 +1763,7 @@ mod tests {
 
         let bar = "(contract-call? .call-foo call-do-it (some .foo-impl))";
 
-        crosscheck_multi_contract(
+        crate::tools::crosscheck_multi_contract(
             &[
                 (ContractName::from_literal("foo"), foo_trait),
                 (ContractName::from_literal("foo-impl"), foo_impl),
@@ -1819,7 +1819,7 @@ mod tests {
         use clarity_types::ClarityName;
 
         use super::*;
-        use crate::tools::{crosscheck, evaluate};
+        use crate::tools::{crosscheck, crosscheck_multi_contract, evaluate};
 
         #[test]
         fn as_contract_safe_switches_sender_and_caller() {

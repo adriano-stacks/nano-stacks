@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Write as _};
 use std::sync::Mutex;
 
+use clarity::util::secp256r1::{secp256r1_verify, secp256r1_verify_digest};
 use clarity::vm::callables::{DefineType, DefinedFunction};
 use clarity::vm::contexts::AssetMap;
 use clarity::vm::costs::{constants as cost_constants, CostTracker};
@@ -32,7 +33,6 @@ use stacks_common::util::hash::{Keccak256Hash, Sha512Sum, Sha512Trunc256Sum};
 use stacks_common::util::secp256k1::{
     secp256k1_decompress, secp256k1_recover, secp256k1_verify, Secp256k1PublicKey,
 };
-use stacks_common::util::secp256r1::{secp256r1_verify, secp256r1_verify_digest};
 use wasmtime::{
     AsContextMut, Caller, Engine, ExternRef, Global, GlobalType, Instance, Linker, Memory, Module,
     Store, Trap, Val,
@@ -2446,7 +2446,6 @@ fn link_with_ft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                 let memory = caller.data().memory.ok_or(WasmError::MemoryNotFound)?;
 
                 let epoch = caller.data().global_context.epoch_id;
-
                 let token_name_value = read_from_wasm(
                     memory,
                     &mut caller,
@@ -2529,7 +2528,6 @@ fn link_with_nft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
                 let memory = caller.data().memory.ok_or(WasmError::MemoryNotFound)?;
 
                 let epoch = caller.data().global_context.epoch_id;
-
                 // we cannot just read an identifier due to the '*' case.
                 let token_name = read_from_wasm(
                     memory,
@@ -2541,7 +2539,6 @@ fn link_with_nft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
                 )?
                 .expect_ascii()?;
                 let asset_name = ClarityName::try_from(token_name.clone())?;
-
                 // Read the contract principal first — needed for both wildcard
                 // and non-wildcard paths.
                 let contract_principal = read_from_wasm(
@@ -2719,7 +2716,6 @@ fn link_stx_get_balance_fn(
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
-
                 // Read the principal from the Wasm memory
                 let value = read_from_wasm(
                     memory,
@@ -2770,7 +2766,6 @@ fn link_stx_account_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), Vm
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
-
                 // Read the principal from the Wasm memory
                 let value = read_from_wasm(
                     memory,
@@ -2864,7 +2859,6 @@ fn link_stx_burn_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
-
                 // Read the principal from the Wasm memory
                 let value = read_from_wasm(
                     memory,
@@ -2962,7 +2956,6 @@ fn link_stx_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
-
                 // Read the sender principal from the Wasm memory
                 let value = read_from_wasm(
                     memory,
@@ -2984,7 +2977,6 @@ fn link_stx_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                     epoch,
                 )?;
                 let recipient = value_as_principal(&value)?;
-
                 // Read the memo from the Wasm memory
                 let memo = if memo_length > 0 {
                     let value = read_from_wasm(
@@ -3147,7 +3139,6 @@ fn link_ft_get_balance_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(),
                 let contract_identifier =
                     caller.data().contract_context().contract_identifier.clone();
                 let epoch = caller.data_mut().global_context.epoch_id;
-
                 // Read the owner principal from the Wasm memory
                 let value = read_from_wasm(
                     memory,
@@ -3220,7 +3211,6 @@ fn link_ft_burn_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
 
                 // Compute the amount
                 let amount = ((amount_hi as u128) << 64) | ((amount_lo as u64) as u128);
-
                 // Read the sender principal from the Wasm memory
                 let value = read_from_wasm(
                     memory,
@@ -3346,7 +3336,6 @@ fn link_ft_mint_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
 
                 // Compute the amount
                 let amount = ((amount_hi as u128) << 64) | ((amount_lo as u64) as u128);
-
                 // Read the sender principal from the Wasm memory
                 let value = read_from_wasm(
                     memory,
@@ -3474,7 +3463,6 @@ fn link_ft_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), Vm
 
                 // Compute the amount
                 let amount = ((amount_hi as u128) << 64) | ((amount_lo as u64) as u128);
-
                 // Read the sender principal from the Wasm memory
                 let value = read_from_wasm(
                     memory,
@@ -3769,7 +3757,6 @@ fn link_nft_burn_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
                     asset_offset,
                     epoch,
                 )?;
-
                 // Read the sender principal from the Wasm memory
                 let value = read_from_wasm(
                     memory,
@@ -3906,7 +3893,6 @@ fn link_nft_mint_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
                     asset_offset,
                     epoch,
                 )?;
-
                 // Read the recipient principal from the Wasm memory
                 let value = read_from_wasm(
                     memory,
@@ -4046,7 +4032,6 @@ fn link_nft_transfer_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                     epoch,
                 )?;
                 let from_principal = value_as_principal(&value)?;
-
                 // Read the recipient principal from the Wasm memory
                 let value = read_from_wasm(
                     memory,
@@ -6486,7 +6471,6 @@ fn link_contract_hash_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
-
                 // Read the contract identifier from the Wasm memory
                 let contract_val = read_from_wasm(
                     memory,
@@ -7423,7 +7407,6 @@ fn link_principal_of_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data_mut().global_context.epoch_id;
-
                 // Read the public key from the memory
                 let key_val = read_from_wasm(
                     memory,
@@ -7455,11 +7438,10 @@ fn link_principal_of_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), V
                 };
 
                 if let Ok(pub_key) = Secp256k1PublicKey::from_slice(pub_key) {
+                    let clarity_version = *caller.data().contract_context().get_clarity_version();
                     // Note: Clarity1 had a bug in how the address is computed (issues/2619).
                     // We want to preserve the old behavior unless the version is greater.
-                    let addr = if *caller.data().contract_context().get_clarity_version()
-                        > ClarityVersion::Clarity1
-                    {
+                    let addr = if clarity_version > ClarityVersion::Clarity1 {
                         pubkey_to_address_v2(pub_key, caller.data().global_context.mainnet)?
                     } else {
                         pubkey_to_address_v1(pub_key)?
@@ -7626,7 +7608,6 @@ fn link_principal_to_string_ascii(
                     .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
 
                 let epoch = caller.data().global_context.epoch_id;
-
                 let principal = read_from_wasm(
                     memory,
                     &mut caller,
@@ -7734,7 +7715,7 @@ fn link_debug_msg<T>(linker: &mut Linker<T>) -> Result<(), VmExecutionError> {
         })
 }
 
-pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
+pub fn dummy_linker<T>(engine: &Engine) -> Result<Linker<T>, wasmtime::Error> {
     let mut linker = Linker::new(engine);
 
     linker.func_wrap(
@@ -7906,75 +7887,75 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
         },
     )?;
 
-    linker.func_wrap("clarity", "block_height", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "block_height", |_: Caller<'_, T>| {
         println!("block-height");
         Ok((0i64, 0i64))
     })?;
 
-    linker.func_wrap("clarity", "stacks_block_height", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "stacks_block_height", |_: Caller<'_, T>| {
         println!("stacks-block-height");
         Ok((0i64, 0i64))
     })?;
 
-    linker.func_wrap("clarity", "stacks_block_time", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "stacks_block_time", |_: Caller<'_, T>| {
         println!("stacks_block_time");
         Ok((0i64, 0i64))
     })?;
 
-    linker.func_wrap("clarity", "tenure_height", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "tenure_height", |_: Caller<'_, T>| {
         println!("tenure-height");
         Ok((0i64, 0i64))
     })?;
 
-    linker.func_wrap("clarity", "burn_block_height", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "burn_block_height", |_: Caller<'_, T>| {
         println!("burn-block-height");
         Ok((0i64, 0i64))
     })?;
 
-    linker.func_wrap("clarity", "stx_liquid_supply", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "stx_liquid_supply", |_: Caller<'_, T>| {
         println!("stx-liquid-supply");
         Ok((0i64, 0i64))
     })?;
 
-    linker.func_wrap("clarity", "is_in_regtest", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "is_in_regtest", |_: Caller<'_, T>| {
         println!("is-in-regtest");
         Ok(0i32)
     })?;
 
-    linker.func_wrap("clarity", "is_in_mainnet", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "is_in_mainnet", |_: Caller<'_, T>| {
         println!("is-in-mainnet");
         Ok(0i32)
     })?;
 
-    linker.func_wrap("clarity", "chain_id", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "chain_id", |_: Caller<'_, T>| {
         println!("chain-id");
         Ok((0i64, 0i64))
     })?;
 
-    linker.func_wrap("clarity", "enter_as_contract", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "enter_as_contract", |_: Caller<'_, T>| {
         println!("as-contract: enter");
         Ok(())
     })?;
 
-    linker.func_wrap("clarity", "exit_as_contract", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "exit_as_contract", |_: Caller<'_, T>| {
         println!("as-contract: exit");
         Ok(())
     })?;
 
-    linker.func_wrap("clarity", "principal_depth", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "principal_depth", |_: Caller<'_, T>| {
         Ok((0i32, 0i32))
     })?;
 
     linker.func_wrap(
         "clarity",
         "restore_principal_depth",
-        |_: Caller<'_, ()>, _sender: i32, _callers: i32| Ok(()),
+        |_: Caller<'_, T>, _sender: i32, _callers: i32| Ok(()),
     )?;
 
     linker.func_wrap(
         "clarity",
         "enter_as_contract_safe",
-        |_: Caller<'_, ()>| -> Option<ExternRef> {
+        |_: Caller<'_, T>| -> Option<ExternRef> {
             println!("as-contract?: enter");
             None
         },
@@ -7983,25 +7964,21 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
     linker.func_wrap(
         "clarity",
         "exit_as_contract_safe",
-        |_: Caller<'_, ()>, _allowance_ref: Option<ExternRef>| {
+        |_: Caller<'_, T>, _allowance_ref: Option<ExternRef>| {
             println!("as-contract?: exit");
             Ok((0i64, 0i64, 0i32))
         },
     )?;
 
-    linker.func_wrap(
-        "clarity",
-        "cleanup_as_contract_safe",
-        |_: Caller<'_, ()>| {
-            println!("as-contract?: cleanup");
-            Ok(())
-        },
-    )?;
+    linker.func_wrap("clarity", "cleanup_as_contract_safe", |_: Caller<'_, T>| {
+        println!("as-contract?: cleanup");
+        Ok(())
+    })?;
 
     linker.func_wrap(
         "clarity",
         "enter_restrict_assets",
-        |_: Caller<'_, ()>| -> Option<ExternRef> {
+        |_: Caller<'_, T>| -> Option<ExternRef> {
             println!("restrict-assets?: enter");
             None
         },
@@ -8010,7 +7987,7 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
     linker.func_wrap(
         "clarity",
         "exit_restrict_assets",
-        |_: Caller<'_, ()>,
+        |_: Caller<'_, T>,
          _asset_owner_offset: i32,
          _asset_owner_length: i32,
          _allowance_ref: Option<ExternRef>| {
@@ -8019,7 +7996,7 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
         },
     )?;
 
-    linker.func_wrap("clarity", "cleanup_restrict_assets", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "cleanup_restrict_assets", |_: Caller<'_, T>| {
         println!("restrict-assets?: cleanup");
         Ok(())
     })?;
@@ -8027,7 +8004,7 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
     linker.func_wrap(
         "clarity",
         "with_all_assets_unsafe",
-        |_: Caller<'_, ()>, _allowance_ref: Option<ExternRef>| {
+        |_: Caller<'_, T>, _allowance_ref: Option<ExternRef>| {
             println!("with_all_assets_unsafe: enter");
             Ok(())
         },
@@ -8036,7 +8013,7 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
     linker.func_wrap(
         "clarity",
         "exit_with_all_assets_unsafe",
-        |_: Caller<'_, ()>| {
+        |_: Caller<'_, T>| {
             println!("with_all_assets_unsafe: exit");
             Ok(())
         },
@@ -8057,7 +8034,7 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
         },
     )?;
 
-    linker.func_wrap("clarity", "exit_with_ft", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "exit_with_ft", |_: Caller<'_, T>| {
         println!("with_ft: exit");
         Ok(())
     })?;
@@ -8080,7 +8057,7 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
         },
     )?;
 
-    linker.func_wrap("clarity", "exit_with_nft", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "exit_with_nft", |_: Caller<'_, T>| {
         println!("with_nft: exit");
         Ok(())
     })?;
@@ -8094,7 +8071,7 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
         },
     )?;
 
-    linker.func_wrap("clarity", "exit_with_stacking", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "exit_with_stacking", |_: Caller<'_, T>| {
         println!("with_stacking: exit");
         Ok(())
     })?;
@@ -8114,7 +8091,7 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
         },
     )?;
 
-    linker.func_wrap("clarity", "exit_with_stx", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "exit_with_stx", |_: Caller<'_, T>| {
         println!("with_stx: exit");
         Ok(())
     })?;
@@ -8128,7 +8105,7 @@ pub fn dummy_linker(engine: &Engine) -> Result<Linker<()>, wasmtime::Error> {
         },
     )?;
 
-    linker.func_wrap("clarity", "exit_at_block", |_: Caller<'_, ()>| {
+    linker.func_wrap("clarity", "exit_at_block", |_: Caller<'_, T>| {
         println!("at-block: exit");
         Ok(())
     })?;

@@ -164,7 +164,6 @@ proptest! {
     #![proptest_config(super::runtime_config())]
 
     #[test]
-    #[ignore = "test system needs to be improved relative to versioning and epochs"]
     fn as_contract_can_return_any_value(
         value in PropValue::any()
     ) {
@@ -251,6 +250,7 @@ proptest! {
         );
     }
 
+    #[cfg(not(feature = "test-clarity-v1"))]
     #[test]
     fn contract_dynamic_call_accepts_any_args_trait_in_let(
         (tys, values)
@@ -326,6 +326,7 @@ proptest! {
         );
     }
 
+    #[cfg(not(feature = "test-clarity-v1"))]
     #[test]
     fn contract_dynamic_call_accepts_any_args_trait_in_match_some(
         (tys, values)
@@ -402,6 +403,7 @@ proptest! {
         );
     }
 
+    #[cfg(not(feature = "test-clarity-v1"))]
     #[test]
     fn contract_dynamic_call_accepts_any_args_trait_in_match_ok(
         (tys, values)
@@ -478,6 +480,7 @@ proptest! {
         );
     }
 
+    #[cfg(not(feature = "test-clarity-v1"))]
     #[test]
     fn contract_dynamic_call_accepts_any_args_trait_in_match_err(
         (tys, values)
@@ -685,7 +688,7 @@ proptest! {
                     || (name.starts_with('u') && name.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
                     || clarity::vm::is_reserved(&name, &TestConfig::clarity_version())
                 {
-                    format!("func{}", idx)
+                    format!("func-{}", idx)
                 } else {
                     name
                 };
@@ -840,6 +843,122 @@ proptest! {
             Ok(Some(expected)),
         );
     }
+}
+
+#[cfg(any(
+    feature = "test-clarity-v2",
+    feature = "test-clarity-v3",
+    feature = "test-clarity-v4"
+))]
+#[test]
+fn contract_call_constant_pre_34_fails() {
+    use clarity::vm::errors::{VmExecutionError, WasmError};
+
+    let callee = r#"(define-public (foo) (ok u42))"#;
+    let caller = r#"
+            (define-constant cst .callee)
+            (contract-call? cst foo)
+        "#;
+    let mut env = clar2wasm::tools::TestEnvironment::new(
+        clarity::types::StacksEpochId::Epoch33,
+        TestConfig::clarity_version(),
+    );
+    env.init_contract_with_snippet("callee", callee)
+        .expect("Failed to init contract.");
+    std::assert_matches!(
+        env.init_contract_with_snippet("caller", caller)
+            .unwrap_err(),
+        VmExecutionError::Wasm(WasmError::WasmGeneratorError(_))
+    );
+}
+
+#[cfg(any(
+    feature = "test-clarity-v2",
+    feature = "test-clarity-v3",
+    feature = "test-clarity-v4"
+))]
+#[test]
+fn contract_call_constant_of_constant_pre_34_fails() {
+    use clarity::vm::errors::{VmExecutionError, WasmError};
+
+    let callee = r#"(define-public (foo) (ok u42))"#;
+    let caller = r#"
+            (define-constant cst1 .callee)
+            (define-constant cst2 cst1)
+            (contract-call? cst2 foo)
+        "#;
+
+    let mut env = clar2wasm::tools::TestEnvironment::new(
+        clarity::types::StacksEpochId::Epoch33,
+        TestConfig::clarity_version(),
+    );
+    env.init_contract_with_snippet("callee", callee)
+        .expect("Failed to init contract.");
+    std::assert_matches!(
+        env.init_contract_with_snippet("caller", caller)
+            .unwrap_err(),
+        VmExecutionError::Wasm(WasmError::WasmGeneratorError(_))
+    )
+}
+
+#[cfg(not(feature = "test-clarity-v1"))]
+#[test]
+fn contract_call_constant_post_34_succeeds() {
+    let callee = r#"(define-public (foo) (ok u42))"#;
+    let caller = r#"
+            (define-constant cst .callee)
+            (contract-call? cst foo)
+        "#;
+
+    crosscheck_multi_contract(
+        &[
+            (ContractName::from_literal("callee"), callee),
+            (ContractName::from_literal("caller"), caller),
+        ],
+        Ok(Some(Value::okay(Value::UInt(42)).unwrap())),
+    );
+}
+
+#[cfg(not(feature = "test-clarity-v1",))]
+#[test]
+fn contract_call_constant_of_constant_post_34_succeeds() {
+    let callee = r#"(define-public (foo) (ok u42))"#;
+    let caller = r#"
+            (define-constant cst1 .callee)
+            (define-constant cst2 cst1)
+            (contract-call? cst2 foo)
+        "#;
+
+    crosscheck_multi_contract(
+        &[
+            (ContractName::from_literal("callee"), callee),
+            (ContractName::from_literal("caller"), caller),
+        ],
+        Ok(Some(Value::okay(Value::UInt(42)).unwrap())),
+    );
+}
+
+#[cfg(not(feature = "test-clarity-v1",))]
+#[test]
+fn contract_call_constant_of_constant_6_time_post_34_succeeds() {
+    let callee = r#"(define-public (foo) (ok u42))"#;
+    let caller = r#"
+            (define-constant cst1 .callee)
+            (define-constant cst2 cst1)
+            (define-constant cst3 cst2)
+            (define-constant cst4 cst3)
+            (define-constant cst5 cst4)
+            (define-constant cst6 cst5)
+            (contract-call? cst6 foo)
+        "#;
+
+    crosscheck_multi_contract(
+        &[
+            (ContractName::from_literal("callee"), callee),
+            (ContractName::from_literal("caller"), caller),
+        ],
+        Ok(Some(Value::okay(Value::UInt(42)).unwrap())),
+    );
 }
 
 /// A called contract has to be sized for the arguments it is given.

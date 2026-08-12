@@ -8,8 +8,9 @@ use clarity::vm::diagnostic::DiagnosableError;
 use clarity::vm::functions::define::DefineFunctions;
 use clarity::vm::types::signatures::{CallableSubtype, StringUTF8Length};
 use clarity::vm::types::{
-    ASCIIData, CharType, FixedFunction, FunctionType, ListTypeData, PrincipalData, SequenceData,
-    SequenceSubtype, StringSubtype, TraitIdentifier, TupleTypeSignature, TypeSignature,
+    ASCIIData, CharType, FixedFunction, FunctionType, ListTypeData, PrincipalData,
+    QualifiedContractIdentifier, SequenceData, SequenceSubtype, StringSubtype, TraitIdentifier,
+    TupleTypeSignature, TypeSignature,
 };
 use clarity::vm::variables::NativeVariables;
 use clarity::vm::{
@@ -61,6 +62,8 @@ pub struct WasmGenerator {
     pub(crate) literal_memory_offset: HashMap<LiteralMemoryEntry, u32>,
     /// Map constants to an offset in the literal memory.
     pub(crate) constants: HashMap<String, TypeSignature>,
+    /// Map constants bound to a contract principal literal to their contract identifier.
+    pub(crate) constant_contract_principals: HashMap<String, QualifiedContractIdentifier>,
     /// The current function body block, used for early exit
     pub(crate) early_return_block_id: Option<InstrSeqId>,
     /// The type of the current function.
@@ -1129,7 +1132,7 @@ impl WasmGenerator {
     }
 
     pub fn new(contract_analysis: ContractAnalysis) -> Result<WasmGenerator, GeneratorError> {
-        let standard_lib_wasm: &[u8] = include_bytes!("standard/standard.wasm");
+        let standard_lib_wasm: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.wasm"));
 
         let mut module = Module::from_buffer(standard_lib_wasm).map_err(|_err| {
             GeneratorError::InternalError("failed to load standard library".to_owned())
@@ -1200,6 +1203,7 @@ impl WasmGenerator {
             linked_error: linked_error_id,
             literal_memory_offset: HashMap::new(),
             constants: HashMap::new(),
+            constant_contract_principals: HashMap::new(),
             bindings: Bindings::new(),
             charge_local_value_copy: true,
             cost_context: None,
@@ -5116,10 +5120,8 @@ mod tests {
 
     #[test]
     fn end_of_standard_data_is_correct() {
-        const STANDARD_LIB_PATH: &str =
-            concat!(env!("CARGO_MANIFEST_DIR"), "/src/standard/standard.wasm");
-        let standard_lib_wasm = std::fs::read(STANDARD_LIB_PATH).expect("Failed to read WASM file");
-        let module = Module::from_buffer(&standard_lib_wasm).unwrap();
+        let standard_lib_wasm: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.wasm"));
+        let module = Module::from_buffer(standard_lib_wasm).unwrap();
         let initial_data_size: usize = module.data.iter().map(|d| d.value.len()).sum();
 
         assert!((initial_data_size as u32) == END_OF_STANDARD_DATA);
@@ -5471,5 +5473,65 @@ mod tests {
                 evaluate("(ok false)"),
             );
         }
+    }
+
+    #[cfg(feature = "test-clarity-v1")]
+    #[test]
+    fn static_contract_call_has_right_type_set() {
+        let callee = (
+            ContractName::from_literal("callee"),
+            "(define-read-only (print-param (par {x: (optional uint),y: int,}))
+                        (print par))",
+        );
+        let caller = (
+            ContractName::from_literal("caller"),
+            "(contract-call? .callee print-param (tuple (x none) (y -54756928044990108781631836)))",
+        );
+
+        let expected = Ok(Some(Value::from(
+            TupleData::from_data(vec![
+                (ClarityName::from_literal("x"), Value::none()),
+                (
+                    ClarityName::from_literal("y"),
+                    Value::Int(-54756928044990108781631836),
+                ),
+            ])
+            .unwrap(),
+        )));
+        crate::tools::crosscheck_multi_contract(&[callee, caller], expected);
+    }
+
+    #[cfg(feature = "test-clarity-v1")]
+    #[test]
+    fn dynamic_contract_call_has_right_type_set() {
+        let callee = (
+            ContractName::from_literal("callee"),
+            "(define-trait printer
+                        ((print-param ({x: (optional uint), y: int})
+                                      (response {x: (optional uint), y: int} uint))))
+                     (define-public (print-param (par {x: (optional uint), y: int}))
+                        (ok (print par)))",
+        );
+        let caller = (
+            ContractName::from_literal("caller"),
+            "(use-trait printer .callee.printer)
+                     (define-private (call-it (tt <printer>))
+                        (contract-call? tt print-param (tuple (x none) (y -54756928044990108781631836))))
+                     (call-it .callee)",
+        );
+        let expected = Ok(Some(
+            Value::okay(Value::from(
+                TupleData::from_data(vec![
+                    (ClarityName::from_literal("x"), Value::none()),
+                    (
+                        ClarityName::from_literal("y"),
+                        Value::Int(-54756928044990108781631836),
+                    ),
+                ])
+                .unwrap(),
+            ))
+            .unwrap(),
+        ));
+        crate::tools::crosscheck_multi_contract(&[callee, caller], expected);
     }
 }
