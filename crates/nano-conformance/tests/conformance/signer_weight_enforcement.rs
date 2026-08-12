@@ -138,11 +138,7 @@ fn decode_array<const N: usize>(encoded: &str, what: &str) -> [u8; N] {
         .unwrap_or_else(|bytes: Vec<u8>| panic!("{what} has {} bytes, expected {N}", bytes.len()))
 }
 
-fn observed_block_events(
-    root: &Path,
-    capture: &Path,
-    cycle: u64,
-) -> Vec<(u64, [u8; 32], Vec<MessageSignature>)> {
+fn observed_block_events(root: &Path, capture: &Path, cycle: u64) -> Vec<(u64, NakamotoBlock)> {
     let calendar = mainnet_context(capture);
     let mut paths = fs::read_dir(root.join("new_block"))
         .expect("the signer evidence contains accepted block events")
@@ -180,7 +176,7 @@ fn observed_block_events(
                 "block hash",
             );
             assert_eq!(digest, block_hash, "the event names its signed block hash");
-            let signatures = event["signer_signature"]
+            let event_signatures = event["signer_signature"]
                 .as_array()
                 .expect("a block event signer-signature list")
                 .iter()
@@ -190,8 +186,29 @@ fn observed_block_events(
                         "signer signature",
                     ))
                 })
-                .collect();
-            Some((height, digest, signatures))
+                .collect::<Vec<_>>();
+            let index_block_hash = event["index_block_hash"]
+                .as_str()
+                .expect("a block event index block hash")
+                .trim_start_matches("0x");
+            let path = root.join("block").join(format!("{index_block_hash}.bin"));
+            let block =
+                NakamotoBlock::decode(&fs::read(&path).unwrap_or_else(|error| {
+                    panic!("read retained block {}: {error}", path.display())
+                }))
+                .unwrap_or_else(|error| {
+                    panic!("decode retained block {}: {error}", path.display())
+                });
+            assert_eq!(
+                *block.header.signer_signature_hash().as_bytes(),
+                digest,
+                "the retained block has the event's signed digest"
+            );
+            assert_eq!(
+                block.header.signer_signatures, event_signatures,
+                "the retained block has the event's signatures"
+            );
+            Some((height, block))
         })
         .collect()
 }
@@ -555,12 +572,10 @@ fn mainnet_blocks_pass_the_check_against_mainnet_state() {
     };
     let threshold = set.approval_threshold().expect("a threshold");
     let checked = if let Some(events) = events {
-        for (height, digest, signatures) in &events {
-            let weight = set
-                .verify_signatures(*digest, signatures)
-                .unwrap_or_else(|error| {
-                    panic!("mainnet block at burn height {height} was accepted: {error}")
-                });
+        for (height, block) in &events {
+            let weight = set.verify(&block.header).unwrap_or_else(|error| {
+                panic!("mainnet block at burn height {height} was accepted: {error}")
+            });
             assert!(
                 weight >= threshold,
                 "block at burn height {height} carries {weight} of the {threshold} required"

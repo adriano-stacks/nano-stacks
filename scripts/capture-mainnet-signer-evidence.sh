@@ -22,7 +22,7 @@ parent="$(dirname "$output")"
 mkdir -p "$parent"
 temporary="$(mktemp -d "$parent/.signer-evidence.XXXXXX")"
 trap 'rm -rf -- "$temporary"' EXIT
-mkdir -p "$temporary/new_block" "$temporary/oracles" "$temporary/stacker_set"
+mkdir -p "$temporary/block" "$temporary/new_block" "$temporary/oracles" "$temporary/stacker_set"
 
 curl -fsS --max-time 20 "$nano_rpc/v2/pox" -o "$temporary/pox.json"
 curl -fsS --max-time 20 "$nano_rpc/v3/stacker_set/$cycle" \
@@ -53,8 +53,20 @@ test -s "$temporary/events.list" || { echo "no accepted block event belongs to c
 xargs -0 cp -t "$temporary/new_block" < "$temporary/events.list"
 rm "$temporary/events.list"
 
+while IFS= read -r event; do
+    index_block_hash="$(jq -er '.index_block_hash' "$event")"
+    index_block_hash="${index_block_hash#0x}"
+    curl -fsS --max-time 20 "$nano_rpc/v3/blocks/$index_block_hash" \
+        -o "$temporary/block/$index_block_hash.bin"
+done < <(find "$temporary/new_block" -mindepth 1 -maxdepth 1 -type f | sort)
+
 event_count="$(find "$temporary/new_block" -mindepth 1 -maxdepth 1 -type f -printf . | wc -c)"
 test "$event_count" -gt 5 || { echo "only $event_count accepted blocks belong to cycle $cycle" >&2; exit 1; }
+block_count="$(find "$temporary/block" -mindepth 1 -maxdepth 1 -type f -printf . | wc -c)"
+test "$block_count" -eq "$event_count" || {
+    echo "retained $block_count raw blocks for $event_count accepted events" >&2
+    exit 1
+}
 first_height="$(find "$temporary/new_block" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort | head -n 1)"
 last_height="$(find "$temporary/new_block" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort | tail -n 1)"
 first_height="$((10#${first_height%%-*}))"
@@ -62,7 +74,7 @@ last_height="$((10#${last_height%%-*}))"
 set_sha256="$(sha256sum "$temporary/stacker_set/cycle-$cycle.json" | awk '{print $1}')"
 (
     cd "$temporary"
-    find new_block oracles stacker_set pox.json -type f -print0 |
+    find block new_block oracles stacker_set pox.json -type f -print0 |
         sort -z |
         xargs -0 sha256sum > SHA256SUMS
 )
@@ -72,6 +84,7 @@ jq -n \
     --argjson stock_rpcs "$(printf '%s\n' "${stock_rpcs[@]}" | jq -Rsc 'split("\n")[:-1]')" \
     --argjson cycle "$cycle" \
     --argjson event_count "$event_count" \
+    --argjson block_count "$block_count" \
     --argjson first_burn_height "$cycle_start" \
     --argjson last_burn_height "$cycle_end" \
     --argjson first_height "$first_height" \
@@ -83,6 +96,7 @@ jq -n \
         stock_rpcs: $stock_rpcs,
         cycle: $cycle,
         accepted_blocks: $event_count,
+        raw_blocks: $block_count,
         cycle_first_burn_height: $first_burn_height,
         cycle_last_burn_height: $last_burn_height,
         first_stacks_height: $first_height,
