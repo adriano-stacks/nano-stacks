@@ -7,10 +7,12 @@
 //! observer cannot tell the two nodes apart.
 //!
 //! What the capture still supplies as context is the burn block: the sortition
-//! that elected the block, its identifier and time, and the parent's. Those come
-//! from a burnchain and a sortition chain that a replay of block bytes does not
-//! stand up — the node reads them from its own, and `mainnet_sortition` is where
-//! that reading is checked.
+//! that elected the block, its winner, identifier and time, and the parent's.
+//! The winner comes from the separately captured sortition snapshots, so the
+//! expected event is not its own `miner_txid` oracle. These fields come from a
+//! burnchain and a sortition chain that a replay of block bytes does not stand up
+//! — the node reads them from its own, and `mainnet_sortition` is where that
+//! reading is checked.
 //!
 //! Everything else is nano's own, and two of them are the point of this file:
 //! **the rewards a block matured** and **the reward set it computed** come out of
@@ -19,7 +21,10 @@
 //! and who may sign the next cycle, against the answer stacks-core published for
 //! the same 340 blocks.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use nano_chainstate::{AppliedBlock, NakamotoBlock, SignerSet, starts_new_tenure};
 use nano_conformance::{captured_signer_sets, replay_captured_blocks};
@@ -90,11 +95,30 @@ fn captured_event(root: &Path, block: &NakamotoBlock) -> Value {
         .unwrap_or_else(|_| panic!("decode {name}"))
 }
 
+/// The miner commitment each captured burn-block sortition elected.
+fn captured_miner_txids(root: &Path) -> HashMap<u64, Sha256Sum> {
+    let snapshots: Vec<Value> = serde_json::from_slice(
+        &std::fs::read(root.join("sortition/snapshots.json")).expect("read captured sortitions"),
+    )
+    .expect("decode captured sortitions");
+    snapshots
+        .into_iter()
+        .filter(|snapshot| snapshot["sortition"].as_i64() == Some(1))
+        .map(|snapshot| {
+            (
+                snapshot["block_height"].as_u64().expect("burn height"),
+                Sha256Sum::from_bytes(bytes32(&snapshot["winning_block_txid"])),
+            )
+        })
+        .collect()
+}
+
 fn context(
     event: &Value,
     applied: &AppliedBlock,
     parent_block_hash: BlockHeaderHash,
     tenure_height: u64,
+    miner_txid: Sha256Sum,
 ) -> BlockEventContext {
     let height = |name: &str| u32::try_from(event[name].as_u64().expect(name)).expect(name);
     BlockEventContext {
@@ -111,7 +135,7 @@ fn context(
         parent_bitcoin_timestamp: event["parent_burn_block_timestamp"]
             .as_u64()
             .expect("parent burn time"),
-        miner_txid: Sha256Sum::from_bytes(bytes32(&event["miner_txid"])),
+        miner_txid,
         tenure_height,
         v1_unlock_height: height("pox_v1_unlock_height"),
         v2_unlock_height: height("pox_v2_unlock_height"),
@@ -206,6 +230,7 @@ fn normalize(payload: &mut Value) {
 #[test]
 fn new_block_payloads_match_the_ones_stacks_core_published() {
     let root = fixtures();
+    let miner_txids = captured_miner_txids(&root);
     let signer_sets = captured_signer_sets(&root);
     let pox = crate::follow_path::pox();
     let mut parent: Option<BlockHeaderHash> = None;
@@ -230,11 +255,21 @@ fn new_block_payloads_match_the_ones_stacks_core_published() {
             Some(_) if starts_new_tenure(block) => tenure_height + 1,
             Some(_) => tenure_height,
         };
+        let burn_height = event["burn_block_height"].as_u64().expect("burn height");
+        let miner_txid = *miner_txids
+            .get(&burn_height)
+            .unwrap_or_else(|| panic!("capture has no winner at burn {burn_height}"));
 
         let mut payload = new_block_payload(
             block,
             applied,
-            &context(&event, applied, parent_block_hash, tenure_height),
+            &context(
+                &event,
+                applied,
+                parent_block_hash,
+                tenure_height,
+                miner_txid,
+            ),
         );
         matured += applied.matured_rewards.len();
         reward_sets += usize::from(applied.reward_set.is_some());
@@ -247,9 +282,7 @@ fn new_block_payloads_match_the_ones_stacks_core_published() {
         );
 
         let mut expected = event;
-        let reward_cycle = pox.reward_cycle(
-            context(&expected, applied, parent_block_hash, tenure_height).bitcoin_height,
-        );
+        let reward_cycle = pox.reward_cycle(burn_height);
         let signers = signer_sets
             .get(&reward_cycle)
             .unwrap_or_else(|| panic!("capture has no signer set for cycle {reward_cycle}"));
