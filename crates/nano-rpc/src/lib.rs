@@ -205,9 +205,11 @@ struct Executed {
     /// peer would let that peer choose the burn view and so the fork. So the
     /// sortition routes read this and never `chain`.
     sortitions: Vec<nano_sync::SortitionInfo>,
-    /// The `PoX` constants, which are configuration rather than chain state, so
-    /// they survive a tip the peer's view no longer reaches.
-    pox: Option<PoxInfo>,
+    /// The `PoX` constants used while executing this snapshot.
+    ///
+    /// They are supplied by the runtime rather than recovered from a full peer
+    /// view, because catch-up deliberately asks peers only for their height.
+    pox: PoxInfo,
 }
 
 /// The validated node state exposed by the public HTTP API.
@@ -466,11 +468,11 @@ impl RpcState {
         &self,
         tip: SealedTip,
         sortitions: Vec<nano_sync::SortitionInfo>,
+        pox: PoxInfo,
     ) {
         self.metrics
             .publish_executed(tip.stacks_height, tip.bitcoin_height, now_seconds());
         let followed = self.followed.read().await.clone();
-        let pox = followed.as_ref().map(|view| view.pox_info.clone());
         let chain = followed.map_or_else(Vec::new, |view| executed_chain(view.tenures, &tip));
         self.metrics.publish_tenure_history(chain.len());
         *self.executed.write().await = Some(Executed {
@@ -1138,7 +1140,7 @@ fn pox_info_json(
 async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<Value>, RpcError> {
     let executed = executed(&state).await?;
     let network = state.network;
-    let pox = executed.pox.ok_or(RpcError::Unavailable)?;
+    let pox = executed.pox;
     let configured = state
         .pox_rpc
         .as_ref()
@@ -1207,10 +1209,7 @@ async fn tenure_info(
             .unwrap_or_default(),
         tip_block_id: format!("0x{}", tip.stacks_tip),
         tip_height: tip.stacks_height,
-        reward_cycle: executed
-            .pox
-            .as_ref()
-            .map_or(0, |pox| pox.reward_cycle(tip.bitcoin_height)),
+        reward_cycle: executed.pox.reward_cycle(tip.bitcoin_height),
     }))
 }
 
@@ -2791,6 +2790,10 @@ mod tests {
         }
     }
 
+    fn captured_pox() -> PoxInfo {
+        captured_view().pox_info
+    }
+
     fn pox_config() -> PoxRpcConfig {
         PoxRpcConfig::for_network(
             NETWORK,
@@ -2805,7 +2808,9 @@ mod tests {
         let state = RpcState::new(NETWORK)
             .with_pox_config(pox_config())
             .with_chain(chain);
-        state.publish(captured_view()).await;
+        // Long catch-up intentionally asks the peer only for its height. PoX is
+        // still part of the executed snapshot and must remain available there.
+        state.publish_followed_height(12).await;
         state
             .publish_executed(
                 SealedTip {
@@ -2817,6 +2822,7 @@ mod tests {
                     state_index_root: TrieHash::from_bytes([8; 32]),
                 },
                 Vec::new(),
+                captured_pox(),
             )
             .await;
         state
@@ -3100,6 +3106,7 @@ mod tests {
                     ConsensusHash::from_bytes([0xdd; 20]),
                 )),
                 vec![derived, previous],
+                captured_pox(),
             )
             .await;
 
@@ -3205,6 +3212,7 @@ mod tests {
             .publish_executed(
                 sealed_at(&blocks[0]),
                 vec![current, missing.clone(), parent.clone()],
+                captured_pox(),
             )
             .await;
 
@@ -3299,7 +3307,9 @@ mod tests {
             consensus_hash: ConsensusHash::from_bytes([10; 20]),
             ..captured_view().tenures[0].sortition.clone()
         };
-        state.publish_executed(sealed.clone(), Vec::new()).await;
+        state
+            .publish_executed(sealed.clone(), Vec::new(), captured_pox())
+            .await;
         state
             .publish_local_sortitions(vec![local_burn.clone()])
             .await;
@@ -3379,6 +3389,7 @@ mod tests {
                     state_index_root: TrieHash::from_bytes([7; 32]),
                 },
                 Vec::new(),
+                captured_pox(),
             )
             .await;
 
@@ -3485,6 +3496,7 @@ mod tests {
                     state_index_root: TrieHash::from_bytes([7; 32]),
                 },
                 Vec::new(),
+                captured_pox(),
             )
             .await;
 
@@ -3630,7 +3642,7 @@ mod tests {
             .with_chain(chain);
         state.publish(view).await;
         state
-            .publish_executed(sealed_at(&blocks[1]), Vec::new())
+            .publish_executed(sealed_at(&blocks[1]), Vec::new(), captured_pox())
             .await;
         let app = router(state);
         let get = |uri: String, app: Router| async move {
@@ -3731,7 +3743,7 @@ mod tests {
         // No followed view at all, and an executed tip the view could not have
         // reached: exactly the node that used to serve nothing.
         state
-            .publish_executed(sealed_at(&blocks[2]), Vec::new())
+            .publish_executed(sealed_at(&blocks[2]), Vec::new(), captured_pox())
             .await;
         let app = router(state);
         let get = |uri: String, app: Router| async move {
@@ -3808,6 +3820,7 @@ mod tests {
                     ConsensusHash::from_bytes([9; 20]),
                 )),
                 Vec::new(),
+                captured_pox(),
             )
             .await;
         let app = router(state);
@@ -3902,7 +3915,7 @@ mod tests {
             .with_block_sink(blocks_out);
         state.publish(view.clone()).await;
         state
-            .publish_executed(sealed_at(&blocks[1]), Vec::new())
+            .publish_executed(sealed_at(&blocks[1]), Vec::new(), captured_pox())
             .await;
         let upload = |block: &NakamotoBlock, app: Router, path: &'static str| {
             let body = block.encode();
@@ -3953,7 +3966,7 @@ mod tests {
             .with_block_sink(blocks_out);
         state.publish(view).await;
         state
-            .publish_executed(sealed_at(&blocks[1]), Vec::new())
+            .publish_executed(sealed_at(&blocks[1]), Vec::new(), captured_pox())
             .await;
 
         let taken = body_json(
@@ -4000,7 +4013,7 @@ mod tests {
             .with_proposal_token("t0ken".to_owned());
         state.publish(view).await;
         state
-            .publish_executed(sealed_at(&blocks[1]), Vec::new())
+            .publish_executed(sealed_at(&blocks[1]), Vec::new(), captured_pox())
             .await;
         ProposalNode {
             app: router(state),

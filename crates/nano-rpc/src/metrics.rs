@@ -756,6 +756,7 @@ mod tests {
     use super::{ExecutionCacheReport, NodeMetrics, RefusalReason, router, serve};
     use crate::{PeerReport, QueueReport, RpcState, SealedTip, SelectedTip};
     use nano_primitives::{BlockHeaderHash, ConsensusHash, Network, StacksBlockId, TrieHash};
+    use nano_sync::PoxInfo;
 
     /// Every sample the golden scrape must contain, one per published metric.
     const GOLDEN_SAMPLES: &[&str] = &[
@@ -823,6 +824,21 @@ mod tests {
         }
     }
 
+    const fn pox_fixture() -> PoxInfo {
+        PoxInfo {
+            first_bitcoin_height: 0,
+            bitcoin_height: 3,
+            prepare_phase_length: 5,
+            reward_phase_length: 15,
+            reward_slots: 2,
+            rejection_fraction: None,
+            pox_5_activation_height: Some(262),
+            v1_unlock_height: Some(205),
+            v2_unlock_height: Some(207),
+            v3_unlock_height: Some(210),
+        }
+    }
+
     #[tokio::test]
     async fn metrics_are_well_formed_and_name_the_three_chain_heights() {
         let state = RpcState::new(Network::MAINNET);
@@ -866,6 +882,7 @@ mod tests {
                     state_index_root: TrieHash::from_bytes([7; 32]),
                 },
                 Vec::new(),
+                pox_fixture(),
             )
             .await;
         state

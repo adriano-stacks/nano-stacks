@@ -259,7 +259,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     if let Some(executor) = executor.as_ref() {
         executor.lock().await.publish_execution_to(state.metrics());
     }
-    publish_sealed_tip(Some(&state), executor.as_ref()).await;
+    publish_sealed_tip(Some(&state), executor.as_ref(), &pox).await;
     // The miner executes the chain itself, because it has to build on its own
     // blocks the moment it makes them; the follower then only keeps the served
     // view fresh.
@@ -383,7 +383,11 @@ async fn keep_executed_blocks(
 /// Publish what this node is sealed at before it follows anything, so a node
 /// that never manages to execute reports the height it is really on rather than
 /// nothing at all.
-async fn publish_sealed_tip(state: Option<&RpcState>, executor: Option<&SharedExecutor>) {
+async fn publish_sealed_tip(
+    state: Option<&RpcState>,
+    executor: Option<&SharedExecutor>,
+    pox: &PoxInfo,
+) {
     if let (Some(state), Some(executor)) = (state, executor) {
         let (sealed, sortitions, cache_usage) = {
             let mut executor = executor.lock().await;
@@ -394,7 +398,9 @@ async fn publish_sealed_tip(state: Option<&RpcState>, executor: Option<&SharedEx
             )
         };
         state.metrics().publish_execution_caches(cache_usage);
-        state.publish_executed(sealed, sortitions).await;
+        state
+            .publish_executed(sealed, sortitions, pox.clone())
+            .await;
     }
 }
 
@@ -748,7 +754,9 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
         )
     };
     state.metrics().publish_execution_caches(cache_usage);
-    state.publish_executed(sealed, sortitions).await;
+    state
+        .publish_executed(sealed, sortitions, pox.clone())
+        .await;
     executor.lock().await.announce_burn_blocks(&notifications);
     let winners = include_local_winner(latest_local_winner, last_sortition_winners(node.tenures()));
     publish_reward_cycle(RewardCycleInputs {
