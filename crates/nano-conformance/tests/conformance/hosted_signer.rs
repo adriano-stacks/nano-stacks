@@ -307,10 +307,9 @@ async fn canonical_block_with(peer: &SyncClient, digest: Sha256Sum) -> bool {
 
 /// A transaction posted to nano is admitted by nano and reaches the network.
 ///
-/// Admission is nano's own answer and is asserted outright. Whether it is *mined*
-/// is the network's answer, and it is only reported: a node that follows without
-/// mining depends on relaying the transaction onward, so this says which of the
-/// two happened rather than conflating them.
+/// Admission is nano's own answer and mining is the network's answer. Both are
+/// required: a follower that accepts a transaction but never relays it has not
+/// completed the client journey.
 #[tokio::test]
 #[ignore = "requires a Hacknet network with one participant's signer hosted on nano"]
 async fn a_transaction_posted_to_nano_is_admitted_and_reported() {
@@ -367,20 +366,17 @@ async fn a_transaction_posted_to_nano_is_admitted_and_reported() {
         body.contains(&txid),
         "nano answered {body} for the transaction {txid} it admitted"
     );
-    println!("nano admitted {txid} into the mempool its miner reads, answering {status}");
+    println!("nano admitted and relayed {txid}, answering {status}");
 
     let mined = mined_by_the_network(&run, &txid).await;
-    println!(
-        "the network reports {txid} as {}",
-        if mined {
-            "mined"
-        } else {
-            "not mined: nano admitted it, and this configuration does not mine"
-        }
+    assert!(
+        mined,
+        "the network did not mine {txid} or nano's observer received no receipt for it"
     );
+    println!("the network mined {txid} and nano's observer received its receipt");
 }
 
-/// Whether the indexer has the transaction in a block yet.
+/// Whether the indexer and nano's own observer both have the transaction.
 async fn mined_by_the_network(run: &Hosted, txid: &str) -> bool {
     let api = env::var("NANO_HACKNET_API").unwrap_or_else(|_| "http://127.0.0.1:3999/".to_owned());
     let Ok(url) = Url::parse(&api).and_then(|api| api.join(&format!("extended/v1/tx/0x{txid}")))
@@ -392,13 +388,36 @@ async fn mined_by_the_network(run: &Hosted, txid: &str) -> bool {
         if let Ok(response) = reqwest::get(url.clone()).await
             && let Ok(body) = response.json::<Value>().await
             && body.get("tx_status").and_then(Value::as_str) == Some("success")
+            && observer_has_transaction(&run.nano_events, txid)
         {
             return true;
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    let _ = run;
     false
+}
+
+fn observer_has_transaction(events: &std::path::Path, txid: &str) -> bool {
+    let Ok(entries) = fs::read_dir(events.join("new_block")) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let Ok(payload) = fs::read(entry.path()) else {
+            return false;
+        };
+        let Ok(payload) = serde_json::from_slice::<Value>(&payload) else {
+            return false;
+        };
+        payload["transactions"]
+            .as_array()
+            .is_some_and(|transactions| {
+                transactions.iter().any(|receipt| {
+                    receipt["txid"]
+                        .as_str()
+                        .is_some_and(|observed| observed.trim_start_matches("0x") == txid)
+                })
+            })
+    })
 }
 
 /// An observer on nano is told the same things stacks-core tells its own.
