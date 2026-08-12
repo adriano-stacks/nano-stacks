@@ -6312,7 +6312,7 @@ fn report_state_engines(directory: &Path) {
 ///
 /// So they are counted by shape and reported as counts. A reader who wants them
 /// runs `cargo xtask scoreboard`.
-fn report_scoreboard() -> bool {
+fn report_scoreboard(state: Option<&Path>, qualifying: bool) -> bool {
     println!("\nscoreboard");
     println!(
         "  NANO_REPLAY_BOTH_ENGINES=1: every captured contract call is compared with the \
@@ -6326,15 +6326,32 @@ fn report_scoreboard() -> bool {
         );
         return false;
     }
+    if qualifying {
+        if state.is_none() {
+            println!("  FAIL: qualifying replay evidence requires --state");
+            return false;
+        }
+        if env::var("NANO_MAINNET_ANCHOR")
+            .ok()
+            .and_then(|height| height.parse::<u64>().ok())
+            .is_none()
+        {
+            println!("  FAIL: NANO_MAINNET_ANCHOR must name the imported checkpoint height");
+            return false;
+        }
+    }
     let Ok(binary) = env::current_exe() else {
         println!("  cannot find this binary to run the scoreboard with");
         return false;
     };
-    let Ok(run) = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .arg("scoreboard")
-        .env("NANO_REPLAY_BOTH_ENGINES", "1")
-        .output()
-    else {
+        .env("NANO_REPLAY_BOTH_ENGINES", "1");
+    if let Some(state) = state {
+        command.env("NANO_MAINNET_STATE", state);
+    }
+    let Ok(run) = command.output() else {
         println!("  the scoreboard could not be run");
         return false;
     };
@@ -6588,7 +6605,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
     let artifact = report_artifact(&artifact_path);
     let contract_arities = report_contract_arities(state.as_deref(), run_gates);
     report_checkpoint(state.as_deref());
-    let scoreboard = report_scoreboard();
+    let scoreboard = report_scoreboard(state.as_deref(), run_gates);
     report_inputs();
     let release_inventory = report_release_inventory(&inventory, run_gates);
 
