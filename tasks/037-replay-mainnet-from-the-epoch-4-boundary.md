@@ -227,9 +227,15 @@ never from fetched, staged or peer-reported height.
 - `cargo xtask scoreboard` reports a mainnet replay depth alongside the Hacknet
   one.
 - Every replayed mainnet header has the matching `state_index_root`.
-- Every replayed transaction has the matching receipt, including status, costs
-  and events.
-- The replay runs offline from captured fixtures.
+- Every transaction in the retained mainnet receipt-oracle window has the
+  matching status, costs and ordered events. Outside that window, where no
+  historical `new_block` oracle exists, the report must call the evidence
+  root-only and keep the frozen receipt slice as a separate compiler regression
+  gate; it must not relabel nano's own receipts as network observations.
+- The captured root/receipt oracle gates run offline from their fixtures. The
+  distinct checkpoint-to-tip qualification uses the live P2P network, has no
+  hosted Stacks API, and reports its Bitcoin source rather than calling that run
+  offline.
 - The reported production depth is clarity-wasm-only and uses the same
   configuration the mainnet release enables by default.
 - The release frontier comes from a newly initialized state directory whose
