@@ -11,15 +11,34 @@ mod clar5;
 
 use clarity::types::StacksEpochId;
 use clarity::vm::ClarityName;
+use clarity_types::ClarityTypeError;
 use walrus::ir::{BinaryOp, Instr, UnaryOp, Unop};
 use walrus::{FunctionId, GlobalId, InstrSeqBuilder, LocalId, Module};
 use wasmtime::{AsContextMut, Global, Val};
 
 use crate::error_mapping::ErrorMap;
 use crate::wasm_generator::{GeneratorError, WasmGenerator};
-use crate::words::Word;
+use crate::words::{ComplexWord, Word};
 
 type Result<T, E = GeneratorError> = std::result::Result<T, E>;
+
+/// helper function to either charge a cost inside a result
+/// or throw a signature type size check error
+pub fn charge_ok_or_throw_runtime_error(
+    cost: &Result<u32, ClarityTypeError>,
+    generator: &mut WasmGenerator,
+    builder: &mut walrus::InstrSeqBuilder,
+    word: &dyn ComplexWord,
+) -> Result<(), GeneratorError> {
+    if let Ok(cost) = cost {
+        word.charge(generator, builder, *cost)?;
+    } else {
+        builder
+            .i32_const(ErrorMap::SignatureTypeSizeCheckError as i32)
+            .call(generator.func_by_name("stdlib.runtime-error"));
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 pub enum Cost {
@@ -1205,6 +1224,9 @@ mod word {
         (3) => {
             StacksEpochId::Epoch31
         };
+        (4) => {
+            StacksEpochId::Epoch33
+        };
     }
 
     macro_rules! decl_test {
@@ -1763,6 +1785,7 @@ mod word {
         2 => CostMeter { runtime: 13556,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
         3 => CostMeter { runtime: 8365,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
+
     decl_tests!("append", "(append (list 1 2 3 4) 5)", {
         1 => CostMeter { runtime: 84000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
         2 => CostMeter { runtime: 2438,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -1960,32 +1983,6 @@ mod word {
                  3 => CostMeter { runtime: 965, read_count: 3, read_length: 77, write_count: 0, write_length: 0 },
              }
     );
-
-    // Cost result differs slightly after epoch 3_3 for contract_call
-    #[test]
-    #[ignore = "Clarity 4 costs needs to be implemented"]
-    fn contract_call_with_epoch_3_3() {
-        let epoch = StacksEpochId::Epoch33;
-        let version = ClarityVersion::Clarity4;
-        execute_snippets(
-            epoch,
-            version,
-            &[
-                (
-                    "callee",
-                    "(define-public (foo (a (response bool int)) (b int) (c int) (d int)) (ok 1))",
-                ),
-                ("caller", "(contract-call? .callee foo (ok true) 2 3 4)"),
-            ],
-            Some(CostMeter {
-                runtime: 0,
-                read_count: 0,
-                read_length: 0,
-                write_count: 0,
-                write_length: 0,
-            }),
-        );
-    }
 
     // decl_tests!("contract_of", "(contract-of contract)", {
     //     1 => CostMeter { runtime: 4000, read_count: 0, read_length: 0, write_count: 0, write_length: 0 },

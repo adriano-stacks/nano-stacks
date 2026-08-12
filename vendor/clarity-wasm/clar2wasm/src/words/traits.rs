@@ -144,11 +144,12 @@ impl ComplexWord for ImplTrait {
 #[cfg(test)]
 mod tests {
     use clarity::types::StacksEpochId;
-    use clarity::vm::types::{
-        CallableData, QualifiedContractIdentifier, StandardPrincipalData, TraitIdentifier,
-    };
+    use clarity::vm::types::{QualifiedContractIdentifier, StandardPrincipalData, TraitIdentifier};
     use clarity::vm::{ClarityName, ClarityVersion, ContractName, Value};
+    use clarity_types::types::PrincipalData;
 
+    use crate::tools::TestConfig;
+    #[allow(unused_imports)]
     use crate::tools::{
         crosscheck, crosscheck_expect_failure, crosscheck_multi_contract,
         crosscheck_multi_contract_with_env, TestEnvironment,
@@ -308,20 +309,26 @@ mod tests {
 (foo .my-trait-contract)
             "#;
 
-        let contract_id = QualifiedContractIdentifier {
+        let contract_id = clarity_types::types::QualifiedContractIdentifier {
             issuer: StandardPrincipalData::transient(),
             name: ContractName::from_literal("my-trait-contract"),
         };
-        crosscheck_multi_contract(
-            &[
-                (first_contract_name, first_snippet),
-                (second_contract_name, second_snippet),
-            ],
+        let expected = if TestConfig::clarity_version() == ClarityVersion::Clarity1 {
+            Ok(Some(
+                Value::cons_list(
+                    (0..2)
+                        .map(|_| Value::Principal(PrincipalData::Contract(contract_id.clone())))
+                        .collect(),
+                    &StacksEpochId::latest(),
+                )
+                .unwrap(),
+            ))
+        } else {
             Ok(Some(
                 Value::cons_list(
                     (0..2)
                         .map(|_| {
-                            Value::CallableContract(CallableData {
+                            Value::CallableContract(clarity_types::types::CallableData {
                                 contract_identifier: contract_id.clone(),
                                 trait_identifier: Some(Box::new(TraitIdentifier {
                                     name: ClarityName::from_literal("my-trait"),
@@ -333,7 +340,14 @@ mod tests {
                     &StacksEpochId::latest(),
                 )
                 .unwrap(),
-            )),
+            ))
+        };
+        crosscheck_multi_contract(
+            &[
+                (first_contract_name, first_snippet),
+                (second_contract_name, second_snippet),
+            ],
+            expected,
         );
     }
 

@@ -44,37 +44,6 @@
 # ---------------------------------------------------------------------------
 
 [[ignored]]
-test = "contract_call_with_epoch_3_3"
-class = "out-of-scope"
-owner = "023"
-covered_by = "scoreboard replay: costs (340/340), mainnet_receipts (500/500)"
-measured = """
-Its reason -- "Clarity 4 costs needs to be implemented" -- is stale twice over,
-and it is the entry that opened task 085 because the old substring rule matched
-`needs to be implemented` and filed it as an environment problem.
-
-It is not an environment problem, and it is also not the differential the reason
-claims. `clar4::WORD_COSTS` *is* implemented and wired: `cost.rs:415` selects it
-for epochs 3.3 and 3.4, and `clar5` for 4.0. What fails is the harness loading
-the `costs-4` *boot contract* for an epoch-3.3 environment.
-
-And nano never charges under epoch 3.3. `compile_under`
-(`nano-vm/src/lib.rs`) passes `StacksEpochId::Epoch40` as the cost epoch whatever
-version the contract was deployed under -- "whatever epoch accepts the contract,
-the chain charges it at the rate it is running at" -- and
-`transaction_cost_tracker_in_context` builds its tracker at `Epoch40` with
-`EPOCH_4_BLOCK_LIMIT` independently of the same. So `clar4` is unreachable in a
-nano node, and the schedule nano *does* charge under is gated by the scoreboard's
-340/340 cost dimensions and the 500/500 frozen mainnet receipts, over real
-mainnet contracts deployed across many epochs.
-
-Reading this one is what turned up the cost fail-open beside it: the tracker used
-to fall back to `LimitedCostTracker::new_free()` when the cost contract would not
-load, which on a node charges nothing and limits nothing. That now refuses on a
-durable store.
-"""
-
-[[ignored]]
 test = "get_tenure_info_block_reward"
 class = "covered"
 owner = "060"
@@ -112,43 +81,7 @@ gated even though this test cannot be.
 # refusal of a word 4.0 does not have, and both engines refuse.
 
 [[ignored]]
-test = "at_block_needs_cleanup"
-class = "out-of-scope"
-owner = "066"
-covered_by = "nano-conformance at_block_refusal"
-
-[[ignored]]
-test = "at_block_needs_cleanup_top_level"
-class = "out-of-scope"
-owner = "066"
-covered_by = "nano-conformance at_block_refusal"
-
-[[ignored]]
-test = "at_block_less_than_two_args"
-class = "out-of-scope"
-owner = "066"
-covered_by = "nano-conformance at_block_refusal"
-
-[[ignored]]
-test = "at_block_more_than_two_args"
-class = "out-of-scope"
-owner = "066"
-covered_by = "nano-conformance at_block_refusal"
-
-[[ignored]]
 test = "at_block_var"
-class = "out-of-scope"
-owner = "066"
-covered_by = "nano-conformance at_block_refusal"
-
-[[ignored]]
-test = "crosscheck_at_block"
-class = "out-of-scope"
-owner = "066"
-covered_by = "nano-conformance at_block_refusal"
-
-[[ignored]]
-test = "crosscheck_at_block_no_leak"
 class = "out-of-scope"
 owner = "066"
 covered_by = "nano-conformance at_block_refusal"
@@ -163,28 +96,6 @@ measured = """
 `get-stacks-block-info?` and `get-tenure-info?`. The `block-reward` field itself
 is still live and is covered by `get_tenure_info_block_reward` above, which is
 classified `semantic`.
-"""
-
-[[ignored]]
-test = "crossprop_blockinfo_within_controlled_range"
-class = "out-of-scope"
-owner = "066"
-covered_by = "nano-conformance at_block_refusal, tenure_block_reward"
-measured = "`use of unresolved function 'get-block-info?'`, in both engines."
-
-[[ignored]]
-test = "as_contract_can_return_any_value"
-class = "out-of-scope"
-owner = "066"
-covered_by = "nano-conformance as_contract_sender, as_contract_codegen, allowance_principal"
-measured = """
-`UnknownFunction("as-contract")`, in both engines. clarity's own registry settles
-it: `AsContract("as-contract", ClarityVersion::Clarity1, Some(ClarityVersion::Clarity3))`
--- the word runs Clarity 1 through 3 and is removed after, replaced by
-`as-contract?`. The harness runs at Clarity 6. Nano covers `as-contract` at the
-versions where it exists (`as_contract_sender`, at Clarity 3, which matters
-because task 064 compiles an old contract under its deployment epoch) and
-`as-contract?` in `allowance_principal` and `as_contract_codegen`.
 """
 
 [[ignored]]
