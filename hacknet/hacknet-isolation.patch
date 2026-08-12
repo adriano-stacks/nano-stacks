@@ -49,8 +49,7 @@ index 59bdeb6..edf0764 100644
 -      - '127.0.0.1:18444:18444'
 +      - "127.0.0.1:${NANO_BITCOIN_RPC_PORT:-18443}:18443"
 +      - "127.0.0.1:${NANO_BITCOIN_PEER_PORT:-18444}:18444"
-@@ -232,4 +232,4 @@ services:
- 
+@@ -232,3 +232,3 @@ services:
    bitcoin-miner:
      image: *IMAGE_BITCOIN
 -    container_name: bitcoin-miner
@@ -66,8 +65,7 @@ index 59bdeb6..edf0764 100644
      ports:
 -      - '127.0.0.1:20443:20443'
 +      - "127.0.0.1:${NANO_MINER_1_RPC_PORT:-20443}:20443"
-@@ -312,3 +312,3 @@ services:
- 
+@@ -312,2 +312,2 @@ services:
    stacks-miner-2:
 -    container_name: stacks-miner-2
 +    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}stacks-miner-2"
@@ -76,8 +74,7 @@ index 59bdeb6..edf0764 100644
      ports:
 -      - '127.0.0.1:21443:20443'
 +      - "127.0.0.1:${NANO_MINER_2_RPC_PORT:-21443}:20443"
-@@ -343,3 +343,3 @@ services:
- 
+@@ -343,2 +343,2 @@ services:
    stacks-miner-3:
 -    container_name: stacks-miner-3
 +    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}stacks-miner-3"
@@ -86,18 +83,15 @@ index 59bdeb6..edf0764 100644
      ports:
 -      - '127.0.0.1:22443:20443'
 +      - "127.0.0.1:${NANO_MINER_3_RPC_PORT:-22443}:20443"
-@@ -374,3 +374,3 @@ services:
- 
+@@ -374,2 +374,2 @@ services:
    stacks-signer-1:
 -    container_name: stacks-signer-1
 +    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}stacks-signer-1"
-@@ -388,3 +388,3 @@ services:
- 
+@@ -388,2 +388,2 @@ services:
    stacks-signer-2:
 -    container_name: stacks-signer-2
 +    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}stacks-signer-2"
-@@ -402,3 +402,3 @@ services:
- 
+@@ -402,2 +402,2 @@ services:
    stacks-signer-3:
 -    container_name: stacks-signer-3
 +    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}stacks-signer-3"
@@ -132,20 +126,17 @@ index 59bdeb6..edf0764 100644
      build: stacker
 -    container_name: pox5-setup
 +    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}pox5-setup"
-@@ -510,4 +510,4 @@ services:
- 
+@@ -510,3 +510,3 @@ services:
    stacker:
      build: stacker
 -    container_name: stacker
 +    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}stacker"
-@@ -539,4 +539,4 @@ services:
- 
+@@ -539,3 +539,3 @@ services:
    bitcoin-staking:
      build: stacker
 -    container_name: bitcoin-staking
 +    container_name: "${NANO_HACKNET_CONTAINER_PREFIX:-}bitcoin-staking"
-@@ -575,4 +575,4 @@ services:
- 
+@@ -575,3 +575,3 @@ services:
    tx-broadcaster:
      build: stacker
 -    container_name: tx-broadcaster
