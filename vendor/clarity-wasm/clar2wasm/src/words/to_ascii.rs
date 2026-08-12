@@ -5,22 +5,10 @@ use walrus::ir::{BinaryOp, ExtendedLoad, LoadKind, MemArg, StoreKind, UnaryOp};
 use walrus::LocalId;
 
 use crate::check_args;
+use crate::cost::WordCharge;
 use crate::wasm_generator::GeneratorError;
 use crate::wasm_utils::ArgumentCountCheck;
 use crate::words::{ComplexWord, Word};
-
-/// A `(string-ascii n)` type, built without the testing-only constructor.
-///
-/// `TypeSignature::new_ascii_type_checked` is gated on `clarity/testing`, and
-/// Cargo unifies features across a build graph — so asking for it on a normal
-/// dependency puts the reference crates' test behaviour into every binary built
-/// from this one, a release node included. `new_ascii_type` is the same
-/// construction with an invalid length reported rather than panicked on.
-fn ascii_type(length: u32) -> Result<TypeSignature, GeneratorError> {
-    TypeSignature::new_ascii_type(i128::from(length)).map_err(|error| {
-        GeneratorError::TypeError(format!("invalid ASCII string length {length}: {error}"))
-    })
-}
 
 #[derive(Debug)]
 pub struct ToAscii;
@@ -45,17 +33,29 @@ impl ComplexWord for ToAscii {
             // the check above makes sure we have exactly one argument.
             unreachable!()
         };
-        let arg_ty = generator.get_expr_type(arg).ok_or_else(|| {
-            GeneratorError::TypeError("to-ascii? 's argument should be typed".to_owned())
-        })?;
+        let arg_ty = generator
+            .get_expr_type(arg)
+            .ok_or_else(|| {
+                GeneratorError::TypeError("to-ascii? 's argument should be typed".to_owned())
+            })?
+            .clone();
+        generator.traverse_expr(builder, arg)?;
+        let arg_locals = generator.save_to_locals(builder, &arg_ty, true);
+        let arg_size = generator.borrow_local(walrus::ValType::I32);
+        generator.runtime_size(builder, &arg_ty, &arg_locals, *arg_size)?;
+        self.charge(generator, builder, *arg_size)?;
+        for local in &arg_locals {
+            builder.local_get(*local);
+        }
+        generator.release_locals(arg_locals);
 
         match arg_ty {
-            TypeSignature::BoolType => to_ascii_bool(generator, builder, expr, arg),
-            TypeSignature::IntType => to_ascii_int(generator, builder, expr, arg),
-            TypeSignature::UIntType => to_ascii_uint(generator, builder, expr, arg),
+            TypeSignature::BoolType => to_ascii_bool(generator, builder),
+            TypeSignature::IntType => to_ascii_int(generator, builder),
+            TypeSignature::UIntType => to_ascii_uint(generator, builder),
             TypeSignature::PrincipalType
             | TypeSignature::CallableType(_)
-            | TypeSignature::ListUnionType(_) => to_ascii_principal(generator, builder, expr, arg),
+            | TypeSignature::ListUnionType(_) => to_ascii_principal(generator, builder),
             TypeSignature::SequenceType(SequenceSubtype::BufferType(_)) => {
                 to_ascii_buffer(generator, builder, expr, arg)
             }
@@ -72,16 +72,13 @@ impl ComplexWord for ToAscii {
 fn to_ascii_bool(
     generator: &mut crate::wasm_generator::WasmGenerator,
     builder: &mut walrus::InstrSeqBuilder,
-    _expr: &clarity::vm::SymbolicExpression,
-    arg: &clarity::vm::SymbolicExpression,
 ) -> Result<(), crate::wasm_generator::GeneratorError> {
     // we should allocate a string of size 5 in memory for either the strings "true" or "false"
     // however, we will use 8 bytes so that we can write u64 values directly to memory.
-    let (offset, _len) = generator.create_call_stack_local(builder, &ascii_type(8)?, false, true);
+    let (offset, _len) = generator.create_call_stack_bytes(builder, 8);
 
     // we traverse the argument and store the boolean result in a local
     let res = generator.borrow_local(walrus::ValType::I32);
-    generator.traverse_expr(builder, arg)?;
     builder.local_set(*res);
 
     // we need to add the offset where to write the result on the stack
@@ -121,18 +118,15 @@ fn to_ascii_bool(
 fn to_ascii_uint(
     generator: &mut crate::wasm_generator::WasmGenerator,
     builder: &mut walrus::InstrSeqBuilder,
-    _expr: &clarity::vm::SymbolicExpression,
-    arg: &clarity::vm::SymbolicExpression,
 ) -> Result<(), crate::wasm_generator::GeneratorError> {
     // the biggest uint we could write will have the length of u128::MAX: 39 characters.
     // We also need a space for the character 'u'
-    let (offset, _len) = generator.create_call_stack_local(builder, &ascii_type(40)?, false, true);
+    let (offset, _len) = generator.create_call_stack_bytes(builder, 40);
 
     let lo = generator.borrow_local(walrus::ValType::I64);
     let hi = generator.borrow_local(walrus::ValType::I64);
     let length = generator.borrow_local(walrus::ValType::I32);
 
-    generator.traverse_expr(builder, arg)?;
     builder.local_set(*hi).local_set(*lo);
 
     builder
@@ -176,20 +170,17 @@ fn to_ascii_uint(
 fn to_ascii_int(
     generator: &mut crate::wasm_generator::WasmGenerator,
     builder: &mut walrus::InstrSeqBuilder,
-    _expr: &clarity::vm::SymbolicExpression,
-    arg: &clarity::vm::SymbolicExpression,
 ) -> Result<(), crate::wasm_generator::GeneratorError> {
     let memory = generator.get_memory()?;
 
     // the biggest int we could write will have the length of i128::MIN: 40 characters, including the '-'.
-    let (offset, _len) = generator.create_call_stack_local(builder, &ascii_type(40)?, false, true);
+    let (offset, _len) = generator.create_call_stack_bytes(builder, 40);
 
     let lo = generator.borrow_local(walrus::ValType::I64);
     let hi = generator.borrow_local(walrus::ValType::I64);
     let neg = generator.borrow_local(walrus::ValType::I32);
     let length = generator.borrow_local(walrus::ValType::I32);
 
-    generator.traverse_expr(builder, arg)?;
     builder.local_set(*hi).local_set(*lo);
 
     // checking if our number is negative.
@@ -411,7 +402,7 @@ fn to_ascii_buffer(
         }
     };
     let (result_offset, _len) =
-        generator.create_call_stack_local(builder, &ascii_type(2 * arg_size + 2)?, false, true);
+        generator.create_call_stack_bytes(builder, (2 * arg_size + 2) as i32);
     let result_length = generator.borrow_local(walrus::ValType::I32);
 
     let current_offset = generator.borrow_local(walrus::ValType::I32);
@@ -419,7 +410,6 @@ fn to_ascii_buffer(
     let buff_length = generator.borrow_local(walrus::ValType::I32);
     let bytes = generator.borrow_local(walrus::ValType::I32);
 
-    generator.traverse_expr(builder, arg)?;
     builder.local_set(*buff_length).local_set(*buff_offset);
 
     // write 0x at offset and update the current offset and length
@@ -564,16 +554,18 @@ fn to_ascii_string_utf8(
             ))
         }
     };
-    let (result_offset, _len) =
-        generator.create_call_stack_local(builder, &ascii_type(arg_size)?, false, true);
+    let (result_offset, _len) = generator.create_call_stack_bytes(builder, arg_size as i32);
     let result_length = generator.borrow_local(walrus::ValType::I32);
 
     let current_offset = generator.borrow_local(walrus::ValType::I32);
     let utf8_offset = generator.borrow_local(walrus::ValType::I32);
     let utf8_length = generator.borrow_local(walrus::ValType::I32);
 
-    generator.traverse_expr(builder, arg)?;
-    builder.local_set(*utf8_length).local_set(*utf8_offset);
+    builder
+        .local_set(*utf8_length)
+        .local_set(*utf8_offset)
+        .i32_const(0)
+        .local_set(*result_length);
 
     builder.block(None, |block| {
         let block_id = block.id();
@@ -585,7 +577,6 @@ fn to_ascii_string_utf8(
             .br_if(block_id);
 
         block.local_get(result_offset).local_set(*current_offset);
-        block.i32_const(0).local_set(*result_length);
 
         block.loop_(None, |loop_| {
             let loop_id = loop_.id();
@@ -603,57 +594,41 @@ fn to_ascii_string_utf8(
                 )
                 .local_tee(*unicode);
 
-            // we break the loop if the character is not ascii
+            // Reject non-ASCII scalars before normalizing the big-endian value.
             loop_
                 .i32_const(!127u32.to_be() as i32)
                 .binop(BinaryOp::I32And)
                 .br_if(block_id);
 
-            // Being under 128 is not enough. Clarity admits a byte that is
-            // alphanumeric, punctuation or whitespace (`string_ascii_from_bytes`),
-            // which is `0x20..=0x7e` plus tab, newline, form feed and carriage
-            // return. Asked directly, the interpreter answers `(err u1)` for
-            // NUL, for a vertical tab and for DEL, and `ok` for every other
-            // byte under 128 — breaking only on the high bit accepted all
-            // three.
+            // Clarity ASCII is 32..=126 plus tab, newline, form feed and return.
+            // 0x3600 has exactly those four control-character bits set, so its
+            // complement directly marks the controls that must be rejected.
             loop_
                 .local_get(*unicode)
                 .i32_const(24)
                 .binop(BinaryOp::I32ShrU)
-                .i32_const(0x20)
-                .binop(BinaryOp::I32GeU)
+                .local_tee(*unicode);
+            loop_.i32_const(127).binop(BinaryOp::I32Eq).br_if(block_id);
+            loop_
                 .local_get(*unicode)
-                .i32_const(24)
+                .i32_const(32)
+                .binop(BinaryOp::I32LtU)
+                .i32_const(!0x3600u32 as i32)
+                .local_get(*unicode)
                 .binop(BinaryOp::I32ShrU)
-                .i32_const(0x7e)
-                .binop(BinaryOp::I32LeU)
+                .i32_const(1)
                 .binop(BinaryOp::I32And);
-            for whitespace in [0x09, 0x0a, 0x0c, 0x0d] {
-                loop_
-                    .local_get(*unicode)
-                    .i32_const(24)
-                    .binop(BinaryOp::I32ShrU)
-                    .i32_const(whitespace)
-                    .binop(BinaryOp::I32Eq)
-                    .binop(BinaryOp::I32Or);
-            }
-            loop_.unop(UnaryOp::I32Eqz).br_if(block_id);
+            loop_.binop(BinaryOp::I32And).br_if(block_id);
 
             // otherwise we store the last byte
-            // CAUTION: for now, string-utf8 are still stored in big-endian order!!!
-            loop_
-                .local_get(*current_offset)
-                .local_get(*unicode)
-                .i32_const(3 * 8)
-                .binop(BinaryOp::I32ShrU)
-                .store(
-                    memory,
-                    StoreKind::I32_8 { atomic: false },
-                    MemArg {
-                        align: 1,
-                        offset: 0,
-                    },
-                );
+            loop_.local_get(*current_offset).local_get(*unicode).store(
+                memory,
+                StoreKind::I32_8 { atomic: false },
+                MemArg {
+                    align: 1,
+                    offset: 0,
+                },
+            );
 
             // now we update the locals and loop if we still have characters to process
             loop_
@@ -694,22 +669,15 @@ fn to_ascii_string_utf8(
 fn to_ascii_principal(
     generator: &mut crate::wasm_generator::WasmGenerator,
     builder: &mut walrus::InstrSeqBuilder,
-    _expr: &clarity::vm::SymbolicExpression,
-    arg: &clarity::vm::SymbolicExpression,
 ) -> Result<(), crate::wasm_generator::GeneratorError> {
-    let (result_offset, length) = generator.create_call_stack_local(
-        builder,
-        // size is 41 for the max size of a standard contract + the dot + the max len of a contract name
-        &ascii_type(41 + 1 + MAX_STRING_LEN as u32)?,
-        false,
-        true,
-    );
+    // size is 41 for the max size of a standard contract + the dot + the max len of a contract name
+    let (result_offset, length) =
+        generator.create_call_stack_bytes(builder, 41 + 1 + MAX_STRING_LEN as i32);
 
     let principal_to_string_ascii = generator.func_by_name("stdlib.principal_to_string_ascii");
 
     let result_length = generator.borrow_local(walrus::ValType::I32);
 
-    generator.traverse_expr(builder, arg)?;
     builder
         .local_get(result_offset)
         .i32_const(length)
@@ -736,7 +704,7 @@ mod tests {
     use clarity_types::types::{BuffData, ResponseData};
     use clarity_types::Value;
 
-    use crate::tools::{crosscheck, evaluate};
+    use crate::tools::{crosscheck, crosscheck_cost, evaluate};
 
     #[test]
     fn to_ascii_bool() {
@@ -884,6 +852,33 @@ mod tests {
         check("ST1HTBVD3JG9C05J7HBJTHGR0GGW7KXW28M5JS8QE.foo")
     }
 
+    #[test]
+    fn to_ascii_costs_match_the_interpreter() {
+        let contract = r#"
+            (define-read-only (ascii-bool) (to-ascii? true))
+            (define-read-only (ascii-int) (to-ascii? -1))
+            (define-read-only (ascii-uint) (to-ascii? u1))
+            (define-read-only (ascii-buffer) (to-ascii? 0x68656c6c6f21))
+            (define-read-only (ascii-utf8) (to-ascii? u"hello"))
+            (define-read-only (ascii-principal)
+                (to-ascii? 'ST1HTBVD3JG9C05J7HBJTHGR0GGW7KXW28M5JS8QE))
+            (define-read-only (ascii-after-short-return)
+                (to-ascii? (unwrap! (if false (some 1) none) (err u99))))
+        "#;
+
+        for function in [
+            "ascii-bool",
+            "ascii-int",
+            "ascii-uint",
+            "ascii-buffer",
+            "ascii-utf8",
+            "ascii-principal",
+        ] {
+            crosscheck_cost(contract, function, &[]);
+        }
+        crosscheck_cost(contract, "ascii-after-short-return", &[]);
+    }
+
     /// Every byte in the ASCII range, against Clarity's own validator.
     ///
     /// The table below picks the boundaries by hand, which is a sample of the
@@ -897,7 +892,7 @@ mod tests {
     /// here is the exhaustiveness, not the fix.
     #[test]
     fn to_ascii_utf8_agrees_with_clarity_on_every_ascii_byte() {
-        for byte in 0..=0x7f_u8 {
+        for byte in u8::MIN..=u8::MAX {
             let admissible = clarity::vm::Value::string_ascii_from_bytes(vec![byte]).is_ok();
             let expected = if admissible {
                 clarity::vm::Value::okay(
