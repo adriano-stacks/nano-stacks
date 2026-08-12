@@ -1,6 +1,6 @@
 pub mod sbtc;
 
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, time::Duration};
 
 use bitcoin::{
     Amount, Block, Transaction, TxIn, TxOut,
@@ -29,6 +29,7 @@ pub struct BitcoinBlock {
 }
 
 const PRE_STX_WINDOW_BLOCKS: u64 = 6;
+const REST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `PreStx` outputs available to later Bitcoin blocks.
 #[derive(Clone, Debug, Default)]
@@ -270,6 +271,7 @@ impl BitcoinRpcSource {
 #[derive(Debug)]
 pub struct BitcoinRestSource {
     base: String,
+    agent: ureq::Agent,
     magic: [u8; 2],
     pre_stx: PreStxCache,
     last_height: Option<u64>,
@@ -278,13 +280,21 @@ pub struct BitcoinRestSource {
 
 impl BitcoinRestSource {
     pub fn new(base: &str, magic: [u8; 2]) -> Result<Self, BitcoinRpcSourceError> {
-        Ok(Self {
+        Ok(Self::with_timeout(base, magic, REST_TIMEOUT))
+    }
+
+    fn with_timeout(base: &str, magic: [u8; 2], timeout: Duration) -> Self {
+        Self {
             base: base.trim_end_matches('/').to_owned(),
+            agent: ureq::Agent::config_builder()
+                .timeout_global(Some(timeout))
+                .build()
+                .into(),
             magic,
             pre_stx: PreStxCache::new(),
             last_height: None,
             last_block: None,
-        })
+        }
     }
 
     /// A plain synchronous GET.
@@ -295,7 +305,9 @@ impl BitcoinRestSource {
     fn get(&self, path: &str) -> Result<Vec<u8>, BitcoinRpcSourceError> {
         use std::io::Read as _;
         let mut body = Vec::new();
-        let mut reader = ureq::get(&format!("{}/{path}", self.base))
+        let mut reader = self
+            .agent
+            .get(format!("{}/{path}", self.base))
             .call()
             .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?
             .into_body()
@@ -1421,7 +1433,31 @@ mod tests {
 
 #[cfg(test)]
 mod rest_tests {
+    use std::{net::TcpListener, thread, time::Duration};
+
     use super::BitcoinRestSource;
+
+    #[test]
+    fn a_stalled_rest_server_cannot_hold_the_node_forever() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a test server");
+        let address = listener.local_addr().expect("the server address");
+        let server = thread::spawn(move || {
+            let (_socket, _) = listener.accept().expect("accept the request");
+            thread::sleep(Duration::from_millis(250));
+        });
+        let source = BitcoinRestSource::with_timeout(
+            &format!("http://{address}"),
+            *b"X2",
+            Duration::from_millis(25),
+        );
+
+        let error = source
+            .tip_height()
+            .expect_err("a server that never answers must time out")
+            .to_string();
+        assert!(error.contains("timeout"), "{error}");
+        server.join().expect("stop the test server");
+    }
 
     /// Reads a real mainnet burn block over Esplora.
     ///
