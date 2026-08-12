@@ -2201,26 +2201,33 @@ pub fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, Bitcoi
     let prepare_phase_length = u32::try_from(field("pox_prepare_phase_length")?).ok()?;
     let reward_phase_length = u32::try_from(field("pox_reward_phase_length")?).ok()?;
     let operations = captured_bitcoin_operations(root)?;
-    let registrations = snapshots
-        .iter()
-        .flat_map(|snapshot| {
-            operations
-                .get(&snapshot.consensus_hash)
-                .into_iter()
-                .flatten()
-                .filter_map(move |operation| match operation.kind {
-                    BitcoinOperationKind::LeaderKeyRegistration {
-                        vrf_public_key,
-                        block_signing_key_hash,
-                        ..
-                    } => Some((
-                        (snapshot.block_height, operation.transaction_index),
-                        (vrf_public_key, block_signing_key_hash),
-                    )),
-                    _ => None,
-                })
+    let mut registrations = nano_node::sortition::read_leader_keys(&root.join("sortition"))
+        .ok()?
+        .entries()
+        .map(|(height, index, registration)| {
+            (
+                (height, index),
+                (registration.vrf_public_key, registration.signing_key_hash),
+            )
         })
         .collect::<BTreeMap<_, _>>();
+    registrations.extend(snapshots.iter().flat_map(|snapshot| {
+        operations
+            .get(&snapshot.consensus_hash)
+            .into_iter()
+            .flatten()
+            .filter_map(move |operation| match operation.kind {
+                BitcoinOperationKind::LeaderKeyRegistration {
+                    vrf_public_key,
+                    block_signing_key_hash,
+                    ..
+                } => Some((
+                    (snapshot.block_height, operation.transaction_index),
+                    (vrf_public_key, block_signing_key_hash),
+                )),
+                _ => None,
+            })
+    }));
     snapshots
         .into_iter()
         .map(|snapshot| {

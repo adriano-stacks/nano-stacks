@@ -935,16 +935,10 @@ impl SortitionTracker {
     /// instead. A malformed one *is* — a registry that half-loaded would resolve
     /// some winners and silently not others.
     pub fn load_leader_keys(&mut self, directory: &Path) -> Result<usize, TrackerError> {
-        let path = directory.join(LEADER_KEY_FILE);
-        let Ok(bytes) = fs::read(&path) else {
-            return Ok(0);
-        };
-        let records: Vec<CapturedLeaderKey> = serde_json::from_slice(&bytes)
-            .map_err(|error| TrackerError::Seed(format!("{}: {error}", path.display())))?;
-        let loaded = records.len();
-        for record in records {
-            self.keys
-                .register(record.block_height, record.vtxindex, record.registration()?);
+        let keys = read_leader_keys(directory)?;
+        let loaded = keys.available();
+        for (height, index, registration) in keys.entries() {
+            self.keys.register(height, index, registration);
         }
         Ok(loaded)
     }
@@ -1029,6 +1023,24 @@ fn unanimous_winner_seed(block: &BitcoinBlock) -> Option<[u8; 32]> {
 /// Beside the snapshots and the consensus hashes, because it answers the same
 /// kind of question they do: what the burnchain below this node's window said.
 pub const LEADER_KEY_FILE: &str = "leader-keys.json";
+
+/// Read the leader-key registry a checkpoint carries.
+///
+/// An absent registry is an empty one. A malformed registry is an error rather
+/// than a partial answer.
+pub fn read_leader_keys(directory: &Path) -> Result<LeaderKeys, TrackerError> {
+    let path = directory.join(LEADER_KEY_FILE);
+    let Ok(bytes) = fs::read(&path) else {
+        return Ok(LeaderKeys::new());
+    };
+    let records: Vec<CapturedLeaderKey> = serde_json::from_slice(&bytes)
+        .map_err(|error| TrackerError::Seed(format!("{}: {error}", path.display())))?;
+    let mut keys = LeaderKeys::new();
+    for record in records {
+        keys.register(record.block_height, record.vtxindex, record.registration()?);
+    }
+    Ok(keys)
+}
 
 /// One leader-key registration, as a checkpoint carries it.
 ///
