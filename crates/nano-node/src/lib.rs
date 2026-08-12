@@ -2178,26 +2178,39 @@ where
         Ok(None)
     }
 
-    /// The burn height of the sortition that elected this block's tenure.
+    /// Record the sortition that elected this block's tenure.
     ///
-    /// Put the tenure's own burn height into the context, leaving the view where it
-    /// is. They are the same block until an extend moves them apart. The local
-    /// sortition history must place the tenure; there is no peer fallback.
-    fn record_tenure_burn_height(
+    /// Its validation inputs and burn height come from the tenure's own snapshot,
+    /// while Clarity-visible fields remain those of the current burn view. They are
+    /// the same block until an extend moves them apart. The local sortition history
+    /// must place both; there is no peer fallback.
+    fn record_tenure_sortition(
         &self,
         block: &NakamotoBlock,
         bitcoin_context: &mut BitcoinBlockContext,
     ) -> Result<(), CheckpointExecutionError> {
-        let tenure = self
-            .sortition
-            .as_ref()
-            .and_then(|tracker| tracker.height_of_consensus_hash(block.header.consensus_hash))
+        let tracker = self.sortition.as_ref().ok_or_else(|| {
+            CheckpointExecutionError::Link(format!(
+                "the local sortition chain cannot place tenure {} for block {} at a burn height",
+                block.header.consensus_hash, block.header.chain_length
+            ))
+        })?;
+        let tenure = tracker
+            .height_of_consensus_hash(block.header.consensus_hash)
             .ok_or_else(|| {
                 CheckpointExecutionError::Link(format!(
                     "the local sortition chain cannot place tenure {} for block {} at a burn height",
                     block.header.consensus_hash, block.header.chain_length
                 ))
             })?;
+        let snapshot = tracker.snapshot_at(tenure).ok_or_else(|| {
+            CheckpointExecutionError::Link(format!(
+                "the local sortition chain no longer holds the authentication snapshot for tenure \
+                 {} at burn {tenure}",
+                block.header.consensus_hash
+            ))
+        })?;
+        LocalSortition::from_snapshot(snapshot).record_authentication(bitcoin_context);
         let view_has_moved = self
             .bitcoin_view
             .is_some_and(|view| view != block.header.consensus_hash);
@@ -2331,7 +2344,7 @@ where
         // Exactly one rule reads it: the prepare-phase signer-set update, which
         // stacks-core drives from the tenure's sortition. Reading the view there is
         // what parted the roots at pox-5 height 931.
-        self.record_tenure_burn_height(block, &mut bitcoin_context)?;
+        self.record_tenure_sortition(block, &mut bitcoin_context)?;
         let phase = std::time::Instant::now();
         self.seed_burn_headers(bitcoin_height);
         timing.headers += phase.elapsed();
@@ -2783,7 +2796,7 @@ where
                 ))
             })?
             .record(&mut context);
-        self.record_tenure_burn_height(block, &mut context)?;
+        self.record_tenure_sortition(block, &mut context)?;
         self.seed_burn_headers(bitcoin_height);
         self.tenure_coinbase(block, context, bitcoin_height)
             .ok_or_else(|| {
@@ -3013,5 +3026,19 @@ mod peer_boundary_tests {
                  burn view a block executes under"
             );
         }
+    }
+
+    #[test]
+    fn an_extended_view_reloads_the_tenure_s_authentication() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("fn record_tenure_sortition")
+            .expect("the tenure context builder exists");
+        let body = &source[start..];
+        let end = body[1..].find("\n    /// ").map_or(body.len(), |at| at + 1);
+        assert!(
+            body[..end].contains("record_authentication(bitcoin_context)"),
+            "moving an extended view back to its tenure must also restore the tenure winner"
+        );
     }
 }

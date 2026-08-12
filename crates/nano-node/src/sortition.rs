@@ -825,6 +825,12 @@ impl SortitionTracker {
 
     fn recover_seed_from(&mut self, block: &BitcoinBlock) -> Result<(), TrackerError> {
         let tip = self.tip();
+        let seed_was_present = self.engine.snapshots().effective_winner_seed().is_some();
+        let winner_key_is_missing =
+            tip.winner_txid.is_some() && tip.winner_vrf_public_key.is_none();
+        if seed_was_present && !winner_key_is_missing {
+            return Ok(());
+        }
         if block.height != tip.bitcoin_height || block.hash != *tip.bitcoin_header_hash.as_bytes() {
             return Err(TrackerError::Seed(format!(
                 "the seed snapshot names burn {} with header {}, but its Bitcoin source \
@@ -835,7 +841,6 @@ impl SortitionTracker {
                 hex::encode(block.hash)
             )));
         }
-        let seed_was_present = self.engine.snapshots().effective_winner_seed().is_some();
         if !seed_was_present {
             let winner = tip.winner_txid.ok_or_else(|| {
                 TrackerError::Seed(format!(
