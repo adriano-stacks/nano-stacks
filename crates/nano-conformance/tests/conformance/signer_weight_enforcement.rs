@@ -127,7 +127,12 @@ fn decode_array<const N: usize>(encoded: &str, what: &str) -> [u8; N] {
         .unwrap_or_else(|bytes: Vec<u8>| panic!("{what} has {} bytes, expected {N}", bytes.len()))
 }
 
-fn observed_block_events(root: &Path, cycle: u64) -> Vec<(u64, [u8; 32], Vec<MessageSignature>)> {
+fn observed_block_events(
+    root: &Path,
+    capture: &Path,
+    cycle: u64,
+) -> Vec<(u64, [u8; 32], Vec<MessageSignature>)> {
+    let calendar = mainnet_context(capture);
     let mut paths = fs::read_dir(root.join("new_block"))
         .expect("the signer evidence contains accepted block events")
         .map(|entry| entry.expect("a block-event entry").path())
@@ -141,12 +146,16 @@ fn observed_block_events(root: &Path, cycle: u64) -> Vec<(u64, [u8; 32], Vec<Mes
                     panic!("read block event {}: {error}", path.display())
                 }))
                 .unwrap_or_else(|error| panic!("decode block event {}: {error}", path.display()));
-            if event["cycle_number"].as_u64() != Some(cycle) {
-                return None;
-            }
             let height = event["burn_block_height"]
                 .as_u64()
                 .expect("a block event burn height");
+            let mut context = calendar;
+            context.move_to_burn_block(height);
+            assert_eq!(
+                nano_chainstate::reward_cycle_at(context),
+                Some(cycle),
+                "the signer evidence contains only blocks from cycle {cycle}"
+            );
             let digest = decode_array(
                 event["signer_signature_hash"]
                     .as_str()
@@ -435,7 +444,7 @@ fn the_mainnet_state_carries_the_signer_set_mainnet_published() {
     let cycle = published_cycle(&evidence);
     let published = published_signer_set(&evidence, cycle).expect("the published reward set reads");
     let context = if observed {
-        let height = observed_block_events(&evidence, cycle)
+        let height = observed_block_events(&evidence, &capture, cycle)
             .first()
             .expect("the evidence contains a block in the published cycle")
             .0;
@@ -518,7 +527,7 @@ fn mainnet_blocks_pass_the_check_against_mainnet_state() {
     let (evidence, observed) = signer_evidence(&capture);
     let cycle = published_cycle(&evidence);
     let events = observed.then(|| {
-        let events = observed_block_events(&evidence, cycle);
+        let events = observed_block_events(&evidence, &capture, cycle);
         assert!(
             !events.is_empty(),
             "the signer evidence contains no block in cycle {cycle}"
