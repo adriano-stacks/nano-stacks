@@ -253,12 +253,11 @@ impl BitcoinRpcSource {
             let raw = bitcoin::consensus::serialize(&self.client.get_block(&hash)?);
             let block =
                 decode_block_with_pre_stx(current_height, &raw, self.magic, &mut self.pre_stx)?;
+            self.last_height = Some(current_height);
+            self.last_block = Some(block.clone());
             current = Some(block);
         }
-        self.last_height = Some(height);
-        let block = current.ok_or(BitcoinParseError::InvalidBlock)?;
-        self.last_block = Some(block.clone());
-        Ok(block)
+        current.ok_or_else(|| BitcoinParseError::InvalidBlock.into())
     }
 }
 
@@ -391,12 +390,11 @@ impl BitcoinRestSource {
             let raw = self.get(&format!("block/{}/raw", hash.trim()))?;
             let block =
                 decode_block_with_pre_stx(current_height, &raw, self.magic, &mut self.pre_stx)?;
+            self.last_height = Some(current_height);
+            self.last_block = Some(block.clone());
             current = Some(block);
         }
-        self.last_height = Some(height);
-        let block = current.ok_or(BitcoinParseError::InvalidBlock)?;
-        self.last_block = Some(block.clone());
-        Ok(block)
+        current.ok_or_else(|| BitcoinParseError::InvalidBlock.into())
     }
 }
 
@@ -1416,7 +1414,7 @@ mod tests {
         }
     }
 
-    fn block_bytes(transactions: Vec<Transaction>) -> Vec<u8> {
+    pub fn block_bytes(transactions: Vec<Transaction>) -> Vec<u8> {
         serialize(&Block {
             header: Header {
                 version: BlockVersion::ONE,
@@ -1433,7 +1431,14 @@ mod tests {
 
 #[cfg(test)]
 mod rest_tests {
-    use std::{net::TcpListener, thread, time::Duration};
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        thread,
+        time::Duration,
+    };
+
+    use bitcoin::{Block, consensus::deserialize};
 
     use super::BitcoinRestSource;
 
@@ -1457,6 +1462,63 @@ mod rest_tests {
             .to_string();
         assert!(error.contains("timeout"), "{error}");
         server.join().expect("stop the test server");
+    }
+
+    #[test]
+    fn a_rate_limited_walk_resumes_after_its_last_decoded_block() {
+        let raw = super::tests::block_bytes(Vec::new());
+        let block: Block = deserialize(&raw).expect("decode the test block");
+        let hash = block.block_hash().to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a test server");
+        let address = listener.local_addr().expect("the server address");
+        let server = thread::spawn(move || {
+            let mut raw_requests = 0;
+            for _ in 0..17 {
+                let (mut socket, _) = listener.accept().expect("accept a request");
+                let mut request = [0; 1024];
+                let length = socket.read(&mut request).expect("read the request");
+                let request = String::from_utf8_lossy(&request[..length]);
+                let is_raw = request
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains("/block/") && line.contains("/raw"));
+                let (status, body) = if is_raw {
+                    raw_requests += 1;
+                    if raw_requests == 3 {
+                        ("429 Too Many Requests", Vec::new())
+                    } else {
+                        ("200 OK", raw.clone())
+                    }
+                } else {
+                    ("200 OK", hash.as_bytes().to_vec())
+                };
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .expect("write the response headers");
+                socket.write_all(&body).expect("write the response body");
+            }
+            raw_requests
+        });
+        let mut source = BitcoinRestSource::with_timeout(
+            &format!("http://{address}"),
+            *b"X2",
+            Duration::from_secs(1),
+        );
+
+        let error = source
+            .block_at(9)
+            .expect_err("the third block request is rate limited");
+        assert!(error.to_string().contains("429"), "{error}");
+        assert_eq!(source.last_height, Some(4));
+        assert_eq!(
+            source.last_block.as_ref().map(|block| block.height),
+            Some(4)
+        );
+        assert_eq!(source.block_at(9).expect("resume the walk").height, 9);
+        assert_eq!(server.join().expect("stop the test server"), 8);
     }
 
     /// Reads a real mainnet burn block over Esplora.
