@@ -1,7 +1,7 @@
 ---
 id: "052"
 title: "Wire the complete RPC and event surface into the node"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: feature
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["029", "046", "047", "050"]
 tags: ["mainnet", "rpc", "events"]
 created_at: 2026-08-02
+completed_at: 2026-08-12
 ---
 
 # Wire the complete RPC and event surface into the node
