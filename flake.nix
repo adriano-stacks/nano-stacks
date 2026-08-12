@@ -48,6 +48,9 @@
             shellHook = ''
               export TMPDIR="''${TMPDIR_OVERRIDE:-$HOME/.cache/nano-stacks/tmp}"
               mkdir -p "$TMPDIR"
+              if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+                git config --local core.hooksPath .githooks
+              fi
             '';
           };
         });

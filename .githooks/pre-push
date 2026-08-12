@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "pre-push: the worktree must be clean before CI is verified" >&2
+  git status --short >&2
+  exit 1
+fi
+
+head=$(git rev-parse HEAD)
+nix develop --command scripts/ci.sh all
+
+if [[ "$(git rev-parse HEAD)" != "$head" || -n "$(git status --porcelain)" ]]; then
+  echo "pre-push: HEAD or the worktree changed while CI was running" >&2
+  exit 1
+fi

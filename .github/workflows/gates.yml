@@ -20,10 +20,6 @@ on:
 # would build release evidence with a compiler nobody chose.
 env:
   CARGO_TERM_COLOR: always
-  NANO_CARGO_VERSION: 1.97.0
-  NANO_CLIPPY_VERSION: 0.1.97
-  NANO_RUSTFMT_VERSION: 1.9.0
-  NANO_RUSTC_VERSION: 1.97.1
 
 jobs:
   gates:
@@ -37,56 +33,39 @@ jobs:
             experimental-features = nix-command flakes
 
       - name: the lock file and exact Rust release decide the toolchain
-        run: |
-          configured=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
-          test "$configured" = "$NANO_RUSTC_VERSION"
-          test "$(nix develop --command rustc --version | awk '{print $2}')" = "$NANO_RUSTC_VERSION"
-          test "$(nix develop --command cargo --version | awk '{print $2}')" = "$NANO_CARGO_VERSION"
-          test "$(nix develop --command cargo clippy --version | awk '{print $2}')" = "$NANO_CLIPPY_VERSION"
-          test "$(nix develop --command rustfmt --version | awk '{print $2}' | cut -d- -f1)" = "$NANO_RUSTFMT_VERSION"
-          git diff --exit-code flake.lock
+        run: nix develop --command scripts/ci.sh toolchain
 
       - uses: Swatinem/rust-cache@v2
 
       - name: workflow syntax
-        run: nix develop --command actionlint
+        run: nix develop --command scripts/ci.sh workflow
 
       - name: formatting
-        # The script covers both Cargo workspaces; root `cargo fmt` cannot see
-        # the independently vendored clarity-wasm workspace.
-        run: nix develop --command scripts/fmt.sh --check
+        run: nix develop --command scripts/ci.sh formatting
 
       - name: clippy, release profile, every target
-        run: |
-          nix develop --command cargo clippy --release --workspace --all-targets -- -D warnings
-          nix develop --command cargo clippy --manifest-path vendor/clarity-wasm/Cargo.toml \
-            --release -p clar2wasm --all-targets -- -D warnings
+        run: nix develop --command scripts/ci.sh clippy
 
       - name: the bounded fixture replay, as a gate
-        run: nix develop --command cargo xtask scoreboard
+        run: nix develop --command scripts/ci.sh scoreboard
 
       - name: fixture integrity
-        run: nix develop --command cargo xtask validate-fixtures
+        run: nix develop --command scripts/ci.sh fixtures
 
       - name: the conformance suite
-        run: nix develop --command cargo test --release -p nano-conformance --test conformance
+        run: nix develop --command scripts/ci.sh conformance
 
       - name: unit tests
-        run: nix develop --command cargo test --release --workspace
+        run: nix develop --command scripts/ci.sh tests
 
       # The report still builds and inspects the release artifact, checks the
       # ignored/conditional inventory and consumes the scoreboard verdict. It does
       # not pretend that this offline runner has the mainnet and Hacknet inputs.
       - name: offline release evidence
-        run: |
-          set +e
-          nix develop --command cargo xtask release-report --no-gates
-          status=$?
-          set -e
-          test "$status" -eq 2
+        run: nix develop --command scripts/ci.sh release
 
       - name: gates leave every pinned input unchanged
-        run: git diff --exit-code -- flake.lock Cargo.lock vendor/clarity-wasm/Cargo.lock
+        run: nix develop --command scripts/ci.sh locks
 
   # Release qualification is deliberately not a push/PR job. It needs large
   # captured state, a live mainnet route and stock Hacknet services; pretending a

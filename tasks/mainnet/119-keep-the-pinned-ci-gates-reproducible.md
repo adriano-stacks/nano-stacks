@@ -8,6 +8,13 @@ type: bug
 group: mainnet
 tags: ["ci", "tooling", "release", "gates"]
 created_at: "2026-08-11"
+verify:
+  - type: bash
+    run: "nix develop --command scripts/ci.sh formatting"
+  - type: bash
+    run: "nix develop --command scripts/ci.sh workflow"
+  - type: bash
+    run: "test \"$(git config --local --get core.hooksPath)\" = .githooks"
 completed_at: 2026-08-12
 ---
 
@@ -27,6 +34,8 @@ hosted runner.
 - [x] Fix every clippy warning with `-D warnings` for both workspaces.
 - [x] Run the remaining offline gates exactly as CI runs them.
 - [x] Add a cheap regression check for the failure mode.
+- [x] Share one checked-in gate driver between Actions and pre-push validation.
+- [x] Refuse pushes from a dirty or concurrently changing worktree.
 
 ## Acceptance Criteria
 
@@ -34,7 +43,8 @@ hosted runner.
 - Both release/all-target clippy checks exit successfully with `-D warnings`.
 - Scoreboard, fixture integrity, conformance, unit tests and offline release
   evidence have the exit statuses required by the workflow.
-- A local pre-push or equivalent fast check runs the pinned formatting gate.
+- A tracked pre-push hook runs the same checked-in gates as Actions and refuses
+  a dirty or concurrently changing worktree.
 
 ## Evidence
 
@@ -51,3 +61,8 @@ hosted runner.
   the required non-qualifying status 2; all three pinned lockfiles are unchanged.
 - The release-dependency checks force the workflow's `CARGO_TERM_COLOR=always`
   locally and request uncoloured `cargo tree` output before parsing it.
+- `scripts/ci.sh` is the single implementation of the offline gates used by
+  both Actions and `.githooks/pre-push`; it exports the workflow colour setting.
+- The tracked hook refuses a dirty tree before running and refuses a changed
+  HEAD or worktree afterward. Entering the Nix shell installs it via
+  `core.hooksPath`.
