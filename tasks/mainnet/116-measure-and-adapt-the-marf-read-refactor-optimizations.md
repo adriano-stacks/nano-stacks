@@ -58,7 +58,7 @@ stacks-core-specific: nano skips `TrieNodePatch` by design (plan W5).
 
 ## Tasks
 
-- [ ] **Measure the branch itself**: build the branch and its upstream
+- [x] **Measure the branch itself**: build the branch and its upstream
       `main` merge-base, run its own `marf_perfs`/long marf tests (the
       branch has "committing for benchmark runs" commits and a reduced test
       matrix for exactly this) on the same machine, and record the read-path
