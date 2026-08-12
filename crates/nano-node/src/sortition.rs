@@ -721,15 +721,17 @@ impl SortitionTracker {
 
     /// Recover and adopt the checkpoint seed before the node starts following.
     ///
-    /// A chain this node saved already carries the effective seed and costs no
-    /// Bitcoin read. A capture that starts on a sortition reads its seed block and
-    /// recovers the winning commitment's seed. Every other case is refused here,
-    /// before a caller can persist or execute against the tracker.
+    /// A chain this node saved already carries the effective seed and winning key,
+    /// and costs no Bitcoin read. A capture missing either reads its seed block and
+    /// recovers the winning commitment. Every other case is refused here, before a
+    /// caller can persist or execute against the tracker.
     pub fn recover_seed<E: Display>(
         &mut self,
         mut block_at: impl FnMut(u64) -> Result<BitcoinBlock, E>,
     ) -> Result<(), TrackerError> {
-        if self.engine.snapshots().effective_winner_seed().is_some() {
+        let seed_is_complete = self.engine.snapshots().effective_winner_seed().is_some()
+            && (self.tip().winner_txid.is_none() || self.tip().winner_vrf_public_key.is_some());
+        if seed_is_complete {
             return Ok(());
         }
         let height = self.tip().bitcoin_height;
@@ -822,9 +824,6 @@ impl SortitionTracker {
     }
 
     fn recover_seed_from(&mut self, block: &BitcoinBlock) -> Result<(), TrackerError> {
-        if self.engine.snapshots().effective_winner_seed().is_some() {
-            return Ok(());
-        }
         let tip = self.tip();
         if block.height != tip.bitcoin_height || block.hash != *tip.bitcoin_header_hash.as_bytes() {
             return Err(TrackerError::Seed(format!(
@@ -836,31 +835,48 @@ impl SortitionTracker {
                 hex::encode(block.hash)
             )));
         }
-        let winner = tip.winner_txid.ok_or_else(|| {
-            TrackerError::Seed(format!(
-                "the sortition seed at burn {} carries no effective winner seed and names no \
-                 winning commitment",
-                tip.bitcoin_height
-            ))
-        })?;
-        // Refused rather than reported. Sampling the next sortition against a zero
-        // seed names miners that did not win, and the only sign of it is their
-        // tenures' coinbase proofs being refused hundreds of blocks later.
-        let seed = winner_seed(block, winner).ok_or_else(|| {
-            TrackerError::Seed(format!(
-                "the sortition seed at burn {} says commitment {} won, and neither that \
-                 eligible commitment nor an agreement between the block's eligible ones \
-                 says which VRF seed it carried -- so the seed the next sortition mixes \
-                 cannot be recovered. A checkpoint has to carry `winner_vrf_seed` for a \
-                 seed row that elected somebody.",
-                tip.bitcoin_height,
-                hex::encode(winner)
-            ))
-        })?;
-        if !self.engine.adopt_root_winner_seed(seed) {
-            return Err(TrackerError::Seed(
-                "the checkpoint seed can only be adopted before the chain advances".to_owned(),
-            ));
+        let seed_was_present = self.engine.snapshots().effective_winner_seed().is_some();
+        if !seed_was_present {
+            let winner = tip.winner_txid.ok_or_else(|| {
+                TrackerError::Seed(format!(
+                    "the sortition seed at burn {} carries no effective winner seed and names no \
+                     winning commitment",
+                    tip.bitcoin_height
+                ))
+            })?;
+            // Refused rather than reported. Sampling the next sortition against a zero
+            // seed names miners that did not win, and the only sign of it is their
+            // tenures' coinbase proofs being refused hundreds of blocks later.
+            let seed = winner_seed(block, winner).ok_or_else(|| {
+                TrackerError::Seed(format!(
+                    "the sortition seed at burn {} says commitment {} won, and neither that \
+                     eligible commitment nor an agreement between the block's eligible ones \
+                     says which VRF seed it carried -- so the seed the next sortition mixes \
+                     cannot be recovered. A checkpoint has to carry `winner_vrf_seed` for a \
+                     seed row that elected somebody.",
+                    tip.bitcoin_height,
+                    hex::encode(winner)
+                ))
+            })?;
+            if !self.engine.adopt_root_winner_seed(seed) {
+                return Err(TrackerError::Seed(
+                    "the checkpoint seed can only be adopted before the chain advances".to_owned(),
+                ));
+            }
+        }
+        // Fresh checkpoint construction authenticates its boundary separately.
+        // This repairs saved roots written before winner keys were persisted.
+        if seed_was_present
+            && self.tip().winner_txid.is_some()
+            && self.tip().winner_vrf_public_key.is_none()
+        {
+            let key = self.authenticate_boundary_winner(block)?;
+            if !self.engine.adopt_root_winner_vrf_public_key(key) {
+                return Err(TrackerError::Seed(
+                    "the checkpoint winner key can only be adopted before the chain advances"
+                        .to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1720,9 +1736,8 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
             .as_deref()
             .map(|value| thirty_two(value, "winning VRF seed"))
             .transpose()?,
-        // Both `None` for the seed itself, and neither is ever read: a seed is
-        // taken as given and no tenure is validated against it. Every snapshot
-        // after it resolves them from the carried registry.
+        // Resolved during priming from the seed's winning commitment and the
+        // carried leader-key registry, before any block in that tenure executes.
         winner_vrf_public_key: None,
         // Stated by the archive for the seed, unlike the VRF key: `miner_pk_hash`
         // is the block-signing hash the winning key was registered with, which is
@@ -1835,6 +1850,29 @@ mod tests {
                 parent_modulus: if on_time { timely } else { (timely + 1) % 5 },
             },
         }
+    }
+
+    #[test]
+    fn a_resumed_winning_seed_recovers_its_vrf_key_before_execution() {
+        let height = 100;
+        let winner = [0x11; 32];
+        let seed = [0xaa; 32];
+        let public_key = [0x22; 32];
+        let mut tracker = tracker_with_seed(Some(winner), Some(seed), 1_000);
+        tracker.keys.register(
+            0,
+            0,
+            nano_sortition::LeaderKeyRegistration {
+                vrf_public_key: public_key,
+                signing_key_hash: Some([0x33; 20]),
+            },
+        );
+        let winner_block = block_with(height, vec![commitment(winner, seed, height, true)]);
+        assert_eq!(tracker.tip().winner_vrf_public_key, None);
+        tracker
+            .recover_seed(|_| Ok::<_, String>(winner_block.clone()))
+            .expect("recovery resolves the winner through the carried registry");
+        assert_eq!(tracker.tip().winner_vrf_public_key, Some(public_key));
     }
 
     /// Where a candidate's burn total places it against this chain.

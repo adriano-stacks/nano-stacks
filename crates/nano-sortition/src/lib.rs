@@ -1285,6 +1285,19 @@ impl SnapshotChain {
         true
     }
 
+    /// Attach the winning leader key to a checkpoint root before deriving above it.
+    pub fn adopt_root_winner_vrf_public_key(&mut self, key: [u8; 32]) -> bool {
+        if self.snapshots.len() != 1 {
+            return false;
+        }
+        let root = self
+            .snapshots
+            .first_mut()
+            .expect("snapshot chain has genesis");
+        root.winner_vrf_public_key = Some(key);
+        true
+    }
+
     pub fn append(
         &mut self,
         block: &BitcoinBlock,
@@ -1651,6 +1664,11 @@ impl SortitionEngine {
     /// See [`SnapshotChain::adopt_root_winner_seed`].
     pub fn adopt_root_winner_seed(&mut self, seed: [u8; 32]) -> bool {
         self.snapshots.adopt_root_winner_seed(seed)
+    }
+
+    /// See [`SnapshotChain::adopt_root_winner_vrf_public_key`].
+    pub fn adopt_root_winner_vrf_public_key(&mut self, key: [u8; 32]) -> bool {
+        self.snapshots.adopt_root_winner_vrf_public_key(key)
     }
 
     /// Commitments the most recent burn block put up for its sortition.
