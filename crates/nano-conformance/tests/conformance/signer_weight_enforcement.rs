@@ -120,6 +120,17 @@ fn signer_evidence(capture: &Path) -> (PathBuf, bool) {
     }
 }
 
+fn open_mainnet_state(root: &Path) -> ChainState {
+    let nested = root.join("chainstate");
+    let directory =
+        if nested.join("marf.sqlite").is_file() && nested.join("clarity.sqlite").is_file() {
+            nested.as_path()
+        } else {
+            root
+        };
+    ChainState::open_existing(directory).expect("the mainnet state opens for reading")
+}
+
 fn decode_array<const N: usize>(encoded: &str, what: &str) -> [u8; N] {
     hex::decode(encoded.trim_start_matches("0x"))
         .unwrap_or_else(|error| panic!("{what} is hexadecimal: {error}"))
@@ -438,8 +449,7 @@ fn the_mainnet_state_carries_the_signer_set_mainnet_published() {
     // reads it. `ChainState::open` would create the directory if the path were
     // wrong, adopt a network, append an `engine_identity` row and leave a WAL --
     // on an operator's 33 GB directory. See task 087.
-    let mut chainstate =
-        ChainState::open_existing(&state).expect("the mainnet state opens for reading");
+    let mut chainstate = open_mainnet_state(&state);
     let (evidence, observed) = signer_evidence(&capture);
     let cycle = published_cycle(&evidence);
     let published = published_signer_set(&evidence, cycle).expect("the published reward set reads");
@@ -522,8 +532,7 @@ fn mainnet_blocks_pass_the_check_against_mainnet_state() {
     // reads it. `ChainState::open` would create the directory if the path were
     // wrong, adopt a network, append an `engine_identity` row and leave a WAL --
     // on an operator's 33 GB directory. See task 087.
-    let mut chainstate =
-        ChainState::open_existing(&state).expect("the mainnet state opens for reading");
+    let mut chainstate = open_mainnet_state(&state);
     let (evidence, observed) = signer_evidence(&capture);
     let cycle = published_cycle(&evidence);
     let events = observed.then(|| {
