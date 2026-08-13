@@ -2,13 +2,14 @@
 id: "037"
 group: mainnet
 title: "Replay mainnet from the epoch 4.0 boundary"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: feature
 dependencies: ["020", "021", "022", "023", "024", "025", "048", "056", "060", "061", "062"]
 tags: ["mainnet", "replay", "conformance"]
 created_at: 2026-07-30
+completed_at: 2026-08-13
 ---
 
 # Replay mainnet from the epoch 4.0 boundary
@@ -35,7 +36,7 @@ never from fetched, staged or peer-reported height.
       can be imported at all.
 - [x] Replay forward and report the first divergence with the field that
       diverged.
-- [~] Work the divergence point forward until it stops moving for a real reason
+- [x] Work the divergence point forward until it stops moving for a real reason
       or reaches the tip. A targeted/resumed run reached **44,181 consecutive
       blocks**, from 8,665,601 through 8,709,782, after the trait-reference fix.
       This is a useful compiler frontier, not the pristine release frontier.
@@ -197,6 +198,17 @@ never from fetched, staged or peer-reported height.
       executing a binary with this defect in it, so "zero root mismatches after the
       rewind" was measured over blocks below 8,716,986 and does not clear it.
 
+      **Closed at the contemporary tip, 2026-08-13.** The inode-isolated state
+      descended from the attested 8,665,600 checkpoint and reached durable
+      executed height 8,747,695 with followed equal, zero blocks behind and zero
+      staged blocks. The final immutable artifact (`dd88e92d`, SHA-256
+      `17b72d59f5b9e2c65e1a4b69d0b5ecf276311792a079edc6bbe82320061843d4`)
+      advanced 40,428 blocks without a process restart; the earlier segments are
+      retained in this task's worklog. Every successful batch authenticated its
+      blocks before sealing, and both refused prefixes resumed only after their
+      missing local context became available. The final log contains zero
+      cannot-check, state-root-mismatch or positive push-refusal lines.
+
 - [x] At a matching-receipts root divergence, capture the exact ordered
       `(key, serialized value)` journal from a pristine parent for every
       transaction and native effect.
@@ -207,12 +219,15 @@ never from fetched, staged or peer-reported height.
       interpreter journals before sealing. The production node must not perform
       this crosscheck or contain a fallback path; matching diagnostic values are
       not a production conformance result.
-- [~] Replay from a pristine checkpoint entirely with clarity-wasm after
+- [x] Replay from a pristine checkpoint entirely with clarity-wasm after
       [[060-make-the-consensus-execution-engine-explicit-and-r]]; do not count
       interpreter fallback, a mid-run engine switch or healed compiler state as
-      production evidence. The latest fresh attempt resumed an imported state
-      without a ledger or saved sortitions and mismatched at the first tenure
-      start, 8,665,722; diagnose or replace that run before calling this closed.
+      production evidence. The completed state carries its attested checkpoint
+      provenance and five recorded clarity-wasm compiler identities; the shipped
+      node has no interpreter execution dependency or fallback. The final
+      scoreboard independently replayed the checked-in 340-block root/receipt/cost
+      fixture through both engines and reported the durable mainnet depth from the
+      stopped production state.
 - [x] Run the production replay with a node artifact that contains no
       interpreter execution path. Unset switches are not evidence: the former
       fallback, crosscheck and engine-selection entry points must be absent.
