@@ -976,12 +976,13 @@ where
     /// peer nothing, while a set bit it could not honour would cost that peer a failed
     /// fetch. It is the conservative direction on purpose.
     ///
-    /// The executed ledger reaches `REORG_REACH` blocks back, so most old cycles are
-    /// empty. They are still answers rather than unknowns: a stock node begins its
-    /// Nakamoto inventory walk at the epoch boundary and a NACK stops it before it can
-    /// reach the recent cycles nano can serve. `nano_p2p::ServedTenures` folds the set
-    /// bits into durable rows, so a tenure nano did run remains advertised after a
-    /// restart.
+    /// The executed-block archive is the source of the set bits because it is also
+    /// what answers `/v3/tenures`: a bit means both "executed" and "still serveable".
+    /// Most old cycles are empty. They are still answers rather than unknowns: a stock
+    /// node begins its Nakamoto inventory walk at the epoch boundary and a NACK stops
+    /// it before it can reach the recent cycles nano can serve.
+    /// `nano_p2p::ServedTenures` folds the set bits into durable rows, so a tenure nano
+    /// did run remains advertised after a restart.
     ///
     /// The burn height the cycle opens at comes back with the answer because that is
     /// what the durable store keys a row by: a reorganization renames the cycle's first
@@ -997,8 +998,19 @@ where
         };
         let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
         let through = self.bitcoin_height().min(tracker.tip().bitcoin_height);
-        let executed: std::collections::HashSet<nano_primitives::ConsensusHash> =
-            self.chainstate.executed_tenures().into_iter().collect();
+        let executed: std::collections::HashSet<nano_primitives::ConsensusHash> = self
+            .archive
+            .as_ref()
+            .and_then(|archive| match archive.executed_tenures() {
+                Ok(tenures) => Some(tenures),
+                Err(error) => {
+                    eprintln!("cannot inventory the tenures this node can serve: {error}");
+                    None
+                }
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         tenure_inventories_from_history(
             &payouts,
             pox.first_bitcoin_height,

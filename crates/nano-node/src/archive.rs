@@ -19,7 +19,7 @@
 use std::{path::Path, sync::Mutex};
 
 use nano_chainstate::NakamotoBlock;
-use nano_primitives::StacksBlockId;
+use nano_primitives::{ConsensusHash, StacksBlockId};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// How many executed blocks are kept.
@@ -35,6 +35,8 @@ pub const ARCHIVE_BLOCKS: u64 = 20_000;
 #[derive(Debug)]
 pub enum ArchiveError {
     Storage(rusqlite::Error),
+    /// A row this process wrote no longer contains a consensus hash.
+    MalformedConsensusHash(usize),
     /// A thread panicked while holding the store, so it cannot be trusted.
     Poisoned,
 }
@@ -43,6 +45,12 @@ impl std::fmt::Display for ArchiveError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Storage(error) => write!(formatter, "executed block storage: {error}"),
+            Self::MalformedConsensusHash(length) => {
+                write!(
+                    formatter,
+                    "executed block storage holds a {length}-byte consensus hash"
+                )
+            }
             Self::Poisoned => formatter.write_str("the executed block store was poisoned"),
         }
     }
@@ -141,6 +149,28 @@ impl Archive {
         Ok(self
             .connection()?
             .query_row("SELECT count(*) FROM executed", [], |row| row.get(0))?)
+    }
+
+    /// The tenures this archive can serve, newest first.
+    pub fn executed_tenures(&self) -> Result<Vec<ConsensusHash>, ArchiveError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT consensus_hash FROM executed
+             GROUP BY consensus_hash ORDER BY max(height) DESC",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut tenures = Vec::new();
+        for row in rows {
+            let bytes = row?;
+            let length = bytes.len();
+            let bytes = bytes
+                .try_into()
+                .map_err(|_| ArchiveError::MalformedConsensusHash(length))?;
+            tenures.push(ConsensusHash::from_bytes(bytes));
+        }
+        drop(statement);
+        drop(connection);
+        Ok(tenures)
     }
 
     /// The block this node executed at a Stacks height, when it kept exactly one.
@@ -313,7 +343,7 @@ mod tests {
     use std::{fs, path::Path};
 
     use nano_chainstate::NakamotoBlock;
-    use nano_primitives::StacksBlockId;
+    use nano_primitives::{ConsensusHash, StacksBlockId};
     use nano_rpc::ExecutedBlocks;
 
     use super::Archive;
@@ -365,6 +395,27 @@ mod tests {
             );
         }
         assert!(archive.block(StacksBlockId::from_bytes([9; 32])).is_none());
+    }
+
+    #[test]
+    fn every_tenure_with_archived_blocks_is_advertisable() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let archive = Archive::open(&directory.path().join("archive.sqlite")).expect("open");
+        let mut blocks = fixtures().into_iter().take(3).collect::<Vec<_>>();
+        let earlier = ConsensusHash::from_bytes([1; 20]);
+        let later = ConsensusHash::from_bytes([2; 20]);
+        blocks[0].header.consensus_hash = earlier;
+        blocks[1].header.consensus_hash = later;
+        blocks[2].header.consensus_hash = earlier;
+        for block in &blocks {
+            archive.keep(block).expect("keep");
+        }
+
+        assert_eq!(
+            archive.executed_tenures().expect("read tenures"),
+            vec![earlier, later],
+            "a tenure remains advertisable while any of its blocks remain serveable"
+        );
     }
 
     /// A tenure comes back whole, in height order, and stops where asked.
