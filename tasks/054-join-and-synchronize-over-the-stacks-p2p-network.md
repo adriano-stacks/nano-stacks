@@ -709,6 +709,21 @@ and its settled burn 278, the full 69-test nano-node library is green, and stric
 all-target nano-node Clippy is clean. The live stock block exchange remains open
 until the rebuilt isolated node demonstrates it.
 
+The rebuilt node did demonstrate the next boundary. The stock follower immediately
+scheduled nano, read its cycle-18 inventory (`data: [0,112]`), derived the archived
+burn-282 tenure, and requested the current tenure through nano's advertised RPC.
+It then rejected the response because `/v3/tenures/:block_id` was backwards: stock
+asks for the named block followed by its parents, newest first, while nano returned
+the named block followed by its children, oldest first. For cursor
+`26ef3f…`, stock expected `dda2ca…` and nano returned `19ddd3…`.
+
+The archive, RPC fallback, client validator and conformance peer now implement the
+reference cursor order together. The focused archive/RPC/client regressions pass;
+all 127 affected library tests pass; all six `follow_path` conformance tests pass;
+and strict all-target Clippy passes across nano-node, nano-rpc, nano-sync and
+nano-conformance. A second isolated stock run remains the authority for the actual
+block exchange.
+
 ### What is left
 
 1. **Relay.** Still counted and dropped. `encode_frame` takes a relayer list for it,

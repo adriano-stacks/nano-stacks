@@ -142,9 +142,9 @@ pub trait ExecutedBlocks: Send + Sync {
     /// The block this identifier names.
     fn block(&self, block_id: StacksBlockId) -> Option<Vec<u8>>;
 
-    /// The blocks of the tenure that starts at this block, lowest first, and
-    /// stopping before `stop` when it is named.
-    fn tenure(&self, start_block_id: StacksBlockId, stop: Option<StacksBlockId>) -> Vec<Vec<u8>>;
+    /// This block and its ancestors in the same tenure, newest first, stopping
+    /// before `stop` when it is named.
+    fn tenure(&self, block_id: StacksBlockId, stop: Option<StacksBlockId>) -> Vec<Vec<u8>>;
 
     /// The first block of the tenure this block belongs to.
     ///
@@ -2079,19 +2079,24 @@ async fn tenure(
             return Ok(RawBlockStream(kept.concat()));
         }
     }
-    let tenure = executed(&state)
-        .await?
-        .chain
-        .into_iter()
-        .find(|tenure| tenure.info.tenure_start_block_id.to_string() == start_block_id)
+    let cursor = block_id(&start_block_id).ok_or(RpcError::NotFound)?;
+    let chain = executed(&state).await?.chain;
+    let blocks = chain
+        .iter()
+        .flat_map(|tenure| tenure.blocks.iter())
+        .collect::<Vec<_>>();
+    let position = blocks
+        .iter()
+        .position(|block| block.block_id() == cursor)
         .ok_or(RpcError::NotFound)?;
+    let consensus_hash = blocks[position].header.consensus_hash;
+    let stop = query.stop.as_deref().and_then(block_id);
     let mut bytes = Vec::new();
-    for block in tenure.blocks.iter() {
-        if query
-            .stop
-            .as_ref()
-            .is_some_and(|stop| *stop == block.block_id().to_string())
-        {
+    for block in blocks[..=position].iter().rev() {
+        if block.header.consensus_hash != consensus_hash {
+            break;
+        }
+        if !bytes.is_empty() && stop.is_some_and(|stop| stop == block.block_id()) {
             break;
         }
         bytes.extend(block.encode());
@@ -3909,12 +3914,16 @@ mod tests {
             assert!(!tenure[field].as_str().expect("a hash").starts_with("0x"));
         }
 
-        // And the tenure stream stops there too.
-        let stream = get(format!("/v3/tenures/{}", blocks[0].block_id()), app.clone()).await;
+        // And the tenure stream descends from that same executed tip.
+        let stream = get(format!("/v3/tenures/{}", blocks[1].block_id()), app.clone()).await;
         let bytes = axum::body::to_bytes(stream.into_body(), usize::MAX)
             .await
             .expect("read tenure");
-        let expected: Vec<u8> = blocks[..2].iter().flat_map(NakamotoBlock::encode).collect();
+        let expected: Vec<u8> = blocks[..2]
+            .iter()
+            .rev()
+            .flat_map(NakamotoBlock::encode)
+            .collect();
         assert_eq!(bytes.as_ref(), expected.as_slice());
 
         // `/v2/pox` keeps the cycle constants, which are configuration, and
@@ -3940,20 +3949,24 @@ mod tests {
             start_block_id: StacksBlockId,
             stop: Option<StacksBlockId>,
         ) -> Vec<Vec<u8>> {
-            let Some(start) = self
+            let Some(position) = self
                 .0
                 .iter()
-                .find(|block| block.block_id() == start_block_id)
+                .position(|block| block.block_id() == start_block_id)
             else {
                 return Vec::new();
             };
-            self.0
-                .iter()
-                .filter(|block| block.header.consensus_hash == start.header.consensus_hash)
-                .skip_while(|block| block.block_id() != start_block_id)
-                .take_while(|block| Some(block.block_id()) != stop)
-                .map(NakamotoBlock::encode)
-                .collect()
+            let consensus_hash = self.0[position].header.consensus_hash;
+            let mut blocks = Vec::new();
+            for block in self.0[..=position].iter().rev() {
+                if block.header.consensus_hash != consensus_hash
+                    || (!blocks.is_empty() && Some(block.block_id()) == stop)
+                {
+                    break;
+                }
+                blocks.push(block.encode());
+            }
+            blocks
         }
     }
 
@@ -4000,20 +4013,24 @@ mod tests {
             assert_eq!(bytes.as_ref(), block.encode().as_slice());
         }
 
-        // The whole tenure, from its first block, in the order it was executed.
-        let stream = get(format!("/v3/tenures/{}", blocks[0].block_id()), app.clone()).await;
+        // The whole tenure, from its tip back through its ancestors.
+        let stream = get(format!("/v3/tenures/{}", blocks[2].block_id()), app.clone()).await;
         let bytes = axum::body::to_bytes(stream.into_body(), usize::MAX)
             .await
             .expect("read the tenure");
-        let whole: Vec<u8> = blocks.iter().flat_map(NakamotoBlock::encode).collect();
+        let whole: Vec<u8> = blocks
+            .iter()
+            .rev()
+            .flat_map(NakamotoBlock::encode)
+            .collect();
         assert_eq!(bytes.as_ref(), whole.as_slice());
 
         // And stopping before a block the caller already holds.
         let stream = get(
             format!(
                 "/v3/tenures/{}?stop={}",
-                blocks[0].block_id(),
-                blocks[2].block_id()
+                blocks[2].block_id(),
+                blocks[0].block_id()
             ),
             app.clone(),
         )
@@ -4021,7 +4038,11 @@ mod tests {
         let bytes = axum::body::to_bytes(stream.into_body(), usize::MAX)
             .await
             .expect("read the tenure");
-        let two: Vec<u8> = blocks[..2].iter().flat_map(NakamotoBlock::encode).collect();
+        let two: Vec<u8> = blocks[1..]
+            .iter()
+            .rev()
+            .flat_map(NakamotoBlock::encode)
+            .collect();
         assert_eq!(bytes.as_ref(), two.as_slice());
 
         // A block this node never executed is still not served.

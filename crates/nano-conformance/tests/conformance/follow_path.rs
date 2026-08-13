@@ -494,8 +494,10 @@ impl Served {
             .collect();
         let page = self.policy.page.unwrap_or(tenure.len()).max(1);
         Some(
-            tenure[tenure.len().saturating_sub(page)..]
+            tenure
                 .iter()
+                .rev()
+                .take(page)
                 .flat_map(|block| block.encode())
                 .collect(),
         )

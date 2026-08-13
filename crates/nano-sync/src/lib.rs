@@ -2118,8 +2118,8 @@ fn validate_tenure(
         return Err(SyncError::TenureStart);
     }
     for pair in blocks.windows(2) {
-        pair[1]
-            .validate_successor(&pair[0].header)
+        pair[0]
+            .validate_successor(&pair[1].header)
             .map_err(SyncError::TenureLink)?;
     }
     Ok(())
@@ -2872,12 +2872,13 @@ mod tests {
             .map(|entry| entry.expect("fixture block").path())
             .collect::<Vec<_>>();
         paths.sort();
-        let blocks = paths
+        let mut blocks = paths
             .into_iter()
             .take(3)
             .map(|path| NakamotoBlock::decode(&fs::read(path).expect("read fixture block")))
             .collect::<Result<Vec<_>, _>>()
             .expect("decode fixture blocks");
+        blocks.reverse();
 
         validate_tenure(blocks[0].block_id(), &blocks).expect("valid fixture tenure");
         assert!(matches!(
@@ -2885,9 +2886,9 @@ mod tests {
             Err(SyncError::TenureStart)
         ));
         let mut invalid = blocks.clone();
-        invalid[1].header.parent_block_id = StacksBlockId::from_bytes([0; 32]);
+        invalid[0].header.parent_block_id = StacksBlockId::from_bytes([0; 32]);
         assert!(matches!(
-            validate_tenure(blocks[0].block_id(), &invalid),
+            validate_tenure(invalid[0].block_id(), &invalid),
             Err(SyncError::TenureLink(TenureError::ParentBlockId))
         ));
     }

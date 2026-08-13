@@ -37,6 +37,10 @@ pub enum ArchiveError {
     Storage(rusqlite::Error),
     /// A row this process wrote no longer contains a consensus hash.
     MalformedConsensusHash(usize),
+    /// A row this process wrote no longer contains a block identifier.
+    MalformedBlockId(usize),
+    /// A row this process wrote no longer contains the block it names.
+    MalformedBlock(StacksBlockId),
     /// A thread panicked while holding the store, so it cannot be trusted.
     Poisoned,
 }
@@ -49,6 +53,18 @@ impl std::fmt::Display for ArchiveError {
                 write!(
                     formatter,
                     "executed block storage holds a {length}-byte consensus hash"
+                )
+            }
+            Self::MalformedBlockId(length) => {
+                write!(
+                    formatter,
+                    "executed block storage holds a {length}-byte block identifier"
+                )
+            }
+            Self::MalformedBlock(block_id) => {
+                write!(
+                    formatter,
+                    "executed block storage cannot decode block {block_id}"
                 )
             }
             Self::Poisoned => formatter.write_str("the executed block store was poisoned"),
@@ -233,27 +249,41 @@ impl Archive {
             .optional()?)
     }
 
-    /// The blocks of one tenure from `height` up, lowest first.
+    /// The named block and its ancestors in the same tenure, newest first.
     fn tenure_from(
         &self,
+        start_block_id: StacksBlockId,
         consensus_hash: &[u8],
         height: u64,
-    ) -> Result<Vec<(StacksBlockId, Vec<u8>)>, ArchiveError> {
+        stop: Option<StacksBlockId>,
+    ) -> Result<Vec<Vec<u8>>, ArchiveError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT block_id, bytes FROM executed
-             WHERE consensus_hash = ?1 AND height >= ?2 ORDER BY height ASC",
+             WHERE consensus_hash = ?1 AND height <= ?2 ORDER BY height DESC",
         )?;
         let rows = statement.query_map(params![consensus_hash, height], |row| {
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?;
         let mut blocks = Vec::new();
+        let mut expected = start_block_id;
         for row in rows {
             let (id, bytes) = row?;
-            blocks.push((
-                StacksBlockId::from_bytes(id.try_into().unwrap_or([0; 32])),
-                bytes,
-            ));
+            let length = id.len();
+            let id = StacksBlockId::from_bytes(
+                id.try_into()
+                    .map_err(|_| ArchiveError::MalformedBlockId(length))?,
+            );
+            if id != expected {
+                continue;
+            }
+            if !blocks.is_empty() && Some(id) == stop {
+                break;
+            }
+            let block =
+                NakamotoBlock::decode(&bytes).map_err(|_| ArchiveError::MalformedBlock(id))?;
+            expected = block.header.parent_block_id;
+            blocks.push(bytes);
         }
         drop(statement);
         drop(connection);
@@ -324,12 +354,8 @@ impl nano_rpc::ExecutedBlocks for Archive {
         let Ok(Some(start)) = self.stored(start_block_id) else {
             return Vec::new();
         };
-        match self.tenure_from(&start.consensus_hash, start.height) {
-            Ok(blocks) => blocks
-                .into_iter()
-                .take_while(|(id, _)| Some(*id) != stop)
-                .map(|(_, bytes)| bytes)
-                .collect(),
+        match self.tenure_from(start_block_id, &start.consensus_hash, start.height, stop) {
+            Ok(blocks) => blocks,
             Err(error) => {
                 eprintln!("cannot read the tenure starting at {start_block_id}: {error}");
                 Vec::new()
@@ -418,9 +444,9 @@ mod tests {
         );
     }
 
-    /// A tenure comes back whole, in height order, and stops where asked.
+    /// A tenure comes back from the cursor through its ancestors and stops where asked.
     #[test]
-    fn a_tenure_is_served_from_its_first_block_and_stops_where_asked() {
+    fn a_tenure_is_served_from_its_cursor_and_stops_where_asked() {
         let directory = tempfile::tempdir().expect("a directory");
         let archive = Archive::open(&directory.path().join("archive.sqlite")).expect("open");
         let blocks = fixtures();
@@ -448,16 +474,17 @@ mod tests {
             .max_by_key(Vec::len)
             .expect("the window holds a tenure");
         assert!(
-            tenure.len() > 1,
-            "the fixture window holds no tenure of more than one block, so this proves nothing"
+            tenure.len() > 2,
+            "the fixture window holds no tenure long enough to test a stop cursor"
         );
-        let first = tenure[0];
+        let cursor = tenure.last().expect("a non-empty tenure");
 
-        let served = archive.tenure(first.block_id(), None);
+        let served = archive.tenure(cursor.block_id(), None);
         assert_eq!(
             served,
             tenure
                 .iter()
+                .rev()
                 .map(|block| block.encode())
                 .collect::<Vec<_>>()
         );
@@ -466,8 +493,12 @@ mod tests {
         // asks for, and it stops *before* rather than after.
         let stop = tenure[1];
         assert_eq!(
-            archive.tenure(first.block_id(), Some(stop.block_id())),
-            vec![first.encode()]
+            archive.tenure(cursor.block_id(), Some(stop.block_id())),
+            tenure[2..]
+                .iter()
+                .rev()
+                .map(|block| block.encode())
+                .collect::<Vec<_>>()
         );
         assert!(
             archive
