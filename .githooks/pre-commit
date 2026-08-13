@@ -5,18 +5,20 @@ root=$(git rev-parse --show-toplevel)
 cd "$root"
 
 if ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
-  echo "pre-commit: stage every change before CI is verified" >&2
+  echo "pre-commit: stage every change before the gates are verified" >&2
   git status --short >&2
   exit 1
 fi
 
+# Only the fast gates run here; the hosted workflow runs the full suite on
+# every push, and it -- not this hook -- is what release evidence cites.
 tree=$(git write-tree)
-nix develop --command scripts/ci.sh all
+nix develop --command scripts/ci.sh fast
 
 if [[ "$(git write-tree)" != "$tree" ]] || ! git diff --quiet \
   || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
-  echo "pre-commit: the index or worktree changed while CI was running" >&2
+  echo "pre-commit: the index or worktree changed while the gates were running" >&2
   exit 1
 fi
 
-printf '%s\n' "$tree" >"$(git rev-parse --git-path nano-ci-verified-tree)"
+printf '%s\n' "$tree" >"$(git rev-parse --git-path nano-fast-verified-tree)"

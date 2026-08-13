@@ -63,10 +63,20 @@ run_gate() {
   esac
 }
 
-if [[ "$gate" == all ]]; then
-  for name in toolchain workflow formatting clippy scoreboard fixtures tests release locks; do
-    run_gate "$name"
-  done
-else
-  run_gate "$gate"
-fi
+case "$gate" in
+  all)
+    for name in toolchain workflow formatting clippy scoreboard fixtures tests release locks; do
+      run_gate "$name"
+    done
+    ;;
+  # The gates cheap enough for a git hook: no compilation, no test run. The
+  # hosted workflow runs `all`; a fast-gated commit is not release evidence.
+  fast)
+    for name in toolchain workflow formatting locks; do
+      run_gate "$name"
+    done
+    ;;
+  *)
+    run_gate "$gate"
+    ;;
+esac

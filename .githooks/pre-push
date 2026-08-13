@@ -10,9 +10,11 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-record=$(git rev-parse --git-path nano-ci-verified-tree)
+# The push only has to be fast-gated; the hosted workflow runs the full
+# suite (clippy, scoreboard, fixtures, tests) on what lands.
+record=$(git rev-parse --git-path nano-fast-verified-tree)
 if [[ ! -r "$record" ]]; then
-  echo "pre-push: no commit has passed the checked-in CI gates" >&2
+  echo "pre-push: no commit has passed the fast gates" >&2
   exit 1
 fi
 verified=$(<"$record")
