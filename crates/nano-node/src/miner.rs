@@ -379,6 +379,8 @@ impl State {
             .into());
         }
         let parent_consensus_hash = executor.tip().header.consensus_hash;
+        let latest_winner = executor.latest_local_winner()?;
+        current_commitment_parent(parent_consensus_hash, latest_winner.as_ref())?;
         let parent_sortition = executor.local_sortition_info(parent_consensus_hash)?;
         let (tenure_start_block_id, _) = executor
             .chainstate_mut()
@@ -456,7 +458,6 @@ impl State {
                 if let Some(tenure) = self.tenure.as_mut() {
                     tenure.advance(&block);
                 }
-                executor.accept_own_block(block);
             }
             return Ok(());
         };
@@ -483,7 +484,6 @@ impl State {
         // signer timeout must be retried on the next round, not mistaken for a
         // tenure this process already mined.
         self.mined.accepted(won.consensus_hash);
-        executor.accept_own_block(block);
         Ok(())
     }
 
@@ -611,13 +611,14 @@ impl State {
             block.transactions.len(),
             hex::encode(applied.execution.state_root.0)
         );
+        let block = self
+            .submit(block, sortition.bitcoin_height, context, executor)
+            .await?;
+        let applied = executor.accept_own_block(&block, context)?;
         self.dispatcher.dispatch(
             EventKind::MinedNakamotoBlock,
             &mined_nakamoto_block_payload(&block, &applied, sortition.bitcoin_height),
         );
-        let block = self
-            .submit(block, sortition.bitcoin_height, context, executor)
-            .await?;
         // A confirmed transaction leaves now rather than when the peer's
         // account nonces catch up, so the next block does not offer it again.
         let mut mempool = self.mempool.lock().await;
@@ -659,12 +660,15 @@ impl State {
             block.header.chain_length,
             hex::encode(applied.execution.state_root.0)
         );
+        let block = self
+            .submit(block, won.bitcoin_height, context, executor)
+            .await?;
+        let applied = executor.accept_own_block(&block, context)?;
         self.dispatcher.dispatch(
             EventKind::MinedNakamotoBlock,
             &mined_nakamoto_block_payload(&block, &applied, won.bitcoin_height),
         );
-        self.submit(block, won.bitcoin_height, context, executor)
-            .await
+        Ok(block)
     }
 
     /// Publish a block to the signers and submit it once they have signed it.
@@ -702,7 +706,7 @@ impl State {
                     // Announced, not offered: `announce` is the outbound queue,
                     // and a block this node mined needs no authenticating against
                     // itself — it was assembled on this node's own tip and its
-                    // state root was sealed here.
+                    // state root was derived here before the stock node accepted it.
                     self.relay
                         .announce(nano_p2p::Offer::block(None, block.clone()));
                     return Ok(block);
@@ -724,6 +728,21 @@ fn now_unix() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
+fn current_commitment_parent(
+    executed: ConsensusHash,
+    latest: Option<&SortitionInfo>,
+) -> Result<(), String> {
+    let latest = latest.ok_or("the local sortition chain has elected no parent tenure")?;
+    if latest.consensus_hash != executed {
+        return Err(format!(
+            "the executed tenure {executed} has not caught up to the latest locally elected \
+             tenure {} at burn {}; delaying the commitment",
+            latest.consensus_hash, latest.bitcoin_height
+        ));
+    }
+    Ok(())
+}
+
 fn parse_outpoint(value: &str) -> Option<OutPoint> {
     let (transaction_id, index) = value.split_once(':')?;
     Some(OutPoint {
@@ -740,7 +759,7 @@ mod tests {
     };
     use nano_sync::SortitionInfo;
 
-    use super::{MinedTenures, State};
+    use super::{MinedTenures, State, current_commitment_parent};
 
     fn won(miner: Hash160) -> SortitionInfo {
         SortitionInfo {
@@ -800,6 +819,22 @@ mod tests {
         let mut foreign = won;
         foreign.consensus_hash = ConsensusHash::from_bytes([11; 20]);
         assert!(State::resume_tenure(&foreign, parent, burn_view).is_err());
+    }
+
+    #[test]
+    fn a_commitment_waits_for_the_latest_elected_tenure_to_execute() {
+        let miner = Hash160::from_bytes([8; 20]);
+        let latest = won(miner);
+        let stale = ConsensusHash::from_bytes([9; 20]);
+        let error = current_commitment_parent(stale, Some(&latest))
+            .expect_err("a stale executed tenure cannot produce a usable commitment");
+        assert!(error.contains(&latest.consensus_hash.to_string()));
+        assert!(error.contains(&latest.bitcoin_height.to_string()));
+
+        assert_eq!(
+            current_commitment_parent(latest.consensus_hash, Some(&latest)),
+            Ok(())
+        );
     }
 
     #[test]

@@ -2604,7 +2604,7 @@ where
         })
     }
 
-    /// Execute a candidate block on the current tip and seal its committed state root.
+    /// Execute a candidate block on the current tip without adopting it.
     pub fn assemble(
         &mut self,
         candidate: NakamotoBlock,
@@ -2615,19 +2615,18 @@ where
             .bitcoin
             .block_at(bitcoin_context.height)
             .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
-        Ok(self
-            .chainstate
-            .assemble_nakamoto_block_with_bitcoin_operations(
-                bitcoin_context,
-                &operations.operations,
-                Some(*self.tip.block_id().as_bytes()),
-                candidate,
-                miner_key,
-            )?)
+        Ok(self.chainstate.preview_nakamoto_block_selecting(
+            bitcoin_context,
+            &operations.operations,
+            Some(*self.tip.block_id().as_bytes()),
+            candidate,
+            &[],
+            miner_key,
+        )?)
     }
 
     /// Execute a candidate block together with transactions it may drop, and
-    /// seal the state root the admitted set produces.
+    /// derive the state root the admitted set produces without adopting it.
     pub fn assemble_selecting(
         &mut self,
         candidate: NakamotoBlock,
@@ -2639,7 +2638,7 @@ where
             .bitcoin
             .block_at(bitcoin_context.height)
             .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
-        Ok(self.chainstate.assemble_nakamoto_block_selecting(
+        Ok(self.chainstate.preview_nakamoto_block_selecting(
             bitcoin_context,
             &operations.operations,
             Some(*self.tip.block_id().as_bytes()),
@@ -2649,9 +2648,26 @@ where
         )?)
     }
 
-    /// Adopt a block this node produced as the new execution tip.
-    pub fn accept_own_block(&mut self, block: NakamotoBlock) {
-        self.tip = block;
+    /// Seal a threshold-signed block the network accepted and adopt its tip.
+    pub fn accept_own_block(
+        &mut self,
+        block: &NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+    ) -> Result<AppliedBlock, CheckpointExecutionError> {
+        let operations = self
+            .bitcoin
+            .block_at(bitcoin_context.height)
+            .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
+        let applied = self
+            .chainstate
+            .append_nakamoto_block_with_bitcoin_operations(
+                bitcoin_context,
+                &operations.operations,
+                Some(*self.tip.block_id().as_bytes()),
+                block,
+            )?;
+        self.tip = block.clone();
+        Ok(applied)
     }
 
     /// Access the portable accounting ledger backing matured native rewards.

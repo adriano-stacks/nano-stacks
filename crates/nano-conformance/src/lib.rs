@@ -3306,14 +3306,16 @@ mod tests {
         let mut chainstate = captured_chainstate(&fixture);
         let miner = StacksPrivateKey::from_seed(b"candidate miner");
         let expected_root = block.header.state_index_root;
+        let tip = chainstate.tip().expect("read candidate parent");
+        let parent_proof = chainstate.parent_tenure_proof();
         let (candidate, applied) = chainstate
-            .assemble_nakamoto_block_with_bitcoin_context(
+            .preview_nakamoto_block_with_bitcoin_context(
                 bitcoin_context,
                 Some(source),
-                block,
+                block.clone(),
                 &miner,
             )
-            .expect("assemble candidate");
+            .expect("preview candidate");
 
         assert_eq!(candidate.header.state_index_root, expected_root);
         assert_eq!(
@@ -3328,6 +3330,26 @@ mod tests {
                 .expect("recover candidate miner"),
             miner.public_key()
         );
+        assert_eq!(chainstate.tip().expect("read tip after preview"), tip);
+        assert_eq!(chainstate.parent_tenure_proof(), parent_proof);
+        assert!(
+            !chainstate
+                .has_block_state(*candidate.block_id().as_bytes())
+                .expect("inspect candidate state"),
+            "a candidate the signers have not accepted is not sealed"
+        );
+
+        let repeated = chainstate
+            .preview_nakamoto_block_with_bitcoin_context(
+                bitcoin_context,
+                Some(source),
+                block,
+                &miner,
+            )
+            .expect("preview the same candidate again");
+        assert_eq!(repeated, (candidate, applied));
+        assert_eq!(chainstate.tip().expect("read tip after retry"), tip);
+        assert_eq!(chainstate.parent_tenure_proof(), parent_proof);
     }
 
     fn captured_context_change(

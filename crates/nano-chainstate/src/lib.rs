@@ -2050,11 +2050,11 @@ impl ChainState {
         &mut self,
         bitcoin_context: BitcoinBlockContext,
         parent: Option<[u8; 32]>,
-        mut block: NakamotoBlock,
+        block: NakamotoBlock,
         miner_key: &StacksPrivateKey,
     ) -> Result<(NakamotoBlock, AppliedBlock), ChainStateError> {
-        let applied = self.execute_nakamoto_block(
-            &mut block,
+        self.prepare_nakamoto_block(
+            block,
             BlockExecution {
                 bitcoin_context,
                 operations: &[],
@@ -2065,7 +2065,38 @@ impl ChainState {
                 authentication: BlockAuthentication::Required,
                 persistence: BlockPersistence::Seal,
             },
-        )?;
+        )
+    }
+
+    /// Derive and sign a candidate without adopting any of its state.
+    pub fn preview_nakamoto_block_with_bitcoin_context(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        parent: Option<[u8; 32]>,
+        block: NakamotoBlock,
+        miner_key: &StacksPrivateKey,
+    ) -> Result<(NakamotoBlock, AppliedBlock), ChainStateError> {
+        self.prepare_nakamoto_block(
+            block,
+            BlockExecution {
+                bitcoin_context,
+                operations: &[],
+                parent,
+                root: RootPolicy::Mine(miner_key),
+                effects: NativeBlockEffects::default(),
+                candidates: &[],
+                authentication: BlockAuthentication::Required,
+                persistence: BlockPersistence::Discard,
+            },
+        )
+    }
+
+    fn prepare_nakamoto_block(
+        &mut self,
+        mut block: NakamotoBlock,
+        execution: BlockExecution<'_>,
+    ) -> Result<(NakamotoBlock, AppliedBlock), ChainStateError> {
+        let applied = self.execute_nakamoto_block(&mut block, execution)?;
         Ok((block, applied))
     }
 
@@ -2100,12 +2131,12 @@ impl ChainState {
         bitcoin_context: BitcoinBlockContext,
         operations: &[BitcoinOperation],
         parent: Option<[u8; 32]>,
-        mut block: NakamotoBlock,
+        block: NakamotoBlock,
         candidates: &[Transaction],
         miner_key: &StacksPrivateKey,
     ) -> Result<(NakamotoBlock, AppliedBlock), ChainStateError> {
-        let applied = self.execute_nakamoto_block(
-            &mut block,
+        self.prepare_nakamoto_block(
+            block,
             BlockExecution {
                 bitcoin_context,
                 operations,
@@ -2116,8 +2147,32 @@ impl ChainState {
                 authentication: BlockAuthentication::Required,
                 persistence: BlockPersistence::Seal,
             },
-        )?;
-        Ok((block, applied))
+        )
+    }
+
+    /// Derive and sign a candidate with selected transactions without adopting it.
+    pub fn preview_nakamoto_block_selecting(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        parent: Option<[u8; 32]>,
+        block: NakamotoBlock,
+        candidates: &[Transaction],
+        miner_key: &StacksPrivateKey,
+    ) -> Result<(NakamotoBlock, AppliedBlock), ChainStateError> {
+        self.prepare_nakamoto_block(
+            block,
+            BlockExecution {
+                bitcoin_context,
+                operations,
+                parent,
+                root: RootPolicy::Mine(miner_key),
+                effects: NativeBlockEffects::default(),
+                candidates,
+                authentication: BlockAuthentication::Required,
+                persistence: BlockPersistence::Discard,
+            },
+        )
     }
 
     /// Add the candidates execution admits to a block being assembled.
