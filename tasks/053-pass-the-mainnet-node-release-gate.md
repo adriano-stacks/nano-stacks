@@ -50,7 +50,7 @@ and steady state, with evidence tied to the durable executed chain.
       chain state.
 - [x] Run an event observer against the executed chain and retain delivered
       block, burn-block and proposal-response payloads.
-- [ ] Run a stock signer and a valid client transaction end to end against the
+- [x] Run a stock signer and a valid client transaction end to end against the
       same executed chain: the signer accepts and signs a proposal validated by
       nano, and the submitted transaction appears in an accepted block and its
       `new_block` event.
@@ -670,27 +670,16 @@ gate asks to be recorded is what the node said.
 
 ## What is still open, and what each one waits on
 
-- **A stock signer accepting a block through nano** — the plumbing is done and the
-  verdict is not: see the section below and
-  [[070-carry-leader-key-history-into-proposal-validation]].
-- **The PoX-5 Hacknet execution mismatch** — the RPC run froze at height 931;
-  [[069-resolve-the-pox-5-follower-state-root-divergence]] owns the clean
-  reproduction and root/receipt oracle.
-- **The clean checkpoint-to-tip replay** — the 8,709,782 frontier is a targeted
-  resume. The fresh attempt failed at 8,665,722 from an incomplete bootstrap, so
-  neither result is the complete release run.
+- **The no-hosted checkpoint-to-tip replay** — the clean replay and P2P-only
+  discovery gates are individually green, but the final release run must still
+  bind them to the same current artifact and retain its serving-peer history.
 - **Holding mainnet tip for 24 hours** — not attempted and not claimed. It needs
-  wall-clock and a node at the tip; the pristine run is a catch-up.
-- **The mainnet signer gates** — cycle 140 has no waterfall set because it was
-  prepared under PoX-4 even though epoch 4.0 and PoX-5 are now active. Run the
-  signer-set and weight gates in cycle 141 or later instead of counting skips.
-- **No-hosted-API operation for every role** — ordinary sync uses discovered
-  peers, but [[071-fail-over-signer-role-replication-across-peers]] still owns
-  the single-client signer replication and proposal-recovery paths.
-- **Recording every executed height and verified root on mainnet** — the offline
-  run above records every height it executed; the mainnet run still prints a root
-  every 500 blocks.
-- **A live Bitcoin reorganization** and a **live** fork switch, as above.
+  wall-clock evidence from the current release candidate under [[106]].
+- **The mainnet signer gates and full infrastructure inventory** — mainnet is now
+  in cycle 141, but every required conditional and ignored gate must run together
+  under [[085]] rather than being inferred from the cycle number.
+- **The whole post-rollover cycle** — the live node crossed 140 to 141 correctly;
+  [[082]] remains open until the comparison covers the complete following cycle.
 
 ## The client-facing surface, driven by a stock signer
 
@@ -728,22 +717,18 @@ on a pox-5 chain". The short account:
 `tests/conformance/hosted_signer.rs` is the gate, through `skip_gate`, so a run
 without the environment cannot report itself green.
 
-**What it is not.** This is the client-facing surface exercised against a real
-client on a real 4.0 chain; it is not the mainnet run. Two things are open and
-neither is an RPC condition:
+Those two historical blockers are now closed. On 2026-08-13, commit `f787569e`
+ran the same `hacknet/harness.sh verify-hosted` gate against a fresh observer
+window. The hosted stock signer accepted block
+`baf79d318118c60b6a8df6da3d3302a6109e9d7b6be84380bdc0587f2e92f90b` through
+nano. A transaction posted to nano (`8637fe84…25ae`) was relayed, mined and
+delivered to nano's observer. The observer received 113 blocks, one burn block
+and 921 StackerDB events, and every transaction receipt in all 113 blocks shared
+with stacks-core matched on status, result and all five execution-cost fields.
+The exact module result was `3 passed; 0 failed`.
 
-- nano answers a proposal `Reject`, so the hosted signer rejects, so the chain was
-  never carried on nano's signature alone. The cause is exact: the proposal
-  validator cannot execute a candidate without a leader-key registry, and the
-  checkpoint the harness exports carries no sortition history to hold one. That is
-  a checkpoint-export and validator-wiring item, not the "056 or a shared
-  validator" this task previously recorded.
-- nano's follower stopped on a **state-root mismatch at height 931** of that chain
-  (`expected f90f06c9…, got e939a724…`; two transfers, not a tenure start). A
-  divergence against a live pox-5 chain is a replay result and belongs with the
-  replay gates, but it is what froze the executed tip during this run and what made
-  `/v3/sortitions/latest_and_last` answer `503` afterwards — a stale executed chain
-  cannot name the sortition before its own tip.
+This closes the stock-signer/client task item. It remains Hacknet evidence, not a
+substitute for the mainnet hold or the complete release-qualification run.
 
 ## Two gates that cannot pass until the chain crosses cycle 141
 

@@ -265,3 +265,24 @@ cargo clippy -p nano-conformance --all-targets -- -D warnings ... ok
 
 Only the live mainnet rollover and following-cycle comparison remains; offline
 execution evidence is not substituted for it.
+
+## Live cycle 141 comparison in progress, 2026-08-13
+
+The continuously running mainnet follower crossed the cycle-141 opening at burn
+962,150. The retained local record shows 142 PoX-history bits at 962,149 and 143
+at 962,150. At the boundary and every recorded burn view after it, the local burn
+hash, sortition identifier, consensus hash, winner, parent, committed block and
+VRF seed match two independent stacks-core nodes (`4.0.1` and `4.0.2`). No
+non-null oracle observation disagrees.
+
+The first monitor used `/v3/sortitions/latest_and_last`, which intentionally
+omits Bitcoin blocks that elected nobody. Commit `391f62ed` corrects the live
+evidence collector to read nano's current `/v3/sortitions` view and each stock
+oracle's exact `/v3/sortitions/burn_height/{height}` response. The corrected
+watcher is running persistently and appending to
+`/home/aldur/mainnet-tip/cycle141-sortitions.jsonl`.
+
+This is a real rollover, but only 186 of cycle 141's 2,100 burn blocks have
+elapsed. The task stays open until the watcher covers the entire following cycle
+and the earlier no-sortition gaps are reconciled against nano's persisted local
+consensus history.

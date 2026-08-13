@@ -179,3 +179,24 @@ expectation is exactly what left `asserts_false` ignored.
   current source against it and reject a missing, stale or unowned entry.
 
 The only task item still open is therefore the infrastructure run named above.
+
+## Infrastructure progress, 2026-08-13
+
+The hosted Hacknet slice now ran against the current release candidate rather
+than an old event directory. The pre-`f787569e` observer trees were preserved
+under `run/evidence/pre-f787569e`; fresh stock and nano sinks then recorded the
+new execution window. `hacknet/harness.sh verify-hosted`, held under the shared
+Cargo build lock with one build job, ran all three inventoried hosted tests:
+
+```text
+a_stock_signer_answers_proposals_through_nano ... ok
+a_transaction_posted_to_nano_is_admitted_and_reported ... ok
+an_observer_on_nano_is_told_what_stacks_core_tells_its_own ... ok
+test result: ok. 3 passed; 0 failed
+the receipts agree for all 113 blocks both observers were told about
+```
+
+This proves those three infrastructure entries executed; it does not waive the
+remaining mainnet, full-Hacknet and scratch-backed entries. The task and its last
+checkbox remain open until the single release-qualification run accounts for all
+of them.
