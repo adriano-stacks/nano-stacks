@@ -114,10 +114,10 @@ fn published_cycle(root: &Path) -> u64 {
 }
 
 fn signer_evidence(capture: &Path) -> (PathBuf, bool) {
-    match std::env::var_os("NANO_MAINNET_SIGNER_EVIDENCE") {
-        Some(path) => (PathBuf::from(path), true),
-        None => (capture.to_path_buf(), false),
-    }
+    std::env::var_os("NANO_MAINNET_SIGNER_EVIDENCE").map_or_else(
+        || (capture.to_path_buf(), false),
+        |path| (PathBuf::from(path), true),
+    )
 }
 
 fn open_mainnet_state(root: &Path) -> ChainState {
@@ -147,7 +147,7 @@ fn observed_block_events(root: &Path, capture: &Path, cycle: u64) -> Vec<(u64, N
     paths.sort_unstable();
     paths
         .into_iter()
-        .filter_map(|path| {
+        .map(|path| {
             let event: serde_json::Value =
                 serde_json::from_slice(&fs::read(&path).unwrap_or_else(|error| {
                     panic!("read block event {}: {error}", path.display())
@@ -208,9 +208,53 @@ fn observed_block_events(root: &Path, capture: &Path, cycle: u64) -> Vec<(u64, N
                 block.header.signer_signatures, event_signatures,
                 "the retained block has the event's signatures"
             );
-            Some((height, block))
+            (height, block)
         })
         .collect()
+}
+
+fn verify_observed_blocks(
+    events: &[(u64, NakamotoBlock)],
+    set: &nano_chainstate::SignerWeights,
+    threshold: u32,
+) -> usize {
+    for (height, block) in events {
+        let weight = set.verify(&block.header).unwrap_or_else(|error| {
+            panic!("mainnet block at burn height {height} was accepted: {error}")
+        });
+        assert!(
+            weight >= threshold,
+            "block at burn height {height} carries {weight} of the {threshold} required"
+        );
+    }
+    events.len()
+}
+
+fn verify_captured_blocks(
+    capture: &Path,
+    set: &nano_chainstate::SignerWeights,
+    threshold: u32,
+) -> usize {
+    fs::read_dir(capture.join("nakamoto/blocks"))
+        .expect("the captured mainnet blocks")
+        .map(|entry| {
+            let path = entry.expect("a block entry").path();
+            let block = NakamotoBlock::decode(&fs::read(&path).expect("read a block"))
+                .expect("a captured mainnet block decodes");
+            let weight = set.verify(&block.header).unwrap_or_else(|error| {
+                panic!(
+                    "mainnet block {} at height {} was accepted by mainnet: {error}",
+                    path.display(),
+                    block.header.chain_length
+                )
+            });
+            assert!(
+                weight >= threshold,
+                "block {} carries {weight} of the {threshold} its cycle requires",
+                block.header.chain_length
+            );
+        })
+        .count()
 }
 
 /// What nano read out of `.signers`, in the same shape.
@@ -571,41 +615,10 @@ fn mainnet_blocks_pass_the_check_against_mainnet_state() {
         return;
     };
     let threshold = set.approval_threshold().expect("a threshold");
-    let checked = if let Some(events) = events {
-        for (height, block) in &events {
-            let weight = set.verify(&block.header).unwrap_or_else(|error| {
-                panic!("mainnet block at burn height {height} was accepted: {error}")
-            });
-            assert!(
-                weight >= threshold,
-                "block at burn height {height} carries {weight} of the {threshold} required"
-            );
-        }
-        events.len()
-    } else {
-        let mut checked = 0;
-        for entry in
-            fs::read_dir(capture.join("nakamoto/blocks")).expect("the captured mainnet blocks")
-        {
-            let path = entry.expect("a block entry").path();
-            let block = NakamotoBlock::decode(&fs::read(&path).expect("read a block"))
-                .expect("a captured mainnet block decodes");
-            let weight = set.verify(&block.header).unwrap_or_else(|error| {
-                panic!(
-                    "mainnet block {} at height {} was accepted by mainnet: {error}",
-                    path.display(),
-                    block.header.chain_length
-                )
-            });
-            assert!(
-                weight >= threshold,
-                "block {} carries {weight} of the {threshold} its cycle requires",
-                block.header.chain_length
-            );
-            checked += 1;
-        }
-        checked
-    };
+    let checked = events.map_or_else(
+        || verify_captured_blocks(&capture, &set, threshold),
+        |events| verify_observed_blocks(&events, &set, threshold),
+    );
     assert!(
         checked > 5,
         "the evidence holds too few mainnet blocks to check"
