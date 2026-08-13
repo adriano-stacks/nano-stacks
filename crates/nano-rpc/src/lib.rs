@@ -4585,8 +4585,26 @@ mod tests {
             .sortition
             .consensus_hash
             .to_string();
+        let view = node.view().expect("node view");
+        let latest = view.tenures.last().expect("followed tenure");
+        let tip = latest.blocks.last().expect("followed block");
+        let sealed = SealedTip {
+            stacks_height: tip.header.chain_length,
+            stacks_tip: tip.block_id(),
+            stacks_block_hash: tip.header.block_hash(),
+            consensus_hash: tip.header.consensus_hash,
+            bitcoin_height: latest.sortition.bitcoin_height,
+            state_index_root: tip.header.state_index_root,
+        };
+        let sortitions = view
+            .tenures
+            .iter()
+            .map(|tenure| tenure.sortition.clone())
+            .collect();
+        let pox = view.pox_info.clone();
         let state = RpcState::new(NETWORK);
-        state.publish(node.view().expect("node view")).await;
+        state.publish(view).await;
+        state.publish_executed(sealed, sortitions, pox).await;
         let app = router(state);
 
         let info = app
