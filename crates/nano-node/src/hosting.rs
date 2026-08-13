@@ -224,6 +224,15 @@ pub(crate) fn validator_sortition_state(config: &Config) -> std::path::PathBuf {
         .join("sortitions")
 }
 
+fn recover_validator_seed<E: std::fmt::Display>(
+    tracker: &mut crate::sortition::SortitionTracker,
+    block_at: impl FnMut(u64) -> Result<nano_bitcoin::BitcoinBlock, E>,
+) -> Result<(), String> {
+    tracker.recover_seed(block_at).map_err(|error| {
+        format!("the proposal validator cannot authenticate its saved winner: {error}")
+    })
+}
+
 struct LocalBlockContext {
     bitcoin: nano_chainstate::BitcoinBlockContext,
     sortition: nano_sync::SortitionInfo,
@@ -254,7 +263,7 @@ impl LocalBurnView {
     ) -> Result<Self, String> {
         let capture = capture_directory(config)?;
         let state = validator_sortition_state(config);
-        let tracker = crate::sortition::SortitionTracker::resume_or_capture_below(
+        let mut tracker = crate::sortition::SortitionTracker::resume_or_capture_below(
             &state,
             capture,
             standing.height,
@@ -271,6 +280,9 @@ impl LocalBurnView {
                 capture.display()
             ));
         }
+        let mut bitcoin = crate::runtime::bitcoin_source(config)
+            .map_err(|error| format!("the proposal validator has no burnchain: {error}"))?;
+        recover_validator_seed(&mut tracker, |height| bitcoin.block_at(height))?;
         let canonical_view = tracker.consensus_hash_at(standing.height).ok_or_else(|| {
             format!(
                 "the proposal validator's standing burn {} is absent from the local sortition \
@@ -278,8 +290,6 @@ impl LocalBurnView {
                 standing.height
             )
         })?;
-        let bitcoin = crate::runtime::bitcoin_source(config)
-            .map_err(|error| format!("the proposal validator has no burnchain: {error}"))?;
         println!(
             "the proposal validator derives burn views locally from burn {} on PoX history {}",
             tracker.tip().bitcoin_height,
@@ -949,7 +959,9 @@ pub fn identifier(contract: &StackerDbContract) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_directory, requested_burn_height, validator_sortition_state};
+    use super::{
+        capture_directory, recover_validator_seed, requested_burn_height, validator_sortition_state,
+    };
     use crate::config::Config;
 
     /// A mainnet checkpoint whose sortition history is not beside its trie, which
@@ -1102,5 +1114,83 @@ mod tests {
             (300, "bb".repeat(20)),
             "the validator did not persist under its role-specific state"
         );
+    }
+
+    #[test]
+    fn a_reopened_validator_recovers_its_saved_winner_key() {
+        use nano_bitcoin::{BitcoinBlock, BitcoinOperation, BitcoinOperationKind};
+        use nano_primitives::{BitcoinHeaderHash, ConsensusHash, SortitionId, sha512_256};
+        use nano_sortition::{PoxId, SortitionSnapshot};
+
+        let height = 100;
+        let winner = [0x11; 32];
+        let seed = [0xaa; 32];
+        let public_key = [0x22; 32];
+        let signing_key = [0x33; 20];
+        let header = BitcoinHeaderHash::from_bytes([1; 32]);
+        let mut snapshot = SortitionSnapshot::genesis(height, header);
+        let mut identifier = Vec::from(header.as_bytes());
+        identifier.extend_from_slice(&snapshot.pox_id.as_consensus_bytes());
+        snapshot.sortition_id = SortitionId::from_bytes(*sha512_256(&identifier).as_bytes());
+        snapshot.consensus_hash = ConsensusHash::from_bytes([0x7f; 20]);
+        snapshot.winner_txid = Some(winner);
+        snapshot.winner_vrf_seed = Some(seed);
+        snapshot.winner_vrf_public_key = Some(public_key);
+        snapshot.winner_signing_key_hash = Some(signing_key);
+        snapshot.committed_block_hash = Some([0x44; 32]);
+        snapshot.pox_id = PoxId::initial();
+        let history = vec![
+            ConsensusHash::from_bytes([0xbe; 20]),
+            snapshot.consensus_hash,
+        ];
+        let mut tracker = crate::sortition::SortitionTracker::new(snapshot, history)
+            .expect("the history ends at its snapshot");
+
+        let state = tempfile::tempdir().expect("a validator state directory");
+        std::fs::write(
+            state.path().join(crate::sortition::LEADER_KEY_FILE),
+            format!(
+                r#"[{{"block_height":0,"vtxindex":0,"public_key":"{}","memo":"{}"}}]"#,
+                hex::encode(public_key),
+                hex::encode(signing_key)
+            ),
+        )
+        .expect("write the carried leader key");
+        tracker
+            .load_leader_keys(state.path())
+            .expect("load the carried leader key");
+        tracker.save(state.path()).expect("save the validator view");
+
+        let mut reopened = crate::sortition::SortitionTracker::resume_or_capture_below(
+            state.path(),
+            state.path(),
+            height,
+        )
+        .expect("reopen the saved validator view");
+        assert_eq!(reopened.tip().winner_vrf_public_key, None);
+        let block = BitcoinBlock {
+            height,
+            hash: [1; 32],
+            timestamp: 0,
+            operations: vec![BitcoinOperation {
+                txid: winner,
+                transaction_index: 0,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                kind: BitcoinOperationKind::LeaderBlockCommit {
+                    block_header_hash: [0x44; 32],
+                    new_seed: seed,
+                    parent_block_height: 0,
+                    parent_transaction_index: 0,
+                    key_block_height: 0,
+                    key_transaction_index: 0,
+                    memo: 0,
+                    parent_modulus: u8::try_from((height + 4) % 5).expect("modulo five fits u8"),
+                },
+            }],
+        };
+        recover_validator_seed(&mut reopened, |_| Ok::<_, String>(block.clone()))
+            .expect("recover the winner from Bitcoin and the carried registry");
+        assert_eq!(reopened.tip().winner_vrf_public_key, Some(public_key));
     }
 }
