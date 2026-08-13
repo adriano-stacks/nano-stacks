@@ -221,7 +221,7 @@ async fn poll(
     else {
         return Ok(());
     };
-    burn.prepare(&pending.proposal.block, pox, live.validator_mut())?;
+    burn.prepare_proposal(&pending.proposal, pox, live.validator_mut())?;
     live.answer(pending, signers)
         .await
         .map_err(|error| error.to_string())?;

@@ -177,6 +177,26 @@ pub(crate) struct LocalBurnView {
     canonical_view: nano_primitives::ConsensusHash,
 }
 
+fn requested_burn_height(
+    tenure_change: Option<nano_primitives::ConsensusHash>,
+    proposal_height: Option<u64>,
+    canonical: nano_primitives::ConsensusHash,
+    locate: impl FnOnce(nano_primitives::ConsensusHash) -> Result<u64, String>,
+) -> Result<u64, String> {
+    if let Some(view) = tenure_change {
+        let height = locate(view)?;
+        if let Some(proposal_height) = proposal_height
+            && proposal_height != height
+        {
+            return Err(format!(
+                "proposal says burn {proposal_height}, but its tenure change names burn {height}"
+            ));
+        }
+        return Ok(height);
+    }
+    proposal_height.map_or_else(|| locate(canonical), Ok)
+}
+
 /// The capture a locally derived burn view is seeded from.
 ///
 /// `checkpoint.sortition`, which is the same directory the canonical follower
@@ -270,13 +290,16 @@ impl LocalBurnView {
     fn context_for(
         &mut self,
         block: &nano_chainstate::NakamotoBlock,
+        proposal_height: Option<u64>,
         pox: &PoxInfo,
         schedule: Option<nano_chainstate::CoinbaseSchedule>,
     ) -> Result<LocalBlockContext, String> {
-        let view = block
-            .bitcoin_view_consensus_hash()
-            .unwrap_or(self.canonical_view);
-        let height = self.locate(view, pox)?;
+        let height = requested_burn_height(
+            block.bitcoin_view_consensus_hash(),
+            proposal_height,
+            self.canonical_view,
+            |view| self.locate(view, pox),
+        )?;
         let view_snapshot = self
             .tracker
             .snapshot_at(height)
@@ -404,9 +427,33 @@ impl LocalBurnView {
         pox: &PoxInfo,
         validator: &mut Validator,
     ) -> Result<(u64, u64), String> {
+        self.prepare_at(block, None, pox, validator)
+    }
+
+    pub(crate) fn prepare_proposal(
+        &mut self,
+        proposal: &BlockProposal,
+        pox: &PoxInfo,
+        validator: &mut Validator,
+    ) -> Result<(u64, u64), String> {
+        self.prepare_at(
+            &proposal.block,
+            Some(proposal.bitcoin_height),
+            pox,
+            validator,
+        )
+    }
+
+    fn prepare_at(
+        &mut self,
+        block: &nano_chainstate::NakamotoBlock,
+        proposal_height: Option<u64>,
+        pox: &PoxInfo,
+        validator: &mut Validator,
+    ) -> Result<(u64, u64), String> {
         validator.clear_context();
         let schedule = validator.coinbase_schedule();
-        let context = self.context_for(block, pox, schedule)?;
+        let context = self.context_for(block, proposal_height, pox, schedule)?;
         if nano_chainstate::starts_new_tenure(block) {
             validator.set_accumulated_coinbase(
                 context.sortition.bitcoin_height,
@@ -895,7 +942,7 @@ pub fn identifier(contract: &StackerDbContract) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_directory, validator_sortition_state};
+    use super::{capture_directory, requested_burn_height, validator_sortition_state};
     use crate::config::Config;
 
     /// A mainnet checkpoint whose sortition history is not beside its trie, which
@@ -947,6 +994,30 @@ mod tests {
         let without = MAINNET.replace(r#"sortition = "/capture/sortition""#, "");
         let config = Config::parse(&without).expect("a valid mainnet configuration");
         assert!(capture_directory(&config).is_err());
+    }
+
+    #[test]
+    fn a_proposal_without_a_tenure_change_uses_its_recorded_burn_height() {
+        let canonical = nano_primitives::ConsensusHash::from_bytes([3; 20]);
+        assert_eq!(
+            requested_burn_height(None, Some(281), canonical, |_| panic!("no lookup")),
+            Ok(281)
+        );
+        let tenure_change = nano_primitives::ConsensusHash::from_bytes([4; 20]);
+        assert_eq!(
+            requested_burn_height(Some(tenure_change), Some(280), canonical, |view| {
+                assert_eq!(view, tenure_change);
+                Ok(280)
+            }),
+            Ok(280)
+        );
+        assert_eq!(
+            requested_burn_height(None, None, canonical, |view| {
+                assert_eq!(view, canonical);
+                Ok(282)
+            }),
+            Ok(282)
+        );
     }
 
     fn tracker(height: u64, identity: u8) -> crate::sortition::SortitionTracker {
