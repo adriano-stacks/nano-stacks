@@ -3,7 +3,22 @@ use clarity::vm::{ClarityName, SymbolicExpression};
 use super::{ComplexWord, Word};
 use crate::wasm_generator::{ArgumentsExt, FunctionKind, GeneratorError, WasmGenerator};
 use crate::wasm_utils::ArgumentCountCheck;
-use crate::{check_args, error_mapping};
+use crate::{check_args, cost::ChargeGenerator, error_mapping};
+
+fn charge_parameter_types(
+    generator: &WasmGenerator,
+    builder: &mut walrus::InstrSeqBuilder,
+    signature: &[SymbolicExpression],
+) -> Result<(), GeneratorError> {
+    for parameter in signature.iter().skip(1) {
+        let type_repr = parameter
+            .match_list()
+            .and_then(|pair| pair.get(1))
+            .ok_or_else(|| GeneratorError::TypeError("invalid function parameter".to_owned()))?;
+        generator.charge_type_parse(builder, type_repr)?;
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 pub struct DefinePrivateFunction;
@@ -31,6 +46,7 @@ impl ComplexWord for DefinePrivateFunction {
             )));
         };
         let name = signature.get_name(0)?;
+        charge_parameter_types(generator, builder, signature)?;
 
         // Handling function name collision.
         // Detects duplicate names and generates
@@ -79,6 +95,7 @@ impl ComplexWord for DefineReadonlyFunction {
             )));
         };
         let name = signature.get_name(0)?;
+        charge_parameter_types(generator, builder, signature)?;
         // Making sure name is not reserved
         if generator.is_reserved_name(name) {
             return Err(GeneratorError::InternalError(format!(
@@ -129,6 +146,7 @@ impl ComplexWord for DefinePublicFunction {
             )));
         };
         let name = signature.get_name(0)?;
+        charge_parameter_types(generator, builder, signature)?;
 
         // Handling function name collision.
         // Detects duplicate names and generates

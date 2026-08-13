@@ -2,6 +2,7 @@ use clarity::vm::{ClarityName, SymbolicExpression, SymbolicExpressionType};
 
 use super::{ComplexWord, Word};
 use crate::check_args;
+use crate::cost::ChargeGenerator;
 use crate::wasm_generator::{ArgumentsExt, GeneratorError, WasmGenerator};
 use crate::wasm_utils::{check_argument_count, ArgumentCountCheck};
 
@@ -30,6 +31,27 @@ impl ComplexWord for DefineTrait {
             return Err(GeneratorError::InternalError(format!(
                 "Name already used {name:?}"
             )));
+        }
+
+        let methods = args
+            .get_expr(1)?
+            .match_list()
+            .ok_or_else(|| GeneratorError::TypeError("invalid trait definition".to_owned()))?;
+        for method in methods {
+            let signature = method
+                .match_list()
+                .ok_or_else(|| GeneratorError::TypeError("invalid trait method".to_owned()))?;
+            let parameters = signature
+                .get(1)
+                .and_then(SymbolicExpression::match_list)
+                .ok_or_else(|| GeneratorError::TypeError("invalid trait parameters".to_owned()))?;
+            for parameter in parameters {
+                generator.charge_type_parse(builder, parameter)?;
+            }
+            let return_type = signature
+                .get(2)
+                .ok_or_else(|| GeneratorError::TypeError("missing trait return type".to_owned()))?;
+            generator.charge_type_parse(builder, return_type)?;
         }
 
         // Store the identifier as a string literal in the memory

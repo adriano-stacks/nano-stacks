@@ -9,7 +9,7 @@ use walrus::ValType;
 
 use super::{ComplexWord, Word};
 use crate::check_args;
-use crate::cost::WordCharge;
+use crate::cost::{ChargeGenerator, WordCharge};
 use crate::error_mapping::ErrorMap;
 use crate::wasm_generator::{
     clar2wasm_ty, uses_packed_value, ArgumentsExt, GeneratorError, LiteralMemoryEntry,
@@ -44,14 +44,22 @@ impl ComplexWord for MapDefinition {
             )));
         }
 
-        let key_type = args.get_expr(1).and_then(|sym_ty| {
-            TypeSignature::parse_type_repr(generator.contract_analysis.epoch, sym_ty, &mut ())
-                .map_err(|e| GeneratorError::TypeError(format!("invalid type for map key: {e}")))
-        })?;
-        let value_type = args.get_expr(2).and_then(|sym_ty| {
-            TypeSignature::parse_type_repr(generator.contract_analysis.epoch, sym_ty, &mut ())
-                .map_err(|e| GeneratorError::TypeError(format!("invalid type for map value: {e}")))
-        })?;
+        let key_type_repr = args.get_expr(1)?;
+        let value_type_repr = args.get_expr(2)?;
+        generator.charge_type_parse(builder, key_type_repr)?;
+        generator.charge_type_parse(builder, value_type_repr)?;
+        let key_type = TypeSignature::parse_type_repr(
+            generator.contract_analysis.epoch,
+            key_type_repr,
+            &mut (),
+        )
+        .map_err(|e| GeneratorError::TypeError(format!("invalid type for map key: {e}")))?;
+        let value_type = TypeSignature::parse_type_repr(
+            generator.contract_analysis.epoch,
+            value_type_repr,
+            &mut (),
+        )
+        .map_err(|e| GeneratorError::TypeError(format!("invalid type for map value: {e}")))?;
 
         // Store the identifier as a string literal in the memory
         let (name_offset, name_length) = generator.add_string_literal(name)?;

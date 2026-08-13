@@ -283,3 +283,61 @@ fn map_over_a_string_matches_result_cost_events_assets_and_writes() {
 fn append_wide_function_result_matches_result_cost_events_assets_and_writes() {
     assert_surfaces(APPEND_WIDE_RESULT, &[], &[]);
 }
+
+fn assert_deployment_surfaces(name: &str, source: &str) {
+    let compiled_directory = tempfile::tempdir().expect("a compiled state directory");
+    let mut vm = Vm::open(Network::TESTNET, compiled_directory.path()).expect("open the VM");
+    vm.begin_block(None, [0x94; 32]).expect("begin a block");
+    let cost = vm
+        .transaction_cost_tracker()
+        .expect("a consensus cost tracker");
+    let compiled = vm
+        .deploy_contract(contract(name), ClarityVersion::Clarity2, source, cost)
+        .expect("deploy with clarity-wasm");
+    let compiled_root = vm.seal_block().expect("seal the compiled state").0;
+
+    let interpreted_directory = tempfile::tempdir().expect("an interpreter state directory");
+    let mut store = MarfStore::open(Network::TESTNET, interpreted_directory.path())
+        .expect("open the interpreter store");
+    store.begin(None, [0x94; 32]).expect("begin a block");
+    let cost = tracker(&mut store);
+    let interpreted = nano_oracle::deploy_contract(
+        &mut store,
+        contract(name),
+        ClarityVersion::Clarity2,
+        source,
+        cost,
+    )
+    .expect("deploy with the interpreter");
+    let interpreted_root = store.seal().expect("seal the interpreted state").0;
+
+    assert_ne!(
+        interpreted.cost,
+        ExecutionCost::ZERO,
+        "a free tracker would make the cost comparison vacuous"
+    );
+    assert_eq!(compiled, interpreted, "deployment receipts disagree");
+    assert_eq!(compiled_root, interpreted_root, "deployment roots disagree");
+}
+
+#[test]
+fn contract_deployment_matches_result_cost_events_assets_and_writes() {
+    assert_deployment_surfaces("deployment", "(define-data-var stored uint u0)");
+}
+
+#[test]
+fn every_contract_definition_matches_deployment_cost_and_writes() {
+    const SOURCE: &str = r"
+        (define-trait reader
+            ((read ((optional uint)) (response (list 2 uint) uint))))
+        (define-constant stored-constant u1)
+        (define-data-var stored-var (optional uint) (some u1))
+        (define-map stored-map { key: uint } { value: (optional uint) })
+        (define-fungible-token token u100)
+        (define-non-fungible-token collectible (buff 4))
+        (define-private (identity (value (optional (list 2 uint))))
+            (default-to (list) value))
+    ";
+
+    assert_deployment_surfaces("definitions", SOURCE);
+}

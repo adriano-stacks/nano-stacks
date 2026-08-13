@@ -10,7 +10,7 @@ mod clar4;
 mod clar5;
 
 use clarity::types::StacksEpochId;
-use clarity::vm::ClarityName;
+use clarity::vm::{ClarityName, SymbolicExpression};
 use walrus::ir::{BinaryOp, Instr, UnaryOp, Unop};
 use walrus::{FunctionId, GlobalId, InstrSeqBuilder, LocalId, Module};
 use wasmtime::{AsContextMut, Global, Val};
@@ -311,6 +311,52 @@ pub trait ChargeGenerator {
     fn charge_variable_copy(&self, instrs: &mut InstrSeqBuilder, size: LocalId) -> Result<()> {
         self.charge_eval(instrs, |costs| costs.variable_size, size)
     }
+
+    /// Charge parsing one analyzed type representation at contract publication.
+    fn charge_type_parse(
+        &self,
+        instrs: &mut InstrSeqBuilder,
+        type_repr: &SymbolicExpression,
+    ) -> Result<()> {
+        self.charge_eval(
+            instrs,
+            |costs| costs.type_parse_steps,
+            type_parse_steps(type_repr)?,
+        )
+    }
+}
+
+fn type_parse_steps(type_repr: &SymbolicExpression) -> Result<u32> {
+    let Some(parts) = type_repr.match_list() else {
+        return Ok(1);
+    };
+    let head = parts
+        .first()
+        .and_then(SymbolicExpression::match_atom)
+        .ok_or_else(|| GeneratorError::TypeError("invalid type representation".to_owned()))?;
+    let nested = match head.as_str() {
+        "list" => parts.get(2).into_iter().collect::<Vec<_>>(),
+        "tuple" => parts
+            .iter()
+            .skip(1)
+            .map(|field| {
+                field
+                    .match_list()
+                    .and_then(|pair| pair.get(1))
+                    .ok_or_else(|| {
+                        GeneratorError::TypeError("invalid tuple type representation".to_owned())
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        "optional" => parts.get(1).into_iter().collect(),
+        "response" => parts.iter().skip(1).take(2).collect(),
+        _ => Vec::new(),
+    };
+    nested.iter().try_fold(1_u32, |steps, nested| {
+        steps
+            .checked_add(type_parse_steps(nested)?)
+            .ok_or_else(|| GeneratorError::TypeError("type representation is too deep".to_owned()))
+    })
 }
 
 /// The runtime the interpreter charges for evaluation itself, rather than for
@@ -323,6 +369,7 @@ pub struct EvalCosts {
     variable_size: Caf,
     user_function_application: Caf,
     inner_type_check: Caf,
+    type_parse_steps: Caf,
 }
 
 /// `costs-1`.
@@ -332,6 +379,7 @@ const EVAL_COSTS_1: EvalCosts = EvalCosts {
     variable_size: Caf::Linear { a: 1_000, b: 0 },
     user_function_application: Caf::Linear { a: 1_000, b: 1_000 },
     inner_type_check: Caf::Linear { a: 1_000, b: 1_000 },
+    type_parse_steps: Caf::Linear { a: 1_000, b: 0 },
 };
 
 /// `costs-2`, on both networks.
@@ -341,6 +389,7 @@ const EVAL_COSTS_2: EvalCosts = EvalCosts {
     variable_size: Caf::Linear { a: 2, b: 1 },
     user_function_application: Caf::Linear { a: 26, b: 140 },
     inner_type_check: Caf::Linear { a: 2, b: 9 },
+    type_parse_steps: Caf::Linear { a: 5, b: 0 },
 };
 
 /// `costs-3`, which `costs-4` and `costs-5` leave alone.
@@ -350,6 +399,7 @@ const EVAL_COSTS_3: EvalCosts = EvalCosts {
     variable_size: Caf::Linear { a: 2, b: 1 },
     user_function_application: Caf::Linear { a: 26, b: 5 },
     inner_type_check: Caf::Linear { a: 2, b: 5 },
+    type_parse_steps: Caf::Linear { a: 4, b: 0 },
 };
 
 impl ChargeGenerator for WasmGenerator {
@@ -3218,6 +3268,39 @@ mod crosscheck {
         ] {
             crosscheck_cost(snippet, "f", &[]);
         }
+    }
+
+    #[test]
+    fn charges_the_hacknet_flood_call() {
+        let snippet = r#"
+            (define-map big-map
+                { a: uint, b: uint, c: uint }
+                { a: uint, b: uint, c: uint })
+            (define-public (set-data (a uint) (b uint) (c uint))
+                (begin
+                    (map-get? big-map { a: a, b: b, c: c })
+                    (map-set big-map { a: a, b: b, c: c } { a: a, b: b, c: c })
+                    (map-get? big-map { a: a, b: b, c: c })
+                    (map-set big-map { a: a, b: b, c: c } { a: a, b: b, c: c })
+                    (map-get? big-map { a: a, b: b, c: c })
+                    (map-set big-map { a: a, b: b, c: c } { a: a, b: b, c: c })
+                    (map-get? big-map { a: a, b: b, c: c })
+                    (map-set big-map { a: a, b: b, c: c } { a: a, b: b, c: c })
+                    (map-get? big-map { a: a, b: b, c: c })
+                    (map-set big-map { a: a, b: b, c: c } { a: a, b: b, c: c })
+                    (map-get? big-map { a: a, b: b, c: c })
+                    (map-set big-map { a: a, b: b, c: c } { a: a, b: b, c: c })
+                    (map-get? big-map { a: a, b: b, c: c })
+                    (map-set big-map { a: a, b: b, c: c } { a: a, b: b, c: c })
+                    (map-get? big-map { a: a, b: b, c: c })
+                    (map-set big-map { a: a, b: b, c: c } { a: a, b: b, c: c })
+                    (ok true)))
+        "#;
+        crosscheck_cost(
+            snippet,
+            "set-data",
+            &[Value::UInt(1), Value::UInt(2), Value::UInt(3)],
+        );
     }
 
     #[test]

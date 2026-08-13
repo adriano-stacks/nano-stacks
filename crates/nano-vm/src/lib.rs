@@ -10,11 +10,14 @@ pub use clar2wasm::wasm_generator::{EmittedLocals, LocalsReport};
 pub use clar2wasm::{ArityReport, MAX_WASM_TYPE_ARITY};
 use clar2wasm::{CompiledContract, ModuleCache};
 use clarity::vm::analysis::{AnalysisDatabase, StaticCheckError, StaticCheckErrorKind};
-use clarity::vm::ast::build_ast;
+use clarity::vm::ast::{ContractAST, build_ast};
 use clarity::vm::contexts::{
     AssetMap, CallStack, ContractContext, GlobalContext, OwnedEnvironment,
 };
-use clarity::vm::costs::{CostErrors, CostTracker, ExecutionCost, LimitedCostTracker};
+use clarity::vm::costs::cost_functions::ClarityCostFunction;
+use clarity::vm::costs::{
+    CostErrors, CostTracker, ExecutionCost, LimitedCostTracker, runtime_cost,
+};
 use clarity::vm::database::clarity_store::{
     ContractCommitment, SpecialCaseHandler, make_contract_hash_key,
 };
@@ -93,6 +96,16 @@ pub enum ContractCallOutcome {
     RuntimeFailure {
         cost: ExecutionCost,
         error: VmExecutionError,
+    },
+}
+
+/// The consensus-visible result of publishing a contract.
+#[derive(Debug)]
+pub enum DeploymentOutcome {
+    Success(Box<TransactionResult>),
+    AnalysisFailure {
+        cost: ExecutionCost,
+        error: ClarityEvalError,
     },
 }
 
@@ -1721,6 +1734,20 @@ impl Vm {
         source: &str,
         cost_tracker: LimitedCostTracker,
     ) -> Result<TransactionResult, ClarityEvalError> {
+        match self.deploy_contract_outcome(contract, version, source, cost_tracker)? {
+            DeploymentOutcome::Success(result) => Ok(*result),
+            DeploymentOutcome::AnalysisFailure { error, .. } => Err(error),
+        }
+    }
+
+    /// Publish a contract while retaining the cost of a rejected analysis.
+    pub fn deploy_contract_outcome(
+        &mut self,
+        contract: QualifiedContractIdentifier,
+        version: ClarityVersion,
+        source: &str,
+        cost_tracker: LimitedCostTracker,
+    ) -> Result<DeploymentOutcome, ClarityEvalError> {
         let Self {
             store,
             context,
@@ -4261,7 +4288,7 @@ const ANALYSIS_FAILED: &str = "contract analysis failed";
 /// interpreter — which needs no module — able to answer.
 #[must_use]
 pub fn is_contract_analysis_failure(error: &ClarityEvalError) -> bool {
-    reports_analysis_failure(error)
+    matches!(error, ClarityEvalError::Parse(_)) || reports_analysis_failure(error)
 }
 
 /// The same question of a message, for callers holding the text rather than
@@ -4277,43 +4304,99 @@ fn reports_analysis_failure(error: &impl std::fmt::Display) -> bool {
     text.contains(ANALYSIS_FAILED) || text.contains("UnableToLoadModule")
 }
 
-/// Type-check a deployment and store its analysis, as stacks-core does.
+/// A deployment's analyzed syntax, types, and accumulated consensus cost.
+pub struct DeploymentAnalysis {
+    /// The canonical syntax tree built while charging the tracker.
+    pub ast: ContractAST,
+    /// The completed static analysis used to compile and persist the contract.
+    pub contract_analysis: clarity::vm::analysis::ContractAnalysis,
+    /// The tracker carrying the parse and analysis cost.
+    pub cost_tracker: LimitedCostTracker,
+}
+
+/// A rejected deployment together with the cost consumed before rejection.
+pub struct DeploymentAnalysisFailure {
+    /// The parse or static-analysis failure.
+    pub error: ClarityEvalError,
+    /// The tracker carrying the cost consumed before the failure.
+    pub cost_tracker: LimitedCostTracker,
+    rejectable: bool,
+}
+
+/// Parse and type-check a deployment while retaining the consensus cost tracker.
 pub fn analyse_for_deployment(
     store: &mut MarfStore,
     contract: &QualifiedContractIdentifier,
     version: ClarityVersion,
     source: &str,
-    cost_tracker: &LimitedCostTracker,
+    mut cost_tracker: LimitedCostTracker,
+) -> Result<DeploymentAnalysis, Box<DeploymentAnalysisFailure>> {
+    let ast = match build_ast(
+        contract,
+        source,
+        &mut cost_tracker,
+        version,
+        StacksEpochId::Epoch40,
+    ) {
+        Ok(ast) => ast,
+        Err(error) => {
+            let rejectable = error.rejectable_in_epoch(StacksEpochId::Epoch40);
+            return Err(Box::new(DeploymentAnalysisFailure {
+                error: error.into(),
+                cost_tracker,
+                rejectable,
+            }));
+        }
+    };
+
+    let mut analysis = AnalysisDatabase::new(store);
+    match clarity::vm::analysis::run_analysis(
+        contract,
+        &ast.expressions,
+        &mut analysis,
+        false,
+        cost_tracker,
+        StacksEpochId::Epoch40,
+        version,
+        true,
+        clarity::vm::resource_limiter::ResourceLimiter::unlimited(),
+    ) {
+        Ok(mut contract_analysis) => {
+            let cost_tracker = contract_analysis.take_contract_cost_tracker();
+            Ok(DeploymentAnalysis {
+                ast,
+                contract_analysis,
+                cost_tracker,
+            })
+        }
+        Err(boxed) => {
+            let (error, cost_tracker) = *boxed;
+            let rejectable = error.err.rejectable_in_epoch(StacksEpochId::Epoch40);
+            Err(Box::new(DeploymentAnalysisFailure {
+                error: ClarityEvalError::from(VmExecutionError::Internal(VmInternalError::Expect(
+                    format!("{ANALYSIS_FAILED}: {error}"),
+                ))),
+                cost_tracker,
+                rejectable,
+            }))
+        }
+    }
+}
+
+/// Persist a successful deployment analysis in the active block state.
+pub fn save_contract_analysis(
+    store: &mut MarfStore,
+    contract: &QualifiedContractIdentifier,
+    contract_analysis: &clarity::vm::analysis::ContractAnalysis,
 ) -> Result<(), ClarityEvalError> {
     let mut analysis = AnalysisDatabase::new(store);
     analysis
-        .execute::<_, _, StaticCheckError>(|analysis_db| {
-            let expressions = build_ast(
-                contract,
-                source,
-                &mut LimitedCostTracker::new_free(),
-                version,
-                StacksEpochId::Epoch40,
-            )
-            .map_err(|error| StaticCheckErrorKind::Unreachable(error.to_string()))?
-            .expressions;
-            clarity::vm::analysis::run_analysis(
-                contract,
-                &expressions,
-                analysis_db,
-                true,
-                cost_tracker.clone(),
-                StacksEpochId::Epoch40,
-                version,
-                false,
-                clarity::vm::resource_limiter::ResourceLimiter::unlimited(),
-            )
-            .map_err(|boxed| boxed.0)?;
-            Ok(())
+        .execute::<_, _, StaticCheckError>(|database| {
+            database.insert_contract(contract, contract_analysis)
         })
-        .map_err(|error: StaticCheckError| {
+        .map_err(|error| {
             ClarityEvalError::from(VmExecutionError::Internal(VmInternalError::Expect(
-                format!("{ANALYSIS_FAILED}: {error}"),
+                error.to_string(),
             )))
         })
 }
@@ -4326,47 +4409,40 @@ fn deploy_contract_with_wasm_in_context(
     version: ClarityVersion,
     source: &str,
     cost_tracker: LimitedCostTracker,
-) -> Result<TransactionResult, ClarityEvalError> {
+) -> Result<DeploymentOutcome, ClarityEvalError> {
     let network = store.network();
-    let compiled = {
-        let mut analysis = AnalysisDatabase::new(store);
-        let compiled: CompiledContract = analysis
-            .execute::<_, _, StaticCheckError>(|analysis_db| {
-                let compiled = clar2wasm::compile(
-                    source,
-                    &contract,
-                    LimitedCostTracker::new_free(),
-                    version,
-                    StacksEpochId::Epoch40,
-                    analysis_db,
-                    true,
-                )
-                .map_err(|error: clar2wasm::CompileError| {
-                    StaticCheckErrorKind::Unreachable(wasm_compile_error(error))
-                })?;
-                analysis_db.insert_contract(&contract, &compiled.contract_analysis)?;
-                // Inside the analysis bracket on purpose: a module wasmtime
-                // will refuse must take its contract analysis back out with it,
-                // or the deploy leaves an analysis behind for a contract that
-                // was never stored, and the interpreter fallback below deploys
-                // on top of it.
-                Ok(loadable(
-                    &contract,
-                    compiled.into_compiled_contract(),
-                    modules.engine(),
-                )
-                .map_err(|error| StaticCheckErrorKind::Unreachable(error.to_string()))?)
-            })
-            .map_err(|error: StaticCheckError| {
-                ClarityEvalError::from(VmExecutionError::Internal(VmInternalError::Expect(
-                    error.to_string(),
-                )))
-            })?;
-        compiled
+    let DeploymentAnalysis {
+        ast: _,
+        contract_analysis,
+        cost_tracker,
+    } = match analyse_for_deployment(store, &contract, version, source, cost_tracker) {
+        Ok(analysis) => analysis,
+        Err(failure) if !failure.rejectable => {
+            let failure = *failure;
+            return Ok(DeploymentOutcome::AnalysisFailure {
+                cost: failure.cost_tracker.get_total(),
+                error: failure.error,
+            });
+        }
+        Err(failure) => return Err(failure.error),
     };
+    let mut module = clar2wasm::compile_contract_with_cost_epoch(
+        contract_analysis.clone(),
+        StacksEpochId::Epoch40,
+    )
+    .map_err(|error| {
+        ClarityEvalError::from(VmExecutionError::Internal(VmInternalError::Expect(
+            format!("clarity-wasm failed to compile {contract}: {error:?}"),
+        )))
+    })?;
+    let compiled = loadable(
+        &contract,
+        CompiledContract::new(module.emit_wasm(), contract_analysis),
+        modules.engine(),
+    )?;
 
-    // A contract's top-level expressions run at deploy time and may call other
-    // contracts, whose modules have to be built first. Only the *call* path did
+    // A contract's top-level expressions may call other contracts, whose modules
+    // have to be built first. Only the *call* path did
     // this, so a deploy that calls anything died with the callee reported
     // missing — and against mainnet a block of dependent deploys is routine.
     for referenced in referenced_contracts(&contract, source, version) {
@@ -4392,36 +4468,56 @@ fn deploy_contract_with_wasm_in_context(
         StacksEpochId::Epoch40,
     );
     global.begin();
-    global.database.insert_contract_hash(&contract, source)?;
-    let mut contract_context = ContractContext::new(contract.clone(), version);
-    let initialized = clar2wasm::initialize::initialize_contract(
-        &mut global,
-        &mut contract_context,
-        None,
-        &compiled.analysis,
-        &compiled.wasm,
-        modules,
-    )?;
-    let data_size = contract_context.data_size;
-    global
-        .database
-        .insert_contract(&contract, contract_context.into())?;
-    global
-        .database
-        .set_contract_data_size(&contract, data_size)?;
-    let (assets, events) = global.commit()?;
-    global
-        .cost_track
-        .add_cost(initialized.cost.into())
+    let initialized = (|| {
+        runtime_cost(
+            ClarityCostFunction::ContractStorage,
+            &mut global.cost_track,
+            source.len(),
+        )
         .map_err(VmExecutionError::from)?;
+        global.database.insert_contract_hash(&contract, source)?;
+        let mut contract_context = ContractContext::new(contract.clone(), version);
+        let initialized = clar2wasm::initialize::initialize_contract(
+            &mut global,
+            &mut contract_context,
+            None,
+            &compiled.analysis,
+            &compiled.wasm,
+            modules,
+        )?;
+        global
+            .cost_track
+            .add_cost(initialized.cost.into())
+            .map_err(VmExecutionError::from)?;
+        let data_size = contract_context.data_size;
+        global
+            .database
+            .insert_contract(&contract, contract_context.into())?;
+        global
+            .database
+            .set_contract_data_size(&contract, data_size)?;
+        Ok::<_, ClarityEvalError>(initialized)
+    })();
+    let initialized = match initialized {
+        Ok(initialized) => initialized,
+        Err(error) => {
+            global.roll_back()?;
+            return Err(error);
+        }
+    };
+    let (assets, events) = global.commit()?;
+    let cost = global.cost_track.get_total();
+    drop(global);
+
+    save_contract_analysis(store, &contract, &compiled.analysis)?;
     modules.insert(contract, compiled);
 
-    Ok(TransactionResult {
+    Ok(DeploymentOutcome::Success(Box::new(TransactionResult {
         value: initialized.ret,
-        cost: global.cost_track.get_total(),
+        cost,
         assets: assets.unwrap_or_default(),
         events: events.map_or_else(Vec::new, |batch| batch.events),
-    })
+    })))
 }
 
 struct ContractCall<'a> {
@@ -5294,8 +5390,8 @@ mod tests {
     use stacks_common::codec::StacksMessageCodec;
     use stacks_common::types::chainstate::StacksBlockId;
 
-    use super::{ContractCallOutcome, ContractPresence, MarfStore, Vm};
-    use clarity::vm::costs::LimitedCostTracker;
+    use super::{ContractCallOutcome, ContractPresence, DeploymentOutcome, MarfStore, Vm};
+    use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 
     use clar2wasm::NativeModuleStore;
     use rusqlite::params;
@@ -5386,6 +5482,49 @@ mod tests {
         assert!(
             refused.contains(&contract.to_string()),
             "the production load refusal did not name its contract: {refused}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_deployment_retains_its_analysis_cost_and_writes_nothing() {
+        let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.rejected")
+            .expect("a contract identifier");
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        vm.begin_block(None, [0x99; 32]).expect("begin block");
+        {
+            let mut database = vm.clarity_db();
+            database.begin();
+            database
+                .set_clarity_epoch_version(StacksEpochId::Epoch40)
+                .expect("set the current epoch");
+            database.commit().expect("commit the current epoch");
+        }
+        let before = vm.pending_state_root().expect("pending root");
+        let tracker = vm
+            .transaction_cost_tracker()
+            .expect("a consensus cost tracker");
+
+        let outcome = vm
+            .deploy_contract_outcome(
+                contract,
+                ClarityVersion::Clarity6,
+                "(define-public (f) (ok (no-such-word u1)))",
+                tracker,
+            )
+            .expect("a normal analysis refusal is a transaction outcome");
+        let DeploymentOutcome::AnalysisFailure { cost, error } = outcome else {
+            panic!("the invalid source was deployed")
+        };
+
+        assert_ne!(cost, ExecutionCost::ZERO, "analysis was charged nothing");
+        assert!(
+            super::is_contract_analysis_failure(&error),
+            "the refusal lost its analysis classification: {error}"
+        );
+        assert_eq!(
+            vm.pending_state_root().expect("pending root"),
+            before,
+            "the rejected deployment wrote state"
         );
     }
 

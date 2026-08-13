@@ -5,7 +5,7 @@ use walrus::ValType;
 
 use super::{ComplexWord, Word};
 use crate::check_args;
-use crate::cost::WordCharge;
+use crate::cost::{ChargeGenerator, WordCharge};
 use crate::wasm_generator::{ArgumentsExt, GeneratorError, LiteralMemoryEntry, WasmGenerator};
 use crate::wasm_utils::ArgumentCountCheck;
 
@@ -37,6 +37,7 @@ impl ComplexWord for DefineDataVar {
         }
 
         let data_type = args.get_expr(1)?;
+        generator.charge_type_parse(builder, data_type)?;
         let ty =
             TypeSignature::parse_type_repr(generator.contract_analysis.epoch, data_type, &mut ())
                 .map_err(|e| GeneratorError::TypeError(e.to_string()))?;

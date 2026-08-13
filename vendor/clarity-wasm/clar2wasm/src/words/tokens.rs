@@ -4,7 +4,7 @@ use walrus::ValType;
 
 use super::{ComplexWord, Word};
 use crate::check_args;
-use crate::cost::WordCharge;
+use crate::cost::{ChargeGenerator, WordCharge};
 use crate::wasm_generator::{ArgumentsExt, GeneratorError, WasmGenerator};
 use crate::wasm_utils::ArgumentCountCheck;
 
@@ -305,9 +305,11 @@ impl ComplexWord for DefineNonFungibleToken {
         // we will save the NFT type for reuse with the nft-x functions
         // (a wrong NFT type is an issue only with Clarity1, but it doesn't
         // hurt to use it with all Clarity versions)
+        let nft_type_repr = args.get_expr(1)?;
+        generator.charge_type_parse(builder, nft_type_repr)?;
         let nft_type = TypeSignature::parse_type_repr(
             generator.contract_analysis.epoch,
-            args.get_expr(1)?,
+            nft_type_repr,
             &mut (),
         )
         .map_err(|e| GeneratorError::TypeError(e.to_string()))?;

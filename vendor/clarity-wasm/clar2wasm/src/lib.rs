@@ -502,3 +502,12 @@ pub fn compile_contract(contract_analysis: ContractAnalysis) -> Result<Module, G
     let generator = WasmGenerator::new(contract_analysis)?;
     generator.generate()
 }
+
+/// Compile an analyzed contract while charging execution at a later cost epoch.
+pub fn compile_contract_with_cost_epoch(
+    contract_analysis: ContractAnalysis,
+    cost_epoch: StacksEpochId,
+) -> Result<Module, GeneratorError> {
+    let generator = WasmGenerator::with_cost_code_for_epoch(contract_analysis, cost_epoch)?;
+    generator.generate()
+}

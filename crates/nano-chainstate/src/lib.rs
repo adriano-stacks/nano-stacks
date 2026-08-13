@@ -35,7 +35,9 @@ use nano_marf::{MarfValue, TriePointer};
 use nano_primitives::{ConsensusHash, Network, Sha256Sum, StacksBlockId, TrieHash, sha512_256};
 use nano_sortition::{SortitionReorg, SortitionSnapshot};
 pub use nano_vm::BitcoinBlockContext;
-use nano_vm::{ContractCallOutcome, ExecutionResult, MarfStoreError, TransactionResult, Vm};
+use nano_vm::{
+    ContractCallOutcome, DeploymentOutcome, ExecutionResult, MarfStoreError, TransactionResult, Vm,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -3469,27 +3471,33 @@ impl ChainState {
             TransactionPayloadData::SmartContract {
                 contract_name,
                 source,
-            } => match self.vm.deploy_contract(
+            } => match self.vm.deploy_contract_outcome(
                 contract_identifier(origin, contract_name)?,
                 VmClarityVersion::Clarity6,
                 source,
                 cost_tracker,
             ) {
-                Ok(result) => result,
-                Err(error) => failed_deployment(error, execution_cost.clone(), &mut runtime_error)?,
+                Ok(DeploymentOutcome::Success(result)) => *result,
+                Ok(DeploymentOutcome::AnalysisFailure { cost, error }) => {
+                    failed_deployment(error, cost, &mut runtime_error)?
+                }
+                Err(error) => return Err(error.into()),
             },
             TransactionPayloadData::VersionedSmartContract {
                 clarity_version,
                 contract_name,
                 source,
-            } => match self.vm.deploy_contract(
+            } => match self.vm.deploy_contract_outcome(
                 contract_identifier(origin, contract_name)?,
                 clarity_version_to_vm(*clarity_version),
                 source,
                 cost_tracker,
             ) {
-                Ok(result) => result,
-                Err(error) => failed_deployment(error, execution_cost.clone(), &mut runtime_error)?,
+                Ok(DeploymentOutcome::Success(result)) => *result,
+                Ok(DeploymentOutcome::AnalysisFailure { cost, error }) => {
+                    failed_deployment(error, cost, &mut runtime_error)?
+                }
+                Err(error) => return Err(error.into()),
             },
             TransactionPayloadData::ContractCall {
                 address,
@@ -4118,9 +4126,8 @@ fn failed_deployment(
     Ok(TransactionResult {
         // The cost a transaction reports is the block's running total, and the
         // caller subtracts what the block had already spent to get this
-        // transaction's own. A rejected deployment costs nothing, which is the
-        // running total unchanged — reporting zero instead underflows that
-        // subtraction and stops the block.
+        // transaction's own. Parsing and analysis are charged even when they
+        // reject the source.
         value: Some(Value::err_none()),
         cost: execution_cost,
         assets: AssetMap::new(),

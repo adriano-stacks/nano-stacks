@@ -4,7 +4,10 @@ use std::sync::Mutex;
 
 use clarity::vm::callables::{DefineType, DefinedFunction};
 use clarity::vm::contexts::AssetMap;
-use clarity::vm::costs::{constants as cost_constants, CostTracker};
+use clarity::vm::costs::cost_functions::ClarityCostFunction;
+use clarity::vm::costs::{
+    constants as cost_constants, runtime_cost, CostOverflowingMath, CostTracker,
+};
 use clarity::vm::database::{ClarityDatabase, STXBalance, StoreType};
 use clarity::vm::errors::{RuntimeCheckErrorKind, RuntimeError, VmExecutionError, VmInternalError};
 #[cfg(any())]
@@ -996,6 +999,13 @@ fn link_define_variable_fn(
                 let value =
                     read_from_wasm_indirect(memory, &mut caller, &value_type, value_offset, epoch)?;
 
+                runtime_cost(
+                    ClarityCostFunction::CreateVar,
+                    caller.data_mut().global_context,
+                    value_type.size()?,
+                )
+                .map_err(VmExecutionError::from)?;
+
                 caller
                     .data_mut()
                     .contract_context_mut()?
@@ -1082,6 +1092,13 @@ fn link_define_ft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmEx
                     None
                 };
 
+                runtime_cost(
+                    ClarityCostFunction::CreateFt,
+                    caller.data_mut().global_context,
+                    0,
+                )
+                .map_err(VmExecutionError::from)?;
+
                 caller
                     .data_mut()
                     .contract_context_mut()?
@@ -1150,7 +1167,15 @@ fn link_define_nft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
                     .get(&cname)
                     .ok_or(crate::error::wasm_error(WasmError::NotInDatabase(
                         "NFT".into(),
-                    )))?;
+                    )))?
+                    .clone();
+
+                runtime_cost(
+                    ClarityCostFunction::CreateNft,
+                    caller.data_mut().global_context,
+                    asset_type.size()?,
+                )
+                .map_err(VmExecutionError::from)?;
                 caller
                     .data_mut()
                     .contract_context_mut()?
@@ -1167,7 +1192,7 @@ fn link_define_nft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
                     .data_mut()
                     .global_context
                     .database
-                    .create_non_fungible_token(&contract_identifier, &name, asset_type)?;
+                    .create_non_fungible_token(&contract_identifier, &name, &asset_type)?;
 
                 caller
                     .data_mut()
@@ -1219,6 +1244,18 @@ fn link_define_map_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
                     .ok_or(crate::error::wasm_error(WasmError::NotInDatabase(
                         "Map".into(),
                     )))?;
+                let key_type = key_type.clone();
+                let value_type = value_type.clone();
+                let total_type_size = u64::from(key_type.size()?)
+                    .cost_overflow_add(u64::from(value_type.size()?))
+                    .map_err(VmExecutionError::from)?;
+
+                runtime_cost(
+                    ClarityCostFunction::CreateMap,
+                    caller.data_mut().global_context,
+                    total_type_size,
+                )
+                .map_err(VmExecutionError::from)?;
 
                 caller
                     .data_mut()
@@ -1240,8 +1277,8 @@ fn link_define_map_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
                 let data_type = caller.data_mut().global_context.database.create_map(
                     &contract_identifier,
                     &name,
-                    key_type.clone(),
-                    value_type.clone(),
+                    key_type,
+                    value_type,
                 )?;
 
                 caller
@@ -1358,6 +1395,13 @@ fn link_define_function_fn(
                         .contract_identifier
                         .to_string(),
                 );
+
+                runtime_cost(
+                    ClarityCostFunction::BindName,
+                    caller.data_mut().global_context,
+                    0,
+                )
+                .map_err(VmExecutionError::from)?;
 
                 // Insert this function into the context
                 caller
@@ -7532,6 +7576,13 @@ fn link_save_constant_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
 
                 let value =
                     read_from_wasm_indirect(memory, &mut caller, value_ty, value_offset, epoch)?;
+
+                runtime_cost(
+                    ClarityCostFunction::BindName,
+                    caller.data_mut().global_context,
+                    0,
+                )
+                .map_err(VmExecutionError::from)?;
 
                 // Insert constant name and expression value into a persistent data structure.
                 // The value counts towards the contract's data size, which is

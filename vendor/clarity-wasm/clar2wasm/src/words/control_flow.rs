@@ -46,7 +46,7 @@ impl ComplexWord for Begin {
         generator.traverse_statement_list(builder, args)?;
         // Charged after the statements, as the interpreter does: `begin` is a
         // native function, applied once its arguments are evaluated. See `ok`.
-        self.charge(generator, builder, 0)
+        self.charge(generator, builder, args.len() as u32)
     }
 }
 

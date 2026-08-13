@@ -33,9 +33,9 @@ use clarity::{
 };
 use nano_primitives::Network;
 use nano_vm::{
-    ChainContext, ContractCallOutcome, MarfStore, TransactionResult, analyse_for_deployment,
-    clarity_database, contract_source, epoch_for_version, is_acceptable_runtime_failure,
-    null_context, referenced_contracts,
+    ChainContext, ContractCallOutcome, DeploymentAnalysis, MarfStore, TransactionResult,
+    analyse_for_deployment, clarity_database, contract_source, epoch_for_version,
+    is_acceptable_runtime_failure, null_context, referenced_contracts, save_contract_analysis,
 };
 
 /// The value and consensus-cost dimensions produced by one Clarity evaluation.
@@ -271,12 +271,13 @@ fn deploy_contract_in_context(
     cost_tracker: LimitedCostTracker,
 ) -> Result<TransactionResult, ClarityEvalError> {
     let network = store.network();
-    // stacks-core type-checks a deployment before it initializes it, and
-    // `initialize_versioned_contract` does not. Without this the interpreter
-    // accepts contracts the chain rejects — a contract naming a map that does
-    // not exist deploys — which is a consensus difference wherever the
-    // interpreter is the deployment path.
-    analyse_for_deployment(store, &contract, version, source, &cost_tracker)?;
+    let DeploymentAnalysis {
+        ast,
+        contract_analysis,
+        cost_tracker,
+    } = analyse_for_deployment(store, &contract, version, source, cost_tracker)
+        .map_err(|failure| failure.error)?;
+    let persisted_contract = contract.clone();
     let database = clarity_database(store, bitcoin_context);
     let mut environment = OwnedEnvironment::new_cost_limited(
         network.is_mainnet(),
@@ -285,12 +286,17 @@ fn deploy_contract_in_context(
         cost_tracker,
         StacksEpochId::Epoch40,
     );
-    let ((), assets, events) =
-        environment.initialize_versioned_contract(contract, version, source, None)?;
+    let ((), assets, events) = environment
+        .initialize_contract_from_ast(contract, version, &ast, source, None)
+        .map_err(ClarityEvalError::from)?;
+    let cost = environment.get_cost_total();
+    drop(environment);
+
+    save_contract_analysis(store, &persisted_contract, &contract_analysis)?;
 
     Ok(TransactionResult {
         value: None,
-        cost: environment.get_cost_total(),
+        cost,
         assets,
         events,
     })
