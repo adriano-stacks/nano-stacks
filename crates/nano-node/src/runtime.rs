@@ -10,7 +10,10 @@ use std::{
     fs::{self, File, OpenOptions},
     future::Future,
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -60,6 +63,30 @@ const ACCOUNTING_FILE: &str = "accounting.json";
 
 /// The shared executed chain the node follows along and answers reads from.
 pub type SharedExecutor = Arc<Mutex<CheckpointExecutor<BurnchainSource>>>;
+
+/// The optional miner owns catch-up while it runs.
+///
+/// Dropping the lease hands execution back to the follower. A miner that cannot
+/// open its wallet is allowed to stop without taking the signer or RPC down, so
+/// its executor cannot disappear with it.
+struct MinerExecutionLease(Arc<AtomicBool>);
+
+impl MinerExecutionLease {
+    fn claim(active: Arc<AtomicBool>) -> Self {
+        active.store(true, Ordering::Release);
+        Self(active)
+    }
+}
+
+impl Drop for MinerExecutionLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn follower_owns_execution(miner_owns_execution: &AtomicBool) -> bool {
+    !miner_owns_execution.load(Ordering::Acquire)
+}
 
 /// What a role reports when it stops, which is always the end of the node.
 pub type Role = Result<(), String>;
@@ -260,16 +287,20 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         executor.lock().await.publish_execution_to(state.metrics());
     }
     publish_sealed_tip(Some(&state), executor.as_ref(), &pox).await;
-    // The miner executes the chain itself, because it has to build on its own
-    // blocks the moment it makes them; the follower then only keeps the served
-    // view fresh.
-    let executing_follower = config.miner.is_none();
+    // The miner executes the chain itself while it runs, because it has to build
+    // on its own blocks the moment it makes them. If the optional miner stops,
+    // its lease hands execution back to the follower.
+    let miner_owns_execution = Arc::new(AtomicBool::new(false));
     start_miner(
         &config,
         network,
         &pox,
         &peer,
-        (executor.clone(), mempool.clone()),
+        (
+            executor.clone(),
+            mempool.clone(),
+            miner_owns_execution.clone(),
+        ),
         (dispatcher, relay.clone(), state.metrics(), state.clone()),
         &mut roles,
     );
@@ -284,7 +315,6 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
         &mut roles,
     )
     .await?;
-    let executor = executor.filter(|_| executing_follower);
     // Following is only worth a task when someone reads what it produces: a
     // signer-only node validates from its own store and needs no second view.
     if rpc_enabled || executor.is_some() {
@@ -300,6 +330,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             source,
             state: Some(state),
             executor,
+            miner_owns_execution,
             offered: api_to_loop.offered,
             submitted: api_to_loop.submitted,
         };
@@ -629,6 +660,7 @@ struct Follower {
     source: [u8; 32],
     state: Option<RpcState>,
     executor: Option<SharedExecutor>,
+    miner_owns_execution: Arc<AtomicBool>,
     /// Blocks the public API authenticated, waiting to be staged.
     offered: tokio::sync::mpsc::UnboundedReceiver<NakamotoBlock>,
     /// Transactions the public API admitted, waiting to be passed on.
@@ -792,6 +824,10 @@ impl Rounds {
         }
     }
 
+    const fn catching_up(&self) -> bool {
+        self.peer_height.saturating_sub(self.executed_height) > FOLLOW_WHEN_WITHIN
+    }
+
     /// Re-weigh the pool on a timer, or immediately after the current peer let a
     /// round down.
     ///
@@ -838,6 +874,7 @@ async fn follow(follower: Follower) -> Role {
         source,
         state,
         executor,
+        miner_owns_execution,
         mut offered,
         mut submitted,
     } = follower;
@@ -875,8 +912,7 @@ async fn follow(follower: Follower) -> Role {
         // far from it — the tenure descends from blocks it has not executed, so
         // the walk fails every round — and the requests it spends are the ones
         // catching up needs. A node this far back has nothing to serve anyway.
-        let catching_up =
-            rounds.peer_height.saturating_sub(rounds.executed_height) > FOLLOW_WHEN_WITHIN;
+        let catching_up = rounds.catching_up();
         rounds.failed |= track_peer(
             &mut rounds.node,
             &rounds.peer,
@@ -886,7 +922,9 @@ async fn follow(follower: Follower) -> Role {
             catching_up,
         )
         .await;
-        if let Some(executor) = executor.as_ref() {
+        if let Some(executor) = executor.as_ref()
+            && follower_owns_execution(&miner_owns_execution)
+        {
             let inputs = RoundInputs {
                 peer: &rounds.peer,
                 history: &mut rounds.history.source,
@@ -2498,7 +2536,11 @@ fn start_miner(
     network: Network,
     pox: &PoxInfo,
     peer: &SyncClient,
-    chain: (Option<SharedExecutor>, Arc<Mutex<nano_mempool::Mempool>>),
+    chain: (
+        Option<SharedExecutor>,
+        Arc<Mutex<nano_mempool::Mempool>>,
+        Arc<AtomicBool>,
+    ),
     announce: (
         EventDispatcher,
         nano_p2p::Relay,
@@ -2507,7 +2549,7 @@ fn start_miner(
     ),
     roles: &mut JoinSet<(Job, Role)>,
 ) {
-    let (executor, mempool) = chain;
+    let (executor, mempool, owns_execution) = chain;
     let (dispatcher, relay, metrics, rpc) = announce;
     let (Some(miner), Some(executor)) = (config.miner.clone(), executor) else {
         return;
@@ -2525,7 +2567,12 @@ fn start_miner(
         metrics,
         rpc,
     };
-    roles.spawn(async move { (Job::Miner, miner::run(runtime).await) });
+    let lease = MinerExecutionLease::claim(owns_execution);
+    roles.spawn(async move {
+        let result = miner::run(runtime).await;
+        drop(lease);
+        (Job::Miner, result)
+    });
 }
 
 /// Validate proposals for the active reward cycle, if this node signs.
@@ -4856,6 +4903,16 @@ authentication_history = "{}"
         assert!(!Job::Miner.is_fatal());
         assert!(!Job::Rpc.is_fatal());
         assert!(!Job::Metrics.is_fatal());
+    }
+
+    #[test]
+    fn a_stopped_optional_miner_returns_execution_to_the_follower() {
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lease = super::MinerExecutionLease::claim(active.clone());
+        assert!(!super::follower_owns_execution(&active));
+
+        drop(lease);
+        assert!(super::follower_owns_execution(&active));
     }
 }
 
