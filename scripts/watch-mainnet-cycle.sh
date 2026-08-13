@@ -34,7 +34,10 @@ last_height=$(tail -n 1 "$output" 2>/dev/null | jq -r '.local.burn_block_height 
 last_height=${last_height:-0}
 
 while true; do
-    local_response=$(curl -fsS --max-time 10 "$local_url/v3/sortitions/latest_and_last" || true)
+    # `/v3/sortitions` includes the current locally derived burn view even when
+    # that Bitcoin block elected no miner. `latest_and_last` deliberately skips
+    # those views, which would leave holes in a whole-cycle comparison.
+    local_response=$(curl -fsS --max-time 10 "$local_url/v3/sortitions" || true)
     local_snapshot=$(jq -ce '.[0]' <<<"$local_response" 2>/dev/null || true)
     height=$(jq -r '.burn_block_height // 0' <<<"$local_snapshot" 2>/dev/null || true)
     height=${height:-0}
@@ -46,8 +49,8 @@ while true; do
         for oracle_url in "${oracle_urls[@]}"; do
             oracle_url=${oracle_url%/}
             snapshot=$(curl -fsS --max-time 10 \
-                "$oracle_url/v3/sortitions/latest_and_last" 2>/dev/null |
-                jq -ce --argjson height "$height" '.[] | select(.burn_block_height == $height)' || true)
+                "$oracle_url/v3/sortitions/burn_height/$height" 2>/dev/null |
+                jq -ce '.[0]' || true)
             info=$(curl -fsS --max-time 10 "$oracle_url/v2/info" 2>/dev/null || echo null)
             pox_id=null
             if [ -n "$snapshot" ]; then
