@@ -43,6 +43,7 @@ STOCK_FOLLOWER_SINK_PORT=${NANO_STOCK_FOLLOWER_SINK_PORT:-3802}
 PAUSE_HEIGHT=${PAUSE_HEIGHT:-999999999999}
 # Seconds between Bitcoin blocks once Nakamoto is active.
 MINE_INTERVAL_EPOCH3=${MINE_INTERVAL_EPOCH3:-10}
+SKIP_BUILD=${NANO_HACKNET_SKIP_BUILD:-0}
 # Keep the upstream 25-block cycle by default; diagnostics can give the
 # prepare phase more time without stretching the whole run.
 POX_PREPARE_LENGTH=${POX_PREPARE_LENGTH:-5}
@@ -171,10 +172,16 @@ up() {
     wipe
     mkdir -p "$(chainstate_dir)"
     chainstate_dir > "$SRC/.current-chainstate-dir"
-    log "building the Hacknet images"
-    COMPOSE_BAKE=true compose build
-    log "starting $PROJECT from genesis"
-    compose up -d
+    if [ "$SKIP_BUILD" = 1 ]; then
+        log "using the existing Hacknet images"
+        log "starting $PROJECT from genesis"
+        compose up -d --no-build
+    else
+        log "building the Hacknet images"
+        COMPOSE_BAKE=true compose build
+        log "starting $PROJECT from genesis"
+        compose up -d
+    fi
 }
 
 down() {
