@@ -94,7 +94,13 @@ impl ServedTenures {
         // sortition invalidates every bit under the old name, because the tenures they
         // stood for are no longer on the chain nano follows.
         let merged = match self.recorded(cycle_height)? {
-            Some((known, tenures_known)) if known == cycle_start => union(&tenures_known, tenures),
+            Some((known, tenures_known)) if known == cycle_start => {
+                let merged = union(&tenures_known, tenures);
+                if merged == tenures_known {
+                    return Ok(claimed(&merged));
+                }
+                merged
+            }
             _ => tenures.clone(),
         };
         self.connection.execute(

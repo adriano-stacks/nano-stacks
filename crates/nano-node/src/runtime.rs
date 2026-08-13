@@ -597,7 +597,7 @@ async fn execute_round(executor: &SharedExecutor, inputs: RoundInputs<'_>) -> Ex
     advertised.publish(LocalAnnouncement {
         bitcoin_height: executor.bitcoin_height(),
         cycle_start: executor.cycle_start_consensus_hash(pox),
-        inventory: executor.tenure_inventory(pox),
+        inventories: executor.tenure_inventories(pox),
     });
     ExecutedRound {
         sealed: sealed_tip(executor.tip(), executor.bitcoin_height()),
@@ -3441,13 +3441,9 @@ struct LocalAnnouncement {
     bitcoin_height: u64,
     /// The consensus hash naming the reward cycle being walked, when derivable.
     cycle_start: Option<nano_primitives::ConsensusHash>,
-    /// The burn height the cycle opens at, the hash naming it, and which of its
-    /// tenures this node has executed and so will serve.
-    inventory: Option<(
-        u64,
-        nano_primitives::ConsensusHash,
-        nano_primitives::BitVec<2100>,
-    )>,
+    /// Every locally known cycle, including empty historical cycles a stock node
+    /// must walk through before it reaches the recent tenures nano can serve.
+    inventories: Vec<crate::TenureInventory>,
 }
 
 impl Advertised {
@@ -3475,12 +3471,14 @@ impl Advertised {
         // Recorded before the snapshot so that the durable answer is never behind the
         // live one: a peer reading between the two would otherwise be told about a
         // tenure whose bit had not been written down yet.
-        if let (Some(served), Some((cycle_height, cycle_start, tenures))) =
-            (self.served.as_ref(), announcement.inventory.as_ref())
+        if let Some(served) = self.served.as_ref()
             && let Ok(served) = served.lock()
-            && let Err(error) = served.record(*cycle_height, *cycle_start, tenures)
         {
-            eprintln!("cannot record the tenures this node serves: {error}");
+            for (cycle_height, cycle_start, tenures) in &announcement.inventories {
+                if let Err(error) = served.record(*cycle_height, *cycle_start, tenures) {
+                    eprintln!("cannot record the tenures this node serves: {error}");
+                }
+            }
         }
         if let Ok(mut held) = self.inner.lock() {
             *held = Some(announcement);
@@ -3510,8 +3508,10 @@ impl Advertised {
         {
             return Some(tenures);
         }
-        let (_, known, tenures) = self.read()?.inventory?;
-        (known == cycle_start).then_some(tenures)
+        self.read()?
+            .inventories
+            .into_iter()
+            .find_map(|(_, known, tenures)| (known == cycle_start).then_some(tenures))
     }
 }
 
@@ -3545,6 +3545,19 @@ fn p2p_identity(working_dir: &Path) -> Result<nano_crypto::StacksPrivateKey, Box
     );
     fs::write(&path, hex::encode(&seed))?;
     Ok(nano_crypto::StacksPrivateKey::from_seed(&seed))
+}
+
+fn advertise_peer_services(local: &mut nano_p2p::LocalPeer, rpc: Option<std::net::SocketAddr>) {
+    // This node accepts and forwards peer messages whenever its p2p transport is
+    // running. Stock peers require both bits before they consider an HTTP endpoint
+    // usable for mempool and block exchange.
+    local.services |= nano_p2p::wire::services::RELAY;
+    if let Some(rpc) = rpc
+        && !rpc.ip().is_unspecified()
+    {
+        local.data_url = format!("http://{rpc}");
+        local.services |= nano_p2p::wire::services::RPC;
+    }
 }
 
 /// Join the binary p2p network: seed the peer table, discover peers, and answer
@@ -3586,15 +3599,7 @@ async fn start_transport(
     {
         local.address = nano_p2p::PeerAddress::from_ip(address.ip());
     }
-    // Only claim to serve what this node actually serves. A peer that records an
-    // RPC endpoint here and finds nothing listening has spent a connection slot on
-    // us, and will stop offering us to its own neighbours.
-    if let Some(rpc) = config.node.rpc_bind
-        && !rpc.ip().is_unspecified()
-    {
-        local.data_url = format!("http://{rpc}");
-        local.services |= nano_p2p::wire::services::RPC;
-    }
+    advertise_peer_services(&mut local, config.node.rpc_bind);
     let peers = match nano_p2p::PeerDb::open(&config.node.working_dir.join("peers.sqlite")) {
         Ok(peers) => peers,
         Err(error) => {
@@ -3777,12 +3782,7 @@ fn start_listener(
     if !advertise.ip().is_unspecified() {
         local.address = nano_p2p::PeerAddress::from_ip(advertise.ip());
     }
-    if let Some(rpc) = config.node.rpc_bind
-        && !rpc.ip().is_unspecified()
-    {
-        local.data_url = format!("http://{rpc}");
-        local.services |= nano_p2p::wire::services::RPC;
-    }
+    advertise_peer_services(&mut local, config.node.rpc_bind);
     roles.spawn(async move {
         (
             Job::Peers,
@@ -3966,6 +3966,22 @@ mod tests {
     use nano_crypto::StacksPrivateKey;
     use nano_primitives::{ConsensusHash, Network, Sha256Sum, TrieHash, hash160};
     use nano_sync::PoxInfo;
+
+    #[test]
+    fn a_serving_peer_advertises_relay_and_its_rpc_endpoint() {
+        let mut local = nano_p2p::LocalPeer::quiet(StacksPrivateKey::from_seed(b"peer"), 20444);
+        super::advertise_peer_services(&mut local, None);
+        assert_eq!(local.services, nano_p2p::wire::services::RELAY);
+        assert!(local.data_url.is_empty());
+
+        let rpc = "127.0.0.1:20443".parse().expect("an RPC address");
+        super::advertise_peer_services(&mut local, Some(rpc));
+        assert_eq!(
+            local.services,
+            nano_p2p::wire::services::RELAY | nano_p2p::wire::services::RPC
+        );
+        assert_eq!(local.data_url, "http://127.0.0.1:20443");
+    }
 
     /// Every execution batch says where it started, where it ended, how many
     /// blocks that was and the root it sealed — and a batch that executed nothing

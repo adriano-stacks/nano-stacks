@@ -40,6 +40,13 @@ const BURN_HEADER_WINDOW: u64 = 32;
 /// an unbounded schedule would repeat.
 const SCHEDULED_TENURES: usize = 32;
 
+/// One reward cycle's locally-derived, peer-facing tenure inventory.
+pub type TenureInventory = (
+    u64,
+    nano_primitives::ConsensusHash,
+    nano_primitives::BitVec<2100>,
+);
+
 #[derive(Debug)]
 pub struct CheckpointExecutor<S> {
     chainstate: ChainState,
@@ -298,6 +305,87 @@ pub fn payout_schedule(pox: &PoxInfo) -> Option<nano_sortition::PayoutSchedule> 
     Some(pox.pox_5_activation_height.map_or(schedule, |activation| {
         schedule.activating_epoch_four_at(u64::from(activation))
     }))
+}
+
+fn tenure_inventories_from_history(
+    payouts: &nano_sortition::PayoutSchedule,
+    first: u64,
+    through: u64,
+    length: u64,
+    consensus_hash_at: impl Fn(u64) -> Option<nano_primitives::ConsensusHash>,
+    executed: &std::collections::HashSet<nano_primitives::ConsensusHash>,
+) -> Vec<TenureInventory> {
+    let Ok(length_u16) = u16::try_from(length) else {
+        return Vec::new();
+    };
+    if first > through {
+        return Vec::new();
+    }
+
+    (first..=through)
+        .filter(|height| payouts.starts_reward_cycle(*height))
+        .filter_map(|start| {
+            let cycle_start = consensus_hash_at(start)?;
+            let mut tenures = nano_primitives::BitVec::<2100>::zeros(length_u16).ok()?;
+            for offset in 0..length {
+                let height = start.checked_add(offset)?;
+                if height > through {
+                    break;
+                }
+                if consensus_hash_at(height).is_some_and(|hash| executed.contains(&hash)) {
+                    tenures.set(u16::try_from(offset).ok()?, true).ok()?;
+                }
+            }
+            Some((start, cycle_start, tenures))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tenure_inventory_tests {
+    use std::collections::HashSet;
+
+    use nano_primitives::ConsensusHash;
+    use nano_sortition::{PayoutSchedule, RewardCycleSchedule};
+
+    use super::tenure_inventories_from_history;
+
+    fn hash(height: u64) -> ConsensusHash {
+        let mut bytes = [0; 20];
+        bytes[..8].copy_from_slice(&height.to_be_bytes());
+        ConsensusHash::from_bytes(bytes)
+    }
+
+    #[test]
+    fn inventories_include_known_empty_cycles_and_executed_tenures() {
+        let cycles = RewardCycleSchedule::new(0, 10, Some(30)).expect("a reward schedule");
+        let payouts = PayoutSchedule::new(cycles, 2).expect("a payout schedule");
+        let executed = HashSet::from([hash(12), hash(30), hash(42)]);
+
+        let inventories = tenure_inventories_from_history(
+            &payouts,
+            0,
+            42,
+            10,
+            |height| Some(hash(height)),
+            &executed,
+        );
+
+        assert_eq!(
+            inventories
+                .iter()
+                .map(|(height, _, _)| *height)
+                .collect::<Vec<_>>(),
+            vec![1, 11, 21, 30, 40]
+        );
+        assert!(
+            (0..inventories[0].2.len()).all(|offset| inventories[0].2.get(offset) == Some(false)),
+            "a known historical cycle with no served tenure is an empty answer, not unknown"
+        );
+        assert_eq!(inventories[1].2.get(1), Some(true));
+        assert_eq!(inventories[3].2.get(0), Some(true));
+        assert_eq!(inventories[4].2.get(2), Some(true));
+    }
 }
 
 /// Say what one round of catching up the sortition chain did.
@@ -880,8 +968,7 @@ where
         None
     }
 
-    /// Which tenures of the cycle being walked this node has executed, for a peer
-    /// that asks.
+    /// Which tenures of every locally known reward cycle this node has executed.
     ///
     /// A bit is set only where this node executed the tenure that began at that
     /// sortition and can therefore serve its blocks, so the vector says less than the
@@ -889,44 +976,37 @@ where
     /// peer nothing, while a set bit it could not honour would cost that peer a failed
     /// fetch. It is the conservative direction on purpose.
     ///
-    /// One round of it says *much* less than the node knows, and the reason is worth
-    /// recording: the executed ledger reaches `REORG_REACH` blocks back, so a round's
-    /// answer covers the recent end of the cycle and nothing older. What closes the gap
-    /// is that the rounds accumulate — `nano_p2p::ServedTenures` folds each one into a
-    /// durable row per cycle, so a node that has walked a cycle can answer for the
-    /// cycle, and can still do so after a restart.
+    /// The executed ledger reaches `REORG_REACH` blocks back, so most old cycles are
+    /// empty. They are still answers rather than unknowns: a stock node begins its
+    /// Nakamoto inventory walk at the epoch boundary and a NACK stops it before it can
+    /// reach the recent cycles nano can serve. `nano_p2p::ServedTenures` folds the set
+    /// bits into durable rows, so a tenure nano did run remains advertised after a
+    /// restart.
     ///
     /// The burn height the cycle opens at comes back with the answer because that is
     /// what the durable store keys a row by: a reorganization renames the cycle's first
     /// sortition, and a store keyed by the name would keep claiming tenures on the fork
     /// nano abandoned.
     #[must_use]
-    pub fn tenure_inventory(
-        &self,
-        pox: &PoxInfo,
-    ) -> Option<(
-        u64,
-        nano_primitives::ConsensusHash,
-        nano_primitives::BitVec<2100>,
-    )> {
-        let tracker = self.sortition.as_ref()?;
-        let start = self.cycle_start_height(pox)?;
+    pub fn tenure_inventories(&self, pox: &PoxInfo) -> Vec<TenureInventory> {
+        let Some(tracker) = self.sortition.as_ref() else {
+            return Vec::new();
+        };
+        let Some(payouts) = payout_schedule(pox) else {
+            return Vec::new();
+        };
         let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
+        let through = self.bitcoin_height().min(tracker.tip().bitcoin_height);
         let executed: std::collections::HashSet<nano_primitives::ConsensusHash> =
             self.chainstate.executed_tenures().into_iter().collect();
-        let mut tenures =
-            nano_primitives::BitVec::<2100>::zeros(u16::try_from(length).ok()?).ok()?;
-        // Walked by offset rather than by searching the history for each executed
-        // tenure: the history is a quarter of a million hashes long, and the cycle is
-        // two thousand.
-        for offset in 0..length {
-            if let Some(hash) = tracker.consensus_hash_at(start + offset)
-                && executed.contains(&hash)
-            {
-                tenures.set(u16::try_from(offset).ok()?, true).ok()?;
-            }
-        }
-        Some((start, tracker.consensus_hash_at(start)?, tenures))
+        tenure_inventories_from_history(
+            &payouts,
+            pox.first_bitcoin_height,
+            through,
+            length,
+            |height| tracker.consensus_hash_at(height),
+            &executed,
+        )
     }
 
     /// The tenures of the cycle this node is walking that it has yet to execute,
@@ -934,7 +1014,7 @@ where
     ///
     /// Every offset from the tip's own burn block upward, which is the whole of the
     /// derivation and is deliberately not the complement of
-    /// [`Self::tenure_inventory`]: that vector reaches only `REORG_REACH` blocks back,
+    /// [`Self::tenure_inventories`]: its set bits reach only `REORG_REACH` blocks back,
     /// so most of a cycle reads unexecuted in it even where this node ran it, and
     /// wanting those would send a round backwards. Above the tip nothing has been
     /// executed by definition, so no lookup is needed to know it is wanted.
