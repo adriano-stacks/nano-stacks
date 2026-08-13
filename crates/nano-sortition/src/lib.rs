@@ -3,7 +3,7 @@ pub(crate) mod carryover;
 use std::collections::{BTreeMap, BTreeSet};
 use std::{collections::HashMap, fmt};
 
-use nano_bitcoin::{BitcoinBlock, BitcoinOperationKind};
+use nano_bitcoin::{BitcoinBlock, BitcoinOperation, BitcoinOperationKind, BitcoinOutput};
 use nano_primitives::{
     BitcoinHeaderHash, ConsensusHash, SortitionId, Uint256, Uint512, hash160, sha256, sha512_256,
 };
@@ -175,17 +175,35 @@ pub const fn commitment_is_on_time(parent_modulus: u8, bitcoin_height: u64) -> b
 }
 
 /// The operations a Bitcoin block contributes to its own consensus hash.
-///
-/// Everything the block carries except the commitments that missed their
-/// target, which the network parses but does not accept.
 #[must_use]
-pub fn accepted_operation_txids(block: &BitcoinBlock) -> Vec<[u8; 32]> {
+fn timely_operation_txids(block: &BitcoinBlock) -> Vec<[u8; 32]> {
     block
         .operations
         .iter()
         .filter(|operation| match operation.kind {
             BitcoinOperationKind::LeaderBlockCommit { parent_modulus, .. } => {
                 commitment_is_on_time(parent_modulus, block.height)
+            }
+            _ => true,
+        })
+        .map(|operation| operation.txid)
+        .collect()
+}
+
+/// The operations a Bitcoin block contributes to its own consensus hash.
+///
+/// A decoded commitment is still absent from stacks-core's operation set when
+/// its pointers or payout outputs fail the commitment parser. An otherwise valid
+/// commitment that missed its target is absent too.
+#[must_use]
+pub fn accepted_operation_txids(block: &BitcoinBlock, payouts: PayoutSchedule) -> Vec<[u8; 32]> {
+    block
+        .operations
+        .iter()
+        .filter(|operation| match operation.kind {
+            BitcoinOperationKind::LeaderBlockCommit { parent_modulus, .. } => {
+                commitment_is_admissible(block.height, operation, payouts)
+                    && commitment_is_on_time(parent_modulus, block.height)
             }
             _ => true,
         })
@@ -319,6 +337,24 @@ impl PayoutSchedule {
         }
     }
 
+    fn accepts_commitment_outputs(&self, bitcoin_height: u64, outputs: &[BitcoinOutput]) -> bool {
+        let Some(first) = outputs.first().filter(|output| output.amount_sats > 0) else {
+            return false;
+        };
+        if self.cycles.is_waterfall_at(bitcoin_height) {
+            return true;
+        }
+        if self.is_in_prepare_phase(bitcoin_height) {
+            return matches!(
+                first.recipient.as_stacks_address(),
+                Some(address) if address.is_burn()
+            );
+        }
+        outputs
+            .get(1)
+            .is_some_and(|second| second.amount_sats > 0 && second.amount_sats == first.amount_sats)
+    }
+
     /// How many Bitcoin blocks the burn distribution for this block is weighed over.
     ///
     /// Six is the ordinary answer and not the only one. stacks-core windows a
@@ -360,6 +396,28 @@ impl PayoutSchedule {
     }
 }
 
+fn commitment_is_admissible(
+    bitcoin_height: u64,
+    operation: &BitcoinOperation,
+    payouts: PayoutSchedule,
+) -> bool {
+    let BitcoinOperationKind::LeaderBlockCommit {
+        parent_block_height,
+        parent_transaction_index,
+        key_block_height,
+        ..
+    } = operation.kind
+    else {
+        return false;
+    };
+    !operation.inputs.is_empty()
+        && (parent_block_height != 0 || parent_transaction_index == 0)
+        && u64::from(parent_block_height) < bitcoin_height
+        && key_block_height != 0
+        && u64::from(key_block_height) < bitcoin_height
+        && payouts.accepts_commitment_outputs(bitcoin_height, &operation.outputs)
+}
+
 /// The commitments a Bitcoin block contributes to the mining window.
 ///
 /// A commitment that missed the block it aimed at by one is kept apart: it is not
@@ -375,9 +433,10 @@ impl PayoutSchedule {
 #[must_use]
 pub fn commitment_window_block(
     block: &BitcoinBlock,
-    payouts: usize,
+    payouts: PayoutSchedule,
     keys: &LeaderKeys,
 ) -> CommitmentWindowBlock {
+    let payout_outputs = payouts.outputs_at(block.height);
     let mut commitments = Vec::new();
     let mut missed_commitments = Vec::new();
     for operation in &block.operations {
@@ -393,6 +452,9 @@ pub fn commitment_window_block(
         else {
             continue;
         };
+        if !commitment_is_admissible(block.height, operation, payouts) {
+            continue;
+        }
         // The first input is the UTXO the commitment chained from, which is what
         // links it to the miner's previous commitment in the window.
         let (spent_txid, spent_output) = operation
@@ -411,7 +473,7 @@ pub fn commitment_window_block(
                 burn_sats: operation
                     .outputs
                     .iter()
-                    .take(payouts)
+                    .take(payout_outputs)
                     .map(|output| output.amount_sats)
                     .sum(),
                 vrf_seed: *new_seed,
@@ -441,7 +503,7 @@ pub fn commitment_window_block(
     CommitmentWindowBlock {
         commitments,
         missed_commitments,
-        requires_single_commit: payouts == 1,
+        requires_single_commit: payout_outputs == 1,
     }
 }
 
@@ -1314,7 +1376,7 @@ impl SnapshotChain {
         pox_id: PoxId,
         winner: Option<SortitionWinner>,
     ) -> Result<&SortitionSnapshot, SortitionError> {
-        let operation_txids = accepted_operation_txids(block);
+        let operation_txids = timely_operation_txids(block);
         self.append_with_operations(block, &operation_txids, total_burn, pox_id, winner)
     }
 
@@ -1946,9 +2008,14 @@ pub fn snapshot_for(block: &BitcoinBlock) -> SortitionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitmentWindowBlock, MINING_COMMITMENT_WINDOW, MiningCommitment, PoxIdTracker,
-        RewardCycleSchedule, SnapshotChain, SortitionEngine, SortitionHash, SortitionSnapshot,
-        commitment_burn_statistics, commitment_distribution, select_epoch4_winner, select_winner,
+        CommitmentWindowBlock, LeaderKeys, MINING_COMMITMENT_WINDOW, MiningCommitment,
+        PayoutSchedule, PoxIdTracker, RewardCycleSchedule, SnapshotChain, SortitionEngine,
+        SortitionHash, SortitionSnapshot, accepted_operation_txids, commitment_burn_statistics,
+        commitment_distribution, commitment_window_block, select_epoch4_winner, select_winner,
+    };
+    use nano_address::{PoxAddress, PoxAddressType20, StacksAddress};
+    use nano_bitcoin::{
+        BitcoinBlock, BitcoinInput, BitcoinOperation, BitcoinOperationKind, BitcoinOutput,
     };
 
     /// A chain resumed at its saved tip can still say what elected somebody below it.
@@ -2509,6 +2576,97 @@ mod tests {
         );
         assert!(!schedule.starts_reward_cycle(962_151));
         assert!(super::PayoutSchedule::new(cycles, 2100).is_err());
+    }
+
+    #[test]
+    fn a_commitment_with_stock_invalid_payouts_changes_neither_hash_nor_window() {
+        let cycles = RewardCycleSchedule::new(0, 20, Some(280)).expect("valid cycle schedule");
+        let payouts = PayoutSchedule::new(cycles, 5).expect("valid payout schedule");
+        let output = |amount_sats, byte| BitcoinOutput {
+            amount_sats,
+            recipient: PoxAddress::Addr20 {
+                mainnet: false,
+                address_type: PoxAddressType20::P2wpkh,
+                bytes: [byte; 20],
+            },
+        };
+        let block = |height, outputs| BitcoinBlock {
+            height,
+            hash: [9; 32],
+            timestamp: 0,
+            operations: vec![BitcoinOperation {
+                txid: [1; 32],
+                transaction_index: 1,
+                inputs: vec![BitcoinInput {
+                    txid: [2; 32],
+                    output_index: 1,
+                }],
+                outputs,
+                kind: BitcoinOperationKind::LeaderBlockCommit {
+                    block_header_hash: [3; 32],
+                    new_seed: [4; 32],
+                    parent_block_height: u32::try_from(height - 1).expect("test height fits u32"),
+                    parent_transaction_index: 1,
+                    key_block_height: u32::try_from(height - 2).expect("test height fits u32"),
+                    key_transaction_index: 1,
+                    memo: 0,
+                    parent_modulus: u8::try_from((height + 4) % 5).expect("modulus fits u8"),
+                },
+            }],
+        };
+
+        let malformed = block(270, vec![output(20_000, 5), output(9_999_947_402, 6)]);
+        assert!(accepted_operation_txids(&malformed, payouts).is_empty());
+        let window = commitment_window_block(&malformed, payouts, &LeaderKeys::new());
+        assert!(window.commitments.is_empty());
+        assert!(window.missed_commitments.is_empty());
+
+        let classic = block(
+            270,
+            vec![
+                output(20_000, 5),
+                output(20_000, 6),
+                output(9_999_947_402, 7),
+            ],
+        );
+        assert_eq!(accepted_operation_txids(&classic, payouts), vec![[1; 32]]);
+        assert_eq!(
+            commitment_window_block(&classic, payouts, &LeaderKeys::new())
+                .commitments
+                .first()
+                .map(|commitment| commitment.burn_sats),
+            Some(40_000)
+        );
+
+        let prepare = block(279, vec![output(20_000, 5), output(9_999_947_402, 6)]);
+        assert!(accepted_operation_txids(&prepare, payouts).is_empty());
+        let prepare_burn = block(
+            279,
+            vec![BitcoinOutput {
+                amount_sats: 20_000,
+                recipient: PoxAddress::Standard {
+                    address: StacksAddress::single_signature(
+                        nano_primitives::Hash160::from_bytes([0; 20]),
+                        false,
+                    ),
+                    hash_mode: None,
+                },
+            }],
+        );
+        assert_eq!(
+            accepted_operation_txids(&prepare_burn, payouts),
+            vec![[1; 32]]
+        );
+
+        let waterfall = block(280, vec![output(20_000, 5), output(9_999_947_402, 6)]);
+        assert_eq!(accepted_operation_txids(&waterfall, payouts), vec![[1; 32]]);
+        assert_eq!(
+            commitment_window_block(&waterfall, payouts, &LeaderKeys::new())
+                .commitments
+                .first()
+                .map(|commitment| commitment.burn_sats),
+            Some(20_000)
+        );
     }
 
     /// The mining window is six blocks except where stacks-core says otherwise.

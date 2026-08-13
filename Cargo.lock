@@ -3068,6 +3068,7 @@ name = "nano-sortition"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "nano-address",
  "nano-bitcoin",
  "nano-primitives",
 ]

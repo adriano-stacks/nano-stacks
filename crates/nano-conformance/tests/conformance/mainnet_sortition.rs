@@ -591,7 +591,7 @@ fn the_burn_distribution_matches_stacks_core() {
             .map(|height| {
                 nano_sortition::commitment_window_block(
                     blocks.get(height).expect("the window's Bitcoin block"),
-                    payouts.outputs_at(*height),
+                    payouts,
                     &keys,
                 )
             })

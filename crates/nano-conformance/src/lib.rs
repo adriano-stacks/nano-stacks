@@ -2408,8 +2408,8 @@ mod tests {
     use clarity::vm::types::{PrincipalData, StandardPrincipalData, Value};
     use nano_address::{PoxAddress, PoxAddressType20, PoxAddressType32, StacksAddress};
     use nano_bitcoin::{
-        BitcoinBlock, BitcoinSource, PreStxCache, decode_block as decode_bitcoin_block,
-        decode_block_with_pre_stx,
+        BitcoinBlock, BitcoinInput, BitcoinOutput, BitcoinSource, PreStxCache,
+        decode_block as decode_bitcoin_block, decode_block_with_pre_stx,
     };
     use nano_chainstate::{BitcoinBlockContext, NakamotoBlock as NanoNakamotoBlock, SignerSet};
     use nano_codec::{
@@ -4188,14 +4188,24 @@ mod tests {
         let commit = |txid: u8, parent_modulus: u8| nano_bitcoin::BitcoinOperation {
             txid: [txid; 32],
             transaction_index: u32::from(txid),
-            inputs: Vec::new(),
-            outputs: Vec::new(),
+            inputs: vec![BitcoinInput {
+                txid: [9; 32],
+                output_index: 1,
+            }],
+            outputs: vec![BitcoinOutput {
+                amount_sats: 20_000,
+                recipient: PoxAddress::Addr20 {
+                    mainnet: false,
+                    address_type: PoxAddressType20::P2wpkh,
+                    bytes: [7; 20],
+                },
+            }],
             kind: nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
                 block_header_hash: [0; 32],
                 new_seed: [0; 32],
-                parent_block_height: 0,
-                parent_transaction_index: 0,
-                key_block_height: 0,
+                parent_block_height: 304,
+                parent_transaction_index: 1,
+                key_block_height: 303,
                 key_transaction_index: 0,
                 memo: 0,
                 parent_modulus,
@@ -4207,9 +4217,15 @@ mod tests {
             timestamp: 0,
             operations: vec![commit(1, on_time), commit(2, (on_time + 1) % 5)],
         };
+        let payouts = nano_sortition::PayoutSchedule::new(
+            nano_sortition::RewardCycleSchedule::new(0, 20, Some(0))
+                .expect("valid reward-cycle schedule"),
+            5,
+        )
+        .expect("valid payout schedule");
 
         assert_eq!(
-            nano_sortition::accepted_operation_txids(&block),
+            nano_sortition::accepted_operation_txids(&block, payouts),
             vec![[1; 32]],
             "the late commitment must not be one of the block's operations"
         );
@@ -6205,6 +6221,17 @@ mod tests {
             .expect("captured reward-cycle schedule is valid")
     }
 
+    fn captured_payout_schedule(fixture_root: &Path) -> nano_sortition::PayoutSchedule {
+        let prepare_phase_length = provenance_field(fixture_root, "pox_prepare_phase_length")
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("the capture names its PoX prepare phase length");
+        nano_sortition::PayoutSchedule::new(
+            captured_sortition_schedule(fixture_root),
+            prepare_phase_length,
+        )
+        .expect("captured payout schedule is valid")
+    }
+
     /// A replay of the captured Bitcoin chain into sortition snapshots.
     struct CapturedReplay {
         fixture_root: PathBuf,
@@ -6385,6 +6412,7 @@ mod tests {
         )
         .expect("parse captured sortition snapshots");
         let mut pre_stx_cache = PreStxCache::new();
+        let payouts = captured_payout_schedule(&fixture_root);
 
         for snapshot in snapshots {
             if snapshot.block_height == 0 {
@@ -6421,7 +6449,7 @@ mod tests {
             );
             assert_eq!(
                 nano_sortition::OpsHash::from_txids(&nano_sortition::accepted_operation_txids(
-                    &block
+                    &block, payouts
                 ),)
                 .as_bytes(),
                 &hex_array(&snapshot.ops_hash),

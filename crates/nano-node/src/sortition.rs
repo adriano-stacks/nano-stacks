@@ -533,9 +533,8 @@ impl SortitionTracker {
             self.pox_id.extend_with_anchor(true);
         }
         self.register_keys(block);
-        let commitments =
-            commitment_window_block(block, payouts.outputs_at(block.height), &self.keys);
-        let txids = accepted_operation_txids(block);
+        let commitments = commitment_window_block(block, payouts, &self.keys);
+        let txids = accepted_operation_txids(block, payouts);
         Ok(self.engine.append(
             block,
             &txids,
@@ -711,8 +710,7 @@ impl SortitionTracker {
             if height == tip {
                 self.recover_seed_from(&block)?;
             }
-            let commitments =
-                commitment_window_block(&block, payouts.outputs_at(height), &self.keys);
+            let commitments = commitment_window_block(&block, payouts, &self.keys);
             self.engine.prime(height, commitments);
         }
         self.primed = true;

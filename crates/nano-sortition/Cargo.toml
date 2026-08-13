@@ -14,3 +14,4 @@ workspace = true
 
 [dev-dependencies]
 hex = "0.4.3"
+nano-address = { path = "../nano-address" }
