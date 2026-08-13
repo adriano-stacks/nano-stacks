@@ -39,17 +39,31 @@ fn view(height: u64) -> ChainView {
     .expect("a tip above the confirmation window")
 }
 
+fn view_with_confirmations(height: u64, confirmations: u64) -> ChainView {
+    ChainView::with_stable_confirmations(
+        height,
+        BitcoinHeaderHash::from_bytes([0x5a; 32]),
+        BitcoinHeaderHash::from_bytes([0xc3; 32]),
+        confirmations,
+    )
+    .expect("a tip above the confirmation window")
+}
+
 /// A node that knows one reward cycle and three neighbours.
 #[derive(Default)]
 struct TestService {
     height: u64,
+    stable_confirmations: Option<u64>,
     offered_blocks: Mutex<Vec<(Hash160, usize)>>,
     offered_transactions: Mutex<Vec<Hash160>>,
 }
 
 impl Service for TestService {
     fn chain_view(&self) -> ChainView {
-        view(self.height)
+        self.stable_confirmations.map_or_else(
+            || view(self.height),
+            |confirmations| view_with_confirmations(self.height, confirmations),
+        )
     }
 
     fn neighbors(&self) -> Vec<nano_p2p::NeighborAddress> {
@@ -91,6 +105,14 @@ async fn listening(
     service: Arc<TestService>,
     data_url: Option<&str>,
 ) -> (SocketAddr, LocalPeer, tokio::task::JoinHandle<()>) {
+    listening_with_protocol(service, data_url, Protocol::testnet()).await
+}
+
+async fn listening_with_protocol(
+    service: Arc<TestService>,
+    data_url: Option<&str>,
+    protocol: Protocol,
+) -> (SocketAddr, LocalPeer, tokio::task::JoinHandle<()>) {
     let listener = Listener::bind("127.0.0.1:0".parse().expect("a loopback address"))
         .await
         .expect("bind");
@@ -124,7 +146,7 @@ async fn listening(
                     stream,
                     from,
                     &local,
-                    Protocol::testnet(),
+                    protocol,
                     service.as_ref(),
                     InboundLimits {
                         timeout: TIMEOUT,
@@ -136,6 +158,33 @@ async fn listening(
         }
     });
     (address, local, task)
+}
+
+/// Regtest's one-confirmation view is protocol-valid on both sides.
+#[tokio::test]
+async fn a_peer_uses_the_configured_stable_confirmation_window() {
+    let protocol = Protocol::testnet()
+        .with_stable_confirmations(1)
+        .expect("one confirmation is valid");
+    let service = Arc::new(TestService {
+        height: 900_000,
+        stable_confirmations: Some(1),
+        ..TestService::default()
+    });
+    let (address, _, _task) = listening_with_protocol(service, None, protocol).await;
+    let dialler = LocalPeer::quiet(StacksPrivateKey::from_seed(b"regtest dialler"), 20444);
+    let mut session = Session::open(
+        address,
+        &dialler,
+        protocol,
+        view_with_confirmations(900_001, 1),
+        TIMEOUT,
+    )
+    .await
+    .expect("the one-confirmation handshake completes");
+
+    assert_eq!(session.remote_view().stable_height, 899_999);
+    session.ping().await.expect("the session remains valid");
 }
 
 /// A peer that answers with a well-formed message that breaks a protocol rule.

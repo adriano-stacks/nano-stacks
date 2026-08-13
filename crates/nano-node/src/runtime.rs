@@ -3376,19 +3376,21 @@ async fn track_peer(
 fn advertised_view(
     bitcoin: &BurnchainSource,
     published: Option<&LocalAnnouncement>,
+    stable_confirmations: u64,
 ) -> nano_p2p::ChainView {
     let stale = || {
-        nano_p2p::ChainView::new(
+        nano_p2p::ChainView::with_stable_confirmations(
             100_000,
             nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
             nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
+            stable_confirmations,
         )
         .expect("a height above the confirmation window")
     };
     let Some(height) = published.map(|announced| announced.bitcoin_height) else {
         return stale();
     };
-    let Some(settled) = height.checked_sub(nano_p2p::STABLE_CONFIRMATIONS) else {
+    let Some(settled) = height.checked_sub(stable_confirmations) else {
         return stale();
     };
     let (Ok(tip_hash), Ok(stable_hash)) = (
@@ -3397,10 +3399,11 @@ fn advertised_view(
     ) else {
         return stale();
     };
-    nano_p2p::ChainView::new(
+    nano_p2p::ChainView::with_stable_confirmations(
         height,
         nano_primitives::BitcoinHeaderHash::from_bytes(tip_hash),
         nano_primitives::BitcoinHeaderHash::from_bytes(stable_hash),
+        stable_confirmations,
     )
     .unwrap_or_else(stale)
 }
@@ -3563,7 +3566,10 @@ async fn start_transport(
     if seeds.is_empty() && config.node.p2p_bind.is_none() {
         return None;
     }
-    let protocol = nano_p2p::Protocol::for_network(network);
+    let stable_confirmations = config.burnchain.stable_confirmations;
+    let protocol = nano_p2p::Protocol::for_network(network)
+        .with_stable_confirmations(stable_confirmations)
+        .expect("the configuration validates the stable confirmation count");
     let identity = match p2p_identity(&config.node.working_dir) {
         Ok(identity) => identity,
         Err(error) => {
@@ -3607,6 +3613,7 @@ async fn start_transport(
             peers: std::sync::Mutex::new(table),
             advertised: advertised.clone(),
             relay: relay.clone(),
+            stable_confirmations,
         }),
         Err(error) => {
             eprintln!("cannot open the peer table for serving: {error}");
@@ -3631,9 +3638,8 @@ async fn start_transport(
             return None;
         }
     };
-    let round = swarm
-        .maintain(advertised_view(&bitcoin, advertised.read().as_ref()), None)
-        .await;
+    let view = advertised_view(&bitcoin, advertised.read().as_ref(), stable_confirmations);
+    let round = swarm.maintain(view, None).await;
     println!(
         "p2p: {} peers connected, {} known, {} endpoints to fetch from",
         round.connected,
@@ -3651,7 +3657,15 @@ async fn start_transport(
     roles.spawn(async move {
         (
             Job::Peers,
-            peer_discovery(swarm, bitcoin, advertised, relay, tick).await,
+            peer_discovery(
+                swarm,
+                bitcoin,
+                advertised,
+                relay,
+                tick,
+                stable_confirmations,
+            )
+            .await,
         )
     });
 
@@ -3680,13 +3694,14 @@ async fn peer_discovery(
     advertised: Advertised,
     relay: nano_p2p::Relay,
     tick: Duration,
+    stable_confirmations: u64,
 ) -> Role {
     let mut ticks = 0_u64;
     loop {
         sleep(tick).await;
         ticks = ticks.wrapping_add(1);
         let published = advertised.read();
-        let view = advertised_view(&bitcoin, published.as_ref());
+        let view = advertised_view(&bitcoin, published.as_ref(), stable_confirmations);
         // `None` before there is a chain to name a cycle, and a peer is then not
         // asked at all rather than asked about a guess.
         let cycle_start = published.and_then(|announced| announced.cycle_start);
@@ -3754,7 +3769,9 @@ fn start_listener(
     let Ok(identity) = p2p_identity(&config.node.working_dir) else {
         return;
     };
-    let protocol = nano_p2p::Protocol::for_network(network);
+    let protocol = nano_p2p::Protocol::for_network(network)
+        .with_stable_confirmations(config.burnchain.stable_confirmations)
+        .expect("the configuration validates the stable confirmation count");
     let advertise = config.node.p2p_address.unwrap_or(bind);
     let mut local = nano_p2p::LocalPeer::quiet(identity, advertise.port());
     if !advertise.ip().is_unspecified() {
@@ -3835,6 +3852,7 @@ struct PeerService {
     /// near a decision. This runs on the listener's task and has no chainstate, so
     /// the most it can honestly do is write down who said what.
     relay: nano_p2p::Relay,
+    stable_confirmations: u64,
 }
 
 impl nano_p2p::Service for PeerService {
@@ -3850,10 +3868,11 @@ impl nano_p2p::Service for PeerService {
         // alone would be a view a peer could contradict. That is why the whole thing
         // stays the stale one for now, and why the swarm — which can await — is where
         // the real view is advertised.
-        nano_p2p::ChainView::new(
+        nano_p2p::ChainView::with_stable_confirmations(
             100_000,
             nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
             nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
+            self.stable_confirmations,
         )
         .expect("a height above the confirmation window")
     }

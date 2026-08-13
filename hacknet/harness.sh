@@ -404,6 +404,7 @@ rpc_user = "$(compose_value BITCOIN_RPC_USER)"
 rpc_password = "$(compose_value BITCOIN_RPC_PASS)"
 magic = "${NANO_BITCOIN_MAGIC:-T3}"
 pox_participation_threshold_pct = 1
+stable_confirmations = 1
 
 [checkpoint]
 marf = "$RUN/checkpoint/marf.sqlite"

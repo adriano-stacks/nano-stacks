@@ -151,6 +151,11 @@ pub struct BurnchainConfig {
     /// Mainnet's value is fixed. Other chains must state theirs when they serve
     /// the `PoX` RPC because it cannot be recovered from the boot contract.
     pub pox_participation_threshold_pct: Option<u64>,
+    /// How many Bitcoin blocks make a P2P view stable on this chain.
+    ///
+    /// Bitcoin mainnet and testnet use seven; regtest uses one.
+    #[serde(default = "stable_confirmations")]
+    pub stable_confirmations: u64,
 }
 
 /// The state this node starts executing from, the first time it starts.
@@ -260,6 +265,10 @@ fn hacknet_magic() -> String {
     "T3".to_owned()
 }
 
+const fn stable_confirmations() -> u64 {
+    nano_p2p::STABLE_CONFIRMATIONS
+}
+
 /// Why a configuration file cannot be used to start a node.
 #[derive(Debug)]
 pub enum ConfigError {
@@ -308,6 +317,11 @@ impl Config {
             ));
         }
         config.burnchain.magic()?;
+        if config.burnchain.stable_confirmations == 0 {
+            return Err(ConfigError::Invalid(
+                "burnchain.stable_confirmations must be greater than zero".to_owned(),
+            ));
+        }
         config.checkpoint.source_state_id()?;
         config.checkpoint.state_root()?;
         config.node.peers()?;
@@ -596,12 +610,39 @@ mod tests {
             0x8000_0000
         );
         assert_eq!(config.burnchain.magic().expect("magic"), *b"T3");
+        assert_eq!(
+            config.burnchain.stable_confirmations,
+            nano_p2p::STABLE_CONFIRMATIONS
+        );
         assert_eq!(config.node.poll_interval_secs, 1);
         assert_eq!(config.node.metrics_bind().to_string(), "127.0.0.1:9153");
         assert!(config.signer.is_none() && config.miner.is_none());
         assert_eq!(
             config.chainstate_dir("chainstate"),
             std::path::Path::new("/tmp/nano/chainstate")
+        );
+    }
+
+    #[test]
+    fn a_regtest_settlement_window_is_explicit_and_nonzero() {
+        let regtest = MINIMAL.replace(
+            "rpc_password = \"hacknet\"",
+            "rpc_password = \"hacknet\"\n        stable_confirmations = 1",
+        );
+        assert_eq!(
+            Config::parse(&regtest)
+                .expect("valid regtest configuration")
+                .burnchain
+                .stable_confirmations,
+            1
+        );
+
+        let invalid = regtest.replace("stable_confirmations = 1", "stable_confirmations = 0");
+        assert!(
+            Config::parse(&invalid)
+                .expect_err("a zero settlement window is refused")
+                .to_string()
+                .contains("stable_confirmations")
         );
     }
 

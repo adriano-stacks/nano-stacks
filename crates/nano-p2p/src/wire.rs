@@ -391,10 +391,21 @@ impl ChainView {
         hash: BitcoinHeaderHash,
         stable_hash: BitcoinHeaderHash,
     ) -> Option<Self> {
+        Self::with_stable_confirmations(height, hash, stable_hash, STABLE_CONFIRMATIONS)
+    }
+
+    /// Build a view for a burnchain with the given settlement window.
+    #[must_use]
+    pub fn with_stable_confirmations(
+        height: u64,
+        hash: BitcoinHeaderHash,
+        stable_hash: BitcoinHeaderHash,
+        stable_confirmations: u64,
+    ) -> Option<Self> {
         Some(Self {
             height,
             hash,
-            stable_height: height.checked_sub(STABLE_CONFIRMATIONS)?,
+            stable_height: height.checked_sub(stable_confirmations)?,
             stable_hash,
         })
     }

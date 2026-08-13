@@ -49,6 +49,7 @@ pub struct Protocol {
     /// a differential codec test cannot see it, because the constant is policy
     /// rather than encoding.
     pub network_id: u32,
+    stable_confirmations: u64,
 }
 
 impl Protocol {
@@ -63,7 +64,26 @@ impl Protocol {
         Self {
             peer_version: major | PEER_VERSION_EPOCH_4_0,
             network_id: network.chain_id(),
+            stable_confirmations: crate::wire::STABLE_CONFIRMATIONS,
         }
+    }
+
+    /// Use the burnchain's configured settlement window.
+    ///
+    /// Mainnet and Bitcoin testnet use seven confirmations. Bitcoin regtest uses
+    /// one, and stacks-core checks the configured value on every message.
+    #[must_use]
+    pub const fn with_stable_confirmations(mut self, confirmations: u64) -> Option<Self> {
+        if confirmations == 0 {
+            return None;
+        }
+        self.stable_confirmations = confirmations;
+        Some(self)
+    }
+
+    #[must_use]
+    pub const fn stable_confirmations(&self) -> u64 {
+        self.stable_confirmations
     }
 
     #[must_use]
@@ -697,10 +717,11 @@ impl Framed {
         // stacks-core treats a stable height that is not exactly the tip less the
         // confirmation window as a protocol violation, because it means the
         // sender is not deriving one from the other.
-        let view = ChainView::new(
+        let view = ChainView::with_stable_confirmations(
             preamble.bitcoin_height,
             preamble.bitcoin_hash,
             preamble.stable_bitcoin_hash,
+            self.protocol.stable_confirmations,
         )
         .filter(|view| view.stable_height == preamble.stable_bitcoin_height)
         .ok_or(SessionError::InconsistentView)?;
