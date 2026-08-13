@@ -130,6 +130,13 @@ jobs:
           }
           trap cleanup EXIT
 
+          test -n "${NANO_RELEASE_TMP:-}"
+          mkdir -p "$NANO_RELEASE_TMP"
+          test "$(stat -c %d "$NANO_RELEASE_TMP")" = "$(stat -c %d "$NANO_MAINNET_MARF")"
+          qualification_tmp=$(mktemp -d "$NANO_RELEASE_TMP/.qualification.XXXXXX")
+          scratch_dirs+=("$qualification_tmp")
+          export TMPDIR="$qualification_tmp"
+
           fresh_reflink() {
             id=$1
             source_name="NANO_${id}_SOURCE"
