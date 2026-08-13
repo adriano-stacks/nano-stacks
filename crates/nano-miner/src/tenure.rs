@@ -278,7 +278,7 @@ pub fn build_tenure_start_block(
             parent_block_id: parent_tenure.tip.block_id,
             transaction_merkle_root: transaction_merkle_root(&transactions),
             state_index_root: TrieHash::from_bytes([0; 32]),
-            timestamp,
+            timestamp: timestamp.max(parent_tenure.tip.timestamp.saturating_add(1)),
             miner_signature: MessageSignature::from_bytes([0; 65]),
             signer_signatures: Vec::new(),
             pox_treatment: BitVec::ones(WATERFALL_POX_TREATMENT_LEN)
@@ -415,9 +415,10 @@ mod tests {
         ));
 
         let block =
-            build_tenure_start_block(&won, parent, view, Network::TESTNET, &miner, &vrf, 20)
+            build_tenure_start_block(&won, parent, view, Network::TESTNET, &miner, &vrf, 10)
                 .expect("build from local parent");
         assert_eq!(block.header.parent_block_id, parent.tip.block_id);
+        assert_eq!(block.header.timestamp, parent.tip.timestamp + 1);
         let TransactionPayloadData::TenureChange(change) = block.transactions[0].payload().data()
         else {
             panic!("first transaction is the tenure change");
