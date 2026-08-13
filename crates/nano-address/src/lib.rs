@@ -161,7 +161,7 @@ pub enum PoxAddressType32 {
     P2tr = 6,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PoxAddress {
     Standard {
         address: StacksAddress,

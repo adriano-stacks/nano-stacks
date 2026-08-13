@@ -6,6 +6,7 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
+nano-address = { path = "../nano-address" }
 nano-bitcoin = { path = "../nano-bitcoin" }
 nano-primitives = { path = "../nano-primitives" }
 
@@ -14,4 +15,3 @@ workspace = true
 
 [dev-dependencies]
 hex = "0.4.3"
-nano-address = { path = "../nano-address" }

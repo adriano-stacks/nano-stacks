@@ -2074,18 +2074,25 @@ async fn open_executor_with_sortition_copy(
         tracker.tip().bitcoin_height,
         tracker.tip().pox_id
     );
-    let mut executor = match context {
-        Some(_) => {
-            let context = local_anchor_context(
-                pox,
-                &tracker,
-                &mut chainstate,
-                &anchor,
-                config.checkpoint.anchor_bitcoin_height,
-            )?;
-            CheckpointExecutor::from_chainstate(chainstate, anchor, context, bitcoin)?
-        }
-        None => CheckpointExecutor::resume(chainstate, anchor, bitcoin),
+    let mut executor = if context.is_some() {
+        let context = local_anchor_context(
+            pox,
+            &tracker,
+            &mut chainstate,
+            &anchor,
+            config.checkpoint.anchor_bitcoin_height,
+        )?;
+        CheckpointExecutor::from_chainstate_using_registry(
+            chainstate,
+            anchor,
+            context,
+            bitcoin,
+            config.node.pox_5_sbtc_registry_contract.clone(),
+        )?
+    } else {
+        let mut executor = CheckpointExecutor::resume(chainstate, anchor, bitcoin);
+        executor.use_waterfall_registry(config.node.pox_5_sbtc_registry_contract.clone());
+        executor
     };
     executor.track_sortitions(tracker, config.node.working_dir.clone());
     Ok(executor)

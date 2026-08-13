@@ -8,6 +8,7 @@ use std::{
 
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use fs2::FileExt;
+use nano_address::PoxAddress;
 use nano_bitcoin::BitcoinSource;
 use nano_chainstate::{BitcoinBlockContext, ChainState, NakamotoBlock, SignerSet, SignerWeights};
 use nano_crypto::StacksPrivateKey;
@@ -170,6 +171,8 @@ pub struct ChainstateProposalValidator<S> {
     candidates: BTreeMap<nano_primitives::StacksBlockId, nano_chainstate::NakamotoBlockHeader>,
     /// Coinbase each tenure accumulated, by the Bitcoin height that awarded it.
     accumulated: BTreeMap<u64, u128>,
+    /// The non-mainnet sBTC registry used to derive future waterfall payouts.
+    waterfall_registry: Option<String>,
 }
 
 fn adopt_sealed_header(
@@ -211,11 +214,23 @@ where
             trusted,
             candidates: BTreeMap::new(),
             accumulated: BTreeMap::new(),
+            waterfall_registry: None,
         }
     }
 
+    /// Use this chain's non-mainnet sBTC registry for waterfall payouts.
+    #[must_use]
+    pub fn using_waterfall_registry(mut self, registry: Option<String>) -> Self {
+        self.waterfall_registry = registry;
+        self
+    }
+
     /// Record an observed block after its state has been independently verified.
-    pub fn observe(&mut self, block: &NakamotoBlock, bitcoin_height: u64) -> Result<(), String> {
+    pub fn observe(
+        &mut self,
+        block: &NakamotoBlock,
+        bitcoin_height: u64,
+    ) -> Result<Option<(u64, PoxAddress)>, String> {
         let block_id = block.block_id();
         if let Some(candidate) = self.candidates.remove(&block_id) {
             // A proposal carries no signer signatures, so only the miner-signed
@@ -224,13 +239,13 @@ where
                 return Err("observed block differs from the validated candidate".to_owned());
             }
         }
-        self.validate_block(
+        let waterfall_payout = self.validate_block(
             block,
             self.context_at(bitcoin_height),
             ValidationTarget::Observed,
         )?;
         self.trusted.insert(block_id, block.header.clone());
-        Ok(())
+        Ok(waterfall_payout)
     }
 
     /// Return whether a block is already in the independently verified chain view.
@@ -316,7 +331,7 @@ where
         block: &NakamotoBlock,
         bitcoin_context: BitcoinBlockContext,
         target: ValidationTarget,
-    ) -> Result<(), String> {
+    ) -> Result<Option<(u64, PoxAddress)>, String> {
         // Sealing only happens once a block's committed state root has been
         // verified, so a block already in the state was already validated.
         if self
@@ -324,7 +339,7 @@ where
             .has_block_state(*block.block_id().as_bytes())
             .map_err(|error| error.to_string())?
         {
-            return Ok(());
+            return Ok(None);
         }
         // A tenure's coinbase depends on the burn blocks since the last
         // sortition, so validating one without that number would seal a state
@@ -354,26 +369,32 @@ where
             ValidationTarget::Observed => (
                 "observed block",
                 self.chainstate
-                    .append_nakamoto_block_with_bitcoin_operations(
+                    .append_nakamoto_block_with_bitcoin_operations_using_registry(
                         bitcoin_context,
                         &operations.operations,
                         parent,
                         block,
+                        self.waterfall_registry.as_deref(),
                     ),
             ),
             ValidationTarget::Proposal => (
                 "proposal",
                 self.chainstate
-                    .validate_nakamoto_proposal_with_bitcoin_operations(
+                    .validate_nakamoto_proposal_with_bitcoin_operations_using_registry(
                         bitcoin_context,
                         &operations.operations,
                         parent,
                         block,
+                        self.waterfall_registry.as_deref(),
                     ),
             ),
         };
-        result.map_err(|error| format!("{kind} execution failed: {error}"))?;
-        Ok(())
+        let applied = result.map_err(|error| format!("{kind} execution failed: {error}"))?;
+        Ok(applied
+            .reward_set
+            .as_ref()
+            .zip(applied.waterfall_payout)
+            .map(|(set, address)| (set.reward_cycle, address)))
     }
 }
 

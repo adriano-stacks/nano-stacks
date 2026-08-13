@@ -493,7 +493,7 @@ impl LocalBurnView {
         validator: &mut Validator,
     ) -> Result<(), String> {
         let (bitcoin_height, _) = self.prepare(block, pox, validator)?;
-        validator
+        let waterfall_payout = validator
             .validator_mut()
             .observe(block, bitcoin_height)
             .map_err(|error| {
@@ -503,6 +503,25 @@ impl LocalBurnView {
                     block.header.chain_length
                 )
             })?;
+        if let Some((cycle, recipient)) = waterfall_payout {
+            let cycle_length = u64::from(pox.prepare_phase_length)
+                .checked_add(u64::from(pox.reward_phase_length))
+                .ok_or_else(|| "reward-cycle length overflow".to_owned())?;
+            let offset = cycle
+                .checked_mul(cycle_length)
+                .ok_or_else(|| format!("reward cycle {cycle} starts past u64::MAX"))?;
+            let starts_at = pox
+                .first_bitcoin_height
+                .checked_add(offset)
+                .ok_or_else(|| format!("reward cycle {cycle} starts past u64::MAX"))?;
+            self.tracker
+                .record_waterfall_payout(starts_at, bitcoin_height, recipient);
+            self.tracker
+                .save_standing_on(&self.state, bitcoin_height)
+                .map_err(|error| {
+                    format!("the locally derived waterfall payout could not be saved: {error}")
+                })?;
+        }
         self.canonical_view = block
             .bitcoin_view_consensus_hash()
             .unwrap_or(self.canonical_view);

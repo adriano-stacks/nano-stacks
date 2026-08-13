@@ -2516,6 +2516,8 @@ mod tests {
         sortition: u8,
         sortition_hash: String,
         winning_block_txid: String,
+        #[serde(default)]
+        pox_payouts: Option<String>,
     }
 
     struct EmptyReferenceBlockMap;
@@ -4206,6 +4208,11 @@ mod tests {
         // A block holding one commitment that arrived on time and one that did
         // not: only the first is one of the block's operations.
         let height = 305;
+        let recipient = PoxAddress::Addr20 {
+            mainnet: false,
+            address_type: PoxAddressType20::P2wpkh,
+            bytes: [7; 20],
+        };
         let on_time = u8::try_from((height + BURN_BLOCK_MINED_AT_MODULUS - 1) % 5).expect("small");
         let commit = |txid: u8, parent_modulus: u8| nano_bitcoin::BitcoinOperation {
             txid: [txid; 32],
@@ -4216,11 +4223,7 @@ mod tests {
             }],
             outputs: vec![BitcoinOutput {
                 amount_sats: 20_000,
-                recipient: PoxAddress::Addr20 {
-                    mainnet: false,
-                    address_type: PoxAddressType20::P2wpkh,
-                    bytes: [7; 20],
-                },
+                recipient,
             }],
             kind: nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
                 block_header_hash: [0; 32],
@@ -4244,7 +4247,8 @@ mod tests {
                 .expect("valid reward-cycle schedule"),
             5,
         )
-        .expect("valid payout schedule");
+        .expect("valid payout schedule")
+        .paying_waterfall_to(recipient);
 
         assert_eq!(
             nano_sortition::accepted_operation_txids(&block, payouts),
@@ -6247,11 +6251,28 @@ mod tests {
         let prepare_phase_length = provenance_field(fixture_root, "pox_prepare_phase_length")
             .and_then(|value| value.parse::<u64>().ok())
             .expect("the capture names its PoX prepare phase length");
-        nano_sortition::PayoutSchedule::new(
+        let schedule = nano_sortition::PayoutSchedule::new(
             captured_sortition_schedule(fixture_root),
             prepare_phase_length,
         )
-        .expect("captured payout schedule is valid")
+        .expect("captured payout schedule is valid");
+        let recipient = captured_sortition_snapshots(fixture_root)
+            .into_iter()
+            .filter_map(|snapshot| snapshot.pox_payouts)
+            .find_map(|encoded| {
+                let (addresses, _): (Vec<serde_json::Value>, u64) =
+                    serde_json::from_str(&encoded).ok()?;
+                let value = addresses.first()?.get("Addr32")?.clone();
+                let (mainnet, kind, bytes): (bool, String, [u8; 32]) =
+                    serde_json::from_value(value).ok()?;
+                (kind == "P2TR").then_some(PoxAddress::Addr32 {
+                    mainnet,
+                    address_type: PoxAddressType32::P2tr,
+                    bytes,
+                })
+            })
+            .expect("the captured waterfall names its P2TR recipient");
+        schedule.paying_waterfall_to(recipient)
     }
 
     /// A replay of the captured Bitcoin chain into sortition snapshots.

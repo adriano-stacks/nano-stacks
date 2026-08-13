@@ -3,6 +3,7 @@ pub(crate) mod carryover;
 use std::collections::{BTreeMap, BTreeSet};
 use std::{collections::HashMap, fmt};
 
+use nano_address::PoxAddress;
 use nano_bitcoin::{BitcoinBlock, BitcoinOperation, BitcoinOperationKind, BitcoinOutput};
 use nano_primitives::{
     BitcoinHeaderHash, ConsensusHash, SortitionId, Uint256, Uint512, hash160, sha256, sha512_256,
@@ -238,6 +239,7 @@ pub struct MissedCommitment {
 pub struct PayoutSchedule {
     cycles: RewardCycleSchedule,
     prepare_phase_length: u64,
+    waterfall_recipient: Option<PoxAddress>,
     /// The Bitcoin height epoch 4.0 activates at, when the node knows it.
     ///
     /// This is pox-5's activation height: `validate_epochs` requires the two to be
@@ -264,8 +266,16 @@ impl PayoutSchedule {
         Ok(Self {
             cycles,
             prepare_phase_length,
+            waterfall_recipient: None,
             epoch_four_activation: None,
         })
+    }
+
+    /// Require waterfall commitments to pay the reward set's sBTC address.
+    #[must_use]
+    pub const fn paying_waterfall_to(mut self, recipient: PoxAddress) -> Self {
+        self.waterfall_recipient = Some(recipient);
+        self
     }
 
     /// Say where epoch 4.0 begins, which shortens the mining window around it.
@@ -337,12 +347,18 @@ impl PayoutSchedule {
         }
     }
 
+    /// Whether commitments at this height use the waterfall recipient.
+    #[must_use]
+    pub fn is_waterfall_at(&self, bitcoin_height: u64) -> bool {
+        self.cycles.is_waterfall_at(bitcoin_height)
+    }
+
     fn accepts_commitment_outputs(&self, bitcoin_height: u64, outputs: &[BitcoinOutput]) -> bool {
         let Some(first) = outputs.first().filter(|output| output.amount_sats > 0) else {
             return false;
         };
         if self.cycles.is_waterfall_at(bitcoin_height) {
-            return true;
+            return self.waterfall_recipient == Some(first.recipient);
         }
         if self.is_in_prepare_phase(bitcoin_height) {
             return matches!(
@@ -2028,6 +2044,14 @@ mod tests {
         BitcoinBlock, BitcoinInput, BitcoinOperation, BitcoinOperationKind, BitcoinOutput,
     };
 
+    fn waterfall_recipient(byte: u8) -> PoxAddress {
+        PoxAddress::Addr32 {
+            mainnet: false,
+            address_type: nano_address::PoxAddressType32::P2tr,
+            bytes: [byte; 32],
+        }
+    }
+
     /// A chain resumed at its saved tip can still say what elected somebody below it.
     ///
     /// The case a live mainnet follower stopped on: seeded at burn 961,342 with the
@@ -2591,7 +2615,10 @@ mod tests {
     #[test]
     fn a_commitment_with_stock_invalid_payouts_changes_neither_hash_nor_window() {
         let cycles = RewardCycleSchedule::new(0, 20, Some(280)).expect("valid cycle schedule");
-        let payouts = PayoutSchedule::new(cycles, 5).expect("valid payout schedule");
+        let waterfall_recipient = waterfall_recipient(0xbc);
+        let payouts = PayoutSchedule::new(cycles, 5)
+            .expect("valid payout schedule")
+            .paying_waterfall_to(waterfall_recipient);
         let output = |amount_sats, byte| BitcoinOutput {
             amount_sats,
             recipient: PoxAddress::Addr20 {
@@ -2668,7 +2695,21 @@ mod tests {
             vec![[1; 32]]
         );
 
-        let waterfall = block(280, vec![output(20_000, 5), output(9_999_947_402, 6)]);
+        let stale_waterfall = block(280, vec![output(20_000, 5), output(9_999_947_402, 6)]);
+        assert!(
+            accepted_operation_txids(&stale_waterfall, payouts).is_empty(),
+            "a waterfall commitment to the old payout address is not an operation"
+        );
+        let waterfall = block(
+            280,
+            vec![
+                BitcoinOutput {
+                    amount_sats: 20_000,
+                    recipient: waterfall_recipient,
+                },
+                output(9_999_947_402, 6),
+            ],
+        );
         assert_eq!(accepted_operation_txids(&waterfall, payouts), vec![[1; 32]]);
         assert_eq!(
             commitment_window_block(&waterfall, payouts, &LeaderKeys::new())

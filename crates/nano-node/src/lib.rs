@@ -9,6 +9,7 @@ pub mod staging;
 
 use std::{collections::HashMap, fmt, path::Path, time::Duration};
 
+use nano_address::PoxAddress;
 use nano_bitcoin::BitcoinSource;
 use nano_chainstate::{
     AppliedBlock, BitcoinBlockContext, ChainState, ChainStateError, NakamotoBlock,
@@ -90,6 +91,11 @@ pub struct CheckpointExecutor<S> {
     /// wall time a block took. Beside the observers for the same reason they
     /// are here — only the executor knows a block was executed.
     metrics: Option<nano_rpc::NodeMetrics>,
+    /// The non-mainnet sBTC registry used when execution computes a new cycle.
+    waterfall_registry: Option<String>,
+    /// A transition computed while applying a checkpoint anchor, before the
+    /// derived sortition tracker is attached.
+    pending_waterfall_payout: Option<(u64, u64, PoxAddress)>,
     bitcoin: S,
 }
 
@@ -860,6 +866,22 @@ pub fn adopt_checkpoint(
     Ok(attestation)
 }
 
+fn waterfall_transition(
+    applied: &AppliedBlock,
+    context: BitcoinBlockContext,
+) -> Option<(u64, u64, PoxAddress)> {
+    let reward_set = applied.reward_set.as_ref()?;
+    let recipient = applied.waterfall_payout?;
+    let cycle_length = u64::from(context.prepare_phase_length)
+        .checked_add(u64::from(context.reward_phase_length))?;
+    let offset = reward_set.reward_cycle.checked_mul(cycle_length)?;
+    Some((
+        context.first_height.checked_add(offset)?,
+        context.height,
+        recipient,
+    ))
+}
+
 impl<S> CheckpointExecutor<S>
 where
     S: BitcoinSource,
@@ -888,21 +910,35 @@ where
 
     /// Apply the checkpoint's first known descendant to an already-open state.
     pub fn from_chainstate(
+        chainstate: ChainState,
+        anchor: NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+        bitcoin: S,
+    ) -> Result<Self, CheckpointExecutionError> {
+        Self::from_chainstate_using_registry(chainstate, anchor, bitcoin_context, bitcoin, None)
+    }
+
+    /// Apply a checkpoint anchor with the non-mainnet sBTC registry whose
+    /// aggregate key determines future waterfall payouts.
+    pub fn from_chainstate_using_registry(
         mut chainstate: ChainState,
         anchor: NakamotoBlock,
         bitcoin_context: BitcoinBlockContext,
         mut bitcoin: S,
+        waterfall_registry: Option<String>,
     ) -> Result<Self, CheckpointExecutionError> {
         let operations = bitcoin
             .block_at(bitcoin_context.height)
             .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
         let parent = chainstate.tip()?;
-        chainstate.append_nakamoto_block_with_bitcoin_operations(
+        let applied = chainstate.append_nakamoto_block_with_bitcoin_operations_using_registry(
             bitcoin_context,
             &operations.operations,
             parent,
             &anchor,
+            waterfall_registry.as_deref(),
         )?;
+        let pending_waterfall_payout = waterfall_transition(&applied, bitcoin_context);
         Ok(Self {
             chainstate,
             sortition: None,
@@ -914,6 +950,8 @@ where
             observers: None,
             archive: None,
             metrics: None,
+            waterfall_registry,
+            pending_waterfall_payout,
             bitcoin,
         })
     }
@@ -937,8 +975,17 @@ where
             observers: None,
             archive: None,
             metrics: None,
+            waterfall_registry: None,
+            pending_waterfall_payout: None,
             bitcoin,
         }
+    }
+
+    /// Configure the registry whose locally executed state determines future
+    /// waterfall payouts. Mainnet deliberately uses its fixed registry when this
+    /// is `None`.
+    pub fn use_waterfall_registry(&mut self, registry: Option<String>) {
+        self.waterfall_registry = registry;
     }
 
     /// Consume an authenticated executor so a proposal validator can use its state.
@@ -979,15 +1026,34 @@ where
         })?;
         let applied = self
             .chainstate
-            .append_nakamoto_block_with_bitcoin_operations(
+            .append_nakamoto_block_with_bitcoin_operations_using_registry(
                 bitcoin_context,
                 operations,
                 Some(*self.tip.block_id().as_bytes()),
                 block,
+                self.waterfall_registry.as_deref(),
             )?;
+        self.remember_waterfall_payout(&applied, bitcoin_context);
         self.tip = block.clone();
         self.bitcoin_height = bitcoin_context.height;
         Ok(applied)
+    }
+
+    fn remember_waterfall_payout(&mut self, applied: &AppliedBlock, context: BitcoinBlockContext) {
+        let Some((start, observed_at, recipient)) = waterfall_transition(applied, context) else {
+            if applied.reward_set.is_some() && applied.waterfall_payout.is_none() {
+                eprintln!(
+                    "a locally computed reward set carries no waterfall payout; the derived \
+                     sortition chain will refuse its cycle"
+                );
+            }
+            return;
+        };
+        if let Some(tracker) = self.sortition.as_mut() {
+            tracker.record_waterfall_payout(start, observed_at, recipient);
+        } else {
+            self.pending_waterfall_payout = Some((start, observed_at, recipient));
+        }
     }
 
     /// The Bitcoin height the sealed tip was executed under.
@@ -1755,6 +1821,10 @@ where
         mut tracker: crate::sortition::SortitionTracker,
         state: std::path::PathBuf,
     ) {
+        if let Some((bitcoin_height, observed_at, recipient)) = self.pending_waterfall_payout.take()
+        {
+            tracker.record_waterfall_payout(bitcoin_height, observed_at, recipient);
+        }
         // Every tenure this node executed stands on a burn block that elected
         // somebody -- a tenure exists only because a sortition chose its miner -- so
         // the executed chain already knows the answer the resumed sortition chain
@@ -2737,12 +2807,14 @@ where
             .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
         let applied = self
             .chainstate
-            .append_nakamoto_block_with_bitcoin_operations(
+            .append_nakamoto_block_with_bitcoin_operations_using_registry(
                 bitcoin_context,
                 &operations.operations,
                 Some(*self.tip.block_id().as_bytes()),
                 block,
+                self.waterfall_registry.as_deref(),
             )?;
+        self.remember_waterfall_payout(&applied, bitcoin_context);
         self.tip = block.clone();
         Ok(applied)
     }

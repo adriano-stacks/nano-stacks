@@ -76,6 +76,9 @@ pub struct AppliedBlock {
     /// computed one. Not "the set of this cycle" — a node can read that any
     /// time; this is the transition, which is what an observer is told about.
     pub reward_set: Option<signers::DerivedRewardSet>,
+    /// The waterfall recipient read alongside `reward_set`, before this block's
+    /// transactions can change the sBTC registry.
+    pub waterfall_payout: Option<PoxAddress>,
 }
 
 /// A transaction stacks-core synthesizes only for event observers.
@@ -800,6 +803,9 @@ enum PayloadOutcome {
 /// What executing one block needs beyond the state it runs against.
 struct BlockExecution<'a> {
     bitcoin_context: BitcoinBlockContext,
+    /// The non-mainnet sBTC registry whose aggregate key determines the next
+    /// waterfall cycle. Mainnet always uses its fixed deployment.
+    waterfall_registry: Option<&'a str>,
     operations: &'a [BitcoinOperation],
     parent: Option<[u8; 32]>,
     root: RootPolicy<'a>,
@@ -1737,11 +1743,31 @@ impl ChainState {
         parent: Option<[u8; 32]>,
         block: &NakamotoBlock,
     ) -> Result<AppliedBlock, ChainStateError> {
+        self.append_nakamoto_block_with_bitcoin_operations_using_registry(
+            bitcoin_context,
+            operations,
+            parent,
+            block,
+            None,
+        )
+    }
+
+    /// Execute a Nakamoto block while deriving a non-mainnet waterfall payout
+    /// from this chain's configured sBTC registry.
+    pub fn append_nakamoto_block_with_bitcoin_operations_using_registry(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+        waterfall_registry: Option<&str>,
+    ) -> Result<AppliedBlock, ChainStateError> {
         let mut block = block.clone();
         self.execute_nakamoto_block(
             &mut block,
             BlockExecution {
                 bitcoin_context,
+                waterfall_registry,
                 operations,
                 parent,
                 root: RootPolicy::Verify,
@@ -1768,11 +1794,31 @@ impl ChainState {
         parent: Option<[u8; 32]>,
         block: &NakamotoBlock,
     ) -> Result<AppliedBlock, ChainStateError> {
+        self.validate_nakamoto_proposal_with_bitcoin_operations_using_registry(
+            bitcoin_context,
+            operations,
+            parent,
+            block,
+            None,
+        )
+    }
+
+    /// Validate a proposal while deriving any non-mainnet waterfall transition
+    /// from this chain's configured sBTC registry.
+    pub fn validate_nakamoto_proposal_with_bitcoin_operations_using_registry(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+        waterfall_registry: Option<&str>,
+    ) -> Result<AppliedBlock, ChainStateError> {
         let mut block = block.clone();
         self.execute_nakamoto_block(
             &mut block,
             BlockExecution {
                 bitcoin_context,
+                waterfall_registry,
                 operations,
                 parent,
                 root: RootPolicy::Verify,
@@ -1801,6 +1847,7 @@ impl ChainState {
             &mut block,
             BlockExecution {
                 bitcoin_context,
+                waterfall_registry: None,
                 operations,
                 parent,
                 root: RootPolicy::Verify,
@@ -1825,6 +1872,7 @@ impl ChainState {
             &mut block,
             BlockExecution {
                 bitcoin_context,
+                waterfall_registry: None,
                 operations: &[],
                 parent,
                 root: RootPolicy::Verify,
@@ -1864,6 +1912,7 @@ impl ChainState {
             &mut block,
             BlockExecution {
                 bitcoin_context,
+                waterfall_registry: None,
                 operations,
                 parent,
                 root: RootPolicy::Trust,
@@ -1891,6 +1940,7 @@ impl ChainState {
             &mut block,
             BlockExecution {
                 bitcoin_context,
+                waterfall_registry: None,
                 operations,
                 parent,
                 root: RootPolicy::Trust,
@@ -1989,6 +2039,7 @@ impl ChainState {
             &mut block,
             BlockExecution {
                 bitcoin_context,
+                waterfall_registry: None,
                 operations: &[],
                 parent,
                 root: RootPolicy::Trust,
@@ -2012,6 +2063,7 @@ impl ChainState {
             &mut block,
             BlockExecution {
                 bitcoin_context,
+                waterfall_registry: None,
                 operations: &[],
                 parent,
                 root: RootPolicy::Verify,
@@ -2036,6 +2088,7 @@ impl ChainState {
             &mut block,
             BlockExecution {
                 bitcoin_context,
+                waterfall_registry: None,
                 operations: &[],
                 parent,
                 root: RootPolicy::Trust,
@@ -2059,6 +2112,7 @@ impl ChainState {
             block,
             BlockExecution {
                 bitcoin_context,
+                waterfall_registry: None,
                 operations: &[],
                 parent,
                 root: RootPolicy::Mine(miner_key),
@@ -2082,6 +2136,7 @@ impl ChainState {
             block,
             BlockExecution {
                 bitcoin_context,
+                waterfall_registry: None,
                 operations: &[],
                 parent,
                 root: RootPolicy::Mine(miner_key),
@@ -2141,6 +2196,7 @@ impl ChainState {
             block,
             BlockExecution {
                 bitcoin_context,
+                waterfall_registry: None,
                 operations,
                 parent,
                 root: RootPolicy::Mine(miner_key),
@@ -2166,6 +2222,7 @@ impl ChainState {
             block,
             BlockExecution {
                 bitcoin_context,
+                waterfall_registry: None,
                 operations,
                 parent,
                 root: RootPolicy::Mine(miner_key),
@@ -2571,6 +2628,7 @@ impl ChainState {
     ) -> Result<AppliedBlock, ChainStateError> {
         let BlockExecution {
             bitcoin_context,
+            waterfall_registry,
             operations,
             parent,
             root,
@@ -2635,6 +2693,8 @@ impl ChainState {
             let coinbase_height = u64::from(self.vm.tenure_height()?);
             let reward_set =
                 signers::update_signer_set(&mut self.vm, bitcoin_context, coinbase_height)?;
+            let waterfall_payout =
+                self.waterfall_payout(reward_set.as_ref(), waterfall_registry)?;
             let (execution_cost, mut receipts) =
                 self.run_transactions(block, candidates, assembled)?;
             let coinbase_height = u64::from(self.vm.tenure_height()?);
@@ -2678,6 +2738,7 @@ impl ChainState {
                 matured_coinbase,
                 matured_anchored_fees,
                 reward_set,
+                waterfall_payout,
             })
         })();
         match result {
@@ -2724,6 +2785,17 @@ impl ChainState {
             },
         )?;
         Ok(ExecutionResult { state_root })
+    }
+
+    fn waterfall_payout(
+        &mut self,
+        reward_set: Option<&signers::DerivedRewardSet>,
+        registry: Option<&str>,
+    ) -> Result<Option<PoxAddress>, ChainStateError> {
+        if reward_set.is_none() || (!self.vm.network().is_mainnet() && registry.is_none()) {
+            return Ok(None);
+        }
+        signers::sbtc_payout_address(&mut self.vm, registry).map(Some)
     }
 
     /// Take the ledger a sealed block produced as this chain's own.

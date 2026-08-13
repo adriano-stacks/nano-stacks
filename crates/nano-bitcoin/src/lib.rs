@@ -943,7 +943,7 @@ fn parse_stack_stx(
     let authorization_id = data.get(66..70).and_then(array).map(u32::from_be_bytes);
     Some(BitcoinOperationKind::StackStx {
         sender,
-        reward_address: outputs.first()?.recipient.clone(),
+        reward_address: outputs.first()?.recipient,
         amount,
         cycles,
         signer_key,

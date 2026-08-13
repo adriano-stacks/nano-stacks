@@ -92,7 +92,7 @@ impl From<BitcoinRpcSourceError> for CommitmentPlanError {
 pub fn plan_local_commitment<S>(
     bitcoin: &mut S,
     key: RegisteredLeaderKey,
-    parent: CommitmentParent,
+    parent: &CommitmentParent,
 ) -> Result<CommitmentPlan, CommitmentPlanError>
 where
     S: BitcoinSource,
@@ -340,12 +340,12 @@ mod tests {
                 bitcoin_height: 7,
                 transaction_index: 8,
             },
-            CommitmentParent {
+            &CommitmentParent {
                 bitcoin_tip_height: 2,
                 tenure_start_block_id: start,
                 sortition: sortition(2),
                 tenure_vrf_proof: proof,
-                sbtc_address: payout.clone(),
+                sbtc_address: payout,
                 reward_cycle: 9,
             },
         )

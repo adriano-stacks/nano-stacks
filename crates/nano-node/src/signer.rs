@@ -55,7 +55,8 @@ pub async fn open(
     let mut context = pox.bitcoin_context();
     context.move_to_burn_block(bitcoin_height);
     Ok(ActiveSortitionValidator::new(
-        ChainstateProposalValidator::new(chainstate, &anchor, context, bitcoin),
+        ChainstateProposalValidator::new(chainstate, &anchor, context, bitcoin)
+            .using_waterfall_registry(config.node.pox_5_sbtc_registry_contract.clone()),
     ))
 }
 

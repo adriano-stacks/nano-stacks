@@ -422,7 +422,7 @@ impl State {
         let plan = plan_local_commitment(
             &mut bitcoin,
             self.leader_key,
-            CommitmentParent {
+            &CommitmentParent {
                 bitcoin_tip_height,
                 tenure_start_block_id,
                 sortition: parent_sortition,

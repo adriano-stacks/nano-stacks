@@ -12,8 +12,9 @@
 //! reaching back thousands of blocks — so the checkpoint carries those hashes.
 //! They are twenty bytes a block: mainnet's whole history is twelve megabytes.
 
-use std::{fmt::Display, fs, path::Path};
+use std::{collections::BTreeMap, fmt::Display, fs, path::Path};
 
+use nano_address::{PoxAddress, PoxAddressType32};
 use nano_bitcoin::{BitcoinBlock, BitcoinOperationKind};
 use nano_primitives::{BitcoinHeaderHash, ConsensusHash, Hash160};
 use nano_sortition::{
@@ -197,12 +198,22 @@ pub struct SortitionTracker {
     /// so a lookup can miss — which is reported rather than treated as "no check
     /// needed".
     keys: LeaderKeys,
+    /// Locally authenticated waterfall recipients, by the first burn height that
+    /// carried each one. Captures take these from stacks-core's own `pox_payouts`;
+    /// live execution adds the reward set it computes for the next cycle.
+    waterfall_payouts: BTreeMap<u64, WaterfallPayout>,
     /// Whether the six burn blocks the distribution weighs over have been read.
     ///
     /// They come from behind the seed, so they are not blocks the chain takes a
     /// snapshot of. Without them the window is short and the winner is not the
     /// one the network picked.
     primed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WaterfallPayout {
+    observed_at: u64,
+    recipient: PoxAddress,
 }
 
 /// One newly derived Bitcoin block to publish to event observers.
@@ -226,8 +237,47 @@ impl SortitionTracker {
             engine,
             pox_id,
             keys: LeaderKeys::new(),
+            waterfall_payouts: BTreeMap::new(),
             primed: false,
         })
+    }
+
+    /// Record the payout address this node computed for a waterfall cycle.
+    pub fn record_waterfall_payout(
+        &mut self,
+        bitcoin_height: u64,
+        observed_at: u64,
+        recipient: PoxAddress,
+    ) {
+        self.waterfall_payouts.insert(
+            bitcoin_height,
+            WaterfallPayout {
+                observed_at,
+                recipient,
+            },
+        );
+    }
+
+    fn payouts_at(
+        &self,
+        payouts: PayoutSchedule,
+        bitcoin_height: u64,
+    ) -> Result<PayoutSchedule, TrackerError> {
+        if !payouts.is_waterfall_at(bitcoin_height) {
+            return Ok(payouts);
+        }
+        let recipient = self
+            .waterfall_payouts
+            .range(..=bitcoin_height)
+            .next_back()
+            .map(|(_, payout)| payout.recipient)
+            .ok_or_else(|| {
+                TrackerError::Seed(format!(
+                    "burn {bitcoin_height} uses the PoX waterfall, but the locally derived chain \
+                     carries no sBTC payout address for it"
+                ))
+            })?;
+        Ok(payouts.paying_waterfall_to(recipient))
     }
 
     /// Read the consensus hashes a capture carries, oldest first.
@@ -520,6 +570,7 @@ impl SortitionTracker {
                 block.height
             )));
         }
+        let payouts = self.payouts_at(payouts, block.height)?;
         // A reward cycle opening adds a bit to the `PoX` history, and the consensus
         // hash mixes that history, so getting this wrong derives a wrong hash for
         // every block after it and reports nothing.
@@ -727,6 +778,7 @@ impl SortitionTracker {
             if height == tip {
                 self.recover_seed_from(&block)?;
             }
+            let payouts = self.payouts_at(payouts, height)?;
             let commitments = commitment_window_block(&block, payouts, &self.keys);
             self.engine.prime(height, commitments);
         }
@@ -1059,6 +1111,15 @@ fn unanimous_winner_seed(block: &BitcoinBlock) -> Option<[u8; 32]> {
 /// Beside the snapshots and the consensus hashes, because it answers the same
 /// kind of question they do: what the burnchain below this node's window said.
 pub const LEADER_KEY_FILE: &str = "leader-keys.json";
+const WATERFALL_PAYOUT_FILE: &str = "waterfall-payouts.json";
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+struct CapturedWaterfallPayout {
+    bitcoin_height: u64,
+    observed_at: u64,
+    mainnet: bool,
+    bytes: [u8; 32],
+}
 
 /// Read the leader-key registry a checkpoint carries.
 ///
@@ -1139,6 +1200,9 @@ struct CapturedSnapshot {
     consensus_hash: String,
     sortition_hash: String,
     total_burn: String,
+    /// stacks-core's expected `PoX` recipients and amount per output.
+    #[serde(default)]
+    pox_payouts: Option<String>,
     /// Stacks-core's cumulative winning-sortition count.
     #[serde(default)]
     num_sortitions: Option<u64>,
@@ -1373,6 +1437,12 @@ impl SortitionTracker {
                  what a restart needs"
             )));
         };
+        let pox_payouts = self
+            .waterfall_payouts
+            .range(..=tip.bitcoin_height)
+            .next_back()
+            .map(|(_, payout)| encoded_waterfall_payout(payout.recipient))
+            .transpose()?;
         let snapshots = vec![CapturedSnapshot {
             block_height: tip.bitcoin_height,
             burn_header_hash: hex::encode(tip.bitcoin_header_hash.as_bytes()),
@@ -1381,6 +1451,7 @@ impl SortitionTracker {
             burn_header_timestamp: tip.bitcoin_timestamp,
             sortition_hash: hex::encode(tip.sortition_hash.as_bytes()),
             total_burn: tip.total_burn.to_string(),
+            pox_payouts,
             num_sortitions: tip.num_sortitions,
             sortition: Some(i64::from(tip.winner_txid.is_some())),
             winning_block_txid: tip.winner_txid.map(hex::encode),
@@ -1460,6 +1531,17 @@ impl SortitionTracker {
         write(
             LEADER_KEY_FILE,
             serde_json::to_vec(&keys).map_err(|error| TrackerError::Seed(error.to_string()))?,
+        )?;
+        let waterfall_payouts = self
+            .waterfall_payouts
+            .iter()
+            .filter(|(_, payout)| payout.observed_at <= tip.bitcoin_height)
+            .map(|(bitcoin_height, payout)| captured_waterfall_payout(*bitcoin_height, *payout))
+            .collect::<Result<Vec<_>, _>>()?;
+        write(
+            WATERFALL_PAYOUT_FILE,
+            serde_json::to_vec(&waterfall_payouts)
+                .map_err(|error| TrackerError::Seed(error.to_string()))?,
         )?;
         write(
             "snapshots.json",
@@ -1615,8 +1697,122 @@ fn tracker_from_capture_seed(
             .snapshots_mut()
             .seed_sortitions_below_window(seed.sortitions_below_window.clone());
     }
+    tracker.waterfall_payouts = read_waterfall_payouts(directory, seed.block_height)?;
     tracker.load_leader_keys(directory)?;
     Ok(tracker)
+}
+
+fn read_waterfall_payouts(
+    directory: &Path,
+    through: u64,
+) -> Result<BTreeMap<u64, WaterfallPayout>, TrackerError> {
+    let mut payouts: BTreeMap<u64, WaterfallPayout> = BTreeMap::new();
+    for snapshot in captured_snapshots(directory)?
+        .into_iter()
+        .filter(|snapshot| snapshot.block_height <= through)
+    {
+        let Some(encoded) = snapshot.pox_payouts.as_deref() else {
+            continue;
+        };
+        if let Some(recipient) = parse_waterfall_payout(encoded)? {
+            let payout = WaterfallPayout {
+                observed_at: snapshot.block_height,
+                recipient,
+            };
+            if payouts
+                .last_key_value()
+                .is_none_or(|(_, previous)| previous.recipient != recipient)
+            {
+                payouts.insert(snapshot.block_height, payout);
+            }
+        }
+    }
+    let path = directory.join(WATERFALL_PAYOUT_FILE);
+    if let Ok(bytes) = fs::read(&path) {
+        let recorded: Vec<CapturedWaterfallPayout> = serde_json::from_slice(&bytes)
+            .map_err(|error| TrackerError::Seed(format!("{}: {error}", path.display())))?;
+        for payout in recorded
+            .into_iter()
+            .filter(|payout| payout.observed_at <= through)
+        {
+            payouts.insert(payout.bitcoin_height, payout.payout());
+        }
+    }
+    Ok(payouts)
+}
+
+fn parse_waterfall_payout(encoded: &str) -> Result<Option<PoxAddress>, TrackerError> {
+    let (addresses, _): (Vec<serde_json::Value>, u64) = serde_json::from_str(encoded)
+        .map_err(|error| TrackerError::Seed(format!("invalid captured PoX payouts: {error}")))?;
+    let Some(value) = addresses.first().and_then(|address| address.get("Addr32")) else {
+        return Ok(None);
+    };
+    let (mainnet, address_type, bytes): (bool, String, [u8; 32]) =
+        serde_json::from_value(value.clone()).map_err(|error| {
+            TrackerError::Seed(format!("invalid captured waterfall payout: {error}"))
+        })?;
+    if address_type != "P2TR" {
+        return Err(TrackerError::Seed(format!(
+            "captured waterfall payout uses {address_type}, not P2TR"
+        )));
+    }
+    Ok(Some(PoxAddress::Addr32 {
+        mainnet,
+        address_type: PoxAddressType32::P2tr,
+        bytes,
+    }))
+}
+
+fn captured_waterfall_payout(
+    bitcoin_height: u64,
+    payout: WaterfallPayout,
+) -> Result<CapturedWaterfallPayout, TrackerError> {
+    let recipient = payout.recipient;
+    let PoxAddress::Addr32 {
+        mainnet,
+        address_type: PoxAddressType32::P2tr,
+        bytes,
+    } = recipient
+    else {
+        return Err(TrackerError::Seed(
+            "a waterfall payout is not a P2TR address".to_owned(),
+        ));
+    };
+    Ok(CapturedWaterfallPayout {
+        bitcoin_height,
+        observed_at: payout.observed_at,
+        mainnet,
+        bytes,
+    })
+}
+
+fn encoded_waterfall_payout(recipient: PoxAddress) -> Result<String, TrackerError> {
+    let value = match recipient {
+        PoxAddress::Addr32 {
+            mainnet,
+            address_type: PoxAddressType32::P2tr,
+            bytes,
+        } => serde_json::json!([[{"Addr32": [mainnet, "P2TR", bytes]}], 0]),
+        _ => {
+            return Err(TrackerError::Seed(
+                "a waterfall payout is not a P2TR address".to_owned(),
+            ));
+        }
+    };
+    Ok(value.to_string())
+}
+
+impl CapturedWaterfallPayout {
+    const fn payout(self) -> WaterfallPayout {
+        WaterfallPayout {
+            observed_at: self.observed_at,
+            recipient: PoxAddress::Addr32 {
+                mainnet: self.mainnet,
+                address_type: PoxAddressType32::P2tr,
+                bytes: self.bytes,
+            },
+        }
+    }
 }
 
 /// The block-signing hash the seed's winning key was registered with.
@@ -1805,6 +2001,7 @@ fn ordered_miner_slot_writers(
 mod tests {
     use std::{fs, path::PathBuf};
 
+    use nano_address::{PoxAddress, PoxAddressType32};
     use nano_bitcoin::{BitcoinBlock, BitcoinOperation, BitcoinOperationKind};
     use nano_primitives::ConsensusHash;
     use nano_sortition::{
@@ -2119,6 +2316,64 @@ mod tests {
     }
 
     #[test]
+    fn the_captured_waterfall_recipient_survives_a_restart() {
+        let capture = captured_sortitions();
+        let mut tracker =
+            SortitionTracker::from_capture(&capture).expect("load the captured chain");
+        let recipient = PoxAddress::Addr32 {
+            mainnet: false,
+            address_type: PoxAddressType32::P2tr,
+            bytes: [
+                188, 203, 26, 12, 216, 93, 168, 108, 78, 75, 115, 253, 39, 143, 98, 215, 34, 85,
+                112, 39, 36, 119, 22, 206, 78, 69, 249, 48, 33, 116, 201, 145,
+            ],
+        };
+        assert_eq!(
+            tracker
+                .waterfall_payouts
+                .range(..=tracker.tip().bitcoin_height)
+                .next_back()
+                .map(|(_, payout)| payout.recipient),
+            Some(recipient)
+        );
+
+        let next = PoxAddress::Addr32 {
+            mainnet: false,
+            address_type: PoxAddressType32::P2tr,
+            bytes: [0xaa; 32],
+        };
+        tracker.record_waterfall_payout(360, tracker.tip().bitcoin_height, next);
+        let not_yet_observed = PoxAddress::Addr32 {
+            mainnet: false,
+            address_type: PoxAddressType32::P2tr,
+            bytes: [0xbb; 32],
+        };
+        tracker.record_waterfall_payout(380, tracker.tip().bitcoin_height + 1, not_yet_observed);
+
+        let state = tempfile::tempdir().expect("a role-specific state directory");
+        tracker.save(state.path()).expect("save the chain");
+        let resumed = SortitionTracker::from_capture(state.path()).expect("resume saved chain");
+        assert_eq!(
+            resumed
+                .waterfall_payouts
+                .range(..=360)
+                .next_back()
+                .map(|(_, payout)| payout.recipient),
+            Some(next),
+            "a future payout learned in the prepare phase survives a restart"
+        );
+        assert_ne!(
+            resumed
+                .waterfall_payouts
+                .range(..=380)
+                .next_back()
+                .map(|(_, payout)| payout.recipient),
+            Some(not_yet_observed),
+            "a payout learned above the saved standing height is not retained"
+        );
+    }
+
+    #[test]
     fn an_absent_duplicate_or_nonwinning_boundary_is_typed() {
         let source = captured_sortitions();
         let snapshots = captured_snapshots(&source).expect("read captured snapshots");
@@ -2278,6 +2533,7 @@ mod tests {
             consensus_hash: String::new(),
             sortition_hash: String::new(),
             total_burn: String::new(),
+            pox_payouts: None,
             num_sortitions: None,
             sortition: Some(0),
             winning_block_txid: None,
