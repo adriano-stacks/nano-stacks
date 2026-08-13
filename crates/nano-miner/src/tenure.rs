@@ -315,6 +315,61 @@ mod tests {
         )
     }
 
+    fn winning_vrf_public_key(
+        bitcoin: &mut BitcoinRpcSource,
+        sortition: &SortitionInfo,
+    ) -> [u8; 32] {
+        let miner = *sortition
+            .miner_public_key_hash
+            .expect("the sortition names its winning miner")
+            .as_bytes();
+        let committed = *sortition
+            .committed_block_hash
+            .expect("the sortition has a winner")
+            .as_bytes();
+
+        for operation in bitcoin
+            .block_at(sortition.bitcoin_height)
+            .expect("read the winning Bitcoin block")
+            .operations
+        {
+            let BitcoinOperationKind::LeaderBlockCommit {
+                block_header_hash,
+                key_block_height,
+                key_transaction_index,
+                ..
+            } = operation.kind
+            else {
+                continue;
+            };
+            if block_header_hash != committed {
+                continue;
+            }
+
+            let registration = bitcoin
+                .block_at(u64::from(key_block_height))
+                .expect("read a leader key's Bitcoin block")
+                .operations
+                .into_iter()
+                .find_map(|operation| match operation.kind {
+                    BitcoinOperationKind::LeaderKeyRegistration {
+                        vrf_public_key,
+                        block_signing_key_hash: Some(signing_key_hash),
+                        ..
+                    } if operation.transaction_index == u32::from(key_transaction_index) => {
+                        Some((vrf_public_key, signing_key_hash))
+                    }
+                    _ => None,
+                })
+                .expect("the commitment references a registered leader key");
+            if registration.1 == miner {
+                return registration.0;
+            }
+        }
+
+        panic!("the winning miner has no commitment in its Bitcoin block")
+    }
+
     #[test]
     fn tenure_start_construction_requires_an_explicit_local_parent() {
         let miner = StacksPrivateKey::from_seed(b"local miner");
@@ -471,42 +526,7 @@ mod tests {
             })
             .expect("tenure-start block carries a VRF proof");
 
-        let winner = bitcoin
-            .block_at(sortition.bitcoin_height)
-            .expect("read the winning Bitcoin block")
-            .operations
-            .into_iter()
-            .find_map(|operation| match operation.kind {
-                BitcoinOperationKind::LeaderBlockCommit {
-                    block_header_hash,
-                    key_block_height,
-                    key_transaction_index,
-                    ..
-                } if block_header_hash
-                    == *sortition
-                        .committed_block_hash
-                        .expect("the sortition has a winner")
-                        .as_bytes() =>
-                {
-                    Some((key_block_height, key_transaction_index))
-                }
-                _ => None,
-            })
-            .expect("the winning commitment is on Bitcoin");
-        let vrf_public_key = bitcoin
-            .block_at(u64::from(winner.0))
-            .expect("read the leader key's Bitcoin block")
-            .operations
-            .into_iter()
-            .find_map(|operation| match operation.kind {
-                BitcoinOperationKind::LeaderKeyRegistration { vrf_public_key, .. }
-                    if operation.transaction_index == u32::from(winner.1) =>
-                {
-                    Some(vrf_public_key)
-                }
-                _ => None,
-            })
-            .expect("the winner registered a leader key");
+        let vrf_public_key = winning_vrf_public_key(&mut bitcoin, &sortition);
 
         let mut blocks = Vec::new();
         for bitcoin_height in
