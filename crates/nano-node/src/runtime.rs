@@ -451,7 +451,7 @@ impl<S: Send> nano_rpc::BlockAdmission for CheckpointExecutor<S> {
 }
 
 /// What this node has sealed, for the RPC to answer from.
-fn sealed_tip(tip: &NakamotoBlock, bitcoin_height: u64) -> SealedTip {
+pub(crate) fn sealed_tip(tip: &NakamotoBlock, bitcoin_height: u64) -> SealedTip {
     SealedTip {
         stacks_height: tip.header.chain_length,
         stacks_tip: tip.block_id(),

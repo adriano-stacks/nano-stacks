@@ -77,6 +77,20 @@ pub async fn run(runtime: Runtime) -> runtime::Role {
         .map_err(|error| format!("the miner stopped: {error}"))
 }
 
+fn open_wallet(config: &Config, miner: &MinerConfig) -> Result<BitcoinWallet, Box<dyn Error>> {
+    Ok(BitcoinWallet::connect(
+        &format!(
+            "{}/wallet/{}",
+            config.burnchain.rpc_url.trim_end_matches('/'),
+            miner.bitcoin_wallet
+        ),
+        Auth::UserPass(
+            config.burnchain.rpc_user.clone(),
+            config.burnchain.rpc_password.clone(),
+        ),
+    )?)
+}
+
 async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
     let Runtime {
         config,
@@ -95,17 +109,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
     let vrf_key = miner.vrf_private_key()?;
     let miner_hash = hash160(&miner_key.public_key().to_bytes_compressed());
     let miner_address = StacksAddress::single_signature(miner_hash, network.is_mainnet());
-    let wallet = BitcoinWallet::connect(
-        &format!(
-            "{}/wallet/{}",
-            config.burnchain.rpc_url.trim_end_matches('/'),
-            miner.bitcoin_wallet
-        ),
-        Auth::UserPass(
-            config.burnchain.rpc_user.clone(),
-            config.burnchain.rpc_password.clone(),
-        ),
-    )?;
+    let wallet = open_wallet(&config, &miner)?;
     let mut state = State {
         config,
         miner,
@@ -135,15 +139,13 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
         "mining as {miner_hash} from the state on disk, wallet {} holding {funded} sats",
         state.miner.bitcoin_wallet
     );
-
     let interval = Duration::from_secs(state.config.node.poll_interval_secs);
-    let staging = Staging::open(
-        &state
-            .config
-            .chainstate_dir(NODE_CHAINSTATE)
-            .join("staging.sqlite"),
-    )
-    .map_err(|error| format!("cannot open the staging store: {error}"))?;
+    let staging_path = state
+        .config
+        .chainstate_dir(NODE_CHAINSTATE)
+        .join("staging.sqlite");
+    let staging = Staging::open(&staging_path)
+        .map_err(|error| format!("cannot open the staging store: {error}"))?;
     let budget = CatchUpBudget {
         fetch: runtime::ROUND_FETCH,
         execute: state.config.node.max_sync_blocks,
@@ -166,6 +168,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
             continue;
         }
         publish_burnchain(&state, &mut executor).await;
+        publish_execution(&state, &mut executor).await;
         let bitcoin_height = wallet.block_count()?;
         if bitcoin_height > state.committed_at {
             match state.commit(&wallet, &mut executor) {
@@ -179,9 +182,24 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
             eprintln!("advancing the tenure failed: {error}");
             state.tenure = None;
         }
+        publish_execution(&state, &mut executor).await;
         drop(executor);
         sleep(interval).await;
     }
+}
+
+async fn publish_execution(state: &State, executor: &mut CheckpointExecutor<BurnchainSource>) {
+    state
+        .metrics
+        .publish_execution_caches(executor.cache_usage());
+    state
+        .rpc
+        .publish_executed(
+            runtime::sealed_tip(executor.tip(), executor.bitcoin_height()),
+            executor.derived_sortitions(),
+            state.pox.clone(),
+        )
+        .await;
 }
 
 async fn publish_burnchain(state: &State, executor: &mut CheckpointExecutor<BurnchainSource>) {
@@ -857,5 +875,16 @@ mod tests {
                 "miner proposals must not read peer consensus input through {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn a_miner_publishes_execution_before_and_after_advancing_a_tenure() {
+        let source = include_str!("miner.rs");
+        assert_eq!(
+            source
+                .matches("\n        publish_execution(&state, &mut executor).await;")
+                .count(),
+            2
+        );
     }
 }
