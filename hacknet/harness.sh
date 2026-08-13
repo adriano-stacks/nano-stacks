@@ -78,6 +78,13 @@ peer_url() {
     esac
 }
 
+# The binary endpoint of one stock participant on Hacknet's private network.
+p2p_peer() {
+    local index=${1:?miner index}
+    case $index in 1 | 2 | 3) ;; *) die "no such participant: $index" ;; esac
+    printf '%s.%s:20444\n' "${NANO_HACKNET_NETWORK_PREFIX:-10.0.0}" "$((100 + index))"
+}
+
 chainstate_dir() { echo "$SRC/docker/chainstate/genesis"; }
 
 # A participant index nano did not replace, to read the chain from.
@@ -389,6 +396,7 @@ working_dir = "$RUN/nano"
 network = "testnet"
 chain_id = $chain_id
 peers = ["$peer/"]
+${NANO_P2P_SEED:+p2p_seeds = [\"$NANO_P2P_SEED\"]}
 ${NANO_RPC_BIND:+rpc_bind = \"$NANO_RPC_BIND\"}
 ${NANO_P2P_BIND:+p2p_bind = \"$NANO_P2P_BIND\"}
 ${NANO_P2P_ADDRESS:+p2p_address = \"$NANO_P2P_ADDRESS\"}
@@ -525,6 +533,7 @@ host() {
     nano_sink "$sink"
     log "starting the nano node for participant $index, hosting a signer on :$endpoint"
     NANO_HOSTED_SIGNER=1 \
+    NANO_P2P_SEED="$(p2p_peer "$(stock_index "$index")")" \
     NANO_RPC_BIND="127.0.0.1:$port" \
     NANO_P2P_BIND="127.0.0.1:$p2p_port" \
     NANO_P2P_ADDRESS="127.0.0.1:$p2p_port" \
