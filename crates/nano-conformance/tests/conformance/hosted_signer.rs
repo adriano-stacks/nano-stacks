@@ -42,6 +42,8 @@ struct Hosted {
     /// Where nano's events were recorded, and where the stock nodes' were.
     nano_events: PathBuf,
     stock_events: PathBuf,
+    /// Nano's sealed height immediately before the stock participant stopped.
+    start_height: u64,
     /// A funded key, for the transaction a submitter posts.
     funded: Option<StacksPrivateKey>,
 }
@@ -64,6 +66,10 @@ impl Hosted {
             .expect("the hosted signer key must be a public key"),
             nano_events: PathBuf::from(env::var("NANO_EVENT_DIR").ok()?),
             stock_events: PathBuf::from(env::var("NANO_STOCK_EVENT_DIR").ok()?),
+            start_height: env::var("NANO_HOSTED_START_HEIGHT")
+                .ok()?
+                .parse()
+                .expect("the hosted start height must be a number"),
             funded: env::var("NANO_FUNDED_KEY")
                 .ok()
                 .map(|key| private_key(key.trim())),
@@ -87,7 +93,8 @@ fn hosted() -> Option<Hosted> {
     if run.is_none() {
         nano_conformance::skip_gate(
             "a hosted run needs NANO_HOSTED_RPC, NANO_HACKNET_PEER, \
-             NANO_HOSTED_SIGNER_PUBLIC_KEY, NANO_EVENT_DIR and NANO_STOCK_EVENT_DIR: \
+             NANO_HOSTED_SIGNER_PUBLIC_KEY, NANO_EVENT_DIR, NANO_STOCK_EVENT_DIR and \
+             NANO_HOSTED_START_HEIGHT: \
              run hacknet/harness.sh verify-hosted",
         );
     }
@@ -158,12 +165,8 @@ async fn a_stock_signer_answers_proposals_through_nano() {
         set.signers().len()
     );
 
-    // What nano *took over its own API*, and not what it holds: nano also pulls
-    // its peer's chunks into the same replica, and the hosted signer shares its
-    // key with the stock signer it replaced — so a chunk read out of the replica
-    // could be either one's. A `stackerdb_chunks` event is dispatched only where a
-    // chunk was POSTed to nano, and nothing but the hosted signer POSTs to nano,
-    // so the events are the only evidence that distinguishes them.
+    // The observer also sees replicated miner and signer slots. Authenticate the
+    // writer instead of treating every observed chunk as the hosted signer's.
     let posted = chunks_nano_took(&run.nano_events);
     assert!(
         !posted.is_empty(),
@@ -171,8 +174,13 @@ async fn a_stock_signer_answers_proposals_through_nano() {
         run.nano_events.join("stackerdb_chunks").display()
     );
     let mut kinds: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut hosted_chunks = 0;
     let mut accepted = None;
-    for (contract, chunk) in &posted {
+    for (_, chunk) in &posted {
+        if !chunk.verify(hash160(&expected)).unwrap_or(false) {
+            continue;
+        }
+        hosted_chunks += 1;
         let Ok(message) = SignerMessage::decode(&chunk.data) else {
             continue;
         };
@@ -196,17 +204,13 @@ async fn a_stock_signer_answers_proposals_through_nano() {
             },
         };
         *kinds.entry(kind).or_default() += 1;
-        // Every one of them is authenticated against the writer nano assigned the
-        // slot, which is the hosted signer's own key.
-        assert!(
-            chunk.verify(hash160(&expected)).unwrap_or(false),
-            "a chunk nano took for {contract} was not signed by the signer it hosts"
-        );
     }
-    println!(
-        "nano took {} chunks from the signer it hosts: {kinds:?}",
+    assert!(
+        hosted_chunks > 0,
+        "none of the {} chunks nano took was signed by the signer it hosts",
         posted.len()
     );
+    println!("nano took {hosted_chunks} authenticated chunks from the signer it hosts: {kinds:?}");
 
     let acceptance = require_accepted_response(accepted);
     let recovered = acceptance
@@ -224,10 +228,18 @@ async fn a_stock_signer_answers_proposals_through_nano() {
     );
     // And the network counted it: the signature is in the header of a block the
     // canonical chain carries, which only happens if nano passed the chunk on.
+    let height = canonical_block_height_with(&peer, acceptance.signer_signature_hash)
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "block {} never became canonical, so nano did not carry the response to the miner",
+                acceptance.signer_signature_hash
+            )
+        });
     assert!(
-        canonical_block_with(&peer, acceptance.signer_signature_hash).await,
-        "block {} never became canonical, so nano did not carry the response to the miner",
-        acceptance.signer_signature_hash
+        height > run.start_height,
+        "the matching acceptance names old block {height}, not one hosted above {}",
+        run.start_height
     );
 }
 
@@ -237,8 +249,10 @@ fn chunks_nano_took(events: &std::path::Path) -> Vec<(String, nano_stackerdb::Ch
     let Ok(entries) = fs::read_dir(events.join("stackerdb_chunks")) else {
         return Vec::new();
     };
+    let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+    entries.sort_by_key(std::fs::DirEntry::path);
     let mut taken = Vec::new();
-    for entry in entries.filter_map(Result::ok) {
+    for entry in entries {
         let Ok(payload) = fs::read(entry.path()) else {
             continue;
         };
@@ -281,7 +295,7 @@ fn chunks_nano_took(events: &std::path::Path) -> Vec<(String, nano_stackerdb::Ch
 }
 
 /// Walk the canonical chain back looking for a block, and the signature in it.
-async fn canonical_block_with(peer: &SyncClient, digest: Sha256Sum) -> bool {
+async fn canonical_block_height_with(peer: &SyncClient, digest: Sha256Sum) -> Option<u64> {
     let deadline = Instant::now() + Duration::from_mins(5);
     loop {
         let tip = peer.tenure_info().await.expect("the peer reports its tip");
@@ -291,7 +305,7 @@ async fn canonical_block_with(peer: &SyncClient, digest: Sha256Sum) -> bool {
                 break;
             };
             if block.header.signer_signature_hash() == digest {
-                return true;
+                return Some(block.header.chain_length);
             }
             if block.header.chain_length == 0 {
                 break;
@@ -299,7 +313,7 @@ async fn canonical_block_with(peer: &SyncClient, digest: Sha256Sum) -> bool {
             block_id = block.header.parent_block_id;
         }
         if Instant::now() >= deadline {
-            return false;
+            return None;
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }

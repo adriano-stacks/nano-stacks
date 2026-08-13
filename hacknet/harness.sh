@@ -497,8 +497,11 @@ host() {
     local port=$HOST_RPC_PORT p2p_port=$HOST_P2P_PORT
     local endpoint=${NANO_HOSTED_SIGNER_PORT:-30003}
     local sink=${NANO_SINK_PORT:-3801} key token image signer_container
+    local stock_sink=${NANO_STOCK_SINK_NAME:-$PROJECT-event-sink}
     [ -f "$RUN/checkpoint/checkpoint.toml" ] || die "run 'harness.sh checkpoint' first"
     [ "$(nano_state)" = "not running" ] || die "a nano participant is already running"
+    [ -n "$(docker ps -q --filter "name=^${stock_sink}$")" ] ||
+        die "run 'harness.sh observe' before hosting so stock receipts are retained"
     key=$(compose_value SIGNER_PRIVATE_KEY "stacks-signer-$index")
     token=$(sed -n 's/^auth_password = "\(.*\)"$/\1/p' "$SRC/docker/stacks/stacks-signer.toml")
     [ -n "$token" ] || die "the signer template sets no auth_password"
@@ -521,6 +524,9 @@ host() {
     NANO_EVENT_OBSERVERS="http://127.0.0.1:$endpoint,http://127.0.0.1:$sink" \
         nano_start "$index"
     nano_ready "$port" || { nano_stop; die "nano did not come up; nothing was stopped"; }
+    curl -sf --max-time 5 "http://127.0.0.1:$port/v2/info" |
+        python3 -c 'import json,sys; print(json.load(sys.stdin)["stacks_tip_height"])' \
+        > "$RUN/hosted-start-height"
 
     log "stopping stock participant $index: stacks-miner-$index and stacks-signer-$index"
     compose stop "stacks-miner-$index" "stacks-signer-$index"
@@ -598,6 +604,10 @@ stop_sink() {
 
 # Start a stock follower whose only configured bootstrap peer is nano.
 #
+# An Epoch-4-only nano does not retain the legacy PoX anchors a stock node needs
+# from genesis. `NANO_STOCK_FOLLOWER_SEED` may name a sanitized stock checkpoint:
+# it must contain chain state but no peer database, so nano remains the only peer.
+#
 # It runs on the host network so nano's loopback-only P2P and RPC listeners are
 # reachable without making either public. Its chainstate, observer and logs are
 # all separate from the three mining participants.
@@ -612,13 +622,20 @@ stock_follower_start() {
         die "stock follower $STOCK_FOLLOWER already exists"
 
     local directory=$RUN/stock-follower state=$RUN/stock-follower/state
-    local source_container image seed public_key start_height bootstrap
+    local state_seed=${NANO_STOCK_FOLLOWER_SEED:-}
+    local source_container image p2p_seed public_key start_height bootstrap
     if [ -d "$state" ] && [ -n "$(find "$state" -mindepth 1 -print -quit)" ]; then
         die "$state is not empty; use a fresh NANO_HACKNET_HOME for acceptance"
     fi
-    seed=$(cat "$RUN/nano/p2p-seed" 2>/dev/null) ||
+    if [ -n "$state_seed" ]; then
+        [ -d "$state_seed/nakamoto-neon/chainstate" ] ||
+            die "$state_seed is not a stock node checkpoint"
+        [ -z "$(find "$state_seed" -maxdepth 2 -name 'peer.sqlite*' -print -quit)" ] ||
+            die "$state_seed contains peer knowledge; sanitize it before acceptance"
+    fi
+    p2p_seed=$(cat "$RUN/nano/p2p-seed" 2>/dev/null) ||
         die "hosted nano has no persisted P2P identity"
-    public_key=$(cd "$ROOT" && cargo xtask seed-public-key "$seed")
+    public_key=$(cd "$ROOT" && cargo xtask seed-public-key "$p2p_seed")
     bootstrap="$public_key@127.0.0.1:$HOST_P2P_PORT"
     start_height=$(curl -sf --max-time 5 "http://127.0.0.1:$HOST_RPC_PORT/v2/info" |
         python3 -c 'import json,sys; print(json.load(sys.stdin)["stacks_tip_height"])') ||
@@ -628,6 +645,10 @@ stock_follower_start() {
     image=$(docker inspect --format '{{.Config.Image}}' "$source_container")
 
     mkdir -p "$state" "$directory/events"
+    if [ -n "$state_seed" ]; then
+        cp -a --reflink=always "$state_seed/." "$state/"
+        printf '%s\n' "$state_seed" > "$directory/seed-state"
+    fi
     # The container entrypoint expands these after Docker supplies their values.
     # shellcheck disable=SC2016
     sed \
@@ -787,6 +808,7 @@ verify_hosted() {
     NANO_HACKNET_PEER="$(peer_url "$(stock_index "$index")")/" \
     NANO_EVENT_DIR="$RUN/nano-events" \
     NANO_STOCK_EVENT_DIR="$RUN/events" \
+    NANO_HOSTED_START_HEIGHT="$(cat "$RUN/hosted-start-height")" \
     NANO_HACKNET_API="http://127.0.0.1:$STACKS_API_RPC_PORT/" \
     NANO_HOSTED_TXID_OUT="$RUN/hosted-txid" \
     NANO_HOSTED_TRANSACTION_OUT="$RUN/hosted-transaction" \
