@@ -295,7 +295,8 @@ pub(crate) async fn catch_up(
             .map_err(|error| format!("could not decode canonical block {block_id}: {error}"))?;
         if validator
             .validator_mut()
-            .has_trusted_block(&block.block_id())
+            .adopt_sealed_block(&block)
+            .map_err(|error| format!("could not read the validator's sealed state: {error}"))?
         {
             break;
         }

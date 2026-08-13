@@ -172,6 +172,17 @@ pub struct ChainstateProposalValidator<S> {
     accumulated: BTreeMap<u64, u128>,
 }
 
+fn adopt_sealed_header(
+    trusted: &mut BTreeMap<nano_primitives::StacksBlockId, nano_chainstate::NakamotoBlockHeader>,
+    block: &NakamotoBlock,
+    sealed: bool,
+) -> bool {
+    if sealed {
+        trusted.insert(block.block_id(), block.header.clone());
+    }
+    sealed
+}
+
 #[derive(Clone, Copy)]
 enum ValidationTarget {
     Observed,
@@ -226,6 +237,20 @@ where
     #[must_use]
     pub fn has_trusted_block(&self, block_id: &nano_primitives::StacksBlockId) -> bool {
         self.trusted.contains_key(block_id)
+    }
+
+    /// Adopt a block this validator already sealed before it restarted.
+    ///
+    /// A peer may temporarily trail the local validator. Walking backward from
+    /// that peer's tip must stop at the first block already present in the local
+    /// state; re-observing it asks for an older burn view that a forward-only
+    /// sortition chain no longer needs to retain.
+    pub fn adopt_sealed_block(&mut self, block: &NakamotoBlock) -> Result<bool, String> {
+        let sealed = self
+            .chainstate
+            .has_block_state(*block.block_id().as_bytes())
+            .map_err(|error| error.to_string())?;
+        Ok(adopt_sealed_header(&mut self.trusted, block, sealed))
     }
 
     /// Replace the burn block every later proposal is validated under.
@@ -1652,7 +1677,7 @@ mod tests {
 
     use super::{
         ActiveSortitionValidator, DEFAULT_CONFLICT_TIMEOUT_SECS, EmbeddedSigner, ProposalValidator,
-        SignerConfig, SignerError, SortitionProposalValidator,
+        SignerConfig, SignerError, SortitionProposalValidator, adopt_sealed_header,
     };
 
     struct Accept;
@@ -1719,6 +1744,18 @@ mod tests {
             mining_competition: None,
         };
         (proposal, sortition)
+    }
+
+    #[test]
+    fn a_sealed_block_becomes_a_trusted_catch_up_boundary() {
+        let block = proposal().block;
+        let block_id = block.block_id();
+        let mut trusted = std::collections::BTreeMap::new();
+
+        assert!(!adopt_sealed_header(&mut trusted, &block, false));
+        assert!(!trusted.contains_key(&block_id));
+        assert!(adopt_sealed_header(&mut trusted, &block, true));
+        assert_eq!(trusted.get(&block_id), Some(&block.header));
     }
 
     #[test]
