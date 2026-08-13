@@ -15,7 +15,7 @@
 use std::{fmt::Display, fs, path::Path};
 
 use nano_bitcoin::{BitcoinBlock, BitcoinOperationKind};
-use nano_primitives::{BitcoinHeaderHash, ConsensusHash};
+use nano_primitives::{BitcoinHeaderHash, ConsensusHash, Hash160};
 use nano_sortition::{
     LeaderKeys, MINING_COMMITMENT_WINDOW, PayoutSchedule, PoxId, SortitionEngine, SortitionError,
     SortitionSnapshot, accepted_operation_txids, commitment_is_on_time, commitment_window_block,
@@ -411,6 +411,23 @@ impl SortitionTracker {
             walk = self.previous_sortition_height(height);
         }
         sortitions
+    }
+
+    /// The two `.miners` writers in their canonical pair order.
+    ///
+    /// This is stacks-core's `make_miners_stackerdb_config` rule: the newest
+    /// winning snapshot occupies pair zero when its cumulative sortition count
+    /// is even and pair one when it is odd. No peer answer is involved.
+    #[must_use]
+    pub fn miner_slot_writers(&self) -> Option<[Hash160; 2]> {
+        let newest_height = if self.tip().winner_txid.is_some() {
+            self.tip().bitcoin_height
+        } else {
+            self.previous_sortition_height(self.tip().bitcoin_height)?
+        };
+        let newest = self.snapshot_at(newest_height)?;
+        let previous = self.snapshot_at(self.previous_sortition_height(newest_height)?)?;
+        ordered_miner_slot_writers(newest, previous)
     }
 
     /// Every locally derived Bitcoin block above a previously published height.
@@ -1122,6 +1139,9 @@ struct CapturedSnapshot {
     consensus_hash: String,
     sortition_hash: String,
     total_burn: String,
+    /// Stacks-core's cumulative winning-sortition count.
+    #[serde(default)]
+    num_sortitions: Option<u64>,
     /// Whether this burn block elected anybody, as stacks-core's own column
     /// spells it. Absent in a chain saved before this field existed.
     #[serde(default)]
@@ -1234,8 +1254,13 @@ impl SortitionTracker {
             if seeded_at > executed_burn_view {
                 return Err(TrackerError::Seed(format!(
                     "the saved chain is seeded at burn {seeded_at}, above the burn view \
-                     {executed_burn_view} execution has reached, and a chain only walks forward"
+                    {executed_burn_view} execution has reached, and a chain only walks forward"
                 )));
+            }
+            if tracker.tip().num_sortitions.is_none() {
+                return Err(TrackerError::Seed(
+                    "the saved chain predates its cumulative sortition count".to_owned(),
+                ));
             }
             Ok(tracker)
         });
@@ -1356,6 +1381,7 @@ impl SortitionTracker {
             burn_header_timestamp: tip.bitcoin_timestamp,
             sortition_hash: hex::encode(tip.sortition_hash.as_bytes()),
             total_burn: tip.total_burn.to_string(),
+            num_sortitions: tip.num_sortitions,
             sortition: Some(i64::from(tip.winner_txid.is_some())),
             winning_block_txid: tip.winner_txid.map(hex::encode),
             // The one field a resumed chain cannot derive and must not guess -- and
@@ -1718,6 +1744,7 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
             &seed.sortition_hash,
             "sortition hash",
         )?),
+        num_sortitions: seed.num_sortitions,
         // Named where the seed's block elected somebody, because the winner's own
         // payout burn is a Clarity answer for every tenure standing on that burn
         // view. The `sortition` column decides it rather than the value, since a
@@ -1760,6 +1787,20 @@ fn seed_snapshot(seed: &CapturedSnapshot) -> Result<SortitionSnapshot, TrackerEr
     })
 }
 
+fn ordered_miner_slot_writers(
+    newest: &SortitionSnapshot,
+    previous: &SortitionSnapshot,
+) -> Option<[Hash160; 2]> {
+    let newest_is_first = newest.num_sortitions? % 2 == 0;
+    let newest = Hash160::from_bytes(newest.winner_signing_key_hash?);
+    let previous = Hash160::from_bytes(previous.winner_signing_key_hash?);
+    Some(if newest_is_first {
+        [newest, previous]
+    } else {
+        [previous, newest]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::PathBuf};
@@ -1773,7 +1814,7 @@ mod tests {
 
     use super::{
         CapturedSnapshot, History, SortitionTracker, TrackerError, captured_snapshots,
-        execution_rollback_floor, seed_snapshot,
+        execution_rollback_floor, ordered_miner_slot_writers, seed_snapshot,
     };
 
     fn captured_sortitions() -> PathBuf {
@@ -1812,6 +1853,7 @@ mod tests {
             consensus_hash: ConsensusHash::from_bytes([0x7f; 20]),
             total_burn,
             sortition_hash: SortitionHash::from_bytes([4; 32]),
+            num_sortitions: Some(u64::from(winner_txid.is_some())),
             winner_txid,
             winner_vrf_seed,
             winner_vrf_public_key: None,
@@ -1824,6 +1866,35 @@ mod tests {
         };
         let history = vec![behind, seed.consensus_hash];
         SortitionTracker::new(seed, history).expect("the history ends at the seed")
+    }
+
+    #[test]
+    fn miner_slot_order_follows_the_cumulative_sortition_parity() {
+        let mut newest =
+            SortitionSnapshot::genesis(2, nano_primitives::BitcoinHeaderHash::from_bytes([2; 32]));
+        newest.winner_signing_key_hash = Some([1; 20]);
+        let mut previous =
+            SortitionSnapshot::genesis(1, nano_primitives::BitcoinHeaderHash::from_bytes([1; 32]));
+        previous.winner_signing_key_hash = Some([2; 20]);
+
+        newest.num_sortitions = Some(8);
+        assert_eq!(
+            ordered_miner_slot_writers(&newest, &previous),
+            Some([
+                nano_primitives::Hash160::from_bytes([1; 20]),
+                nano_primitives::Hash160::from_bytes([2; 20]),
+            ])
+        );
+        newest.num_sortitions = Some(9);
+        assert_eq!(
+            ordered_miner_slot_writers(&newest, &previous),
+            Some([
+                nano_primitives::Hash160::from_bytes([2; 20]),
+                nano_primitives::Hash160::from_bytes([1; 20]),
+            ])
+        );
+        newest.num_sortitions = None;
+        assert_eq!(ordered_miner_slot_writers(&newest, &previous), None);
     }
 
     fn block_with(height: u64, operations: Vec<BitcoinOperation>) -> BitcoinBlock {
@@ -2020,6 +2091,34 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_chain_without_its_sortition_count_is_rederived() {
+        let capture = captured_sortitions();
+        let tracker = SortitionTracker::from_capture(&capture).expect("load the captured chain");
+        let expected = tracker.tip().num_sortitions;
+        assert!(expected.is_some(), "the capture states its sortition count");
+        let state = tempfile::tempdir().expect("a role-specific state directory");
+        tracker.save(state.path()).expect("save the chain");
+
+        let path = state.path().join("snapshots.json");
+        let mut snapshots: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&path).expect("read saved snapshots"))
+                .expect("decode saved snapshots");
+        snapshots[0]
+            .as_object_mut()
+            .expect("a snapshot object")
+            .remove("num_sortitions");
+        fs::write(
+            &path,
+            serde_json::to_vec(&snapshots).expect("encode old snapshots"),
+        )
+        .expect("write old snapshots");
+
+        let resumed = SortitionTracker::resume_or_capture(state.path(), &capture)
+            .expect("re-derive from the complete capture");
+        assert_eq!(resumed.tip().num_sortitions, expected);
+    }
+
+    #[test]
     fn an_absent_duplicate_or_nonwinning_boundary_is_typed() {
         let source = captured_sortitions();
         let snapshots = captured_snapshots(&source).expect("read captured snapshots");
@@ -2179,6 +2278,7 @@ mod tests {
             consensus_hash: String::new(),
             sortition_hash: String::new(),
             total_burn: String::new(),
+            num_sortitions: None,
             sortition: Some(0),
             winning_block_txid: None,
             winner_vrf_seed: None,

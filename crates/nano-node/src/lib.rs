@@ -2863,6 +2863,13 @@ where
         )
     }
 
+    /// The two locally elected `.miners` writers in stacks-core's slot order.
+    pub(crate) fn local_miner_slot_writers(&self) -> Option<[nano_primitives::Hash160; 2]> {
+        self.sortition
+            .as_ref()
+            .and_then(crate::sortition::SortitionTracker::miner_slot_writers)
+    }
+
     /// One locally derived sortition, selected by its consensus hash.
     pub(crate) fn local_sortition_info(
         &self,

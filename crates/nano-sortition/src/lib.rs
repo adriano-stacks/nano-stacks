@@ -1009,6 +1009,11 @@ pub struct SortitionSnapshot {
     pub consensus_hash: ConsensusHash,
     pub total_burn: u64,
     pub sortition_hash: SortitionHash,
+    /// Number of winning sortitions through this burn block.
+    ///
+    /// Stacks-core uses its parity to keep the two `.miners` writers in stable
+    /// slot pairs. `None` is an old capture that did not retain the count.
+    pub num_sortitions: Option<u64>,
     pub winner_txid: Option<[u8; 32]>,
     pub winner_vrf_seed: Option<[u8; 32]>,
     /// The winning commitment's leader-key VRF public key, if this node saw the
@@ -1064,6 +1069,7 @@ impl SortitionSnapshot {
             consensus_hash: ConsensusHash::from_bytes([0; 20]),
             total_burn: 0,
             sortition_hash: SortitionHash::initial(),
+            num_sortitions: Some(0),
             winner_txid: None,
             winner_vrf_seed: None,
             winner_vrf_public_key: None,
@@ -1412,6 +1418,9 @@ impl SnapshotChain {
         let sortition_hash = parent
             .sortition_hash
             .mix_bitcoin_header(bitcoin_header_hash);
+        let num_sortitions = parent
+            .num_sortitions
+            .and_then(|count| count.checked_add(u64::from(winner.is_some())));
         let snapshot = SortitionSnapshot {
             bitcoin_height: block.height,
             bitcoin_header_hash,
@@ -1424,6 +1433,7 @@ impl SnapshotChain {
             sortition_hash: winner.map_or(sortition_hash, |winner| {
                 sortition_hash.mix_vrf_seed(winner.vrf_seed)
             }),
+            num_sortitions,
             winner_txid: winner.map(|winner| winner.txid),
             winner_vrf_seed: winner.map(|winner| winner.vrf_seed),
             winner_vrf_public_key: winner.and_then(|winner| winner.vrf_public_key),

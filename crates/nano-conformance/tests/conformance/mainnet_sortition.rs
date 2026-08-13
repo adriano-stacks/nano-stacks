@@ -33,6 +33,7 @@ pub struct Captured {
     pub sortition_id: String,
     pub consensus_hash: String,
     pub sortition_hash: String,
+    pub num_sortitions: u64,
     pub ops_hash: String,
     pub total_burn: String,
     pub sortition: i64,
@@ -100,6 +101,9 @@ pub fn consensus_history(root: &std::path::Path) -> Option<Vec<ConsensusHash>> {
 
 /// The first field a derived snapshot disagrees with the network on.
 fn disagrees(derived: &SortitionSnapshot, snapshot: &Captured) -> Option<&'static str> {
+    if derived.num_sortitions != Some(snapshot.num_sortitions) {
+        return Some("sortition count");
+    }
     let checks: [(&'static str, String, &String); 4] = [
         (
             "operations hash",
@@ -223,6 +227,7 @@ pub fn seed_from(genesis: &Captured) -> SortitionSnapshot {
         sortition_hash: SortitionHash::from_bytes(
             <[u8; 32]>::try_from(decode(&genesis.sortition_hash).as_slice()).expect("32 bytes"),
         ),
+        num_sortitions: Some(genesis.num_sortitions),
         // The seed's own winner, as the archive states it. Read for one reason: the
         // last burn block that elected somebody is where a tenure's accumulated
         // coinbase is measured from, and for the first tenures above a checkpoint
@@ -836,6 +841,12 @@ fn assert_snapshot_derives(derived: &nano_sortition::SortitionSnapshot, snapshot
         derived.winner_txid.map(hex::encode),
         expected_winner,
         "the node names the winner at burn {}",
+        snapshot.block_height
+    );
+    assert_eq!(
+        derived.num_sortitions,
+        Some(snapshot.num_sortitions),
+        "the node carries the cumulative sortition count at burn {}",
         snapshot.block_height
     );
     // The two Clarity-visible spends of the sortition, against the archive's own

@@ -746,7 +746,6 @@ struct ExecutedPublication<'a> {
     pox: &'a PoxInfo,
     config: &'a Config,
     network: Network,
-    node: &'a Node,
     published: &'a mut RewardCyclePublication,
     peer: &'a SyncClient,
 }
@@ -759,27 +758,21 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
         pox,
         config,
         network,
-        node,
         published,
         peer,
     } = publication
     else {
         return;
     };
-    let (sortitions, cache_usage, latest_local_winner, registered_miners, notifications) = {
+    let (sortitions, cache_usage, local_writers, registered_miners, notifications) = {
         let mut executor = executor.lock().await;
         // On Bitcoin's clock: a node at the chain tip with nothing staged still
         // has to derive and report the burn view its own tip stands on.
         let (_, notifications) = executor.follow_burnchain_deferred(pox);
-        let latest_local_winner = executor
-            .latest_local_winner()
-            .ok()
-            .flatten()
-            .and_then(|winner| winner.miner_public_key_hash);
         (
             executor.derived_sortitions(),
             executor.cache_usage(),
-            latest_local_winner,
+            executor.local_miner_slot_writers(),
             executor.registered_local_miner_keys(),
             notifications,
         )
@@ -789,13 +782,12 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
         .publish_executed(sealed, sortitions, pox.clone())
         .await;
     executor.lock().await.announce_burn_blocks(&notifications);
-    let winners = include_local_winner(latest_local_winner, last_sortition_winners(node.tenures()));
     publish_reward_cycle(RewardCycleInputs {
         state,
         executor,
         network,
         context: bitcoin_context(config, pox),
-        winners: &winners,
+        local_writers,
         registered_miners: &registered_miners,
         published,
         peer,
@@ -948,7 +940,6 @@ async fn follow(follower: Follower) -> Role {
                 pox: &pox,
                 config: &config,
                 network,
-                node: &rounds.node,
                 published: &mut rounds.published,
                 peer: &rounds.peer,
             })
@@ -1248,8 +1239,8 @@ struct RewardCycleInputs<'a> {
     executor: &'a SharedExecutor,
     network: Network,
     context: nano_chainstate::BitcoinBlockContext,
-    /// Recent winners, used only when both unwritten slots have one clear owner.
-    winners: &'a [nano_primitives::Hash160],
+    /// The two locally elected writers in stacks-core's canonical pair order.
+    local_writers: Option<[nano_primitives::Hash160; 2]>,
     /// Every miner key registered by this node's locally derived burnchain.
     registered_miners: &'a [nano_primitives::Hash160],
     published: &'a mut RewardCyclePublication,
@@ -1338,7 +1329,7 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
         executor,
         network,
         mut context,
-        winners,
+        local_writers,
         registered_miners,
         published,
         peer,
@@ -1353,7 +1344,7 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
         state,
         network,
         cycle,
-        winners,
+        local_writers,
         registered_miners,
         published,
         peer,
@@ -1438,86 +1429,34 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
     );
 }
 
-/// The block-signing keys that won the most recent sortitions, newest first.
-///
-/// Whose commitment won a burn block needs the burn distribution, which nano
-/// cannot derive ([[049-derive-sortitions-locally]]), so this is the peer's
-/// answer — and it is used for nothing but naming who may write a `StackerDB`
-/// slot, which is replication rather than consensus.
-fn last_sortition_winners(tenures: &[nano_sync::FollowedTenure]) -> Vec<nano_primitives::Hash160> {
-    let mut winners = Vec::new();
-    for tenure in tenures.iter().rev() {
-        if !tenure.sortition.was_sortition {
-            continue;
-        }
-        if let Some(hash) = tenure.sortition.miner_public_key_hash {
-            winners.push(hash);
-        }
-        if winners.len() == MINER_SLOT_CANDIDATES {
-            break;
-        }
-    }
-    winners
-}
-
-fn include_local_winner(
-    local: Option<nano_primitives::Hash160>,
-    mut followed: Vec<nano_primitives::Hash160>,
-) -> Vec<nano_primitives::Hash160> {
-    if let Some(local) = local {
-        followed.retain(|winner| *winner != local);
-        followed.insert(0, local);
-    }
-    followed
-}
-
-/// How many recent sortition winners retain the empty-slot fallback.
-///
-/// Signed metadata is attributed through the complete local leader-key registry.
-/// This window is used only before both pairs have signed metadata, when repeated
-/// wins by one miner make their assignment unambiguous.
-const MINER_SLOT_CANDIDATES: usize = 8;
 /// Proposal and pushed-block slots held by each of the two retained miners.
 const MINER_SLOTS_PER_WRITER: usize = 2;
 /// The current and prior sortition winner retained by `.miners`.
 const MINER_WRITERS: usize = 2;
 
-fn one_miner_slots(winners: &[nano_primitives::Hash160]) -> Option<Vec<nano_primitives::Hash160>> {
-    let latest = *winners.first()?;
-    winners
-        .iter()
-        .all(|winner| *winner == latest)
-        .then(|| vec![latest; MINER_WRITERS * MINER_SLOTS_PER_WRITER])
-}
-
 /// Replicate `.miners`, so a signer hosted here can read what a miner proposed.
 ///
-/// Each of the last two sortition winners owns two adjacent slots. Which pair each
-/// winner gets is `num_sortitions % 2` in stacks-core — a count over the whole
-/// burnchain that a checkpointed node has never made and no snapshot nano holds
-/// carries. A `.miners` replica with its pairs swapped refuses the very chunks it
-/// exists for, so the order has to come from somewhere.
-///
-/// It comes from the chunks. Every slot's metadata is signed by its writer, so
-/// asking the peer for its `.miners` listing and recovering each signature says
-/// who holds each slot. The recovered key still has to exist in this node's local
-/// leader-key registry; a peer cannot introduce a writer by naming one.
+/// The local sortition chain carries stacks-core's cumulative sortition count,
+/// so its parity gives the exact pair order. Signed peer metadata is only a
+/// bootstrap fallback for an old capture that did not retain that count. Every
+/// writer still has to exist in this node's local leader-key registry.
 async fn configure_miner_slots(
     state: &RpcState,
     network: Network,
     cycle: u64,
-    winners: &[nano_primitives::Hash160],
+    local_writers: Option<[nano_primitives::Hash160; 2]>,
     registered_miners: &[nano_primitives::Hash160],
     published: &mut RewardCyclePublication,
     peer: &SyncClient,
 ) {
-    if winners.is_empty() && registered_miners.is_empty() {
+    if local_writers.is_none() && registered_miners.is_empty() {
         return;
     }
     let contract = crate::config::miner_contract(network);
-    let assignment = miner_slots(peer, &contract, registered_miners)
-        .await
-        .or_else(|| one_miner_slots(winners));
+    let assignment = match local_miner_slots(local_writers, registered_miners) {
+        Some(assignment) => Some(assignment),
+        None => miner_slots(peer, &contract, registered_miners).await,
+    };
     let Some(assignment) = assignment else {
         if published.ambiguous_miners != Some(cycle) {
             published.ambiguous_miners = Some(cycle);
@@ -1544,6 +1483,17 @@ async fn configure_miner_slots(
         .await
         .configure(&crate::hosting::identifier(&contract), assignment);
     println!("replicating .miners for the miners that hold its slots, in order: {names}");
+}
+
+fn local_miner_slots(
+    writers: Option<[nano_primitives::Hash160; 2]>,
+    registered_miners: &[nano_primitives::Hash160],
+) -> Option<Vec<nano_primitives::Hash160>> {
+    let [first, second] = writers?;
+    [first, second]
+        .iter()
+        .all(|writer| registered_miners.contains(writer))
+        .then_some(vec![first, first, second, second])
 }
 
 /// Who owns each `.miners` slot, read off the peer's own listing.
@@ -4144,25 +4094,18 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_wins_do_not_hide_the_other_miner_slot_owner() {
-        let newest = nano_primitives::Hash160::from_bytes([1; 20]);
-        let older = nano_primitives::Hash160::from_bytes([2; 20]);
+    fn local_miner_slots_require_registered_writers() {
+        let first = nano_primitives::Hash160::from_bytes([1; 20]);
+        let second = nano_primitives::Hash160::from_bytes([2; 20]);
 
         assert_eq!(
-            super::one_miner_slots(&[newest, newest]),
-            Some(vec![newest, newest, newest, newest])
+            super::local_miner_slots(Some([first, second]), &[second, first]),
+            Some(vec![first, first, second, second])
         );
         assert_eq!(
-            super::one_miner_slots(&[newest, newest, older]),
+            super::local_miner_slots(Some([first, second]), &[first]),
             None,
-            "an older writer may still own the slot the newest miner did not rewrite"
-        );
-        let candidates = super::include_local_winner(Some(newest), vec![older, older]);
-        assert_eq!(candidates, vec![newest, older, older]);
-        assert_eq!(
-            super::one_miner_slots(&candidates),
-            None,
-            "the locally elected miner is visible before its first proposal is accepted"
+            "a locally named writer still has to exist in the leader-key registry"
         );
     }
 
