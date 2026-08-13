@@ -591,11 +591,10 @@ async fn execute_round(executor: &SharedExecutor, inputs: RoundInputs<'_>) -> Ex
             peer_failed = true;
         }
     }
-    // What this node tells its peers about itself, now that there is a chain to
-    // describe: the discovery loop starts before there is one and advertises a
-    // deliberately old view until this runs.
+    // What execution makes this node able to serve. The transport derives its burn
+    // view directly from the local Bitcoin source; execution supplies the cycle and
+    // inventory.
     advertised.publish(LocalAnnouncement {
-        bitcoin_height: executor.bitcoin_height(),
         cycle_start: executor.cycle_start_consensus_hash(pox),
         inventories: executor.tenure_inventories(pox),
     });
@@ -3362,23 +3361,21 @@ async fn track_peer(
 
 /// The Bitcoin view this node advertises to its peers.
 ///
-/// Derived from the node's own executed height and its own Bitcoin source, never
-/// from what a peer said: a preamble view is a gossip hint rather than a consensus
-/// input, but a node repeating a peer's claim back at the network would be laundering
-/// it into one.
+/// Derived from the node's own Bitcoin source, never from what a peer said: a
+/// preamble view is a gossip hint rather than a consensus input, but a node repeating
+/// a peer's claim back at the network would be laundering it into one.
 ///
 /// The fallback matters as much as the derivation. A peer refuses a message whose
 /// *stable* header hash contradicts its own at that height, and it keeps roughly 288
 /// blocks below its own stable height — so a view older than that cannot be
 /// contradicted, and stacks-core reads not-contradictable as merely stale. A node
-/// with no executed chain yet advertises exactly that and gets in, which is what
-/// lets discovery run before there is a chain to describe.
-fn advertised_view(
-    bitcoin: &BurnchainSource,
-    published: Option<&LocalAnnouncement>,
+/// whose Bitcoin source cannot answer yet advertises exactly that and gets in; the
+/// next discovery round retries the local source.
+fn advertised_view<S: nano_bitcoin::BitcoinSource>(
+    bitcoin: &S,
     stable_confirmations: u64,
 ) -> nano_p2p::ChainView {
-    let Some(height) = published.map(|announced| announced.bitcoin_height) else {
+    let Ok(height) = bitcoin.tip_height() else {
         return stale_peer_view(stable_confirmations);
     };
     let Some(settled) = height.checked_sub(stable_confirmations) else {
@@ -3414,13 +3411,11 @@ fn stale_peer_view(stable_confirmations: u64) -> nano_p2p::ChainView {
 /// The transport comes up *before* there is a chainstate — that is its whole point,
 /// since it is the way in that does not depend on a configured HTTP peer — so the
 /// discovery loop cannot read an executor that is built after it. This is the handle
-/// the follow loop writes each round and discovery reads: how far this node's own
-/// burnchain view has got, and which reward cycle to ask peers' inventories about.
+/// the follow loop writes each round and discovery reads: which reward cycle to ask
+/// peers' inventories about and what inventory to serve.
 ///
-/// Both are *this node's* answers. A preamble view is a gossip hint, but repeating a
-/// peer's claim back at the network is how a hint becomes a consensus input, and a
-/// cycle identifier taken from a peer would make its view of the burnchain the thing
-/// nano's own requests are keyed on.
+/// Both are *this node's* answers. A cycle identifier taken from a peer would make
+/// its view of the burnchain the thing nano's own requests are keyed on.
 #[derive(Clone, Default)]
 pub struct Advertised {
     inner: Arc<std::sync::Mutex<Option<LocalAnnouncement>>>,
@@ -3440,8 +3435,6 @@ pub struct Advertised {
 /// What the follow loop knows and the peer-facing loops need.
 #[derive(Clone, Debug)]
 struct LocalAnnouncement {
-    /// The Bitcoin height the sealed tip was executed under.
-    bitcoin_height: u64,
     /// The consensus hash naming the reward cycle being walked, when derivable.
     cycle_start: Option<nano_primitives::ConsensusHash>,
     /// Every locally known cycle, including empty historical cycles a stock node
@@ -3661,7 +3654,7 @@ async fn start_transport(
             return None;
         }
     };
-    let view = advertised_view(&bitcoin, advertised.read().as_ref(), stable_confirmations);
+    let view = advertised_view(&bitcoin, stable_confirmations);
     advertised.publish_view(view);
     let round = swarm.maintain(view, None).await;
     println!(
@@ -3725,7 +3718,7 @@ async fn peer_discovery(
         sleep(tick).await;
         ticks = ticks.wrapping_add(1);
         let published = advertised.read();
-        let view = advertised_view(&bitcoin, published.as_ref(), stable_confirmations);
+        let view = advertised_view(&bitcoin, stable_confirmations);
         advertised.publish_view(view);
         // `None` before there is a chain to name a cycle, and a peer is then not
         // asked at all rather than asked about a guess.
@@ -4009,6 +4002,37 @@ mod tests {
         advertised.publish_view(view);
 
         assert_eq!(advertised.chain_view(stable_confirmations), view);
+    }
+
+    #[test]
+    fn the_first_peer_handshake_uses_the_local_bitcoin_tip() {
+        struct ViewSource;
+
+        impl BitcoinSource for ViewSource {
+            type Error = &'static str;
+
+            fn block_at(&mut self, _height: u64) -> Result<BitcoinBlock, Self::Error> {
+                Err("this view reads headers only")
+            }
+
+            fn block_hash_at(&self, height: u64) -> Result<[u8; 32], Self::Error> {
+                match height {
+                    278 => Ok([2; 32]),
+                    285 => Ok([1; 32]),
+                    _ => Err("height outside the view"),
+                }
+            }
+
+            fn tip_height(&self) -> Result<u64, Self::Error> {
+                Ok(285)
+            }
+        }
+
+        let view = super::advertised_view(&ViewSource, 7);
+        assert_eq!(view.height, 285);
+        assert_eq!(view.stable_height, 278);
+        assert_eq!(view.hash.as_bytes(), &[1; 32]);
+        assert_eq!(view.stable_hash.as_bytes(), &[2; 32]);
     }
 
     /// Every execution batch says where it started, where it ended, how many

@@ -690,10 +690,24 @@ since it is the way in that does not need a configured HTTP peer — so it was p
 every round, forever. A stale view is one no peer will walk toward.
 
 `Advertised` is the handle the follow loop writes each round and the peer-facing
-loops read: the Bitcoin height this node executed under, the cycle to ask
-inventories about, and the inventory to serve. All three are nano's own answers,
-because repeating a peer's claim back at the network is how a gossip hint becomes a
-consensus input.
+loops read: the cycle to ask inventories about and the inventory to serve. Both are
+nano's own answers, because repeating a peer's claim back at the network is how a
+gossip hint becomes a consensus input.
+
+That first repair was incomplete on a young chain. A stock conversation accepts a
+new preamble burn view only when its height is strictly greater than the one already
+cached. Nano's deliberately old fallback used height 100,000, so a Hacknet peer that
+first connected at burn 285 permanently ignored every later correct view. The live
+stock follower consequently parsed nano's inventory and tenure boundaries but kept
+nano out of its unconfirmed download schedule.
+
+The preamble now comes from the tip and settled hashes of nano's local Bitcoin
+source from the first handshake onward. Stacks execution still publishes the cycle
+identifier and served inventory, but no longer defines the Bitcoin tip: those are
+separate facts. `the_first_peer_handshake_uses_the_local_bitcoin_tip` pins burn 285
+and its settled burn 278, the full 69-test nano-node library is green, and strict
+all-target nano-node Clippy is clean. The live stock block exchange remains open
+until the rebuilt isolated node demonstrates it.
 
 ### What is left
 
