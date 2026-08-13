@@ -16,12 +16,12 @@ trap 'rm -rf -- "$test_dir"' EXIT
 export SRC=$test_dir
 
 docker() {
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$STACKING_CYCLES" "$STACKS_30_HEIGHT" \
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$STACKING_CYCLES" "$STACKS_30_HEIGHT" \
         "$STACKS_31_HEIGHT" "$STACKS_32_HEIGHT" "$STACKS_33_HEIGHT" \
         "$STACKS_34_HEIGHT" "$STACKS_40_HEIGHT" "$POX_PREPARE_LENGTH" \
-        "$POX_REWARD_LENGTH"
+        "$POX_REWARD_LENGTH" "$DOCKER_NETWORK"
 }
-equal "$(compose config)" '12|232|233|234|235|242|262|5|20'
+equal "$(compose config)" '12|232|233|234|235|242|262|5|20|hacknet-stacks'
 STACKING_CYCLES=7
 STACKS_30_HEIGHT=227
 STACKS_31_HEIGHT=228
@@ -31,7 +31,7 @@ STACKS_34_HEIGHT=242
 STACKS_40_HEIGHT=272
 POX_PREPARE_LENGTH=10
 POX_REWARD_LENGTH=15
-equal "$(compose config)" '7|227|228|229|230|242|272|10|15'
+equal "$(compose config)" '7|227|228|229|230|242|272|10|15|hacknet-stacks'
 
 peer_url() { printf 'mock-peer\n'; }
 pox_cycle() { printf '22 ST000000000000000000002AMW42H.pox-5\n'; }
