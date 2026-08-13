@@ -388,6 +388,69 @@ mod tenure_inventory_tests {
     }
 }
 
+#[cfg(test)]
+mod bitcoin_view_tests {
+    use nano_crypto::StacksPrivateKey;
+    use nano_miner::{
+        TenureExtension, TenureTip, build_tenure_continuation_block, build_tenure_extend_block,
+    };
+    use nano_primitives::{ConsensusHash, Network, StacksBlockId};
+
+    use super::immediate_bitcoin_view;
+
+    #[test]
+    fn a_resumed_continuation_inherits_its_parent_s_burn_view() {
+        let miner = StacksPrivateKey::from_seed(b"view inheritance");
+        let tenure = TenureTip {
+            consensus_hash: ConsensusHash::from_bytes([1; 20]),
+            block_id: StacksBlockId::from_bytes([2; 32]),
+            height: 10,
+            bitcoin_spent: 30,
+            timestamp: 40,
+        };
+        let view = ConsensusHash::from_bytes([3; 20]);
+        let parent = build_tenure_extend_block(
+            &tenure,
+            TenureExtension {
+                burn_view_consensus_hash: view,
+                blocks_in_tenure: 2,
+                nonce: 0,
+                now: 41,
+            },
+            Network::TESTNET,
+            &miner,
+            Vec::new(),
+        )
+        .expect("build the parent that states the view");
+        let child = build_tenure_continuation_block(
+            &TenureTip {
+                consensus_hash: parent.header.consensus_hash,
+                block_id: parent.block_id(),
+                height: parent.header.chain_length,
+                bitcoin_spent: parent.header.bitcoin_spent,
+                timestamp: parent.header.timestamp,
+            },
+            Vec::new(),
+            42,
+        );
+
+        assert_eq!(immediate_bitcoin_view(&child, &parent), Some(view));
+
+        let other_tenure = build_tenure_continuation_block(
+            &TenureTip {
+                consensus_hash: ConsensusHash::from_bytes([4; 20]),
+                block_id: parent.block_id(),
+                height: parent.header.chain_length,
+                bitcoin_spent: parent.header.bitcoin_spent,
+                timestamp: parent.header.timestamp,
+            },
+            Vec::new(),
+            42,
+        );
+        assert_eq!(immediate_bitcoin_view(&other_tenure, &parent), None);
+    }
+}
+
 /// Say what one round of catching up the sortition chain did.
 ///
 /// The split, and not a total, because a total here was read as a per-Stacks-block
@@ -452,6 +515,20 @@ fn ended_by_a_rate_limit<T>(
         Err(error) if error.is_rate_limited() => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// The burn view stated by this block or its immediate same-tenure parent.
+fn immediate_bitcoin_view(
+    block: &NakamotoBlock,
+    parent: &NakamotoBlock,
+) -> Option<nano_primitives::ConsensusHash> {
+    block.bitcoin_view_consensus_hash().or_else(|| {
+        if parent.header.consensus_hash == block.header.consensus_hash {
+            parent.bitcoin_view_consensus_hash()
+        } else {
+            None
+        }
+    })
 }
 
 /// What one round of catching up actually did.
@@ -2369,7 +2446,7 @@ where
         // than its own sortition, and `burn-block-height` is what a
         // contract stores. Only a tenure change states the view, so it
         // carries forward to the blocks that follow.
-        if let Some(view) = block.bitcoin_view_consensus_hash() {
+        if let Some(view) = immediate_bitcoin_view(block, &self.tip) {
             self.bitcoin_view = Some(view);
         } else if self.bitcoin_view.is_none() {
             // A resumed node did not execute the tenure change that stated
