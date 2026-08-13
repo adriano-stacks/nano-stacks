@@ -172,6 +172,12 @@ pub struct ChainstateProposalValidator<S> {
     accumulated: BTreeMap<u64, u128>,
 }
 
+#[derive(Clone, Copy)]
+enum ValidationTarget {
+    Observed,
+    Proposal,
+}
+
 impl<S> ChainstateProposalValidator<S>
 where
     S: BitcoinSource,
@@ -206,9 +212,12 @@ where
             if candidate.miner_signature_hash() != block.header.miner_signature_hash() {
                 return Err("observed block differs from the validated candidate".to_owned());
             }
-        } else {
-            self.validate_block(block, self.context_at(bitcoin_height))?;
         }
+        self.validate_block(
+            block,
+            self.context_at(bitcoin_height),
+            ValidationTarget::Observed,
+        )?;
         self.trusted.insert(block_id, block.header.clone());
         Ok(())
     }
@@ -270,6 +279,7 @@ where
         &mut self,
         block: &NakamotoBlock,
         bitcoin_context: BitcoinBlockContext,
+        target: ValidationTarget,
     ) -> Result<(), String> {
         // Sealing only happens once a block's committed state root has been
         // verified, so a block already in the state was already validated.
@@ -303,14 +313,30 @@ where
             .bitcoin
             .block_at(bitcoin_context.height)
             .map_err(|error| format!("could not load Bitcoin operations: {error}"))?;
-        self.chainstate
-            .append_nakamoto_proposal_with_bitcoin_operations(
-                bitcoin_context,
-                &operations.operations,
-                Some(*block.header.parent_block_id.as_bytes()),
-                block,
-            )
-            .map_err(|error| format!("proposal execution failed: {error}"))?;
+        let parent = Some(*block.header.parent_block_id.as_bytes());
+        let (kind, result) = match target {
+            ValidationTarget::Observed => (
+                "observed block",
+                self.chainstate
+                    .append_nakamoto_block_with_bitcoin_operations(
+                        bitcoin_context,
+                        &operations.operations,
+                        parent,
+                        block,
+                    ),
+            ),
+            ValidationTarget::Proposal => (
+                "proposal",
+                self.chainstate
+                    .validate_nakamoto_proposal_with_bitcoin_operations(
+                        bitcoin_context,
+                        &operations.operations,
+                        parent,
+                        block,
+                    ),
+            ),
+        };
+        result.map_err(|error| format!("{kind} execution failed: {error}"))?;
         Ok(())
     }
 }
@@ -328,7 +354,11 @@ where
         {
             return Ok(());
         }
-        self.validate_block(&proposal.block, self.context_at(proposal.bitcoin_height))?;
+        self.validate_block(
+            &proposal.block,
+            self.context_at(proposal.bitcoin_height),
+            ValidationTarget::Proposal,
+        )?;
         self.candidates
             .insert(block_id, proposal.block.header.clone());
         Ok(())

@@ -805,6 +805,7 @@ struct BlockExecution<'a> {
     /// Transactions the block may carry if execution admits them.
     candidates: &'a [Transaction],
     authentication: BlockAuthentication,
+    persistence: BlockPersistence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -812,6 +813,12 @@ enum BlockAuthentication {
     Required,
     Proposal,
     UnauthenticatedFixture,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockPersistence {
+    Seal,
+    Discard,
 }
 
 /// Everything a block changes that the MARF does not hold.
@@ -1739,17 +1746,20 @@ impl ChainState {
                 effects: NativeBlockEffects::default(),
                 candidates: &[],
                 authentication: BlockAuthentication::Required,
+                persistence: BlockPersistence::Seal,
             },
         )
     }
 
-    /// Execute a signer proposal with every consensus check except signer threshold.
+    /// Validate a signer proposal with every consensus check except signer threshold.
     ///
     /// A proposal carries the miner's signature and complete transactions, but no
     /// signer signatures: producing those is the decision this execution informs.
     /// The state root, miner, sortition, tenure, VRF and transaction checks remain
-    /// identical to a followed block.
-    pub fn append_nakamoto_proposal_with_bitcoin_operations(
+    /// identical to a followed block. Its transient state is discarded: a miner
+    /// may replace a proposal before signer consensus, and an unaccepted sibling
+    /// must never become this validator's chain tip.
+    pub fn validate_nakamoto_proposal_with_bitcoin_operations(
         &mut self,
         bitcoin_context: BitcoinBlockContext,
         operations: &[BitcoinOperation],
@@ -1767,6 +1777,7 @@ impl ChainState {
                 effects: NativeBlockEffects::default(),
                 candidates: &[],
                 authentication: BlockAuthentication::Proposal,
+                persistence: BlockPersistence::Discard,
             },
         )
     }
@@ -1794,6 +1805,7 @@ impl ChainState {
                 effects: NativeBlockEffects::default(),
                 candidates: &[],
                 authentication: BlockAuthentication::UnauthenticatedFixture,
+                persistence: BlockPersistence::Seal,
             },
         )
     }
@@ -1817,6 +1829,7 @@ impl ChainState {
                 effects,
                 candidates: &[],
                 authentication: BlockAuthentication::Required,
+                persistence: BlockPersistence::Seal,
             },
         )
     }
@@ -1855,6 +1868,7 @@ impl ChainState {
                 effects: NativeBlockEffects::default(),
                 candidates: &[],
                 authentication: BlockAuthentication::Required,
+                persistence: BlockPersistence::Seal,
             },
         )
     }
@@ -1881,6 +1895,7 @@ impl ChainState {
                 effects: NativeBlockEffects::default(),
                 candidates: &[],
                 authentication: BlockAuthentication::UnauthenticatedFixture,
+                persistence: BlockPersistence::Seal,
             },
         )
     }
@@ -1978,6 +1993,30 @@ impl ChainState {
                 effects,
                 candidates: &[],
                 authentication: BlockAuthentication::UnauthenticatedFixture,
+                persistence: BlockPersistence::Seal,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn validate_unauthenticated_fixture_block(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        parent: Option<[u8; 32]>,
+        block: &NakamotoBlock,
+    ) -> Result<AppliedBlock, ChainStateError> {
+        let mut block = block.clone();
+        self.execute_nakamoto_block(
+            &mut block,
+            BlockExecution {
+                bitcoin_context,
+                operations: &[],
+                parent,
+                root: RootPolicy::Verify,
+                effects: NativeBlockEffects::default(),
+                candidates: &[],
+                authentication: BlockAuthentication::UnauthenticatedFixture,
+                persistence: BlockPersistence::Discard,
             },
         )
     }
@@ -2001,6 +2040,7 @@ impl ChainState {
                 effects,
                 candidates: &[],
                 authentication: BlockAuthentication::Required,
+                persistence: BlockPersistence::Seal,
             },
         )
     }
@@ -2023,6 +2063,7 @@ impl ChainState {
                 effects: NativeBlockEffects::default(),
                 candidates: &[],
                 authentication: BlockAuthentication::Required,
+                persistence: BlockPersistence::Seal,
             },
         )?;
         Ok((block, applied))
@@ -2073,6 +2114,7 @@ impl ChainState {
                 effects: NativeBlockEffects::default(),
                 candidates,
                 authentication: BlockAuthentication::Required,
+                persistence: BlockPersistence::Seal,
             },
         )?;
         Ok((block, applied))
@@ -2478,6 +2520,7 @@ impl ChainState {
             effects,
             candidates,
             authentication,
+            persistence,
         } = execution;
         // A block this node is assembling is not one it is following, and the
         // difference is signatures: the miner signs the header at seal time and
@@ -2566,27 +2609,11 @@ impl ChainState {
                 sip_031_minted,
             };
             self.settle_state_root(block, root, &receipts, executed)?;
-            let header = note_executed_block(&mut self.vm, &mut ledger, block, bitcoin_context)?;
-            // Keep this tenure's proof: it is what the *next* tenure's committed
-            // seed has to hash to. On the copy, so a block that does not seal
-            // does not leave the next tenure checked against its seed.
-            if let Some(proof) = coinbase_vrf_proof(block) {
-                ledger.parent_tenure_proof = Some(proof);
-            }
-            // The ledger is complete before the seal, which is what lets the two
-            // be one commit: it is written with the header and the block's
-            // metadata in one side-store transaction, and the MARF commit that
-            // follows is the single moment the block becomes real.
-            let state_root = self.vm.commit_block(
-                *block.block_id().as_bytes(),
-                &nano_vm::BlockCommit {
-                    header,
-                    ledger: ledger.encode()?,
-                },
-            )?;
+            let execution =
+                self.finish_block_execution(block, bitcoin_context, persistence, &mut ledger)?;
             Ok(AppliedBlock {
                 bitcoin_height: bitcoin_context.height,
-                execution: ExecutionResult { state_root },
+                execution,
                 execution_cost,
                 receipts,
                 observer_transactions: self.phantom_unlocks_for_observer(block, unlock_events),
@@ -2598,7 +2625,9 @@ impl ChainState {
         })();
         match result {
             Ok(applied) => {
-                self.adopt(ledger);
+                if persistence == BlockPersistence::Seal {
+                    self.adopt(ledger);
+                }
                 Ok(applied)
             }
             Err(error) => {
@@ -2608,6 +2637,36 @@ impl ChainState {
                 Err(error)
             }
         }
+    }
+
+    fn finish_block_execution(
+        &mut self,
+        block: &NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+        persistence: BlockPersistence,
+        ledger: &mut ChainLedger,
+    ) -> Result<ExecutionResult, ChainStateError> {
+        if persistence == BlockPersistence::Discard {
+            let state_root = self.vm.pending_state_root()?;
+            self.vm.abort_block()?;
+            return Ok(ExecutionResult { state_root });
+        }
+
+        let header = note_executed_block(&mut self.vm, ledger, block, bitcoin_context)?;
+        // Keep this tenure's proof: it is what the *next* tenure's committed
+        // seed has to hash to. The ledger remains a copy until the VM seals.
+        if let Some(proof) = coinbase_vrf_proof(block) {
+            ledger.parent_tenure_proof = Some(proof);
+        }
+        // Header, ledger, metadata, and MARF become durable together.
+        let state_root = self.vm.commit_block(
+            *block.block_id().as_bytes(),
+            &nano_vm::BlockCommit {
+                header,
+                ledger: ledger.encode()?,
+            },
+        )?;
+        Ok(ExecutionResult { state_root })
     }
 
     /// Take the ledger a sealed block produced as this chain's own.
@@ -4826,6 +4885,41 @@ mod tests {
             chainstate.ledger, untouched.ledger,
             "and owes the same as one that never saw the rejected block"
         );
+    }
+
+    #[test]
+    fn validating_a_proposal_leaves_no_sibling_state_behind() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let (mut chainstate, source, context, tenure) = open_captured(directory.path());
+        *chainstate.accounting_mut() = accounting_counting_fees(tenure);
+        let block = captured_first_block();
+        let block_id = *block.block_id().as_bytes();
+        let tip = chainstate.tip().expect("read tip");
+        let ledger = chainstate.ledger.clone();
+
+        let first = chainstate
+            .validate_unauthenticated_fixture_block(context, Some(source), &block)
+            .expect("the proposal validates");
+        assert_eq!(chainstate.tip().expect("read tip"), tip);
+        assert_eq!(chainstate.ledger, ledger);
+        assert!(
+            !chainstate
+                .has_block_state(block_id)
+                .expect("inspect proposal state"),
+            "a proposal that signers have not accepted is not a sealed block"
+        );
+
+        let repeated = chainstate
+            .validate_unauthenticated_fixture_block(context, Some(source), &block)
+            .expect("a sibling can validate against the same parent");
+        assert_eq!(repeated, first);
+        assert_eq!(chainstate.tip().expect("read tip"), tip);
+        assert_eq!(chainstate.ledger, ledger);
+
+        let accepted = append_unauthenticated_fixture(&mut chainstate, context, source, &block)
+            .expect("the observed block seals after validation");
+        assert_eq!(accepted, first);
+        assert_eq!(chainstate.tip().expect("read tip"), Some(block_id));
     }
 
     /// An accepted block's state, the header a later block reads it through, and
