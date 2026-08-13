@@ -62,6 +62,8 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    #[cfg(feature = "marf-profile")]
+    nano_marf::marf_profile_reset();
     let depth = replay_into(
         &mut chainstate,
         source,
@@ -89,6 +91,8 @@ fn main() -> ExitCode {
         eprintln!("the journal cannot be written: {error}");
         return ExitCode::FAILURE;
     }
+    #[cfg(feature = "marf-profile")]
+    eprintln!("{}", nano_marf::marf_profile_report());
     if depth.completed < blocks {
         eprintln!(
             "replayed {} of {blocks} from offset {sealed}: {:?}",

@@ -17,6 +17,19 @@ pub use provenance::{
 };
 use storage::{BlockRecord, TrieStorage};
 
+#[cfg(feature = "marf-profile")]
+/// Report cumulative read-path timing and allocation counters for this process.
+#[must_use]
+pub fn marf_profile_report() -> String {
+    storage::profile::report()
+}
+
+#[cfg(feature = "marf-profile")]
+/// Reset the read-path counters at the start of a measured interval.
+pub fn marf_profile_reset() {
+    storage::profile::reset();
+}
+
 /// A `SQLite` URI that opens `path` immutably: no lock, no `-shm`, no `-wal`.
 ///
 /// `SQLite` decodes `%XX` inside a URI path, so the three characters that would
@@ -380,7 +393,12 @@ impl TrieChild {
                 Some(block) => block,
                 None => storage.block_hash(block)?,
             };
-            let mut node = (*storage.node(block, index)?).clone();
+            let stored = storage.node(block, index)?;
+            #[cfg(feature = "marf-profile")]
+            let started = std::time::Instant::now();
+            let mut node = (*stored).clone();
+            #[cfg(feature = "marf-profile")]
+            storage::profile::cloned_node(&node, started.elapsed());
             node.prepare_for_copy(owner);
             self.target = ChildTarget::Memory(Arc::new(node));
             self.referenced_block = None;
@@ -388,7 +406,7 @@ impl TrieChild {
             let ChildTarget::Memory(node) = &mut self.target else {
                 unreachable!("the stored case is handled above");
             };
-            Arc::make_mut(node).prepare_for_copy(block);
+            make_node_mut(node).prepare_for_copy(block);
         }
         let ChildTarget::Memory(node) = &mut self.target else {
             unreachable!("the child was just materialized");
@@ -403,8 +421,19 @@ impl TrieChild {
         value: MarfValue,
     ) -> Result<(), MarfError> {
         let node = self.owned(storage)?;
-        Arc::make_mut(node).insert(storage, path, value)
+        make_node_mut(node).insert(storage, path, value)
     }
+}
+
+fn make_node_mut(node: &mut Arc<TrieNode>) -> &mut TrieNode {
+    #[cfg(feature = "marf-profile")]
+    let started = (Arc::strong_count(node) > 1).then(std::time::Instant::now);
+    let node = Arc::make_mut(node);
+    #[cfg(feature = "marf-profile")]
+    if let Some(started) = started {
+        storage::profile::cloned_node(node, started.elapsed());
+    }
+    node
 }
 
 /// Reads answer with a storage failure rather than panicking on one.
@@ -497,7 +526,14 @@ impl MarfTrie {
 fn extend_root(storage: &TrieStorage, parent: &BlockRecord) -> Result<Vec<TrieChild>, MarfError> {
     let mut children = match parent.node {
         Some(index) => match &*storage.node(parent.id, index)? {
-            TrieNode::Internal { children, .. } => children.clone(),
+            TrieNode::Internal { children, .. } => {
+                #[cfg(feature = "marf-profile")]
+                let started = std::time::Instant::now();
+                let children = children.clone();
+                #[cfg(feature = "marf-profile")]
+                storage::profile::cloned_root(&children, started.elapsed());
+                children
+            }
             TrieNode::Leaf { .. } => {
                 return Err(MarfError::Storage("root state is a leaf".to_owned()));
             }
