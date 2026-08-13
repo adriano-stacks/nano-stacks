@@ -148,7 +148,7 @@ load-independent, the wall is not.
 | # | branch idea | decision | deciding measurement |
 |---|---|---|---|
 | 1 | mmap read path / blob layout | **reject** | Fetch cost is cold-I/O on 1.6% of reads, not per-read syscall CPU; task 110 already measured SQLite mmap at replay scale (sys 924 s vs 183 s pread) and reverted it; the branch's own split credits mmap with only 1.20× of its 2.56× |
-| 2 | reusable referential read state | **reject — already implemented** | nano reads return `Arc<TrieNode>` from the cache without copying; the remaining write-side COW clones cost 2.65 s per 4,149 blocks, under the ±10 s noise band |
+| 2 | reusable referential read state | **reject — hit path equivalent, miss path measured** | cache hits (98.4%) return `Arc<TrieNode>` copy-free; misses still pay `pread`'s kernel→userspace copy plus decode, but that traffic is bounded by the measured 135.4 MB of rows (tens of ms of memcpy) inside the fetch/decode buckets, and the write-side COW clones cost 2.65 s per 4,149 blocks — all under the ±10 s noise band |
 | 3 | inline `NodePath` | **reject** | 22,158 path allocations / 629 KB across the whole replay (~5 per block); a free implementation would be invisible |
 | 4 | scratch buffers / patch-depth fields | **reject — not applicable** | nano-marf has no `TrieNodePatch` by design (plan W5); there is no patch path to buffer |
 | 5 | reference-taking `insert_batch` | **reject — already satisfied** | `MarfTrie::insert(key: &[u8], MarfValue)` takes the key by reference; `MarfValue` is an inline `[u8; 40]`; no owned-`Vec` batch API exists |
@@ -157,9 +157,14 @@ load-independent, the wall is not.
 Nothing is adopted, so there is no before/after pair to record: the branch
 solves stacks-core's 16 µs/read problem, and nano's arena + `Arc` node cache
 already hold the equivalent path at ~4.9 µs *including* cold I/O (40 s of
-fetch+decode over 8.17 M reads) — warm hits are pointer loads. The
-instrumentation ships feature-gated so the profile stays one command away;
-the release binary compiles it out.
+fetch+decode over 8.17 M reads) — warm hits are pointer loads, and the miss
+path's kernel→userspace copies are inside those measured buckets. Removing
+the miss-path copy is exactly the mmap trade, priced twice: the branch's own
+split values syscall+copy avoidance at ~1.2 µs/read (7,489→6,262 ns), which
+over 128,558 misses is ~0.15 s per replay, and task 110's at-scale SQLite
+mmap run was net negative. A cold major fault reads the same disk block
+either way. The instrumentation ships feature-gated so the profile stays one
+command away; the release binary compiles it out.
 
 ## Consensus safety
 
