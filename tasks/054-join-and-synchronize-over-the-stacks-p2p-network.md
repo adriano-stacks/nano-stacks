@@ -62,7 +62,7 @@ steady-state operation may require a hosted Stacks API.
 - [x] Make exchanged Nakamoto inventories drive a bounded forward download
       schedule instead of only prioritizing peers during the backward
       parent-walk.
-- [ ] Complete a live whole-sync interoperability run with a stock
+- [x] Complete a live whole-sync interoperability run with a stock
       `stacks-node`, including inventory and block exchange in both directions
       and transaction relay. Reference-codec socket tests remain necessary but
       are not this acceptance run.
@@ -1168,3 +1168,40 @@ observations from the stock node's own log — it completed the handshake, it fe
 tenure or an inventory from nano, and it accepted a transaction nano relayed. None of
 that needs anything in `nano-p2p`; it needs a host with an open port and a stock node
 pointed at it.
+
+## Live stock-node interoperability run, 2026-08-13
+
+The missing run is now complete in the isolated Hacknet under
+`/home/aldur/.cache/nano-stacks/hacknet-task054b-20260813`. No hosted Stacks API was
+in the path: nano fetched and authenticated blocks from the local stock source on
+`127.0.0.1:60443`, listened on `127.0.0.1:65444`, and the separate stock follower used
+nano as its bootstrap peer. Nano resumed the durable chain originally imported from the
+height-513 checkpoint and its log records the stock source's blocks being admitted and
+executed with the local miner, sortition, signer-threshold and tenure-continuity checks.
+
+The stock follower began at Stacks height 557. With release artifact
+`ed2b885da2df83efa5ff3bfe8a91b338e81120ad627efe52840cc3c64cc26ab3`
+(commit `05317bcdb1e0dd672bfb74ee9c9d2ec9316402d6`), its own log records nano's real burn
+view `(284, 615176fc…49e0)-(285, 13776610…6ccc)`, successful inventory exchange, a
+request for `/v3/tenures/96aea404…458a6`, and `Got unconfirmed tenure blocks,
+complete: true`. It accepted the reverse-ordered tenure stream and advanced from 557 to
+2,304, exactly the height reported by nano and the stock source. This is the
+nano-to-stock half; nano's locally authenticated fetch from the stock source is the
+stock-to-nano half.
+
+Transaction relay was measured with the traffic generator paused so no nonce could
+race it. All three nodes reported nonce 741 for the funded sender. Before submission,
+the stock follower returned HTTP 404 for transaction
+`300e24bee1af2c1ce86bb49ff78c8dab2ae8d60940bc86e07b76056967f4e602`.
+The transaction was submitted only to nano; nano returned that txid and logged
+`relaying the transaction ... this node admitted`. The stock follower then returned
+HTTP 200 and `status: Mempool` with the exact 180-byte transaction, while the source
+stock node still returned HTTP 404. The generator was unpaused after the observation.
+
+The production changes behind the run were gated before their immutable artifacts were
+built: the exact archive/RPC/sync regressions, all `nano-node`, `nano-rpc`, and
+`nano-sync` library tests, the complete `follow_path::` conformance module, strict
+all-target Clippy for those packages plus `nano-conformance`, `taskmd validate`, and
+`git diff --check` were green. The separate attested-checkpoint-to-mainnet-tip run and
+its per-tenure multi-peer provenance remain open above; this Hacknet result does not
+stand in for that mainnet criterion.
