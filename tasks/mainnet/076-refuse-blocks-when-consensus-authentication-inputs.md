@@ -1,7 +1,7 @@
 ---
 id: "076"
 title: "Refuse blocks when consensus authentication inputs are unavailable"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["050", "070"]
 tags: ["mainnet", "consensus", "authentication", "checkpoint"]
 created_at: 2026-08-07
+completed_at: 2026-08-13
 ---
 
 # Refuse blocks when consensus authentication inputs are unavailable
@@ -27,7 +28,7 @@ check with a warning.
       checked against the imported executed ledger.
 - [x] Refuse a tenure-start block when its winner VRF key, registered miner
       signing key, coinbase proof or parent-tenure proof is unavailable.
-- [~] Validate checkpoint completeness before synchronization starts: signer
+- [x] Validate checkpoint completeness before synchronization starts: signer
       sets, executed tenure history, leader-key registry and parent proof must be
       coherent with the attested state.
 - [x] Remove production tests that expect an unknown leader or signing key to
@@ -121,7 +122,7 @@ and the task itself remain open.
       stock signer accepted and signed a proposal after nano validated it under
       the locally authenticated checkpoint view; missing and inconsistent
       history controls remain typed refusals.
-- [ ] Start a fresh state directory from the real mainnet checkpoint, the exported
+- [x] Start a fresh state directory from the real mainnet checkpoint, the exported
       authentication-history suffix, its boundary proof, the attested signer set
       and accounting; complete the captured replay/follow window and retain release
       output showing every signer, miner, sortition, coinbase VRF, parent-seed and
