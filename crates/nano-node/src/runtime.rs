@@ -3378,26 +3378,17 @@ fn advertised_view(
     published: Option<&LocalAnnouncement>,
     stable_confirmations: u64,
 ) -> nano_p2p::ChainView {
-    let stale = || {
-        nano_p2p::ChainView::with_stable_confirmations(
-            100_000,
-            nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
-            nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
-            stable_confirmations,
-        )
-        .expect("a height above the confirmation window")
-    };
     let Some(height) = published.map(|announced| announced.bitcoin_height) else {
-        return stale();
+        return stale_peer_view(stable_confirmations);
     };
     let Some(settled) = height.checked_sub(stable_confirmations) else {
-        return stale();
+        return stale_peer_view(stable_confirmations);
     };
     let (Ok(tip_hash), Ok(stable_hash)) = (
         nano_bitcoin::BitcoinSource::block_hash_at(bitcoin, height),
         nano_bitcoin::BitcoinSource::block_hash_at(bitcoin, settled),
     ) else {
-        return stale();
+        return stale_peer_view(stable_confirmations);
     };
     nano_p2p::ChainView::with_stable_confirmations(
         height,
@@ -3405,7 +3396,17 @@ fn advertised_view(
         nano_primitives::BitcoinHeaderHash::from_bytes(stable_hash),
         stable_confirmations,
     )
-    .unwrap_or_else(stale)
+    .unwrap_or_else(|| stale_peer_view(stable_confirmations))
+}
+
+fn stale_peer_view(stable_confirmations: u64) -> nano_p2p::ChainView {
+    nano_p2p::ChainView::with_stable_confirmations(
+        100_000,
+        nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
+        nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
+        stable_confirmations,
+    )
+    .expect("a height above the confirmation window")
 }
 
 /// What this node tells its peers about itself, written by the loop that knows it.
@@ -3423,6 +3424,8 @@ fn advertised_view(
 #[derive(Clone, Default)]
 pub struct Advertised {
     inner: Arc<std::sync::Mutex<Option<LocalAnnouncement>>>,
+    /// The locally derived Bitcoin view attached to every inbound reply.
+    view: Arc<std::sync::Mutex<Option<nano_p2p::ChainView>>>,
     /// The inventory that outlives the process, when there is a working directory to
     /// keep it in.
     ///
@@ -3463,6 +3466,7 @@ impl Advertised {
         };
         Self {
             inner: Arc::default(),
+            view: Arc::default(),
             served,
         }
     }
@@ -3489,6 +3493,20 @@ impl Advertised {
         // A poisoned lock means a panic while publishing a height, which is not a
         // reason to stop talking to peers: the stale view below is a correct answer.
         self.inner.lock().ok().and_then(|held| held.clone())
+    }
+
+    fn publish_view(&self, view: nano_p2p::ChainView) {
+        if let Ok(mut held) = self.view.lock() {
+            *held = Some(view);
+        }
+    }
+
+    fn chain_view(&self, stable_confirmations: u64) -> nano_p2p::ChainView {
+        self.view
+            .lock()
+            .ok()
+            .and_then(|held| *held)
+            .unwrap_or_else(|| stale_peer_view(stable_confirmations))
     }
 
     /// Answer a peer's inventory request, or `None` for a cycle this node cannot
@@ -3644,6 +3662,7 @@ async fn start_transport(
         }
     };
     let view = advertised_view(&bitcoin, advertised.read().as_ref(), stable_confirmations);
+    advertised.publish_view(view);
     let round = swarm.maintain(view, None).await;
     println!(
         "p2p: {} peers connected, {} known, {} endpoints to fetch from",
@@ -3707,6 +3726,7 @@ async fn peer_discovery(
         ticks = ticks.wrapping_add(1);
         let published = advertised.read();
         let view = advertised_view(&bitcoin, published.as_ref(), stable_confirmations);
+        advertised.publish_view(view);
         // `None` before there is a chain to name a cycle, and a peer is then not
         // asked at all rather than asked about a guess.
         let cycle_start = published.and_then(|announced| announced.cycle_start);
@@ -3857,24 +3877,10 @@ struct PeerService {
 
 impl nano_p2p::Service for PeerService {
     fn chain_view(&self) -> nano_p2p::ChainView {
-        // The stale view is what a node with no executed chain says, and it is safe
-        // rather than a placeholder: a peer keeps only about 288 blocks below its
-        // stable height, so a claim older than that is uncontradictable rather than
-        // wrong. Once there is a chain, the height is this node's own.
-        //
-        // Deliberately not derived from a Bitcoin fetch: this trait is synchronous
-        // because an inbound reply that can block on I/O is one that can stall the
-        // listener, so the honest tip *hash* is not reachable from here and the height
-        // alone would be a view a peer could contradict. That is why the whole thing
-        // stays the stale one for now, and why the swarm — which can await — is where
-        // the real view is advertised.
-        nano_p2p::ChainView::with_stable_confirmations(
-            100_000,
-            nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
-            nano_primitives::BitcoinHeaderHash::from_bytes([0; 32]),
-            self.stable_confirmations,
-        )
-        .expect("a height above the confirmation window")
+        // The async discovery loop reads Bitcoin and publishes the result. Inbound
+        // replies only copy it, so a peer cannot make this synchronous listener wait
+        // on Bitcoin I/O and still sees the same local view the outbound swarm sends.
+        self.advertised.chain_view(self.stable_confirmations)
     }
 
     fn tenure_inventory(
@@ -3981,6 +3987,28 @@ mod tests {
             nano_p2p::wire::services::RELAY | nano_p2p::wire::services::RPC
         );
         assert_eq!(local.data_url, "http://127.0.0.1:20443");
+    }
+
+    #[test]
+    fn inbound_replies_share_the_locally_derived_bitcoin_view() {
+        let advertised = super::Advertised::default();
+        let stable_confirmations = 7;
+        assert_eq!(
+            advertised.chain_view(stable_confirmations).height,
+            100_000,
+            "a listener with no local view uses only the uncontradictable stale view"
+        );
+
+        let view = nano_p2p::ChainView::with_stable_confirmations(
+            285,
+            nano_primitives::BitcoinHeaderHash::from_bytes([1; 32]),
+            nano_primitives::BitcoinHeaderHash::from_bytes([2; 32]),
+            stable_confirmations,
+        )
+        .expect("a settled view");
+        advertised.publish_view(view);
+
+        assert_eq!(advertised.chain_view(stable_confirmations), view);
     }
 
     /// Every execution batch says where it started, where it ended, how many
