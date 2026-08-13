@@ -223,7 +223,16 @@ async fn poll(
     else {
         return Ok(());
     };
-    burn.prepare_proposal(&pending.proposal, pox, live.validator_mut())?;
+    burn.prepare_proposal(&pending.proposal, pox, live.validator_mut())
+        .map_err(|error| {
+            format!(
+                "proposal {} at Stacks height {} records burn {} and tenure {}: {error}",
+                pending.proposal.block.block_id(),
+                pending.proposal.block.header.chain_length,
+                pending.proposal.bitcoin_height,
+                pending.proposal.block.header.consensus_hash,
+            )
+        })?;
     live.answer(pending, signers)
         .await
         .map_err(|error| error.to_string())?;

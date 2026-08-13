@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     fs::{self, File, OpenOptions},
     io,
@@ -787,7 +787,13 @@ pub struct SignerService<V> {
     /// Contract carrying the promises signers publish before they sign.
     pre_commit_contract: StackerDbContract,
     signer: EmbeddedSigner<V>,
-    last_proposal: Option<Sha256Sum>,
+    proposal_cursor: Option<ProposalCursor>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProposalCursor {
+    position: (u64, u64),
+    answered: BTreeSet<Sha256Sum>,
 }
 
 /// A decoded miner proposal that has not yet been answered by this signer.
@@ -1135,7 +1141,7 @@ impl<V: ProposalValidator + Send> SignerService<V> {
             signer_contract,
             pre_commit_contract,
             signer,
-            last_proposal: None,
+            proposal_cursor: None,
         }
     }
 
@@ -1181,7 +1187,7 @@ impl<V: ProposalValidator + Send> SignerService<V> {
         Ok(newest_proposal_for_cycle(
             proposals,
             reward_cycle,
-            self.last_proposal,
+            self.proposal_cursor.as_ref(),
         ))
     }
 
@@ -1247,8 +1253,24 @@ impl<V: ProposalValidator + Send> SignerService<V> {
                 code: acknowledgement.code,
             });
         }
-        self.last_proposal = Some(pending.hash);
+        self.record_answered(&pending);
         Ok(acknowledgement)
+    }
+
+    fn record_answered(&mut self, pending: &PendingProposal) {
+        let position = proposal_position(pending);
+        match self.proposal_cursor.as_mut() {
+            Some(cursor) if cursor.position == position => {
+                cursor.answered.insert(pending.hash);
+            }
+            Some(cursor) if cursor.position > position => {}
+            _ => {
+                self.proposal_cursor = Some(ProposalCursor {
+                    position,
+                    answered: BTreeSet::from([pending.hash]),
+                });
+            }
+        }
     }
 
     /// Advance the local writer version to the latest version accepted by `StackerDB`.
@@ -1285,12 +1307,12 @@ impl<V: ProposalValidator + Send> SignerService<V> {
         self.signer_contract = signer_contract;
         self.pre_commit_contract = pre_commit_contract;
         self.signer.set_writer_slot(writer_slot);
-        self.last_proposal = None;
+        self.proposal_cursor = None;
     }
 
     /// Read proposals from, and write responses into, another peer's replica.
     ///
-    /// `last_proposal` is kept: it records what this signer has already answered,
+    /// The proposal cursor is kept: it records what this signer has already answered,
     /// which is a fact about the signer and not about the peer it heard it from.
     /// Clearing it would have a failover answer the same proposal twice.
     pub fn use_client(&mut self, client: StackerDbClient) {
@@ -1305,21 +1327,36 @@ impl<V: ProposalValidator + Send> SignerService<V> {
 /// the cycle would leave a signer refusing that one and never reaching the
 /// proposals that matter, which stops the network it is part of.
 #[must_use]
-pub fn newest_proposal_for_cycle(
+fn newest_proposal_for_cycle(
     proposals: Vec<PendingProposal>,
     reward_cycle: u64,
-    answered: Option<Sha256Sum>,
+    cursor: Option<&ProposalCursor>,
 ) -> Option<PendingProposal> {
+    let newest_position = proposals
+        .iter()
+        .filter(|pending| pending.proposal.reward_cycle == reward_cycle)
+        .map(proposal_position)
+        .max()?;
+    if cursor.is_some_and(|cursor| cursor.position > newest_position) {
+        return None;
+    }
     proposals
         .into_iter()
         .filter(|pending| pending.proposal.reward_cycle == reward_cycle)
-        .filter(|pending| answered != Some(pending.hash))
-        .max_by_key(|pending| {
-            (
-                pending.proposal.bitcoin_height,
-                pending.proposal.block.header.chain_length,
-            )
+        .filter(|pending| proposal_position(pending) == newest_position)
+        .filter(|pending| {
+            cursor.is_none_or(|cursor| {
+                cursor.position != newest_position || !cursor.answered.contains(&pending.hash)
+            })
         })
+        .max_by_key(|pending| pending.hash)
+}
+
+const fn proposal_position(pending: &PendingProposal) -> (u64, u64) {
+    (
+        pending.proposal.bitcoin_height,
+        pending.proposal.block.header.chain_length,
+    )
 }
 
 /// The weight of the reward set promising to sign one block.
@@ -1807,32 +1844,60 @@ mod tests {
     /// leaves a signer stuck on it and signing nothing at all.
     #[test]
     fn a_stale_cycle_proposal_is_never_the_one_to_answer() {
-        let pending = |reward_cycle: u64, bitcoin_height: u64, hash: u8| super::PendingProposal {
-            hash: Sha256Sum::from_bytes([hash; 32]),
-            proposal: BlockProposal {
-                block: proposal().block,
-                bitcoin_height,
-                reward_cycle,
-                data: BlockProposal::empty_data(),
-            },
+        let pending = |reward_cycle: u64, bitcoin_height: u64, stacks_height: u64, hash: u8| {
+            let mut block = proposal().block;
+            block.header.chain_length = stacks_height;
+            super::PendingProposal {
+                hash: Sha256Sum::from_bytes([hash; 32]),
+                proposal: BlockProposal {
+                    block,
+                    bitcoin_height,
+                    reward_cycle,
+                    data: BlockProposal::empty_data(),
+                },
+            }
         };
-        let stale = pending(20, 419, 1);
-        let current = pending(21, 425, 2);
+        let stale_cycle = pending(20, 419, 8_000, 1);
+        let stale_position = pending(21, 424, 8_100, 2);
+        let current = pending(21, 425, 8_200, 3);
 
         assert_eq!(
-            super::newest_proposal_for_cycle(vec![stale.clone(), current.clone()], 21, None)
+            super::newest_proposal_for_cycle(vec![stale_cycle.clone(), current.clone()], 21, None,)
                 .expect("the proposal of the active cycle")
                 .hash,
             current.hash
         );
         assert!(
-            super::newest_proposal_for_cycle(vec![stale], 21, None).is_none(),
+            super::newest_proposal_for_cycle(vec![stale_cycle], 21, None).is_none(),
             "a proposal from an earlier cycle is not answered"
         );
+        let cursor = super::ProposalCursor {
+            position: super::proposal_position(&current),
+            answered: std::collections::BTreeSet::from([current.hash]),
+        };
         assert!(
-            super::newest_proposal_for_cycle(vec![current.clone()], 21, Some(current.hash))
-                .is_none(),
-            "a proposal already answered is not answered twice"
+            super::newest_proposal_for_cycle(
+                vec![stale_position, current.clone()],
+                21,
+                Some(&cursor),
+            )
+            .is_none(),
+            "answering the newest proposal never falls back to an older slot"
+        );
+        let replacement = super::PendingProposal {
+            hash: Sha256Sum::from_bytes([4; 32]),
+            proposal: BlockProposal {
+                block: current.proposal.block.clone(),
+                bitcoin_height: current.proposal.bitcoin_height,
+                reward_cycle: current.proposal.reward_cycle,
+                data: BlockProposal::empty_data(),
+            },
+        };
+        assert_eq!(
+            super::newest_proposal_for_cycle(vec![current, replacement.clone()], 21, Some(&cursor))
+                .expect("a replacement at the current position is still considered")
+                .hash,
+            replacement.hash,
         );
     }
 
