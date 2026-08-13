@@ -838,7 +838,7 @@ verify() {
     log "generating contract traffic for the verification window"
     traffic "${VERIFY_TRAFFIC_SECS:-600}" > "$RUN/traffic.log" 2>&1 &
     local traffic_pid=$!
-    trap 'kill "$traffic_pid" 2>/dev/null || true' RETURN
+    trap "kill $traffic_pid 2>/dev/null || true; wait $traffic_pid 2>/dev/null || true; trap - RETURN" RETURN
     log "verifying the network with participant $index replaced"
     local miner_key=""
     [ -s "$RUN/miner-signing.key" ] && miner_key=$(cd "$ROOT" && cargo xtask public-key "$(cat "$RUN/miner-signing.key")")
@@ -846,7 +846,9 @@ verify() {
     NANO_MINER_PUBLIC_KEY="$miner_key" \
     NANO_HACKNET_PEER="$(peer_url "$(stock_index "$index")")/" \
         cargo test --manifest-path "$ROOT/Cargo.toml" -p nano-conformance \
-        --test hacknet_replacement -- --ignored --nocapture
+        --test conformance \
+        hacknet_replacement::hacknet_keeps_working_with_a_nano_participant \
+        -- --ignored --exact --nocapture --test-threads=1
 }
 
 # Give nano a Bitcoin identity: a wallet that holds keys, funded by the wallet
@@ -984,6 +986,9 @@ restore() {
 traffic() {
     need_source
     local key seconds=${1:-120}
+    # PAUSE_HEIGHT puts the stock transfer broadcaster to sleep for a day.
+    # Restart it so this verification window contains real token transfers.
+    compose restart tx-broadcaster
     # The first account the broadcaster already sends transfers from, which the
     # genesis chainstate funds, unlike the key the flood script defaults to.
     key=$(compose_value ACCOUNT_KEYS tx-broadcaster | cut -d, -f1)

@@ -12,7 +12,9 @@
 //!
 //! ```text
 //! NANO_SIGNER_PUBLIC_KEY=<hex> cargo test -p nano-conformance \
-//!     --test hacknet_replacement -- --ignored --nocapture
+//!     --test conformance \
+//!     hacknet_replacement::hacknet_keeps_working_with_a_nano_participant \
+//!     -- --ignored --exact --nocapture --test-threads=1
 //! ```
 
 use std::{
