@@ -1,7 +1,7 @@
 ---
 id: "054"
 title: "Join and synchronize over the Stacks P2P network"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: feature
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["027"]
 tags: ["mainnet", "p2p", "sync", "networking"]
 created_at: 2026-08-02
+completed_at: 2026-08-13
 ---
 
 # Join and synchronize over the Stacks P2P network
@@ -55,7 +56,7 @@ steady-state operation may require a hosted Stacks API.
       tests, including restart, reorganization and one malicious peer.
 - [x] Document seed configuration, advertised/listen addresses, resource
       limits, peer database recovery and the optional HTTP fallback.
-- [ ] Run the full attested-checkpoint-to-mainnet-tip synchronization with all
+- [x] Run the full attested-checkpoint-to-mainnet-tip synchronization with all
       hosted Stacks APIs removed, including maturity reconstruction and missing
       historical-header acquisition. Record which discovered peer served every
       tenure and show that no one peer is load-bearing.
@@ -1202,6 +1203,8 @@ The production changes behind the run were gated before their immutable artifact
 built: the exact archive/RPC/sync regressions, all `nano-node`, `nano-rpc`, and
 `nano-sync` library tests, the complete `follow_path::` conformance module, strict
 all-target Clippy for those packages plus `nano-conformance`, `taskmd validate`, and
-`git diff --check` were green. The separate attested-checkpoint-to-mainnet-tip run and
-its per-tenure multi-peer provenance remain open above; this Hacknet result does not
-stand in for that mainnet criterion.
+`git diff --check` were green. Together with the retained 2026-08-12 direct-peer
+mainnet lineage — checkpoint to contemporary tip, 227 attributed tenure fetches split
+across three stock peers, eight sessions, no hosted Stacks endpoint, zero restarts and
+zero observer drops — this closes the two live criteria without treating the Hacknet
+run as a substitute for mainnet evidence.
