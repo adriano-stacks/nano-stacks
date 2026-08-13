@@ -258,6 +258,17 @@ where
             .map_err(|error| error.to_string())
     }
 
+    /// Read the signer weights active at a locally observed Bitcoin height.
+    pub fn recorded_signer_weights_at(
+        &mut self,
+        bitcoin_height: u64,
+    ) -> Result<SignerWeights, String> {
+        let context = self.context_at(bitcoin_height);
+        self.chainstate
+            .recorded_signer_set(context)
+            .map_err(|error| error.to_string())
+    }
+
     fn context_at(&self, bitcoin_height: u64) -> BitcoinBlockContext {
         let mut context = self.bitcoin_context;
         // Both, not the view alone: a proposal's tenure and its view are the same

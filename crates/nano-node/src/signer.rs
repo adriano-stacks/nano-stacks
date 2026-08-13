@@ -201,9 +201,11 @@ async fn local_binding(
     key: &StacksPrivateKey,
 ) -> Result<Binding, String> {
     catch_up(peers, burn, pox, validator, max_blocks).await?;
-    let context = validator.validator_mut().bitcoin_context();
-    let cycle = pox.reward_cycle(context.height);
-    let expected = validator.validator_mut().recorded_signer_weights()?;
+    let bitcoin_height = burn.bitcoin_tip_height()?;
+    let cycle = pox.reward_cycle(bitcoin_height);
+    let expected = validator
+        .validator_mut()
+        .recorded_signer_weights_at(bitcoin_height)?;
     binding(peers, network, cycle, &expected, key).await
 }
 

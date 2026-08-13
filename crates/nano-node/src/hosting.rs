@@ -231,6 +231,13 @@ struct LocalBlockContext {
 }
 
 impl LocalBurnView {
+    /// The height whose reward-cycle signer channel is currently active.
+    pub(crate) fn bitcoin_tip_height(&self) -> Result<u64, String> {
+        self.bitcoin
+            .tip_height()
+            .map_err(|error| format!("this node's burnchain cannot be read: {error}"))
+    }
+
     /// Resume the derived chain, or seed it from the checkpoint that carries one.
     ///
     /// From `checkpoint.sortition`, which is the same directory the canonical
