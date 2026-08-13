@@ -2455,7 +2455,7 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, SyncError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, fs, path::Path, time::Duration};
+    use std::{collections::BTreeSet, env, fs, path::Path, time::Duration};
 
     use reqwest::Url;
     use tokio::time::{sleep, timeout};
@@ -3221,8 +3221,12 @@ mod tests {
             .expect("initial tenure");
         let mut reward_cycles = BTreeSet::from([initial.info.reward_cycle]);
         let mut saw_prepare_phase = false;
+        let timeout_seconds = env::var("NANO_HACKNET_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(75);
 
-        timeout(Duration::from_secs(75), async {
+        timeout(Duration::from_secs(timeout_seconds), async {
             loop {
                 let calendar = client.pox_info().await.expect("fetch stacking calendar");
                 saw_prepare_phase |= is_prepare_phase(&calendar);
