@@ -7,6 +7,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     convert::Infallible,
+    hash::Hasher,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -31,10 +32,13 @@ use nano_chainstate::NakamotoBlock;
 use nano_codec::Transaction;
 use nano_crypto::MessageSignature;
 use nano_mempool::{Account, ChainTip, Mempool};
-use nano_primitives::{BlockHeaderHash, ConsensusHash, Network, StacksBlockId, TrieHash};
+use nano_primitives::{
+    BlockHeaderHash, ConsensusHash, Network, Sha256Sum, StacksBlockId, TrieHash,
+};
 use nano_sync::{FollowedTenure, NodeView, PoxInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use siphasher::sip::SipHasher;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 
@@ -53,6 +57,8 @@ const MAINNET_POX_PARTICIPATION_THRESHOLD_PCT: u64 = 5;
 const MAINNET_SBTC_CONTRACT: &str = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token";
 const MAINNET_SBTC_REGISTRY_CONTRACT: &str =
     "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-registry";
+const MEMPOOL_PAGE_TRANSACTIONS: usize = 128;
+const MEMPOOL_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
 /// The chain constants `/v2/pox` cannot derive from Clarity state.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -624,6 +630,7 @@ pub fn router(state: RpcState) -> Router {
             post(call_read_only),
         )
         .route("/v2/transactions", post(submit_transaction))
+        .route("/v2/mempool/query", post(query_mempool))
         .route(
             "/v2/stackerdb/{address}/{contract}",
             get(stackerdb_metadata),
@@ -1236,30 +1243,29 @@ async fn tenure_info(
     let start = archive
         .tenure_start(tip.stacks_tip)
         .ok_or(RpcError::Unavailable)?;
-    // The parent tenure, through the tenure-start block's own parent. Absent for the
-    // first tenure a checkpointed node holds, where saying so beats inventing links.
+    // The parent tenure, through the tenure-start block's own parent. The stock
+    // response has no absent representation for these hashes, so a checkpoint
+    // that does not retain the parent cannot truthfully answer this route yet.
     let parent = archive
         .block(start)
         .and_then(|bytes| NakamotoBlock::decode(&bytes).ok())
-        .map(|block| block.header.parent_block_id);
-    let parent_start = parent.and_then(|parent| archive.tenure_start(parent));
-    let parent_consensus = parent
-        .and_then(|parent| archive.block(parent))
+        .map(|block| block.header.parent_block_id)
+        .ok_or(RpcError::Unavailable)?;
+    let parent_start = archive.tenure_start(parent).ok_or(RpcError::Unavailable)?;
+    let parent_consensus = archive
+        .block(parent)
         .and_then(|bytes| NakamotoBlock::decode(&bytes).ok())
-        .map(|block| block.header.consensus_hash);
-    Ok(axum::Json(TenureInfoWire {
-        consensus_hash: format!("0x{}", tip.consensus_hash),
-        tenure_start_block_id: format!("0x{start}"),
-        parent_consensus_hash: parent_consensus
-            .map(|hash| format!("0x{hash}"))
-            .unwrap_or_default(),
-        parent_tenure_start_block_id: parent_start
-            .map(|start| format!("0x{start}"))
-            .unwrap_or_default(),
-        tip_block_id: format!("0x{}", tip.stacks_tip),
+        .map(|block| block.header.consensus_hash)
+        .ok_or(RpcError::Unavailable)?;
+    Ok(axum::Json(TenureInfoWire::from(nano_sync::TenureInfo {
+        consensus_hash: tip.consensus_hash,
+        tenure_start_block_id: start,
+        parent_consensus_hash: parent_consensus,
+        parent_tenure_start_block_id: parent_start,
+        tip_block_id: tip.stacks_tip,
         tip_height: tip.stacks_height,
         reward_cycle: executed.pox.reward_cycle(tip.bitcoin_height),
-    }))
+    })))
 }
 
 async fn sortition(
@@ -1546,6 +1552,101 @@ async fn submit_transaction(
         let _ = submitted.send(transaction);
     }
     Ok(axum::Json(txid.to_string()))
+}
+
+#[derive(Default, Deserialize)]
+struct MempoolPageQuery {
+    page_id: Option<String>,
+}
+
+struct KnownMempool {
+    seed: [u8; 32],
+    tags: HashSet<[u8; 8]>,
+}
+
+fn parse_mempool_query(body: &[u8]) -> Result<Option<KnownMempool>, RpcError> {
+    let Some((&kind, body)) = body.split_first() else {
+        return Err(RpcError::BadRequest("empty mempool query".to_owned()));
+    };
+    if kind == 1 {
+        return Ok(None);
+    }
+    if kind != 2 || body.len() < 36 {
+        return Err(RpcError::BadRequest("invalid mempool query".to_owned()));
+    }
+    let seed = body[..32]
+        .try_into()
+        .expect("the query seed slice has a fixed length");
+    let count = u32::from_be_bytes(
+        body[32..36]
+            .try_into()
+            .expect("the query count slice has a fixed length"),
+    ) as usize;
+    let expected_length = count
+        .checked_mul(8)
+        .and_then(|length| length.checked_add(36))
+        .ok_or_else(|| RpcError::BadRequest("invalid mempool tag query".to_owned()))?;
+    if body.len() != expected_length {
+        return Err(RpcError::BadRequest("invalid mempool tag query".to_owned()));
+    }
+    let tags = body[36..]
+        .chunks_exact(8)
+        .map(|tag| tag.try_into().expect("the tag chunk has a fixed length"))
+        .collect::<HashSet<_>>();
+    Ok(Some(KnownMempool { seed, tags }))
+}
+
+fn mempool_tag(seed: &[u8; 32], txid: Sha256Sum) -> [u8; 8] {
+    let mut hasher = SipHasher::new();
+    hasher.write(seed);
+    hasher.write(txid.as_bytes());
+    hasher.finish().to_be_bytes()
+}
+
+fn parse_page_id(page_id: Option<String>) -> Result<Option<Sha256Sum>, RpcError> {
+    page_id
+        .map(|page_id| {
+            hex::decode(page_id)
+                .ok()
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(Sha256Sum::from_bytes)
+                .ok_or_else(|| RpcError::BadRequest("invalid mempool page identifier".to_owned()))
+        })
+        .transpose()
+}
+
+async fn query_mempool(
+    State(state): State<RpcState>,
+    Query(query): Query<MempoolPageQuery>,
+    body: Bytes,
+) -> Result<impl IntoResponse, RpcError> {
+    let known = parse_mempool_query(&body)?;
+    let after = parse_page_id(query.page_id)?;
+    let mempool = state.mempool.clone().ok_or(RpcError::Unavailable)?;
+    let mempool = mempool.lock().await;
+    let (transactions, next) = mempool.page(
+        after,
+        MEMPOOL_PAGE_TRANSACTIONS,
+        MEMPOOL_PAGE_BYTES,
+        |txid| {
+            known
+                .as_ref()
+                .is_none_or(|known| !known.tags.contains(&mempool_tag(&known.seed, txid)))
+        },
+    );
+    drop(mempool);
+
+    let mut response = Vec::new();
+    for transaction in transactions {
+        response.extend_from_slice(transaction.as_bytes());
+    }
+    if let Some(next) = next {
+        response.extend_from_slice(next.as_bytes());
+    }
+    Ok((
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        response,
+    ))
 }
 
 /// The executed state, read one account at a time as the pool asks for them.
@@ -2703,10 +2804,58 @@ mod tests {
 
         let accepted = transfer(&sender, 1);
         let txid = accepted.txid();
+        let encoded = accepted.encode();
         let response = submit(accepted, app.clone()).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await, json!(txid.to_string()));
         assert!(mempool.lock().await.contains(txid));
+
+        let mut query = vec![2];
+        query.extend_from_slice(&[0; 32]);
+        query.extend_from_slice(&0_u32.to_be_bytes());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/mempool/query")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(query))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/octet-stream"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        assert_eq!(body.as_ref(), encoded);
+
+        let mut known = vec![2];
+        let seed = [3; 32];
+        known.extend_from_slice(&seed);
+        known.extend_from_slice(&1_u32.to_be_bytes());
+        known.extend_from_slice(&super::mempool_tag(&seed, txid));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/mempool/query")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(known))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        assert!(body.is_empty());
 
         let stale = transfer(&sender, 0);
         let response = submit(stale, app).await;
@@ -3750,6 +3899,15 @@ mod tests {
             tenure["tip_block_id"],
             json!(blocks[1].block_id().to_string())
         );
+        for field in [
+            "consensus_hash",
+            "tenure_start_block_id",
+            "parent_consensus_hash",
+            "parent_tenure_start_block_id",
+            "tip_block_id",
+        ] {
+            assert!(!tenure[field].as_str().expect("a hash").starts_with("0x"));
+        }
 
         // And the tenure stream stops there too.
         let stream = get(format!("/v3/tenures/{}", blocks[0].block_id()), app.clone()).await;

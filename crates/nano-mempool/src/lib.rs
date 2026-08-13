@@ -307,6 +307,57 @@ impl Mempool {
         self.entries.get(&txid).map(|entry| &entry.transaction)
     }
 
+    /// Return one stable page of transactions a peer does not already know.
+    ///
+    /// The cursor is the last transaction in the returned page. A caller can
+    /// therefore resume strictly after it without depending on `HashMap`
+    /// iteration order.
+    pub fn page<F>(
+        &self,
+        after: Option<Sha256Sum>,
+        max_transactions: usize,
+        max_bytes: usize,
+        mut wanted: F,
+    ) -> (Vec<Transaction>, Option<Sha256Sum>)
+    where
+        F: FnMut(Sha256Sum) -> bool,
+    {
+        if max_transactions == 0 {
+            return (Vec::new(), None);
+        }
+        let mut txids: Vec<_> = self.entries.keys().copied().collect();
+        txids.sort_unstable();
+
+        let mut transactions = Vec::new();
+        let mut bytes = 0_usize;
+        let mut more = false;
+        for txid in txids {
+            if after.is_some_and(|after| txid <= after) || !wanted(txid) {
+                continue;
+            }
+            let entry = &self.entries[&txid];
+            let length = entry.transaction.as_bytes().len();
+            if transactions.is_empty() && length > max_bytes {
+                continue;
+            }
+            if transactions.len() == max_transactions
+                || bytes.checked_add(length).is_none_or(|sum| sum > max_bytes)
+            {
+                more = true;
+                break;
+            }
+            bytes += length;
+            transactions.push(entry.transaction.clone());
+        }
+        let next = more.then(|| {
+            transactions
+                .last()
+                .expect("a bounded page made progress")
+                .txid()
+        });
+        (transactions, next)
+    }
+
     /// Every account a held transaction depends on, which is what a tip has to
     /// be able to answer for.
     #[must_use]
@@ -765,6 +816,29 @@ mod tests {
             Ok(Admission::AlreadyPresent)
         );
         assert_eq!(mempool.len(), 1);
+    }
+
+    #[test]
+    fn peer_pages_are_stable_bounded_and_filter_known_transactions() {
+        let mut mempool = Mempool::new(NETWORK);
+        let mut expected = Vec::new();
+        for seed in [b"page-a".as_slice(), b"page-b", b"page-c"] {
+            let transaction = transfer(&key(seed), 0, 400, 1);
+            expected.push((transaction.txid(), transaction.clone()));
+            mempool
+                .submit(transaction, &tip(&[]), 0)
+                .expect("hold a transaction");
+        }
+        expected.sort_unstable_by_key(|(txid, _)| *txid);
+
+        let ignored = expected[1].0;
+        let (first, next) = mempool.page(None, 1, usize::MAX, |txid| txid != ignored);
+        assert_eq!(first[0].txid(), expected[0].0);
+        assert_eq!(next, Some(expected[0].0));
+
+        let (second, next) = mempool.page(next, 1, usize::MAX, |txid| txid != ignored);
+        assert_eq!(second[0].txid(), expected[2].0);
+        assert_eq!(next, None);
     }
 
     #[test]

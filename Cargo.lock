@@ -3036,6 +3036,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "siphasher",
  "tokio",
  "tokio-stream",
  "tower",
