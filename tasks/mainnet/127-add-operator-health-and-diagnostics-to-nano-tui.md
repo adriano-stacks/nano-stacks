@@ -1,7 +1,7 @@
 ---
 id: "127"
 title: "Add operator health and diagnostics to nano-tui"
-status: in-progress
+status: completed
 priority: high
 effort: medium
 type: feature
@@ -15,6 +15,7 @@ verify:
     run: "nix develop -c cargo test -p nano-rpc -p nano-node -p nano-tui"
   - type: bash
     run: "nix develop -c cargo clippy -p nano-rpc -p nano-node -p nano-tui --all-targets -- -D warnings"
+completed_at: 2026-08-14
 ---
 
 # Add operator health and diagnostics to nano-tui
@@ -44,7 +45,7 @@ This is delivery slice 2 from task 125's usability study.
       metrics explicit without degrading RPC health.
 - [x] Cover healthy, catch-up, stalled, refusal, queue pressure, observer failure,
       missing metrics and mixed-role nodes.
-- [ ] Run rustfmt, tests and strict clippy without warnings.
+- [x] Run rustfmt, tests and strict clippy without warnings.
 
 ## Acceptance Criteria
 
