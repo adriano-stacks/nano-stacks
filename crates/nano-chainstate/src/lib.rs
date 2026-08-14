@@ -81,6 +81,88 @@ pub struct AppliedBlock {
     pub waterfall_payout: Option<PoxAddress>,
 }
 
+/// A miner proposal that passed the block's signature-independent envelope checks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposedBlock {
+    block: NakamotoBlock,
+}
+
+impl ProposedBlock {
+    #[must_use]
+    pub const fn block(&self) -> &NakamotoBlock {
+        &self.block
+    }
+}
+
+/// A finalized block authenticated against this chain's local consensus context.
+#[derive(Debug, Eq, PartialEq)]
+pub struct AuthenticatedBlock {
+    block: NakamotoBlock,
+    bitcoin_context: BitcoinBlockContext,
+    operations: Vec<BitcoinOperation>,
+    parent: Option<[u8; 32]>,
+}
+
+impl AuthenticatedBlock {
+    #[must_use]
+    pub const fn block(&self) -> &NakamotoBlock {
+        &self.block
+    }
+
+    #[must_use]
+    pub const fn bitcoin_context(&self) -> BitcoinBlockContext {
+        self.bitcoin_context
+    }
+}
+
+/// A proposal whose transactions and committed root were evaluated transiently.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutedBlock {
+    block: ProposedBlock,
+    applied: AppliedBlock,
+}
+
+impl ExecutedBlock {
+    #[must_use]
+    pub const fn block(&self) -> &NakamotoBlock {
+        self.block.block()
+    }
+
+    #[must_use]
+    pub const fn applied(&self) -> &AppliedBlock {
+        &self.applied
+    }
+
+    #[must_use]
+    pub fn into_applied(self) -> AppliedBlock {
+        self.applied
+    }
+}
+
+/// An authenticated block whose VM state and ledger were committed atomically.
+#[derive(Debug, PartialEq)]
+pub struct CommittedBlock {
+    block: AuthenticatedBlock,
+    applied: AppliedBlock,
+}
+
+impl CommittedBlock {
+    #[must_use]
+    pub const fn block(&self) -> &NakamotoBlock {
+        self.block.block()
+    }
+
+    #[must_use]
+    pub const fn applied(&self) -> &AppliedBlock {
+        &self.applied
+    }
+
+    #[must_use]
+    pub fn into_applied(self) -> AppliedBlock {
+        self.applied
+    }
+}
+
 /// A transaction stacks-core synthesizes only for event observers.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ObservedTransaction {
@@ -819,6 +901,7 @@ struct BlockExecution<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlockAuthentication {
     Required,
+    Authenticated,
     Proposal,
     UnauthenticatedFixture,
 }
@@ -857,7 +940,7 @@ struct ChainLedger {
     tenure_start_blocks: BTreeMap<u32, [u8; 32]>,
     /// The blocks executed since the checkpoint, oldest first, bounded at
     /// `REORG_REACH`.
-    executed: Vec<ExecutedBlock>,
+    executed: Vec<ExecutedHeader>,
     /// The coinbase VRF proof of the last tenure this chain accepted.
     ///
     /// A tenure's committed seed has to be the hash of the *parent* tenure's
@@ -914,7 +997,7 @@ impl ChainLedger {
             .executed
             .into_iter()
             .map(|block| {
-                Ok(ExecutedBlock {
+                Ok(ExecutedHeader {
                     block_id: decode_hex(&block.block_id)
                         .ok_or_else(|| bad("an executed block"))?,
                     consensus_hash: ConsensusHash::from_bytes(
@@ -990,7 +1073,7 @@ pub struct ChainState {
 
 /// A block nano has executed, and the tenure it belongs to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ExecutedBlock {
+struct ExecutedHeader {
     block_id: [u8; 32],
     consensus_hash: ConsensusHash,
     tenure_height: u32,
@@ -1456,7 +1539,7 @@ impl ChainState {
         }
         self.check_signer_signatures(block, entry.bitcoin_context)
             .map_err(history_block(height))?;
-        ledger.executed.push(ExecutedBlock {
+        ledger.executed.push(ExecutedHeader {
             block_id: *block.block_id().as_bytes(),
             consensus_hash: block.header.consensus_hash,
             tenure_height,
@@ -1597,7 +1680,7 @@ impl ChainState {
         ledger
             .tenure_start_heights
             .insert(header.tenure_height, header.tenure_start_height);
-        ledger.executed.push(ExecutedBlock {
+        ledger.executed.push(ExecutedHeader {
             block_id: parent,
             consensus_hash: ConsensusHash::from_bytes(header.consensus_hash),
             tenure_height: header.tenure_height,
@@ -1762,21 +1845,60 @@ impl ChainState {
         block: &NakamotoBlock,
         waterfall_registry: Option<&str>,
     ) -> Result<AppliedBlock, ChainStateError> {
-        let mut block = block.clone();
-        self.execute_nakamoto_block(
+        let authenticated = self.authenticate_nakamoto_block_with_bitcoin_operations(
+            bitcoin_context,
+            operations,
+            parent,
+            block.clone(),
+        )?;
+        self.commit_authenticated_nakamoto_block(authenticated, waterfall_registry)
+            .map(CommittedBlock::into_applied)
+    }
+
+    /// Execute and atomically commit a block carrying local authentication proof.
+    pub fn commit_authenticated_nakamoto_block(
+        &mut self,
+        authenticated: AuthenticatedBlock,
+        waterfall_registry: Option<&str>,
+    ) -> Result<CommittedBlock, ChainStateError> {
+        let AuthenticatedBlock {
+            mut block,
+            bitcoin_context,
+            operations,
+            parent,
+        } = authenticated;
+        let current = self.tip()?;
+        if parent != current {
+            return Err(ChainStateError::InvalidTransaction(format!(
+                "authenticated block {} names parent {:?}, but chainstate now stands on {:?}",
+                block.block_id(),
+                parent.map(hex::encode),
+                current.map(hex::encode),
+            )));
+        }
+        let applied = self.execute_nakamoto_block(
             &mut block,
             BlockExecution {
                 bitcoin_context,
                 waterfall_registry,
-                operations,
+                operations: &operations,
                 parent,
                 root: RootPolicy::Verify,
                 effects: NativeBlockEffects::default(),
                 candidates: &[],
-                authentication: BlockAuthentication::Required,
+                authentication: BlockAuthentication::Authenticated,
                 persistence: BlockPersistence::Seal,
             },
-        )
+        )?;
+        Ok(CommittedBlock {
+            block: AuthenticatedBlock {
+                block,
+                bitcoin_context,
+                operations,
+                parent,
+            },
+            applied,
+        })
     }
 
     /// Validate a signer proposal with every consensus check except signer threshold.
@@ -1813,8 +1935,30 @@ impl ChainState {
         block: &NakamotoBlock,
         waterfall_registry: Option<&str>,
     ) -> Result<AppliedBlock, ChainStateError> {
-        let mut block = block.clone();
-        self.execute_nakamoto_block(
+        let proposed = self
+            .proposed_block(block.clone())
+            .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+        self.execute_proposed_nakamoto_block(
+            proposed,
+            bitcoin_context,
+            operations,
+            parent,
+            waterfall_registry,
+        )
+        .map(ExecutedBlock::into_applied)
+    }
+
+    /// Execute a proposal transiently without admitting it to durable staging.
+    pub fn execute_proposed_nakamoto_block(
+        &mut self,
+        proposed: ProposedBlock,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        parent: Option<[u8; 32]>,
+        waterfall_registry: Option<&str>,
+    ) -> Result<ExecutedBlock, ChainStateError> {
+        let mut block = proposed.block.clone();
+        let applied = self.execute_nakamoto_block(
             &mut block,
             BlockExecution {
                 bitcoin_context,
@@ -1827,7 +1971,8 @@ impl ChainState {
                 authentication: BlockAuthentication::Proposal,
                 persistence: BlockPersistence::Discard,
             },
-        )
+        )?;
+        Ok(ExecutedBlock { proposed, applied })
     }
 
     /// Execute a fixture block and verify its state root without authenticating consensus.
@@ -2562,6 +2707,38 @@ impl ChainState {
         )
     }
 
+    /// Admit an unsigned-signer proposal to transient proposal execution only.
+    pub fn proposed_block(&self, block: NakamotoBlock) -> Result<ProposedBlock, ConsensusError> {
+        authenticate::authenticate_block(
+            &block,
+            self.vm.network(),
+            authenticate::Signatures::Present,
+        )?;
+        Ok(ProposedBlock { block })
+    }
+
+    /// Authenticate a finalized block against the local chain and burn context.
+    pub fn authenticate_nakamoto_block_with_bitcoin_operations(
+        &mut self,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        parent: Option<[u8; 32]>,
+        block: NakamotoBlock,
+    ) -> Result<AuthenticatedBlock, ChainStateError> {
+        self.check_before_executing(&block, parent, bitcoin_context, operations, false)?;
+        self.vm
+            .begin_block_execution(parent, temporary_state_id(), bitcoin_context)?;
+        let authenticated = self.check_signer_signatures(&block, bitcoin_context);
+        self.vm.abort_block()?;
+        authenticated?;
+        Ok(AuthenticatedBlock {
+            block,
+            bitcoin_context,
+            operations: operations.to_vec(),
+            parent,
+        })
+    }
+
     /// Run everything the block carries, and everything the pool offers a block
     /// this node is assembling.
     ///
@@ -2643,7 +2820,10 @@ impl ChainState {
         // asked of a followed block and not of a candidate. The miner's own
         // answer to each of them is the code that builds the block.
         let assembled = matches!(root, RootPolicy::Mine(_));
-        if authentication != BlockAuthentication::UnauthenticatedFixture {
+        if matches!(
+            authentication,
+            BlockAuthentication::Required | BlockAuthentication::Proposal
+        ) {
             self.check_before_executing(block, parent, bitcoin_context, operations, assembled)?;
         }
         self.vm
@@ -3074,7 +3254,7 @@ impl ChainState {
     /// that look right — and narrower still than refusing to advance at all.
     ///
     /// Distinct from `backfill_block_header`, which is for blocks near the tip:
-    /// that one reads a tenure height and records an `ExecutedBlock`, and both
+    /// that one reads a tenure height and records an `ExecutedHeader`, and both
     /// would be wrong here. This node did not execute this block and cannot
     /// read state at it.
     pub fn backfill_ancestor_header(
@@ -3744,7 +3924,7 @@ fn note_executed_block(
         // but it is not the tenure-start identifier a miner must commit to.
         ledger.tenure_start_blocks.remove(&tenure_height);
     }
-    ledger.executed.push(ExecutedBlock {
+    ledger.executed.push(ExecutedHeader {
         block_id: *block.block_id().as_bytes(),
         consensus_hash: block.header.consensus_hash,
         tenure_height,
@@ -4534,7 +4714,7 @@ const fn clarity_version_to_vm(version: ClarityVersion) -> VmClarityVersion {
 
 #[cfg(test)]
 mod tests {
-    use super::{CoinbaseSchedule, ExecutedBlock, TenureEarnings};
+    use super::{CoinbaseSchedule, ExecutedHeader, TenureEarnings};
     use clarity::vm::contexts::AssetMap;
     use clarity::vm::costs::ExecutionCost;
     use clarity::vm::events::{STXEventType, STXMintEventData, StacksTransactionEvent};
@@ -5183,7 +5363,7 @@ mod tests {
         );
         assert_eq!(
             chainstate.ledger.executed,
-            vec![ExecutedBlock {
+            vec![ExecutedHeader {
                 block_id: *parent.as_bytes(),
                 consensus_hash: ConsensusHash::from_bytes(header.consensus_hash),
                 tenure_height: header.tenure_height,
@@ -5267,7 +5447,7 @@ mod tests {
             accounting: accounting_counting_fees(120),
             tenure_start_heights: [(251_321, 8_665_600), (251_322, 8_665_612)].into(),
             tenure_start_blocks: [(251_321, [0x2a; 32]), (251_322, [0x3a; 32])].into(),
-            executed: vec![ExecutedBlock {
+            executed: vec![ExecutedHeader {
                 block_id: [0x3a; 32],
                 consensus_hash: nano_primitives::ConsensusHash::from_bytes([0x7c; 20]),
                 tenure_height: 251_322,
