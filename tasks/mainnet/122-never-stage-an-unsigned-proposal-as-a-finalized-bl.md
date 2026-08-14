@@ -28,7 +28,7 @@ while retaining the unsigned bytes.
 - [x] Pin the successful validator path: it emits an `Ok` proposal verdict but
       offers no block to staging.
 - [x] Re-run the stock-signer proposal gates and strict Clippy.
-- [ ] Start a fresh isolated Hacknet and prove nano executes the finalized block
+- [x] Start a fresh isolated Hacknet and prove nano executes the finalized block
       after validating its unsigned proposal, including across the next reward
       cycle boundary.
 
