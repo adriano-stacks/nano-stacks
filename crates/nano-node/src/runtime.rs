@@ -435,13 +435,12 @@ async fn publish_sealed_tip(
     }
 }
 
-/// A block offered over the public API passes the boundary a followed block
-/// passes, and it is the same call: `ChainState::authenticate_block`, which
-/// [[050-authenticate-every-followed-nakamoto-block]] put in front of execution.
+/// A block offered over the public API passes the same self-contained envelope
+/// check as a peer push before it can be retained as a download.
 ///
-/// Nothing is reimplemented here on purpose. A node that admits over its own API
-/// what it would refuse from a peer is forkable through its own API, and the only
-/// way to be sure the two agree is for there to be one of them.
+/// Full local burn, miner, VRF and signer-set authentication requires the
+/// block's execution context. It runs later, through the same typed constructor
+/// as every peer-fetched direct child, before executable staging.
 impl<S: Send> nano_rpc::BlockAdmission for CheckpointExecutor<S> {
     fn authenticate(&mut self, block: &NakamotoBlock) -> Result<(), String> {
         self.chainstate
@@ -696,7 +695,7 @@ async fn take_admitted(inputs: AdmittedInputs<'_>) {
         staging,
         metrics,
     } = inputs;
-    stage_admitted_blocks(offered, staging, relay);
+    stage_admitted_blocks(offered, staging);
     relay_admitted_transactions(submitted, relay);
     if let Some(executor) = executor {
         check_relayed(executor, mempool, relay, staging, metrics.as_ref()).await;
@@ -705,12 +704,20 @@ async fn take_admitted(inputs: AdmittedInputs<'_>) {
 
 /// The store staged blocks wait in, or the role's own failure.
 fn open_staging(config: &Config) -> Result<Staging, Role> {
-    Staging::open(
+    let staging = Staging::open(
         &config
             .chainstate_dir(NODE_CHAINSTATE)
             .join("staging.sqlite"),
     )
-    .map_err(|error| Err(format!("cannot open the staging store: {error}")))
+    .map_err(|error| Err(format!("cannot open the staging store: {error}")))?;
+    let quarantined = staging.quarantined_rows();
+    if quarantined > 0 {
+        println!(
+            "the staging store retains {quarantined} quarantined legacy representations; \
+             they cannot execute"
+        );
+    }
+    Ok(staging)
 }
 
 /// What the follow loop carries from one round to the next.
@@ -985,36 +992,32 @@ async fn prepare_to_follow(
     backfill_ancestors(executor, peer, pox, source).await
 }
 
-/// Take the block uploads the public API admitted and stage them.
+/// Keep uploaded representations as downloads until execution authenticates them.
 ///
-/// Nothing is validated here on purpose: the route already put each one through
-/// `ChainState::authenticate_block`, and the executor checks its state root when
-/// it runs it. Draining the channel rather than awaiting it keeps this on the
+/// The route checks the self-contained block envelope. Local burn, miner, VRF
+/// and signer-set authentication happens when the direct child is promoted into
+/// executable staging. Draining the channel rather than awaiting it keeps this on the
 /// round's own clock — an upload is visible within one poll interval, and a burst
 /// of them cannot starve the peer.
 ///
-/// Having passed that boundary, an uploaded block is also relayed. A node that
-/// accepted a block and told nobody is a hole in the network's propagation, and the
-/// only thing that made these blocks special — that they arrived over HTTP — stops
-/// being true the moment they are authenticated.
+/// It is relayed only after execution commits it, through the same announcement
+/// path as a peer-fetched block.
 fn stage_admitted_blocks(
     offered: &mut tokio::sync::mpsc::UnboundedReceiver<NakamotoBlock>,
     staging: &Staging,
-    relay: &nano_p2p::Relay,
 ) {
     while let Ok(block) = offered.try_recv() {
-        match staging.put(&block) {
-            Ok(()) => println!(
-                "admitted block {} at height {} over the public API",
+        match staging.download(&block) {
+            Ok(_) => println!(
+                "downloaded block {} at height {} over the public API",
                 block.block_id(),
                 block.header.chain_length
             ),
             Err(error) => eprintln!(
-                "staging the admitted block {} failed: {error}",
+                "keeping the uploaded block {} failed: {error}",
                 block.block_id()
             ),
         }
-        relay.announce(nano_p2p::Offer::block(None, block));
     }
 }
 
@@ -1038,18 +1041,13 @@ fn relay_admitted_transactions(
     }
 }
 
-/// Put everything peers pushed through this node's own checks, and relay what
-/// passes.
+/// Keep self-consistent peer pushes as downloads and relay them.
 ///
 /// This is the boundary the whole of task 054's relay item turns on, and the reason
 /// it is *here* is that here is where the chainstate is.
-/// `ChainState::authenticate_block` enforces the signer weight against the reward set
-/// nano derived, the miner signature against the sortition winner, the coinbase VRF
-/// proof, the seed the winning commit committed to, and the header's cumulative burn
-/// against nano's own burnchain — all before any of the block runs. A block that
-/// passes it is staged, and from that point it is indistinguishable from one this node
-/// fetched itself; a block that fails it is dropped, and the state root check at
-/// execution is still in front of everything that survives.
+/// The RPC boundary checks the block's own envelope. The locally derived burn,
+/// miner, VRF and signer-set checks run only when a representation becomes the
+/// direct child; only their opaque result can enter executable staging.
 ///
 /// A rejected push is *not* a penalty. A block can fail because this node cannot yet
 /// derive the cycle's reward set, or has not executed the tenure it builds on, and
@@ -1072,8 +1070,8 @@ async fn check_relayed(
     {
         let mut executor = executor.lock().await;
         for offer in offers {
-            let (from, block) = match offer.data {
-                nano_p2p::Pushed::Block(block) => (offer.from, block),
+            let block = match offer.data {
+                nano_p2p::Pushed::Block(block) => block,
                 // Held back rather than handled here: admission wants the mempool's
                 // lock as well, and taking it under the executor's would invert the
                 // order `/v2/transactions` takes them in.
@@ -1087,12 +1085,11 @@ async fn check_relayed(
             // is forkable through whichever of the two is laxer.
             match nano_rpc::BlockAdmission::authenticate(&mut *executor, &block) {
                 Ok(()) => {
-                    if let Err(error) = staging.put(&block) {
-                        eprintln!("staging a relayed block failed: {error}");
+                    if let Err(error) = staging.download(&block) {
+                        eprintln!("keeping a relayed block failed: {error}");
                         continue;
                     }
                     accepted += 1;
-                    relay.announce(nano_p2p::Offer::block(from, *block));
                 }
                 Err(error) => {
                     rejected += 1;

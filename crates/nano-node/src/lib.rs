@@ -12,8 +12,8 @@ use std::{collections::HashMap, fmt, path::Path, time::Duration};
 use nano_address::PoxAddress;
 use nano_bitcoin::BitcoinSource;
 use nano_chainstate::{
-    AppliedBlock, BitcoinBlockContext, ChainState, ChainStateError, NakamotoBlock,
-    NakamotoBlockHeader, SignerSet, SignerSetError, SignerWeights, TenureAccounting,
+    AppliedBlock, AuthenticatedBlock, BitcoinBlockContext, ChainState, ChainStateError,
+    NakamotoBlock, NakamotoBlockHeader, SignerSet, SignerSetError, SignerWeights, TenureAccounting,
 };
 pub use nano_marf::{CheckpointAttestation, CheckpointManifest, CheckpointProvenance};
 use nano_miner::{BitcoinTenureView, ParentTenure, TenureTip};
@@ -1011,11 +1011,21 @@ where
         block: &NakamotoBlock,
         bitcoin_context: BitcoinBlockContext,
     ) -> Result<AppliedBlock, CheckpointExecutionError> {
+        let authenticated = self.authenticate(block, bitcoin_context)?;
+        self.apply_authenticated(authenticated)
+    }
+
+    /// Authenticate one direct descendant without executing or staging it.
+    pub fn authenticate(
+        &mut self,
+        block: &NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+    ) -> Result<AuthenticatedBlock, CheckpointExecutionError> {
         let operations = self
             .bitcoin
             .block_at(bitcoin_context.height)
             .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
-        self.apply_with_operations(block, bitcoin_context, &operations.operations)
+        self.authenticate_with_operations(block, bitcoin_context, &operations.operations)
     }
 
     /// Validate and execute one direct descendant with decoded Bitcoin operations.
@@ -1025,6 +1035,18 @@ where
         bitcoin_context: BitcoinBlockContext,
         operations: &[nano_bitcoin::BitcoinOperation],
     ) -> Result<AppliedBlock, CheckpointExecutionError> {
+        let authenticated =
+            self.authenticate_with_operations(block, bitcoin_context, operations)?;
+        self.apply_authenticated(authenticated)
+    }
+
+    /// Authenticate one direct descendant with decoded Bitcoin operations.
+    pub fn authenticate_with_operations(
+        &mut self,
+        block: &NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[nano_bitcoin::BitcoinOperation],
+    ) -> Result<AuthenticatedBlock, CheckpointExecutionError> {
         block.validate_successor(&self.tip.header).map_err(|error| {
             CheckpointExecutionError::Link(format!(
                 "{error}: block {} at height {} names parent {}, but this node is at {} of height {}",
@@ -1035,17 +1057,29 @@ where
                 self.tip.header.chain_length,
             ))
         })?;
-        let applied = self
-            .chainstate
-            .append_nakamoto_block_with_bitcoin_operations_using_registry(
+        self.chainstate
+            .authenticate_nakamoto_block_with_bitcoin_operations(
                 bitcoin_context,
                 operations,
                 Some(*self.tip.block_id().as_bytes()),
-                block,
-                self.waterfall_registry.as_deref(),
-            )?;
+                block.clone(),
+            )
+            .map_err(CheckpointExecutionError::from)
+    }
+
+    /// Commit a block whose exact parent and Bitcoin inputs were authenticated.
+    pub fn apply_authenticated(
+        &mut self,
+        authenticated: AuthenticatedBlock,
+    ) -> Result<AppliedBlock, CheckpointExecutionError> {
+        let block = authenticated.block().clone();
+        let bitcoin_context = authenticated.bitcoin_context();
+        let applied = self
+            .chainstate
+            .commit_authenticated_nakamoto_block(authenticated, self.waterfall_registry.as_deref())?
+            .into_applied();
         self.remember_waterfall_payout(&applied, bitcoin_context);
-        self.tip = block.clone();
+        self.tip = block;
         self.bitcoin_height = bitcoin_context.height;
         Ok(applied)
     }
@@ -1525,7 +1559,7 @@ where
                         history.last_served().unwrap_or("an unnamed peer")
                     );
                     for block in &blocks {
-                        staging.put(block)?;
+                        staging.download(block)?;
                     }
                     // Only what is above the executed tip counts against the budget,
                     // and the reason is a stall this measured. The schedule starts at
@@ -1569,7 +1603,7 @@ where
         let mut cursor = from;
         let mut fetched = 0;
         while cursor != until.block_id && fetched < budget {
-            if staging.holds(cursor)? {
+            if staging.has_representation(cursor)? {
                 break;
             }
             // A whole tenure per request rather than a block per request: over
@@ -1609,7 +1643,7 @@ where
             // is on another branch, since a fork's blocks are at heights this node
             // has already sealed. Dropping them here silenced the fork switch.
             for block in &blocks {
-                staging.put(block)?;
+                staging.download(block)?;
             }
             fetched += blocks.len();
             // A tenure arrives whole, so a batch straddling the executed tip
@@ -2659,18 +2693,40 @@ where
         let mut timing = ExecutionTiming::default();
         let mut previous_view = None;
         while executed < budget {
-            let Some(block) = staging.child_of(self.tip.block_id())? else {
+            let representations = staging.child_representations(self.tip.block_id())?;
+            let Some(first) = representations.first() else {
                 break;
             };
+            let selected_id = first.block_id();
             let Some((bitcoin_context, executed_height)) = self
-                .context_for(peers, pox, &block, &mut timing, &mut previous_view)
+                .context_for(peers, pox, first, &mut timing, &mut previous_view)
                 .await?
             else {
                 rate_limited = true;
                 break;
             };
             let phase = std::time::Instant::now();
-            let applied = self.apply(&block, bitcoin_context)?;
+            let mut rejected = None;
+            let mut accepted = None;
+            for block in representations {
+                match self.authenticate(&block, bitcoin_context) {
+                    Ok(authenticated) => {
+                        accepted = Some((block, authenticated));
+                        break;
+                    }
+                    Err(error) => rejected = Some(error),
+                }
+            }
+            let Some((block, authenticated)) = accepted else {
+                // Signer signatures are absent from the block ID. Keeping only
+                // rejected bytes would make descent hide a later finalized form.
+                staging.remove(selected_id)?;
+                return Err(rejected
+                    .expect("a non-empty set of representations was rejected")
+                    .into());
+            };
+            staging.put(&authenticated)?;
+            let applied = self.apply_authenticated(authenticated)?;
             if nano_chainstate::starts_new_tenure(&block) {
                 tenure_starts += 1;
             }

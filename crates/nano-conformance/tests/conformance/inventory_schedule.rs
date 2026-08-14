@@ -316,7 +316,9 @@ async fn an_existing_staged_gap_is_closed_before_forward_scheduling_exhausts_the
         "the fixture does not contain the staged suffix"
     );
     for block in &upper {
-        staging.put(block).expect("stage the suffix above the gap");
+        staging
+            .download(block)
+            .expect("stage the suffix above the gap");
     }
 
     // One block per descent answer makes closing the two-block gap consume exactly

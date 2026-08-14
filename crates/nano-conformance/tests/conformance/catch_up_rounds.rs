@@ -20,6 +20,8 @@
 //!   rounds, so the tip a round started from is stale before it finishes;
 //! - a **restart at every chunk boundary**, reaching the same sealed root,
 //!   executed tip and accounting as a run that was never interrupted;
+//! - an **unsigned same-ID representation** is evicted, then the finalized
+//!   representation is fetched and executed after another restart;
 //! - **monotonicity**, explicitly: the executed height never decreases, and the
 //!   number of blocks executed across every round equals the height the chain
 //!   advanced — so a block that was sealed and executed again would be counted.
@@ -109,7 +111,11 @@ impl Progress {
 fn staged_chain(staging: &Staging, chain: &[NakamotoBlock]) -> Vec<(u64, StacksBlockId)> {
     let staged = chain
         .iter()
-        .filter(|block| staging.holds(block.block_id()).expect("staging answers"))
+        .filter(|block| {
+            staging
+                .has_representation(block.block_id())
+                .expect("staging answers")
+        })
         .map(|block| (block.header.chain_length, block.block_id()))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -550,6 +556,84 @@ fn assert_only_unexecuted_blocks_are_staged(staged: &[(u64, StacksBlockId)], exe
         staged.iter().all(|(height, _)| *height > executed_height),
         "staging retained a block at or below the sealed tip: {staged:?}"
     );
+}
+
+#[tokio::test]
+async fn an_unsigned_same_id_download_cannot_hide_the_finalized_block_after_restart() {
+    let policy = Policy::default();
+    let chain = captured_chain();
+    let boundary = fixture_boundary_blocks(&chain);
+    let blocks = chain[..boundary + ONE_TENURE].to_vec();
+    let target = blocks.last().expect("a peer tip").header.chain_length;
+    let (client, task) =
+        serve(Served::honest(blocks.clone(), snapshots()).under(policy.clone())).await;
+    let directory = tempfile::tempdir().expect("a directory");
+    let staging_path = directory.path().join("staging.sqlite");
+    let burnchain = MovableBurnchain::new(captured_burnchain());
+    let (mut executor, _) = node(directory.path(), burnchain.clone());
+    let anchor = executor.tip().block_id();
+    let finalized = blocks
+        .iter()
+        .find(|block| block.header.parent_block_id == anchor)
+        .expect("the peer has the finalized child")
+        .clone();
+    assert!(!finalized.header.signer_signatures.is_empty());
+    let mut unsigned = finalized.clone();
+    unsigned.header.signer_signatures.clear();
+    assert_eq!(unsigned.block_id(), finalized.block_id());
+
+    {
+        let staging = Staging::open(&staging_path).expect("staging opens");
+        staging
+            .download(&unsigned)
+            .expect("persist the historical unsigned representation");
+    }
+    let staging = Staging::open(&staging_path).expect("restart with the unsigned representation");
+    let mut history = TenureSource::only(client.clone());
+    let budget = CatchUpBudget {
+        fetch: 64,
+        execute: 64,
+    };
+    policy.refusing.store(true, Ordering::SeqCst);
+    let refused = executor
+        .catch_up(&client, &mut history, &pox(), &staging, budget, &[])
+        .await
+        .expect_err("the unsigned representation has no signer threshold");
+    assert!(
+        refused.to_string().contains("signer"),
+        "the local authentication boundary refused it for another reason: {refused}"
+    );
+    assert_eq!(executor.tip().block_id(), anchor);
+    assert!(
+        !staging
+            .has_representation(finalized.block_id())
+            .expect("inspect rejected representation"),
+        "rejected bytes still hide the same-ID finalized block"
+    );
+
+    drop(executor);
+    drop(staging);
+    policy.refusing.store(false, Ordering::SeqCst);
+    let mut executor = resumed(directory.path(), &chain, burnchain);
+    let staging = Staging::open(&staging_path).expect("restart after rejection");
+    let client = SyncClient::new(client.base_url().clone()).expect("restart peer client");
+    let mut history = TenureSource::only(client.clone());
+    for round in 0..ROUND_LIMIT {
+        executor
+            .catch_up(&client, &mut history, &pox(), &staging, budget, &[])
+            .await
+            .unwrap_or_else(|error| panic!("round {round} failed: {error}"));
+        if executor.tip().header.chain_length == target {
+            break;
+        }
+    }
+    assert_eq!(executor.tip().header.chain_length, target);
+    assert_eq!(
+        executor.tip().block_id(),
+        blocks.last().expect("peer tip").block_id()
+    );
+    assert!(staging.is_empty().expect("staging count"));
+    task.abort();
 }
 
 /// A whole round of 429s ends successfully, and the next round carries on.
