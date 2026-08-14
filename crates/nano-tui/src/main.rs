@@ -66,6 +66,7 @@ enum Source {
     Pox,
     Tenure,
     Sortitions,
+    Metrics,
 }
 
 #[derive(Default)]
@@ -131,6 +132,7 @@ struct Sources {
     tenure: SourceState,
     sortitions: SourceState,
     blocks: SourceState,
+    metrics: SourceState,
 }
 
 impl Sources {
@@ -141,6 +143,7 @@ impl Sources {
             Source::Pox => &mut self.pox,
             Source::Tenure => &mut self.tenure,
             Source::Sortitions => &mut self.sortitions,
+            Source::Metrics => &mut self.metrics,
         }
     }
 
@@ -173,6 +176,7 @@ enum PollUpdate {
     Pox(Result<node::Pox, String>),
     Tenure(Result<node::TenureInfo, String>),
     Sortitions(Result<Vec<Sortition>, String>),
+    Metrics(Result<node::Metrics, String>),
 }
 
 struct Poller {
@@ -220,6 +224,10 @@ fn poll_routes(node: &Node, updates: &Sender<PollUpdate>) {
     ] {
         let _ = updates.send(PollUpdate::Started(source));
     }
+    let poll_metrics = node.metrics_url().is_some();
+    if poll_metrics {
+        let _ = updates.send(PollUpdate::Started(Source::Metrics));
+    }
     thread::scope(|scope| {
         let send = updates.clone();
         let sync_node = node.clone();
@@ -246,6 +254,13 @@ fn poll_routes(node: &Node, updates: &Sender<PollUpdate>) {
         scope.spawn(move || {
             let _ = send.send(PollUpdate::Sortitions(sortitions_node.sortitions()));
         });
+        if poll_metrics {
+            let send = updates.clone();
+            let metrics_node = node.clone();
+            scope.spawn(move || {
+                let _ = send.send(PollUpdate::Metrics(metrics_node.metrics()));
+            });
+        }
     });
 }
 
@@ -387,10 +402,8 @@ fn main() -> ExitCode {
 
 fn try_main() -> io::Result<ExitCode> {
     let args = Args::parse();
-    // Parsed now so task 127 can consume one validated URL without changing the
-    // command-line contract established here.
-    drop(args.metrics_url);
-    let node = Node::new(args.rpc_url.as_str());
+    let node = Node::new(args.rpc_url.as_str())
+        .with_metrics_url(args.metrics_url.as_ref().map(Url::as_str));
     // One frame as text, for a check that does not need a terminal at all: the same
     // draw against the same node, rendered into a buffer instead of onto a screen.
     if args.once {
@@ -507,6 +520,9 @@ struct State {
     operations_scroll: u16,
     sources: Sources,
     sync_baseline: Option<SyncStatus>,
+    metrics: Option<node::Metrics>,
+    metrics_baseline: Option<node::Metrics>,
+    metrics_enabled: bool,
     requested_tip: Option<String>,
     block_generation: u64,
     backfill_inserted: usize,
@@ -517,6 +533,7 @@ impl State {
         match update {
             PollUpdate::Started(source) => {
                 self.sources.get_mut(source).started();
+                self.metrics_enabled |= matches!(source, Source::Metrics);
                 return None;
             }
             PollUpdate::Sync(result) => {
@@ -542,6 +559,12 @@ impl State {
                 }
                 Err(error) => self.sources.sortitions.failed(&error),
             },
+            PollUpdate::Metrics(result) => {
+                if self.metrics_baseline.is_none() {
+                    self.metrics_baseline = result.as_ref().ok().cloned();
+                }
+                apply_reading(&mut self.metrics, &mut self.sources.metrics, result);
+            }
         }
 
         let (Some(height), Some(tip)) = (
@@ -1382,6 +1405,14 @@ fn operations_lines(state: &State) -> Vec<Line<'static>> {
                 baseline.and_then(|sync| sync.relay_dropped),
             ),
         ),
+    ];
+    lines.extend(observer_lines(sync, baseline));
+    lines.extend(metrics_lines(state));
+    lines
+}
+
+fn observer_lines(sync: Option<&SyncStatus>, baseline: Option<&SyncStatus>) -> Vec<Line<'static>> {
+    let mut lines = vec![
         Line::default(),
         Line::from(Span::styled(
             "event observers",
@@ -1423,6 +1454,175 @@ fn operations_lines(state: &State) -> Vec<Line<'static>> {
     lines
 }
 
+fn metrics_lines(state: &State) -> Vec<Line<'static>> {
+    let status = if state.metrics_enabled {
+        state.sources.metrics.description()
+    } else {
+        "not configured · pass --metrics-url for local diagnostics".to_owned()
+    };
+    let mut lines = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            "optional metrics",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        detail("metrics data", status),
+    ];
+    let Some(metrics) = state.metrics.as_ref() else {
+        return lines;
+    };
+    let opened = state.metrics_baseline.as_ref();
+    lines.extend(peer_metrics_lines(metrics));
+    lines.extend(counter_metrics_lines(metrics, opened));
+    lines.extend(execution_metrics_lines(metrics, opened));
+    lines.extend(cache_metrics_lines(metrics));
+    lines
+}
+
+fn peer_metrics_lines(metrics: &node::Metrics) -> [Line<'static>; 4] {
+    [
+        detail("follower peers", metric_current(metrics.serving_followers)),
+        detail(
+            "proposal peers",
+            metric_current(metrics.serving_proposal_validators),
+        ),
+        detail(
+            "StackerDB peers",
+            metric_current(metrics.serving_stackerdb_replicas),
+        ),
+        detail("mempool now", metric_current(metrics.mempool_transactions)),
+    ]
+}
+
+fn counter_metrics_lines(
+    metrics: &node::Metrics,
+    opened: Option<&node::Metrics>,
+) -> [Line<'static>; 10] {
+    [
+        detail(
+            "refusals",
+            metric_change(
+                metrics.refusal_total(),
+                opened.and_then(node::Metrics::refusal_total),
+            ),
+        ),
+        detail(
+            "  compiler gap",
+            metric_change(
+                metrics.refusal_compiler_gap,
+                opened.and_then(|metrics| metrics.refusal_compiler_gap),
+            ),
+        ),
+        detail(
+            "  root mismatch",
+            metric_change(
+                metrics.refusal_root_mismatch,
+                opened.and_then(|metrics| metrics.refusal_root_mismatch),
+            ),
+        ),
+        detail(
+            "  signature",
+            metric_change(
+                metrics.refusal_signature,
+                opened.and_then(|metrics| metrics.refusal_signature),
+            ),
+        ),
+        detail(
+            "  missing context",
+            metric_change(
+                metrics.refusal_missing_context,
+                opened.and_then(|metrics| metrics.refusal_missing_context),
+            ),
+        ),
+        detail(
+            "  other",
+            metric_change(
+                metrics.refusal_other,
+                opened.and_then(|metrics| metrics.refusal_other),
+            ),
+        ),
+        detail(
+            "sync unanswered",
+            metric_change(
+                metrics.sync_rounds_unanswered,
+                opened.and_then(|metrics| metrics.sync_rounds_unanswered),
+            ),
+        ),
+        detail(
+            "StackerDB unanswered",
+            metric_change(
+                metrics.stackerdb_rounds_unanswered,
+                opened.and_then(|metrics| metrics.stackerdb_rounds_unanswered),
+            ),
+        ),
+        detail(
+            "peer failovers",
+            metric_change(
+                metrics.peer_failovers,
+                opened.and_then(|metrics| metrics.peer_failovers),
+            ),
+        ),
+        detail(
+            "push refusals",
+            metric_change(
+                metrics.pushed_blocks_refused,
+                opened.and_then(|metrics| metrics.pushed_blocks_refused),
+            ),
+        ),
+    ]
+}
+
+fn execution_metrics_lines(
+    metrics: &node::Metrics,
+    opened: Option<&node::Metrics>,
+) -> [Line<'static>; 7] {
+    [
+        detail(
+            "last block txs",
+            metric_current(metrics.last_block_transactions),
+        ),
+        detail("block execution", execution_average(metrics, opened)),
+        detail(
+            "last read count",
+            metric_percent(metrics.last_block_read_count),
+        ),
+        detail(
+            "last read bytes",
+            metric_percent(metrics.last_block_read_length),
+        ),
+        detail(
+            "last write count",
+            metric_percent(metrics.last_block_write_count),
+        ),
+        detail(
+            "last write bytes",
+            metric_percent(metrics.last_block_write_length),
+        ),
+        detail("last runtime", metric_percent(metrics.last_block_runtime)),
+    ]
+}
+
+fn cache_metrics_lines(metrics: &node::Metrics) -> [Line<'static>; 5] {
+    [
+        detail("cache memory", metric_bytes(metrics.cache_bytes())),
+        detail("  MARF nodes", metric_bytes(metrics.marf_node_cache_bytes)),
+        detail(
+            "  MARF auxiliary",
+            metric_bytes(metrics.marf_auxiliary_cache_bytes),
+        ),
+        detail(
+            "  Clarity values",
+            metric_bytes(metrics.clarity_value_cache_bytes),
+        ),
+        detail(
+            "  Wasm modules",
+            metric_bytes(metrics.wasm_module_cache_bytes),
+        ),
+    ]
+}
+
 fn current_count(value: Option<u64>) -> String {
     value.map_or_else(|| "unavailable".to_owned(), thousands)
 }
@@ -1437,6 +1637,77 @@ fn counter_change(current: Option<u64>, opened: Option<u64>) -> String {
             )
         },
     )
+}
+
+fn metric_current(value: Option<f64>) -> String {
+    value.map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.0}"))
+}
+
+fn metric_change(current: Option<f64>, opened: Option<f64>) -> String {
+    current.zip(opened).map_or_else(
+        || "unavailable".to_owned(),
+        |(current, opened)| {
+            if current >= opened {
+                format!("+{:.0} since opened", current - opened)
+            } else {
+                format!("{current:.0} now · counter reset since opened")
+            }
+        },
+    )
+}
+
+fn metric_percent(value: Option<f64>) -> String {
+    value.map_or_else(
+        || "unavailable".to_owned(),
+        |value| format!("{:.1}% of block limit", value * 100.0),
+    )
+}
+
+fn metric_bytes(value: Option<f64>) -> String {
+    value.map_or_else(
+        || "unavailable".to_owned(),
+        |bytes| {
+            const KIB: f64 = 1024.0;
+            const MIB: f64 = KIB * 1024.0;
+            const GIB: f64 = MIB * 1024.0;
+            if bytes >= GIB {
+                format!("{:.1} GiB current", bytes / GIB)
+            } else if bytes >= MIB {
+                format!("{:.1} MiB current", bytes / MIB)
+            } else if bytes >= KIB {
+                format!("{:.1} KiB current", bytes / KIB)
+            } else {
+                format!("{bytes:.0} B current")
+            }
+        },
+    )
+}
+
+fn execution_average(metrics: &node::Metrics, opened: Option<&node::Metrics>) -> String {
+    let Some((sum, count, opened_sum, opened_count)) = metrics
+        .block_execution_seconds_sum
+        .zip(metrics.block_execution_seconds_count)
+        .zip(opened.and_then(|metrics| {
+            metrics
+                .block_execution_seconds_sum
+                .zip(metrics.block_execution_seconds_count)
+        }))
+        .map(|((sum, count), (opened_sum, opened_count))| (sum, count, opened_sum, opened_count))
+    else {
+        return "unavailable".to_owned();
+    };
+    if sum < opened_sum || count < opened_count {
+        return "counter reset since opened".to_owned();
+    }
+    let observed = count - opened_count;
+    if observed == 0.0 {
+        "no blocks observed since opened".to_owned()
+    } else {
+        format!(
+            "{:.3}s average · {observed:.0} blocks since opened",
+            (sum - opened_sum) / observed
+        )
+    }
 }
 
 fn draw_tenure(frame: &mut Frame, area: Rect, state: &State) {
@@ -2523,6 +2794,24 @@ mod tests {
     }
 
     #[test]
+    fn missing_optional_metrics_do_not_degrade_a_responsive_rpc() {
+        let mut state = State::default();
+        state.apply_poll(PollUpdate::Started(Source::Metrics));
+        state.apply_poll(PollUpdate::Metrics(Err("connection refused".to_owned())));
+        state.apply_poll(PollUpdate::Info(Ok(node::NodeInfo::default())));
+
+        assert!(!state.sources.unreachable());
+        assert!(!state.sources.degraded());
+        assert!(
+            state
+                .sources
+                .metrics
+                .description()
+                .contains("connection refused")
+        );
+    }
+
+    #[test]
     fn incremental_backfill_keeps_newest_first_and_the_cursor_on_its_block() {
         let mut state = State::default();
         state.blocks.push(block("old", "older", 40));
@@ -2665,6 +2954,49 @@ mod tests {
 
         handle_key(&mut state, KeyCode::Esc);
         assert_eq!(state.screen, Screen::Blocks);
+    }
+
+    #[test]
+    fn operations_show_current_metric_gauges_and_session_deltas() {
+        let mut state = dashboard_state();
+        state.screen = Screen::Operations;
+        state.metrics_enabled = true;
+        state.sources.metrics.succeeded();
+        state.metrics_baseline = Some(node::Metrics {
+            refusal_signature: Some(10.0),
+            peer_failovers: Some(2.0),
+            block_execution_seconds_sum: Some(1.0),
+            block_execution_seconds_count: Some(2.0),
+            ..node::Metrics::default()
+        });
+        state.metrics = Some(node::Metrics {
+            refusal_signature: Some(12.0),
+            peer_failovers: Some(3.0),
+            serving_followers: Some(4.0),
+            serving_proposal_validators: Some(2.0),
+            serving_stackerdb_replicas: Some(3.0),
+            mempool_transactions: Some(7.0),
+            last_block_transactions: Some(5.0),
+            last_block_runtime: Some(0.25),
+            block_execution_seconds_sum: Some(1.6),
+            block_execution_seconds_count: Some(4.0),
+            marf_node_cache_bytes: Some(1024.0),
+            marf_auxiliary_cache_bytes: Some(1024.0),
+            clarity_value_cache_bytes: Some(1024.0),
+            wasm_module_cache_bytes: Some(1024.0),
+            ..node::Metrics::default()
+        });
+
+        let rendered = render_at(&mut state, 110, 70);
+
+        assert!(rendered.contains("metrics data      fresh 0s ago"));
+        assert!(rendered.contains("proposal peers    2"));
+        assert!(rendered.contains("StackerDB peers   3"));
+        assert!(rendered.contains("refusals          +2 since opened"));
+        assert!(rendered.contains("peer failovers    +1 since opened"));
+        assert!(rendered.contains("0.300s average · 2 blocks since opened"));
+        assert!(rendered.contains("25.0% of block limit"));
+        assert!(rendered.contains("cache memory      4.0 KiB current"));
     }
 
     #[test]

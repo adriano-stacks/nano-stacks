@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use prometheus_parse::{Scrape, Value};
 use serde::Deserialize;
 
 /// How long any one request may take.
@@ -55,6 +56,154 @@ pub struct ObserverStatus {
     pub dropped: u64,
     pub undelivered: u64,
     pub reachable: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Metrics {
+    pub refusal_compiler_gap: Option<f64>,
+    pub refusal_root_mismatch: Option<f64>,
+    pub refusal_signature: Option<f64>,
+    pub refusal_missing_context: Option<f64>,
+    pub refusal_other: Option<f64>,
+    pub peer_failovers: Option<f64>,
+    pub sync_rounds_unanswered: Option<f64>,
+    pub stackerdb_rounds_unanswered: Option<f64>,
+    pub pushed_blocks_refused: Option<f64>,
+    pub serving_followers: Option<f64>,
+    pub serving_proposal_validators: Option<f64>,
+    pub serving_stackerdb_replicas: Option<f64>,
+    pub last_sealed_timestamp_seconds: Option<f64>,
+    pub mempool_transactions: Option<f64>,
+    pub last_block_transactions: Option<f64>,
+    pub last_block_read_count: Option<f64>,
+    pub last_block_read_length: Option<f64>,
+    pub last_block_write_count: Option<f64>,
+    pub last_block_write_length: Option<f64>,
+    pub last_block_runtime: Option<f64>,
+    pub block_execution_seconds_sum: Option<f64>,
+    pub block_execution_seconds_count: Option<f64>,
+    pub marf_node_cache_bytes: Option<f64>,
+    pub marf_auxiliary_cache_bytes: Option<f64>,
+    pub clarity_value_cache_bytes: Option<f64>,
+    pub wasm_module_cache_bytes: Option<f64>,
+}
+
+impl Metrics {
+    fn parse(body: &str) -> Result<Self, String> {
+        let scrape = Scrape::parse(body.lines().map(|line| Ok(line.to_owned())))
+            .map_err(|error| format!("metrics: {error}"))?;
+        let mut metrics = Self::default();
+        let mut found = false;
+        for sample in scrape.samples {
+            let Some(value) = scalar(&sample.value) else {
+                continue;
+            };
+            found |= sample.metric.starts_with("nano_");
+            match sample.metric.as_str() {
+                "nano_block_refusals_total" => match sample.labels.get("reason") {
+                    Some("compiler_gap") => metrics.refusal_compiler_gap = Some(value),
+                    Some("root_mismatch") => metrics.refusal_root_mismatch = Some(value),
+                    Some("signature") => metrics.refusal_signature = Some(value),
+                    Some("missing_context") => metrics.refusal_missing_context = Some(value),
+                    Some("other") => metrics.refusal_other = Some(value),
+                    _ => {}
+                },
+                "nano_peer_failovers_total" => metrics.peer_failovers = Some(value),
+                "nano_sync_rounds_unanswered_total" => {
+                    metrics.sync_rounds_unanswered = Some(value);
+                }
+                "nano_stackerdb_rounds_unanswered_total" => {
+                    metrics.stackerdb_rounds_unanswered = Some(value);
+                }
+                "nano_pushed_blocks_refused_total" => {
+                    metrics.pushed_blocks_refused = Some(value);
+                }
+                "nano_serving_peers" => match sample.labels.get("role") {
+                    Some("follower") => metrics.serving_followers = Some(value),
+                    Some("proposal_validator") => {
+                        metrics.serving_proposal_validators = Some(value);
+                    }
+                    Some("stackerdb_replication") => {
+                        metrics.serving_stackerdb_replicas = Some(value);
+                    }
+                    _ => {}
+                },
+                "nano_last_sealed_timestamp_seconds" => {
+                    metrics.last_sealed_timestamp_seconds = Some(value);
+                }
+                "nano_mempool_transactions" => metrics.mempool_transactions = Some(value),
+                "nano_last_block_transaction_count" => {
+                    metrics.last_block_transactions = Some(value);
+                }
+                "nano_last_block_read_count" => metrics.last_block_read_count = Some(value),
+                "nano_last_block_read_length" => metrics.last_block_read_length = Some(value),
+                "nano_last_block_write_count" => metrics.last_block_write_count = Some(value),
+                "nano_last_block_write_length" => metrics.last_block_write_length = Some(value),
+                "nano_last_block_runtime" => metrics.last_block_runtime = Some(value),
+                "nano_block_execution_seconds_sum" => {
+                    metrics.block_execution_seconds_sum = Some(value);
+                }
+                "nano_block_execution_seconds_count" => {
+                    metrics.block_execution_seconds_count = Some(value);
+                }
+                "nano_marf_node_cache_bytes" => metrics.marf_node_cache_bytes = Some(value),
+                "nano_marf_auxiliary_cache_bytes" => {
+                    metrics.marf_auxiliary_cache_bytes = Some(value);
+                }
+                "nano_clarity_value_cache_bytes" => {
+                    metrics.clarity_value_cache_bytes = Some(value);
+                }
+                "nano_wasm_module_cache_bytes" => metrics.wasm_module_cache_bytes = Some(value),
+                _ => {}
+            }
+        }
+        if found {
+            Ok(metrics)
+        } else {
+            Err("metrics: endpoint contains no nano metrics".to_owned())
+        }
+    }
+
+    pub fn refusal_total(&self) -> Option<f64> {
+        sum_present([
+            self.refusal_compiler_gap,
+            self.refusal_root_mismatch,
+            self.refusal_signature,
+            self.refusal_missing_context,
+            self.refusal_other,
+        ])
+    }
+
+    pub fn cache_bytes(&self) -> Option<f64> {
+        sum_present([
+            self.marf_node_cache_bytes,
+            self.marf_auxiliary_cache_bytes,
+            self.clarity_value_cache_bytes,
+            self.wasm_module_cache_bytes,
+        ])
+    }
+}
+
+fn scalar(value: &Value) -> Option<f64> {
+    match value {
+        Value::Counter(value) | Value::Gauge(value) | Value::Untyped(value)
+            if value.is_finite() && *value >= 0.0 =>
+        {
+            Some(*value)
+        }
+        Value::Counter(_)
+        | Value::Gauge(_)
+        | Value::Untyped(_)
+        | Value::Histogram(_)
+        | Value::Summary(_) => None,
+    }
+}
+
+fn sum_present<const N: usize>(values: [Option<f64>; N]) -> Option<f64> {
+    values
+        .into_iter()
+        .flatten()
+        .reduce(|total, value| total + value)
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -205,6 +354,7 @@ pub struct TenureChange {
 #[derive(Clone)]
 pub struct Node {
     url: String,
+    metrics_url: Option<String>,
     agent: ureq::Agent,
 }
 
@@ -212,6 +362,7 @@ impl Node {
     pub fn new(url: &str) -> Self {
         Self {
             url: url.trim_end_matches('/').to_owned(),
+            metrics_url: None,
             agent: ureq::AgentBuilder::new()
                 .timeout(TIMEOUT)
                 .user_agent("nano-tui")
@@ -221,6 +372,30 @@ impl Node {
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    #[must_use]
+    pub fn with_metrics_url(mut self, url: Option<&str>) -> Self {
+        self.metrics_url = url.map(str::to_owned);
+        self
+    }
+
+    pub fn metrics_url(&self) -> Option<&str> {
+        self.metrics_url.as_deref()
+    }
+
+    pub fn metrics(&self) -> Result<Metrics, String> {
+        let url = self
+            .metrics_url()
+            .ok_or_else(|| "metrics: no endpoint configured".to_owned())?;
+        let body = self
+            .agent
+            .get(url)
+            .call()
+            .map_err(|error| format!("metrics: {error}"))?
+            .into_string()
+            .map_err(|error| format!("metrics: {error}"))?;
+        Metrics::parse(&body)
     }
 
     fn json<T: for<'a> Deserialize<'a>>(&self, route: &str) -> Result<T, String> {
@@ -590,7 +765,41 @@ fn memo_text(memo: &[u8; 34]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clarity_value, decode, memo_text};
+    use super::{Metrics, clarity_value, decode, memo_text};
+
+    #[test]
+    fn metrics_keep_labels_counters_gauges_and_execution_samples() {
+        let metrics = Metrics::parse(
+            r#"
+# TYPE nano_block_refusals counter
+nano_block_refusals_total{reason="signature"} 3
+# TYPE nano_serving_peers gauge
+nano_serving_peers{role="proposal_validator"} 2
+# TYPE nano_last_sealed_timestamp_seconds gauge
+nano_last_sealed_timestamp_seconds 1786310400
+# TYPE nano_last_block_runtime gauge
+nano_last_block_runtime 0.125
+# TYPE nano_block_execution_seconds histogram
+nano_block_execution_seconds_sum 0.75
+nano_block_execution_seconds_count 3
+"#,
+        )
+        .expect("nano metrics");
+
+        assert_eq!(metrics.refusal_signature, Some(3.0));
+        assert_eq!(metrics.refusal_total(), Some(3.0));
+        assert_eq!(metrics.serving_proposal_validators, Some(2.0));
+        assert_eq!(metrics.last_sealed_timestamp_seconds, Some(1_786_310_400.0));
+        assert_eq!(metrics.last_block_runtime, Some(0.125));
+        assert_eq!(metrics.block_execution_seconds_sum, Some(0.75));
+        assert_eq!(metrics.block_execution_seconds_count, Some(3.0));
+    }
+
+    #[test]
+    fn a_different_prometheus_endpoint_is_not_mistaken_for_the_node() {
+        let error = Metrics::parse("process_cpu_seconds_total 1\n").expect_err("not nano");
+        assert!(error.contains("no nano metrics"));
+    }
 
     #[test]
     fn clarity_arguments_are_human_readable() {

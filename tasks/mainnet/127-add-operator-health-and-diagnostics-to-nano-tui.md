@@ -34,11 +34,11 @@ This is delivery slice 2 from task 125's usability study.
       unreachable states from named evidence and freshness.
 - [ ] Put health, reason, last-sealed age, lag, network and local roles in the
       persistent header.
-- [ ] Add an Operations view for staged work, relay and role queues, peers,
+- [x] Add an Operations view for staged work, relay and role queues, peers,
       StackerDB/proposal coverage and event-observer delivery.
-- [ ] Optionally poll the metrics URL for refusals, unanswered rounds, failovers,
+- [x] Optionally poll the metrics URL for refusals, unanswered rounds, failovers,
       mempool, last-block execution/cost and cache memory.
-- [ ] Render counters as changes or rates since the TUI opened and gauges as
+- [x] Render counters as changes or rates since the TUI opened and gauges as
       current state; never alert on an unexplained lifetime total.
 - [ ] Show the facts used by every derived status and make missing optional
       metrics explicit without degrading RPC health.
