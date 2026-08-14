@@ -1,7 +1,7 @@
 ---
 id: "131"
 title: "Make executable block authentication a typed storage invariant"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 dependencies: ["079"]
@@ -10,6 +10,7 @@ created_at: 2026-08-14
 parent: 053
 type: bug
 touches: ["crates/nano-chainstate", "crates/nano-node", "crates/nano-conformance"]
+completed_at: 2026-08-14
 ---
 
 # Make executable block authentication a typed storage invariant
@@ -23,21 +24,21 @@ every current and future caller to preserve the routing convention.
 
 ## Tasks
 
-- [ ] Introduce distinct `ProposedBlock`, `AuthenticatedBlock`, `ExecutedBlock`
+- [x] Introduce distinct `ProposedBlock`, `AuthenticatedBlock`, `ExecutedBlock`
       and `CommittedBlock` types with private constructors at their validation
       transitions.
-- [ ] Make the durable staging API accept only `AuthenticatedBlock`; proposal
+- [x] Make the durable staging API accept only `AuthenticatedBlock`; proposal
       validation must use a physically separate ephemeral channel or store.
-- [ ] Normalize staged block core bytes and signer certificates. A block ID may
+- [x] Normalize staged block core bytes and signer certificates. A block ID may
       have multiple valid signer representations, but no unsigned representation
       may satisfy the executable-block query.
-- [ ] Replace unconditional `INSERT OR REPLACE` with explicit identical-value,
+- [x] Replace unconditional `INSERT OR REPLACE` with explicit identical-value,
       additional-certificate and representation-conflict handling.
-- [ ] On startup, detect old unsigned or incoherent staged rows and fail closed
+- [x] On startup, detect old unsigned or incoherent staged rows and fail closed
       or quarantine them before fork selection.
-- [ ] Route P2P fetch, block upload, signer finalization, restart recovery and
+- [x] Route P2P fetch, block upload, signer finalization, restart recovery and
       fork switching through the same authenticated constructor.
-- [ ] Reproduce task 122's same-ID unsigned/finalized incident, including
+- [x] Reproduce task 122's same-ID unsigned/finalized incident, including
       multiple independently valid signature subsets and restart at each step.
 
 ## Acceptance Criteria
