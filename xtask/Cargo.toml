@@ -25,6 +25,7 @@ nano-sync = { path = "../crates/nano-sync" }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
+nano-sortition = { path = "../crates/nano-sortition" }
 tempfile = "3"
 
 [lints]

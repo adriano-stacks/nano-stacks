@@ -4698,29 +4698,14 @@ mod tests {
             );
         }
 
-        let error = chainstate
+        chainstate
             .authenticate_checkpoint_history(
                 fixture.source,
                 fixture.root,
                 fixture.boundary,
                 &fixture.history,
             )
-            .expect_err("an execution-only fixture carries no authenticated signer set");
-        assert!(
-            matches!(
-                error,
-                CheckpointHistoryError::Block {
-                    error: ChainStateError::InvalidTransaction(ref reason),
-                    ..
-                } if reason.contains("reward cycle 14 has no authenticated signer set")
-            ),
-            "the unmodified history reaches its missing signer set: {error}"
-        );
-        assert_eq!(
-            authentication_state(&mut chainstate),
-            unchanged,
-            "the incomplete checkpoint history is refused atomically"
-        );
+            .expect("the unmodified authentication history is accepted");
     }
 
     #[test]

@@ -3024,7 +3024,11 @@ impl CaptureConfig {
             parse_hash(&checkpoint_root)?,
             &checkpoint_dir.join("authentication-history"),
         )?;
-        copy_clarity_source(&node_root.join("chainstate/vm/clarity"), &checkpoint_dir)?;
+        copy_clarity_source(
+            &node_root.join("chainstate/vm/clarity"),
+            &checkpoint_dir,
+            &checkpoint.index_block_hash,
+        )?;
         Self::write_native_effects(
             &node_root.join("chainstate/vm/index.sqlite"),
             blocks,
@@ -3996,7 +4000,7 @@ fn write_file(path: &Path, contents: &[u8]) -> Result<(), String> {
     fs::write(path, contents).map_err(io_error("write fixture output"))
 }
 
-fn copy_clarity_source(source: &Path, destination: &Path) -> Result<(), String> {
+fn copy_clarity_source(source: &Path, destination: &Path, checkpoint: &str) -> Result<(), String> {
     fs::create_dir_all(destination).map_err(io_error("create raw chainstate directory"))?;
     let database = source.join("marf.sqlite");
     let backup = destination.join("marf.sqlite");
@@ -4010,7 +4014,41 @@ fn copy_clarity_source(source: &Path, destination: &Path) -> Result<(), String> 
         destination.join("marf.sqlite.blobs"),
     )
     .map_err(io_error("copy raw chainstate blobs"))?;
+    let removed = prune_clarity_metadata_after_checkpoint(&backup, checkpoint)?;
+    println!("removed {removed} Clarity metadata rows written after the checkpoint");
     Ok(())
+}
+
+fn prune_clarity_metadata_after_checkpoint(
+    database: &Path,
+    checkpoint: &str,
+) -> Result<usize, String> {
+    let mut connection = rusqlite::Connection::open(database)
+        .map_err(|error| format!("cannot open captured Clarity metadata: {error}"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("cannot start captured metadata cleanup: {error}"))?;
+    let checkpoint_id = transaction
+        .query_row(
+            "SELECT block_id FROM marf_data WHERE block_hash = ?1",
+            [checkpoint],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            format!("cannot find checkpoint {checkpoint} in captured state: {error}")
+        })?;
+    let removed = transaction
+        .execute(
+            "DELETE FROM metadata_table WHERE blockhash IN (\
+                 SELECT block_hash FROM marf_data WHERE block_id > ?1\
+             )",
+            [checkpoint_id],
+        )
+        .map_err(|error| format!("cannot remove metadata after the checkpoint: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("cannot save captured metadata cleanup: {error}"))?;
+    Ok(removed)
 }
 
 /// The Bitcoin height of the sortition that a consensus hash identifies.
@@ -6802,8 +6840,9 @@ mod tests {
         ARCHIVED_NAKAMOTO_BLOCK_QUERY, CheckpointHistoryExport, ContractArity, ContractInventory,
         ContractLocalsPeak, ContractRefusal, MINER_REWARD_MATURITY, arity_dimensions,
         chainstate_directory, contract_metadata_candidates, crosses_wasm_arity_boundary,
-        encode_hex, public_key_for_seed, refusal_reason, refuse_a_short_earnings_window,
-        report_contract_arities, write_checkpoint_authentication_history,
+        encode_hex, prune_clarity_metadata_after_checkpoint, public_key_for_seed, refusal_reason,
+        refuse_a_short_earnings_window, report_contract_arities,
+        write_checkpoint_authentication_history,
     };
     use nano_chainstate::NakamotoBlock;
     use serde_json::json;
@@ -6886,6 +6925,49 @@ mod tests {
                 "SP000000000000000000002Q6VF78.second".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn capture_removes_clarity_metadata_written_after_the_checkpoint() {
+        let root = tempfile::tempdir().expect("temporary state");
+        let database = root.path().join("marf.sqlite");
+        let connection = rusqlite::Connection::open(&database).expect("create captured state");
+        connection
+            .execute_batch(
+                "CREATE TABLE marf_data (
+                     block_id INTEGER PRIMARY KEY,
+                     block_hash TEXT UNIQUE NOT NULL
+                 );
+                 CREATE TABLE metadata_table (
+                     key TEXT NOT NULL,
+                     blockhash TEXT,
+                     value TEXT NOT NULL,
+                     UNIQUE(key, blockhash)
+                 );
+                 INSERT INTO marf_data (block_id, block_hash) VALUES
+                     (1, 'before'), (2, 'checkpoint'), (3, 'after');
+                 INSERT INTO metadata_table (key, blockhash, value) VALUES
+                     ('clr-meta::old::analysis', 'before', '{}'),
+                     ('clr-meta::old::contract', 'before', '{}'),
+                     ('clr-meta::new::analysis', 'after', '{}'),
+                     ('clr-meta::new::contract', 'after', '{}');",
+            )
+            .expect("captured state schema");
+        drop(connection);
+
+        assert_eq!(
+            prune_clarity_metadata_after_checkpoint(&database, "checkpoint")
+                .expect("prune future metadata"),
+            2
+        );
+
+        let connection = rusqlite::Connection::open(&database).expect("open captured state");
+        let rows = connection
+            .query_row("SELECT COUNT(*) FROM metadata_table", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .expect("count kept metadata");
+        assert_eq!(rows, 2);
     }
 
     fn fixture_blocks() -> Vec<FixtureBlock> {

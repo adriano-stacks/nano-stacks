@@ -5718,6 +5718,7 @@ dependencies = [
  "nano-node",
  "nano-oracle",
  "nano-primitives",
+ "nano-sortition",
  "nano-sync",
  "nano-vm",
  "rusqlite",

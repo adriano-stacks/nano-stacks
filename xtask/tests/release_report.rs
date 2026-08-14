@@ -35,21 +35,58 @@ fn tamper_one_receipt(fixtures: &Path) {
 }
 
 fn make_checkpoint_winner_absent(fixtures: &Path) {
-    let history: serde_json::Value = serde_json::from_slice(
+    let mut history: serde_json::Value = serde_json::from_slice(
         &fs::read(fixtures.join("sortition/consensus-hashes.json"))
             .expect("read captured consensus history"),
     )
     .expect("captured consensus history JSON");
-    let seed_consensus_hash = history["hashes"]
-        .as_array()
-        .and_then(|hashes| hashes.last())
-        .and_then(serde_json::Value::as_str)
-        .expect("captured history has a seed consensus hash")
-        .to_owned();
     let snapshots_path = fixtures.join("sortition/snapshots.json");
     let mut snapshots: Vec<serde_json::Value> =
         serde_json::from_slice(&fs::read(&snapshots_path).expect("read captured snapshots"))
             .expect("captured snapshots JSON");
+    let operations = nano_conformance::captured_bitcoin_operations(fixtures)
+        .expect("decode captured Bitcoin operations");
+    let (history_end, seed_consensus_hash) = history["hashes"]
+        .as_array()
+        .expect("captured history has consensus hashes")
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, hash)| {
+            let hash = hash.as_str()?;
+            let height = snapshots
+                .iter()
+                .find(|snapshot| snapshot["consensus_hash"] == hash)?["block_height"]
+                .as_u64()?;
+            let mut seeds =
+                operations
+                    .get(hash)?
+                    .iter()
+                    .filter_map(|operation| match &operation.kind {
+                        nano_bitcoin::BitcoinOperationKind::LeaderBlockCommit {
+                            new_seed,
+                            parent_modulus,
+                            ..
+                        } if nano_sortition::commitment_is_on_time(*parent_modulus, height) => {
+                            Some(new_seed)
+                        }
+                        _ => None,
+                    });
+            let first = seeds.next()?;
+            seeds
+                .any(|seed| seed != first)
+                .then(|| (index + 1, hash.to_owned()))
+        })
+        .expect("captured history has a seed with disagreeing commitments");
+    history["hashes"]
+        .as_array_mut()
+        .expect("captured history has consensus hashes")
+        .truncate(history_end);
+    fs::write(
+        fixtures.join("sortition/consensus-hashes.json"),
+        serde_json::to_vec(&history).expect("encode adversarial history"),
+    )
+    .expect("write adversarial history");
     let seed = snapshots
         .iter_mut()
         .find(|snapshot| snapshot["consensus_hash"].as_str() == Some(&seed_consensus_hash))

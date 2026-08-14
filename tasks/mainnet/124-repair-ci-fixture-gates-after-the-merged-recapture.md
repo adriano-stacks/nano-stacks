@@ -1,7 +1,7 @@
 ---
 title: "Repair CI fixture gates after the merged recapture"
 id: "124"
-status: in-progress
+status: completed
 priority: high
 effort: small
 type: bug
@@ -16,6 +16,7 @@ verify:
     run: "nix develop --command scripts/ci.sh fixtures"
   - type: bash
     run: "nix develop --command scripts/ci.sh clippy"
+completed_at: 2026-08-14
 ---
 
 # Repair CI fixture gates after the merged recapture
@@ -30,7 +31,9 @@ Make the hosted CI gates pass with the checked-in capture.
 - [x] Select current reward and waterfall evidence by its data, not old heights.
 - [x] Check in a real PoX-5 lock window.
 - [x] Keep the fixed PoX-5 replay test on the checked-in fixture.
-- [ ] Run the complete local CI gates.
+- [x] Remove Clarity metadata written after the captured checkpoint.
+- [x] Keep authentication and release-report tests independent of the old fixture shape.
+- [x] Run the complete local CI gates.
 
 ## Acceptance Criteria
 
@@ -41,4 +44,7 @@ Make the hosted CI gates pass with the checked-in capture.
 
 ## Outcome
 
-Pending the complete local CI run.
+The capture now removes metadata from blocks after its checkpoint. The checked-in
+fixture has the same cleanup. Tests select current sortition evidence and accept
+the complete authentication history. Tests, fixture validation, and strict Clippy
+all pass.
