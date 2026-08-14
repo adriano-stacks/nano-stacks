@@ -16,6 +16,7 @@ nano-codec = { path = "../nano-codec" }
 nano-chainstate = { path = "../nano-chainstate" }
 nano-primitives = { path = "../nano-primitives" }
 clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
+chrono = "0.4.45"
 clap = { version = "4.6.4", features = ["derive"] }
 crossterm = "0.29"
 hex = "0.4.3"

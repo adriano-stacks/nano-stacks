@@ -2864,6 +2864,7 @@ dependencies = [
 name = "nano-tui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "clarity",
  "crossterm 0.29.0",

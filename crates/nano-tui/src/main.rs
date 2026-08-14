@@ -25,6 +25,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -1396,13 +1397,18 @@ fn compact_protocol_story(state: &State) -> Vec<Line<'static>> {
             let height = latest
                 .and_then(|sortition| sortition.burn_block_height)
                 .map_or_else(|| "?".to_owned(), thousands);
+            let time = timestamp_context(
+                latest.and_then(|sortition| sortition.burn_header_timestamp),
+            );
             if elected {
                 format!(
-                    "Bitcoin block {height}: new network miner elected from {} commitments",
+                    "Bitcoin block {height}: new network miner elected from {} commitments · {time}",
                     competition.map_or(0, |competition| competition.participants.len())
                 )
             } else {
-                format!("Bitcoin block {height}: no successor; active tenure continued")
+                format!(
+                    "Bitcoin block {height}: no successor; active tenure continued · {time}"
+                )
             }
         },
     );
@@ -1570,7 +1576,7 @@ fn commitment_story(state: &State) -> String {
             .map_or_else(|| "unavailable".to_owned(), short),
         participant_weight(winner, competition),
         competition.sampled_window_blocks,
-        relative_time(latest.and_then(|sortition| sortition.burn_header_timestamp))
+        timestamp_context(latest.and_then(|sortition| sortition.burn_header_timestamp))
     )
 }
 
@@ -1660,20 +1666,13 @@ fn pox_schedule_story(state: &State) -> String {
                 pox.current_cycle
                     .as_ref()
                     .and_then(|cycle| cycle.stacked_ustx)
-                    .map_or_else(
-                        || "unavailable".to_owned(),
-                        |amount| format!(
-                            "{} STX ({} uSTX)",
-                            thousands_u128(amount / 1_000_000),
-                            thousands_u128(amount)
-                        )
-                    ),
+                    .map_or_else(|| "unavailable".to_owned(), stx_amount),
                 pox.current_epoch.as_deref().unwrap_or("unavailable"),
-                compact_limit(pox.current_budget().and_then(|budget| budget.runtime)),
+                exact_compact_limit(pox.current_budget().and_then(|budget| budget.runtime)),
                 count_limit(pox.current_budget().and_then(|budget| budget.read_count)),
-                byte_limit(pox.current_budget().and_then(|budget| budget.read_length)),
+                exact_byte_limit(pox.current_budget().and_then(|budget| budget.read_length)),
                 count_limit(pox.current_budget().and_then(|budget| budget.write_count)),
-                byte_limit(pox.current_budget().and_then(|budget| budget.write_length))
+                exact_byte_limit(pox.current_budget().and_then(|budget| budget.write_length))
             )
         },
     )
@@ -2612,7 +2611,7 @@ fn draw_block(frame: &mut Frame, area: Rect, state: &mut State) {
             ),
             label("   timestamp "),
             Span::styled(
-                block.timestamp.to_string(),
+                timestamp_context((block.timestamp > 0).then_some(block.timestamp)),
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -2686,7 +2685,7 @@ fn draw_transaction(frame: &mut Frame, area: Rect, state: &mut State) {
                 .sponsor_nonce
                 .map_or_else(|| "none".to_owned(), |nonce| nonce.to_string()),
         ),
-        detail("fee", format!("{} uSTX", transaction.fee)),
+        detail("fee", stx_amount(u128::from(transaction.fee))),
         detail("authorization", transaction.authorization),
         detail(
             "network",
@@ -3058,6 +3057,31 @@ fn relative_time(timestamp: Option<u64>) -> String {
     }
 }
 
+fn timestamp_context(timestamp: Option<u64>) -> String {
+    let Some(timestamp) = timestamp else {
+        return "time unavailable".to_owned();
+    };
+    let absolute = i64::try_from(timestamp)
+        .ok()
+        .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
+        .map_or_else(
+            || format!("Unix {timestamp}"),
+            |timestamp| timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        );
+    format!("{absolute} · {}", relative_time(Some(timestamp)))
+}
+
+fn stx_amount(amount: u128) -> String {
+    let whole = thousands_u128(amount / 1_000_000);
+    let remainder = amount % 1_000_000;
+    let stx = if remainder == 0 {
+        whole
+    } else {
+        format!("{whole}.{remainder:06}")
+    };
+    format!("{stx} STX · {} uSTX exact", thousands_u128(amount))
+}
+
 fn compact_limit(value: Option<u64>) -> String {
     let Some(value) = value else {
         return "—".to_owned();
@@ -3068,6 +3092,19 @@ fn compact_limit(value: Option<u64>) -> String {
         }
     }
     thousands(value)
+}
+
+fn exact_compact_limit(value: Option<u64>) -> String {
+    value.map_or_else(
+        || "—".to_owned(),
+        |value| {
+            format!(
+                "{} ({} exact)",
+                compact_limit(Some(value)),
+                thousands(value)
+            )
+        },
+    )
 }
 
 fn count_limit(value: Option<u64>) -> String {
@@ -3083,6 +3120,19 @@ fn byte_limit(value: Option<u64>) -> String {
             } else {
                 format!("{} bytes", thousands(value))
             }
+        },
+    )
+}
+
+fn exact_byte_limit(value: Option<u64>) -> String {
+    value.map_or_else(
+        || "—".to_owned(),
+        |value| {
+            format!(
+                "{} ({} bytes exact)",
+                byte_limit(Some(value)),
+                thousands(value)
+            )
         },
     )
 }
@@ -3119,7 +3169,10 @@ fn number(value: Option<u64>, colour: Color) -> Span<'static> {
 
 /// Mainnet heights are eight digits and are read as magnitudes, not as strings.
 fn thousands(value: u64) -> String {
-    let digits = value.to_string();
+    grouped_digits(&value.to_string())
+}
+
+fn grouped_digits(digits: &str) -> String {
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
         if index > 0 && (digits.len() - index).is_multiple_of(3) {
@@ -3132,7 +3185,7 @@ fn thousands(value: u64) -> String {
 
 /// The same, for an amount rather than a height.
 fn thousands_u128(value: u128) -> String {
-    thousands(u64::try_from(value).unwrap_or(u64::MAX))
+    grouped_digits(&value.to_string())
 }
 
 #[cfg(test)]
@@ -3144,7 +3197,8 @@ mod tests {
 
     use super::{
         Action, BlockUpdate, Health, PollUpdate, Poller, STALL_AFTER, Screen, Source, State, draw,
-        handle_key, health_summary, node, short, thousands,
+        exact_byte_limit, exact_compact_limit, handle_key, health_summary, node,
+        pox_schedule_story, short, stx_amount, thousands, thousands_u128, timestamp_context,
     };
 
     #[test]
@@ -3153,6 +3207,36 @@ mod tests {
         assert_eq!(thousands(0), "0");
         assert_eq!(thousands(999), "999");
         assert_eq!(thousands(1_000), "1,000");
+    }
+
+    #[test]
+    fn human_units_retain_exact_protocol_values() {
+        assert_eq!(stx_amount(1_000_000), "1 STX · 1,000,000 uSTX exact");
+        assert_eq!(stx_amount(2), "0.000002 STX · 2 uSTX exact");
+        assert_eq!(
+            thousands_u128(u128::MAX),
+            "340,282,366,920,938,463,463,374,607,431,768,211,455"
+        );
+
+        let timestamp = timestamp_context(Some(1_700_000_000));
+        assert!(timestamp.starts_with("2023-11-14 22:13:20 UTC · "));
+        assert!(timestamp.ends_with("ago"));
+        assert_eq!(
+            exact_compact_limit(Some(5_000_000_000)),
+            "5B (5,000,000,000 exact)"
+        );
+        assert_eq!(
+            exact_byte_limit(Some(200_000_000)),
+            "200 MB (200,000,000 bytes exact)"
+        );
+
+        let mut state = dashboard_state();
+        let pox = pox_schedule_story(&state);
+        assert!(pox.contains("5B (5,000,000,000 exact)"));
+        assert!(pox.contains("200 MB (200,000,000 bytes exact)"));
+        let overview = render_at(&mut state, 160, 32);
+        assert!(overview.contains("1 STX · 1,000,000 uSTX exact"));
+        assert!(overview.contains("2023-11-14 22:13:20 UTC"));
     }
 
     /// Both ends, because a hash is read to recognise one and to tell two apart.
@@ -3436,6 +3520,7 @@ mod tests {
         assert!(rendered.contains("function"));
         assert!(rendered.contains("argument 0"));
         assert!(rendered.contains("u42"));
+        assert!(rendered.contains("0.000002 STX · 2 uSTX exact"));
     }
 
     #[test]
@@ -3639,6 +3724,9 @@ mod tests {
         let standard = render_at(&mut standard, 80, 24);
         assert!(standard.contains("verified locally"));
         assert!(standard.contains("Bitcoin decisions become Stacks activity"));
+        assert!(standard.contains("next boundary"));
+        assert!(standard.contains("PoX schedule"));
+        assert!(standard.contains("data freshness"));
         assert!(standard.contains("1 overview"));
 
         let mut wide = dashboard_state();

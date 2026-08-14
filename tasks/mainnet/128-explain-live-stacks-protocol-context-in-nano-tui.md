@@ -39,10 +39,10 @@ This is delivery slice 3 from task 125's usability study.
 - [x] Define every visible protocol term, starting with burn block, tenure,
       extension, election/sortition, fork choice, signer, PoX phase, state root
       and uSTX.
-- [ ] Prefer human units and times while retaining exact values in details.
+- [x] Prefer human units and times while retaining exact values in details.
 - [x] Retain commitment sampling and relative-weight detail without describing
       the value as win probability.
-- [ ] Cover help/navigation, missing context and the full story at supported
+- [x] Cover help/navigation, missing context and the full story at supported
       terminal sizes.
 - [ ] Run rustfmt, tests and strict clippy without warnings.
 
