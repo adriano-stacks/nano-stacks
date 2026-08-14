@@ -22,7 +22,7 @@ use nano_primitives::{
 use nano_stackerdb::Chunk;
 use reqwest::Url;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 /// A block whose transactions were all skipped still says nothing about
 /// microblocks, which epoch 4.0 does not have.
@@ -596,6 +596,7 @@ fn transaction_payload(
         "txid": format!("0x{}", receipt.txid),
         "tx_index": index,
         "status": status,
+        "committed": receipt.committed,
         "raw_result": receipt
             .result
             .value
@@ -755,6 +756,15 @@ struct Event {
 #[derive(Clone, Debug)]
 pub struct EventDispatcher {
     observers: Vec<Arc<Observer>>,
+    stream: broadcast::Sender<StreamEvent>,
+    stream_sequence: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StreamEvent {
+    pub kind: EventKind,
+    pub sequence: u64,
+    pub body: Arc<Vec<u8>>,
 }
 
 impl EventDispatcher {
@@ -770,6 +780,7 @@ impl EventDispatcher {
     /// Publish to the supplied observers under limits of your own.
     #[must_use]
     pub fn with_limits(observers: Vec<Url>, limits: DispatchLimits) -> Self {
+        let (stream, _) = broadcast::channel(256);
         let client = reqwest::Client::new();
         let observers = observers
             .into_iter()
@@ -792,7 +803,11 @@ impl EventDispatcher {
                 observer
             })
             .collect();
-        Self { observers }
+        Self {
+            observers,
+            stream,
+            stream_sequence: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     #[must_use]
@@ -800,14 +815,15 @@ impl EventDispatcher {
         self.observers.is_empty()
     }
 
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<StreamEvent> {
+        self.stream.subscribe()
+    }
+
     /// Queue one event for every observer and return.
     ///
     /// Serializes the payload once and shares the bytes, so a second observer
     /// costs a pointer rather than a copy of a mainnet block's receipts.
     pub fn dispatch(&self, kind: EventKind, payload: &Value) {
-        if self.observers.is_empty() {
-            return;
-        }
         let body = match serde_json::to_vec(payload) {
             Ok(body) => Arc::new(body),
             // A payload that will not serialize is a bug here, not an observer's
@@ -817,6 +833,12 @@ impl EventDispatcher {
                 return;
             }
         };
+        let sequence = self.stream_sequence.fetch_add(1, Ordering::Relaxed);
+        let _ = self.stream.send(StreamEvent {
+            kind,
+            sequence,
+            body: Arc::clone(&body),
+        });
         for observer in &self.observers {
             observer.offer(kind, &body);
         }
@@ -1052,6 +1074,23 @@ mod tests {
         SEQUENCE_HEADER, Url, Value, receipt_events, transaction_payload,
     };
 
+    #[tokio::test]
+    async fn dispatch_also_numbers_the_local_event_stream() {
+        let dispatcher = EventDispatcher::new(Vec::new());
+        let mut events = dispatcher.subscribe();
+
+        dispatcher.dispatch(EventKind::NewBlock, &json!({ "transactions": [] }));
+        dispatcher.dispatch(EventKind::NewBurnBlock, &json!({ "burn_block_height": 7 }));
+
+        let block = events.recv().await.expect("new block event");
+        assert_eq!(block.kind, EventKind::NewBlock);
+        assert_eq!(block.sequence, 0);
+        assert_eq!(block.body.as_slice(), br#"{"transactions":[]}"#);
+        let burn = events.recv().await.expect("burn block event");
+        assert_eq!(burn.kind, EventKind::NewBurnBlock);
+        assert_eq!(burn.sequence, 1);
+    }
+
     #[test]
     fn phantom_unlock_receipts_have_the_stock_observer_shape() {
         let raw = hex::decode(
@@ -1086,6 +1125,7 @@ mod tests {
         let payload = transaction_payload(2, &raw, &receipt);
         assert_eq!(payload["tx_index"], 2);
         assert_eq!(payload["status"], "success");
+        assert_eq!(payload["committed"], true);
         assert_eq!(payload["raw_result"], "0x0703");
         assert_eq!(payload["raw_tx"], format!("0x{}", hex::encode(raw)));
         assert_eq!(

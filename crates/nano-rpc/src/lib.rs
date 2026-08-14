@@ -8,6 +8,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     convert::Infallible,
     hash::Hasher,
+    pin::Pin,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -40,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use siphasher::sip::SipHasher;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
-use tokio_stream::{StreamExt, wrappers::BroadcastStream};
+use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 
 pub use chain::{AccountEntry, ChainAccess, ChainAccessError, ReadOnlyCall};
 pub use events::{
@@ -2132,14 +2133,34 @@ async fn block(
 
 async fn events(
     State(state): State<RpcState>,
-) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    let stream = BroadcastStream::new(state.events.subscribe()).filter_map(|event| {
-        event.ok().and_then(|event| {
-            serde_json::to_string(&event)
-                .ok()
-                .map(|data| Ok(Event::default().event("new_block").data(data)))
-        })
-    });
+) -> Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
+    let stream: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
+        if let Some(dispatcher) = state.observers.as_ref() {
+            Box::pin(
+                BroadcastStream::new(dispatcher.subscribe()).filter_map(|event| {
+                    event.ok().and_then(|event| {
+                        String::from_utf8(event.body.as_ref().clone())
+                            .ok()
+                            .map(|data| {
+                                Ok(Event::default()
+                                    .event(event.kind.path())
+                                    .id(event.sequence.to_string())
+                                    .data(data))
+                            })
+                    })
+                }),
+            )
+        } else {
+            Box::pin(
+                BroadcastStream::new(state.events.subscribe()).filter_map(|event| {
+                    event.ok().and_then(|event| {
+                        serde_json::to_string(&event)
+                            .ok()
+                            .map(|data| Ok(Event::default().event("new_block").data(data)))
+                    })
+                }),
+            )
+        };
     Sse::new(stream)
 }
 

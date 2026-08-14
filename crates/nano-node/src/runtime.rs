@@ -2506,11 +2506,9 @@ async fn start_rpc(
             .with_block_admission(executor.clone() as Arc<Mutex<dyn nano_rpc::BlockAdmission>>)
             .with_chain(executor as Arc<Mutex<dyn ChainAccess>>);
     }
-    // Only when there is somewhere for them to go: `/v3/block_proposal` refuses a
-    // proposal it could not report the verdict on, as stacks-core does.
-    if !dispatcher.is_empty() {
-        state = state.with_observers(dispatcher.clone());
-    }
+    // The RPC shares this dispatcher even without configured POST observers:
+    // its local stream is what lets `/events` expose execution receipts.
+    state = state.with_observers(dispatcher.clone());
     if let Some(token) = config.node.block_proposal_token.clone() {
         state = state.with_proposal_token(token);
     }
