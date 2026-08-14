@@ -1,7 +1,7 @@
 ---
 id: "128"
 title: "Explain live Stacks protocol context in nano-tui"
-status: in-progress
+status: completed
 priority: high
 effort: medium
 type: feature
@@ -15,6 +15,7 @@ verify:
     run: "nix develop -c cargo test -p nano-tui"
   - type: bash
     run: "nix develop -c cargo clippy -p nano-tui --all-targets -- -D warnings"
+completed_at: 2026-08-14
 ---
 
 # Explain live Stacks protocol context in nano-tui
@@ -44,7 +45,7 @@ This is delivery slice 3 from task 125's usability study.
       the value as win probability.
 - [x] Cover help/navigation, missing context and the full story at supported
       terminal sizes.
-- [ ] Run rustfmt, tests and strict clippy without warnings.
+- [x] Run rustfmt, tests and strict clippy without warnings.
 
 ## Acceptance Criteria
 
