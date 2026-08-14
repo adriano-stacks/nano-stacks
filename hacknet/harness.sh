@@ -652,7 +652,7 @@ stock_follower_start() {
     fi
     p2p_seed=$(cat "$RUN/nano/p2p-seed" 2>/dev/null) ||
         die "hosted nano has no persisted P2P identity"
-    public_key=$(cd "$ROOT" && cargo xtask seed-public-key "$p2p_seed")
+    public_key=$(cd "$ROOT" && cargo -q xtask seed-public-key "$p2p_seed")
     bootstrap="$public_key@127.0.0.1:$HOST_P2P_PORT"
     start_height=$(curl -sf --max-time 5 "http://127.0.0.1:$HOST_RPC_PORT/v2/info" |
         python3 -c 'import json,sys; print(json.load(sys.stdin)["stacks_tip_height"])') ||
@@ -821,7 +821,7 @@ verify_hosted() {
     # The first account the broadcaster sends transfers from, which genesis funds.
     log "verifying the stock signer, a submitter and an observer against nano"
     NANO_HOSTED_RPC="http://127.0.0.1:$port/" \
-    NANO_HOSTED_SIGNER_PUBLIC_KEY=$(cd "$ROOT" && cargo xtask public-key "${key%01}") \
+    NANO_HOSTED_SIGNER_PUBLIC_KEY=$(cd "$ROOT" && cargo -q xtask public-key "${key%01}") \
     NANO_HACKNET_PEER="$(peer_url "$(stock_index "$index")")/" \
     NANO_EVENT_DIR="$RUN/nano-events" \
     NANO_STOCK_EVENT_DIR="$RUN/events" \
@@ -837,7 +837,7 @@ verify_hosted() {
 # Assert the network keeps doing every kind of work while nano signs for it.
 verify() {
     need_source
-    local index key
+    local index key signer_key
     index=$(cat "$RUN/replaced-participant" 2>/dev/null || echo "")
     [ -n "$index" ] || die "no participant is replaced"
     [ "$(nano_state)" != "not running" ] || die "the nano participant is not running"
@@ -847,13 +847,20 @@ verify() {
     log "generating contract traffic for the verification window"
     traffic "${VERIFY_TRAFFIC_SECS:-600}" > "$RUN/traffic.log" 2>&1 &
     local traffic_pid=$!
-    trap "kill $traffic_pid 2>/dev/null || true; wait $traffic_pid 2>/dev/null || true; trap - RETURN" RETURN
+    trap 'kill "$traffic_pid" 2>/dev/null || true; wait "$traffic_pid" 2>/dev/null || true; trap - RETURN' RETURN
     log "verifying the network with participant $index replaced"
     local miner_key=""
-    [ -s "$RUN/miner-signing.key" ] && miner_key=$(cd "$ROOT" && cargo xtask public-key "$(cat "$RUN/miner-signing.key")")
-    NANO_SIGNER_PUBLIC_KEY=$(cd "$ROOT" && cargo xtask public-key "${key%01}") \
-    NANO_MINER_PUBLIC_KEY="$miner_key" \
-    NANO_HACKNET_PEER="$(peer_url "$(stock_index "$index")")/" \
+    local -a verification_env
+    if [ -s "$RUN/miner-signing.key" ] && grep -qx '\[miner\]' "$RUN/nano.toml"; then
+        miner_key=$(cd "$ROOT" && cargo -q xtask public-key "$(cat "$RUN/miner-signing.key")")
+    fi
+    signer_key=$(cd "$ROOT" && cargo -q xtask public-key "${key%01}")
+    verification_env=(
+        "NANO_SIGNER_PUBLIC_KEY=$signer_key"
+        "NANO_HACKNET_PEER=$(peer_url "$(stock_index "$index")")/"
+    )
+    [ -z "$miner_key" ] || verification_env+=("NANO_MINER_PUBLIC_KEY=$miner_key")
+    env -u NANO_MINER_PUBLIC_KEY "${verification_env[@]}" \
         cargo test --manifest-path "$ROOT/Cargo.toml" -p nano-conformance \
         --test conformance \
         hacknet_replacement::hacknet_keeps_working_with_a_nano_participant \
