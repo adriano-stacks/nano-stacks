@@ -1252,6 +1252,29 @@ fn execute_fixture_orphan(
     (executor, executed)
 }
 
+fn reopen_fixture_at(
+    directory: &Path,
+    burnchain: MovableBurnchain,
+    block: NakamotoBlock,
+) -> CheckpointExecutor<MovableBurnchain> {
+    let block_id = *block.block_id().as_bytes();
+    let height =
+        u32::try_from(block.header.chain_length).expect("the fixture height fits the state store");
+    let (mut chainstate, _) = crate::restart::open(directory);
+    chainstate
+        .discard_above(height)
+        .expect("restart gives back the abandoned states");
+    assert!(
+        chainstate
+            .recover_ledger_at(block_id)
+            .expect("restart recovers the surviving ledger"),
+        "the surviving block sealed a ledger"
+    );
+    let mut executor = CheckpointExecutor::resume(chainstate, block, burnchain);
+    nano_conformance::derive_sortitions(&mut executor, &fixtures(), directory);
+    executor
+}
+
 #[tokio::test]
 async fn a_branch_that_parts_at_a_block_is_followed_onto_the_fork() {
     let chain = captured_chain();
@@ -1326,25 +1349,12 @@ async fn a_branch_that_parts_at_a_block_is_followed_onto_the_fork() {
     );
 
     drop(executor);
-    let (mut chainstate, _) = crate::restart::open(directory.path());
     let agreed_block = honest
         .iter()
         .find(|block| *block.block_id().as_bytes() == agreed)
         .expect("the common block is in the served chain")
         .clone();
-    let agreed_height = u32::try_from(agreed_block.header.chain_length)
-        .expect("the fixture height fits the state store");
-    chainstate
-        .discard_above(agreed_height)
-        .expect("restart gives back the abandoned states");
-    assert!(
-        chainstate
-            .recover_ledger_at(agreed)
-            .expect("restart recovers the surviving ledger"),
-        "the common block sealed a ledger"
-    );
-    let mut executor = CheckpointExecutor::resume(chainstate, agreed_block, burnchain);
-    nano_conformance::derive_sortitions(&mut executor, &fixtures(), directory.path());
+    let mut executor = reopen_fixture_at(directory.path(), burnchain, agreed_block);
 
     let next = executor
         .catch_up(&branch_client, &mut history, &pox(), &staging, budget, &[])
