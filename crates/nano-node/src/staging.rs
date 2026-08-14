@@ -196,8 +196,8 @@ impl Staging {
             StagingInsert::Inserted
         };
         transaction.commit()?;
-        drop(connection);
         self.invalidate_selection()?;
+        drop(connection);
         Ok(outcome)
     }
 
@@ -242,8 +242,8 @@ impl Staging {
             }
         };
         transaction.commit()?;
-        drop(connection);
         self.invalidate_selection()?;
+        drop(connection);
         Ok(outcome)
     }
 
@@ -311,48 +311,45 @@ impl Staging {
 
     /// The longest coherent staged branch, with block-id ordering as a stable tie-break.
     fn selected_branch(&self) -> Result<Vec<StagedLink>, StagingError> {
+        // The database lock precedes the cache lock on reads and writes, so a
+        // committed mutation cannot race a stale branch back into the cache.
+        let connection = self.connection()?;
         let mut selected = self.selected.lock().map_err(|_| StagingError::Poisoned)?;
         if let Some(branch) = selected.as_ref() {
             return Ok(branch.clone());
         }
-        let (blocks, parents) = {
-            let connection = self.connection()?;
-            let mut statement = connection.prepare(
-                "SELECT block_id, parent_block_id, height FROM staged
-                 UNION
-                 SELECT block_id, parent_block_id, height FROM downloaded",
-            )?;
-            let rows = statement.query_map([], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, u64>(2)?,
-                ))
-            })?;
-            let mut blocks = BTreeMap::new();
-            let mut parents = BTreeSet::new();
-            for row in rows {
-                let (block_id, parent, height) = row?;
-                let block_id = StacksBlockId::from_bytes(
-                    block_id.try_into().map_err(|_| StagingError::Incoherent)?,
-                );
-                let parent = StacksBlockId::from_bytes(
-                    parent.try_into().map_err(|_| StagingError::Incoherent)?,
-                );
-                parents.insert(parent);
-                blocks.insert(
+        let mut statement = connection.prepare(
+            "SELECT block_id, parent_block_id, height FROM staged
+             UNION
+             SELECT block_id, parent_block_id, height FROM downloaded",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        })?;
+        let mut blocks = BTreeMap::new();
+        let mut parents = BTreeSet::new();
+        for row in rows {
+            let (block_id, parent, height) = row?;
+            let block_id = StacksBlockId::from_bytes(
+                block_id.try_into().map_err(|_| StagingError::Incoherent)?,
+            );
+            let parent =
+                StacksBlockId::from_bytes(parent.try_into().map_err(|_| StagingError::Incoherent)?);
+            parents.insert(parent);
+            blocks.insert(
+                block_id,
+                StagedLink {
                     block_id,
-                    StagedLink {
-                        block_id,
-                        parent,
-                        height,
-                    },
-                );
-            }
-            drop(statement);
-            drop(connection);
-            (blocks, parents)
-        };
+                    parent,
+                    height,
+                },
+            );
+        }
+        drop(statement);
         let Some(tip) = blocks
             .values()
             .filter(|candidate| !parents.contains(&candidate.block_id))
@@ -381,6 +378,8 @@ impl Staging {
         }
         branch.reverse();
         *selected = Some(branch.clone());
+        drop(selected);
+        drop(connection);
         Ok(branch)
     }
 
@@ -396,11 +395,15 @@ impl Staging {
         let rows = statement.query_map(params![block_id.as_bytes().as_slice()], |row| {
             row.get::<_, Vec<u8>>(0)
         })?;
-        rows.map(|row| {
-            let bytes = row?;
-            NakamotoBlock::decode(&bytes).map_err(StagingError::Block)
-        })
-        .collect()
+        let blocks = rows
+            .map(|row| {
+                let bytes = row?;
+                NakamotoBlock::decode(&bytes).map_err(StagingError::Block)
+            })
+            .collect();
+        drop(statement);
+        drop(connection);
+        blocks
     }
 
     fn block(&self, block_id: StacksBlockId) -> Result<Option<NakamotoBlock>, StagingError> {
@@ -470,8 +473,8 @@ impl Staging {
             params![block_id.as_bytes().as_slice()],
         )?;
         transaction.commit()?;
-        drop(connection);
         self.invalidate_selection()?;
+        drop(connection);
         Ok(())
     }
 
@@ -492,8 +495,8 @@ impl Staging {
         transaction.execute("DELETE FROM staged WHERE height <= ?1", params![height])?;
         transaction.execute("DELETE FROM downloaded WHERE height <= ?1", params![height])?;
         transaction.commit()?;
-        drop(connection);
         self.invalidate_selection()?;
+        drop(connection);
         Ok(removed)
     }
 
@@ -504,8 +507,8 @@ impl Staging {
         transaction.execute("DELETE FROM staged", [])?;
         transaction.execute("DELETE FROM downloaded", [])?;
         transaction.commit()?;
-        drop(connection);
         self.invalidate_selection()?;
+        drop(connection);
         Ok(())
     }
 
