@@ -5,7 +5,7 @@
 //! programs over three command lines.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     error::Error,
     fs::{self, File, OpenOptions},
     future::Future,
@@ -1218,11 +1218,11 @@ fn now_unix() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-/// Which reward cycle this node has already answered for, so a walk of the
+/// Which reward cycles this node has already answered for, so a walk of the
 /// pox-5 signer list happens once per cycle instead of once per round.
 #[derive(Default)]
 struct RewardCyclePublication {
-    served: Option<u64>,
+    served: BTreeSet<u64>,
     /// The cycle whose derivation failure has been reported, so a chain with no
     /// pox-5 stackers says so once rather than every second.
     complained: Option<u64>,
@@ -1288,14 +1288,14 @@ async fn carry_checkpoint_set(
     if stacker_set.is_null() {
         return false;
     }
-    if published.served != Some(cycle) {
+    if !published.served.contains(&cycle) {
         println!(
             "serving the reward set the checkpoint carried for cycle {cycle}, which was \
              stacked before this node's history begins and cannot be derived from its state"
         );
     }
     state.publish_stacker_set(cycle, stacker_set).await;
-    published.served = Some(cycle);
+    published.served.insert(cycle);
     true
 }
 
@@ -1321,8 +1321,8 @@ async fn configure_signer_slots(
     drop(store);
 }
 
-/// Publish the reward set the executed state derives, and configure the
-/// `StackerDB` contracts that cycle's signers write to.
+/// Publish the current and upcoming reward sets the executed state derives, and
+/// configure the `StackerDB` contracts their signers write to.
 ///
 /// Derived from this node's own pox-5 state rather than read from the peer, which
 /// is the whole difference between serving a reward set and relaying one. The
@@ -1356,13 +1356,52 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
         peer,
     )
     .await;
-    if published.served == Some(cycle) {
+    let [context, next_context] = signer_cycle_contexts(context);
+    let mut signer_inputs = SignerCycleInputs {
+        state,
+        executor,
+        network,
+        published,
+        registry,
+        checkpoint,
+    };
+    publish_signer_cycle(&mut signer_inputs, context).await;
+    publish_signer_cycle(&mut signer_inputs, next_context).await;
+}
+
+fn signer_cycle_contexts(
+    context: nano_chainstate::BitcoinBlockContext,
+) -> [nano_chainstate::BitcoinBlockContext; 2] {
+    let cycle_length = u64::from(context.prepare_phase_length)
+        .saturating_add(u64::from(context.reward_phase_length));
+    let mut next = context;
+    next.move_to_burn_block(context.height.saturating_add(cycle_length));
+    [context, next]
+}
+
+struct SignerCycleInputs<'a> {
+    state: &'a RpcState,
+    executor: &'a SharedExecutor,
+    network: Network,
+    published: &'a mut RewardCyclePublication,
+    registry: Option<&'a str>,
+    checkpoint: &'a crate::config::CheckpointConfig,
+}
+
+async fn publish_signer_cycle(
+    inputs: &mut SignerCycleInputs<'_>,
+    context: nano_chainstate::BitcoinBlockContext,
+) {
+    let Some(cycle) = nano_chainstate::signers::reward_cycle_at(context) else {
+        return;
+    };
+    if inputs.published.served.contains(&cycle) {
         return;
     }
     // The lock is held only for the walk: it is the same lock every account read
     // takes, and the walk is one contract call per signer.
     let derived = nano_chainstate::signers::active_signer_set(
-        executor.lock().await.chainstate_mut().vm_mut(),
+        inputs.executor.lock().await.chainstate_mut().vm_mut(),
         context,
     );
     let derived = match derived {
@@ -1373,12 +1412,21 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
         // cannot be derived from this state at all. What the network published
         // for it is what the checkpoint already carries to attest itself with,
         // so it is served verbatim rather than not at all.
-        Err(_) if carry_checkpoint_set(state, published, checkpoint, cycle, context).await => {
+        Err(_)
+            if carry_checkpoint_set(
+                inputs.state,
+                inputs.published,
+                inputs.checkpoint,
+                cycle,
+                context,
+            )
+            .await =>
+        {
             return;
         }
         Err(error) => {
-            if published.complained != Some(cycle) {
-                published.complained = Some(cycle);
+            if inputs.published.complained != Some(cycle) {
+                inputs.published.complained = Some(cycle);
                 eprintln!(
                     "this node cannot derive the reward set for cycle {cycle} from its own \
                      state, so /v3/stacker_set will not answer for it and its signers' \
@@ -1393,16 +1441,17 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
     // registry state. Without it the document cannot claim the 4.0 shape, so a
     // chain whose registry nano cannot read is served the version every reader
     // accepts and the reason is said once.
-    let payout = executor
+    let payout = inputs
+        .executor
         .lock()
         .await
         .chainstate_mut()
-        .sbtc_payout_address(registry);
+        .sbtc_payout_address(inputs.registry);
     let sbtc_address = match payout {
         Ok(address) => Some(address),
         Err(error) => {
-            if published.complained != Some(cycle) {
-                published.complained = Some(cycle);
+            if inputs.published.complained != Some(cycle) {
+                inputs.published.complained = Some(cycle);
                 eprintln!(
                     "this node cannot derive the waterfall payout address from its own sBTC \
                      registry state, so /v3/stacker_set/{cycle} carries the version 0 shape \
@@ -1412,7 +1461,8 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
             None
         }
     };
-    state
+    inputs
+        .state
         .publish_stacker_set(
             cycle,
             nano_rpc::stacker_set_payload(
@@ -1422,8 +1472,8 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
             ),
         )
         .await;
-    configure_signer_slots(state, network, cycle, &entries).await;
-    published.served = Some(cycle);
+    configure_signer_slots(inputs.state, inputs.network, cycle, &entries).await;
+    inputs.published.served.insert(cycle);
     println!(
         "derived the reward set for cycle {cycle} from this node's own state: {} signers, \
          {} of weight, replicating their StackerDB contracts",
@@ -4761,13 +4811,17 @@ authentication_history = "{}"
         context.prepare_phase_length = 100;
         context.reward_phase_length = 2_000;
 
+        let cycles =
+            super::signer_cycle_contexts(context).map(nano_chainstate::signers::reward_cycle_at);
+        assert_eq!(cycles, [Some(140), Some(141)]);
+
         let state = super::RpcState::new(super::Network::MAINNET);
         let mut published = super::RewardCyclePublication::default();
         assert!(
             super::carry_checkpoint_set(&state, &mut published, &checkpoint, 140, context).await,
             "the checkpoint's own cycle is answered"
         );
-        assert_eq!(published.served, Some(140));
+        assert_eq!(published.served, std::collections::BTreeSet::from([140]));
         assert!(
             !super::carry_checkpoint_set(&state, &mut published, &checkpoint, 141, context).await,
             "a later cycle is not answered with the checkpoint's signers"
