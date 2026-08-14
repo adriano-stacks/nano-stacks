@@ -113,6 +113,30 @@ Clarity children and a second borrowed/owned contract at the Wasm host boundary.
 That risk is disproportionate to the measured ceiling. The spike and its
 temporary two-call harness were removed. The retained implementation, storage
 bytes, roots, receipts and compiler identity are unchanged.
+## Reconciled against the post-120/121 engine, 2026-08-13
+
+The rejection was priced against task 115's 1.52× state; the engine has since
+moved and the arithmetic only hardens:
+
+- Task 120 (2.06×, wasm 15.6 s vs interpreter 32.0 s on the same corpus)
+  consumed the largest counted traffic rows directly: `runtime_shape_size(handle)`
+  ended the whole-value writes into linear memory per size measurement (the
+  bulk of loto's 60,628 wasm-write operations), and arena-memoized sizes ended
+  the repeated decodes behind them. Its residual list keeps only "per-op
+  metadata clones in the var/map closures" from this path.
+- Task 121's vendor adoption left cost vectors and receipts byte-identical
+  (scoreboard 340/340 costs, 500/500 digests), so 120's attribution stands.
+- The remaining ceiling, taken at the old ≲1 ms/call bound it no longer fills:
+  2,564 corpus calls × 1 ms ≈ 2.6 s per 4,149-block replay — under the
+  harness's ±10 s noise band (task 110's shipping rule), on a range current
+  main replays at 147 s user CPU (task 116's confirmation run, 2026-08-13,
+  all roots sealed). The largest residual byte mover, the copy into linear
+  memory where the ABI consumes the value, is the one this refactor cannot
+  remove.
+
+Decision reaffirmed on today's HEAD: keep owned Clarity values; reopen only
+with a new attribution showing the value path material relative to run
+variance.
 
 ## Acceptance Criteria
 

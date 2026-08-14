@@ -11,6 +11,201 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{ChildTarget, MarfBlockId, MarfError, MarfValue, TrieChild, TrieNode, TrieNodeId};
 
+#[cfg(feature = "marf-profile")]
+pub mod profile {
+    use std::{
+        fmt::Write as _,
+        mem::size_of,
+        sync::atomic::{AtomicU64, Ordering},
+        time::Duration,
+    };
+
+    use crate::{TrieChild, TrieNode};
+
+    static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+    static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+    static SQLITE_NANOS: AtomicU64 = AtomicU64::new(0);
+    static SQLITE_BYTES: AtomicU64 = AtomicU64::new(0);
+    static HASH_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+    static HASH_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+    static HASH_SQLITE_NANOS: AtomicU64 = AtomicU64::new(0);
+    static HASH_SQLITE_BYTES: AtomicU64 = AtomicU64::new(0);
+    static DECODE_NANOS: AtomicU64 = AtomicU64::new(0);
+    static PATH_ALLOCS: AtomicU64 = AtomicU64::new(0);
+    static PATH_BYTES: AtomicU64 = AtomicU64::new(0);
+    static CHILD_ALLOCS: AtomicU64 = AtomicU64::new(0);
+    static CHILD_BYTES: AtomicU64 = AtomicU64::new(0);
+    static NODE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+    static NODE_BYTES: AtomicU64 = AtomicU64::new(0);
+    static NODE_CLONES: AtomicU64 = AtomicU64::new(0);
+    static CLONE_BYTES: AtomicU64 = AtomicU64::new(0);
+    static CLONE_NANOS: AtomicU64 = AtomicU64::new(0);
+    static ROOT_CLONES: AtomicU64 = AtomicU64::new(0);
+    static ROOT_CLONE_BYTES: AtomicU64 = AtomicU64::new(0);
+    static ROOT_CLONE_NANOS: AtomicU64 = AtomicU64::new(0);
+
+    fn add(counter: &AtomicU64, value: usize) {
+        counter.fetch_add(u64::try_from(value).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    fn add_duration(counter: &AtomicU64, elapsed: Duration) {
+        counter.fetch_add(
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn cache_hit() {
+        CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn cache_miss() {
+        CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn sqlite_read(elapsed: Duration, bytes: usize) {
+        add_duration(&SQLITE_NANOS, elapsed);
+        add(&SQLITE_BYTES, bytes);
+    }
+
+    pub fn hash_cache_hit() {
+        HASH_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn hash_cache_miss() {
+        HASH_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn hash_sqlite_read(elapsed: Duration, bytes: usize) {
+        add_duration(&HASH_SQLITE_NANOS, elapsed);
+        add(&HASH_SQLITE_BYTES, bytes);
+    }
+
+    pub fn decoded(elapsed: Duration) {
+        add_duration(&DECODE_NANOS, elapsed);
+    }
+
+    pub fn path(length: usize) {
+        if length != 0 {
+            PATH_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            add(&PATH_BYTES, length);
+        }
+    }
+
+    pub fn children(count: usize) {
+        if count != 0 {
+            CHILD_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            add(&CHILD_BYTES, count.saturating_mul(size_of::<TrieChild>()));
+        }
+    }
+
+    pub fn node_allocation() {
+        NODE_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        add(&NODE_BYTES, size_of::<TrieNode>());
+    }
+
+    pub fn cloned_node(node: &TrieNode, elapsed: Duration) {
+        NODE_CLONES.fetch_add(1, Ordering::Relaxed);
+        node_allocation();
+        let bytes = match node {
+            TrieNode::Leaf { path, .. } => path.len(),
+            TrieNode::Internal { path, children } => path
+                .len()
+                .saturating_add(children.len().saturating_mul(size_of::<TrieChild>())),
+        };
+        add(&CLONE_BYTES, bytes);
+        add_duration(&CLONE_NANOS, elapsed);
+    }
+
+    pub fn cloned_root(children: &[TrieChild], elapsed: Duration) {
+        ROOT_CLONES.fetch_add(1, Ordering::Relaxed);
+        add(
+            &ROOT_CLONE_BYTES,
+            children.len().saturating_mul(size_of::<TrieChild>()),
+        );
+        add_duration(&ROOT_CLONE_NANOS, elapsed);
+    }
+
+    pub fn reset() {
+        for counter in [
+            &CACHE_HITS,
+            &CACHE_MISSES,
+            &SQLITE_NANOS,
+            &SQLITE_BYTES,
+            &HASH_CACHE_HITS,
+            &HASH_CACHE_MISSES,
+            &HASH_SQLITE_NANOS,
+            &HASH_SQLITE_BYTES,
+            &DECODE_NANOS,
+            &PATH_ALLOCS,
+            &PATH_BYTES,
+            &CHILD_ALLOCS,
+            &CHILD_BYTES,
+            &NODE_ALLOCS,
+            &NODE_BYTES,
+            &NODE_CLONES,
+            &CLONE_BYTES,
+            &CLONE_NANOS,
+            &ROOT_CLONES,
+            &ROOT_CLONE_BYTES,
+            &ROOT_CLONE_NANOS,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn report() -> String {
+        let value = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let mut report = String::from("MARF_PROFILE\n");
+        let _ = writeln!(
+            report,
+            "cache_hits={} cache_misses={}",
+            value(&CACHE_HITS),
+            value(&CACHE_MISSES)
+        );
+        let _ = writeln!(
+            report,
+            "sqlite_nanos={} sqlite_row_bytes={}",
+            value(&SQLITE_NANOS),
+            value(&SQLITE_BYTES)
+        );
+        let _ = writeln!(
+            report,
+            "hash_cache_hits={} hash_cache_misses={} hash_sqlite_nanos={} hash_sqlite_bytes={}",
+            value(&HASH_CACHE_HITS),
+            value(&HASH_CACHE_MISSES),
+            value(&HASH_SQLITE_NANOS),
+            value(&HASH_SQLITE_BYTES)
+        );
+        let _ = writeln!(report, "decode_nanos={}", value(&DECODE_NANOS));
+        let _ = writeln!(
+            report,
+            "path_allocs={} path_bytes={} child_allocs={} child_bytes={}",
+            value(&PATH_ALLOCS),
+            value(&PATH_BYTES),
+            value(&CHILD_ALLOCS),
+            value(&CHILD_BYTES)
+        );
+        let _ = writeln!(
+            report,
+            "node_allocs={} node_payload_bytes={} node_clones={} clone_bytes={} clone_nanos={}",
+            value(&NODE_ALLOCS),
+            value(&NODE_BYTES),
+            value(&NODE_CLONES),
+            value(&CLONE_BYTES),
+            value(&CLONE_NANOS)
+        );
+        let _ = write!(
+            report,
+            "root_clones={} root_clone_bytes={} root_clone_nanos={}",
+            value(&ROOT_CLONES),
+            value(&ROOT_CLONE_BYTES),
+            value(&ROOT_CLONE_NANOS)
+        );
+        report
+    }
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS marf_block (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -474,15 +669,30 @@ impl TrieStorage {
 
     pub(crate) fn node(&self, block: u32, index: u32) -> Result<Arc<TrieNode>, MarfError> {
         if let Some(node) = self.nodes.borrow_mut().get(&(block, index)) {
+            #[cfg(feature = "marf-profile")]
+            profile::cache_hit();
             return Ok(node);
         }
+        #[cfg(feature = "marf-profile")]
+        profile::cache_miss();
+        #[cfg(feature = "marf-profile")]
+        let sqlite_started = std::time::Instant::now();
         let data: Option<Vec<u8>> = self
             .connection
             .prepare_cached("SELECT data FROM marf_node WHERE block = ?1 AND idx = ?2")?
             .query_row(params![block, index], |row| row.get(0))
             .optional()?;
         let data = data.ok_or_else(|| missing(&format!("trie node {block}/{index}")))?;
-        let node = Arc::new(self.decode(block, &data)?);
+        #[cfg(feature = "marf-profile")]
+        profile::sqlite_read(sqlite_started.elapsed(), data.len());
+        #[cfg(feature = "marf-profile")]
+        let decode_started = std::time::Instant::now();
+        let decoded = self.decode(block, &data)?;
+        #[cfg(feature = "marf-profile")]
+        profile::decoded(decode_started.elapsed());
+        #[cfg(feature = "marf-profile")]
+        profile::node_allocation();
+        let node = Arc::new(decoded);
         self.nodes
             .borrow_mut()
             .insert((block, index), Arc::clone(&node));
@@ -499,14 +709,22 @@ impl TrieStorage {
     /// so nothing ever rewrites one.
     pub(crate) fn node_hash(&self, block: u32, index: u32) -> Result<TrieHash, MarfError> {
         if let Some(hash) = self.node_hashes.borrow_mut().get(&(block, index)) {
+            #[cfg(feature = "marf-profile")]
+            profile::hash_cache_hit();
             return Ok(hash);
         }
+        #[cfg(feature = "marf-profile")]
+        profile::hash_cache_miss();
+        #[cfg(feature = "marf-profile")]
+        let sqlite_started = std::time::Instant::now();
         let hash: Option<Vec<u8>> = self
             .connection
             .prepare_cached("SELECT hash FROM marf_node WHERE block = ?1 AND idx = ?2")?
             .query_row(params![block, index], |row| row.get(0))
             .optional()?;
         let hash = hash.ok_or_else(|| missing(&format!("trie node {block}/{index}")))?;
+        #[cfg(feature = "marf-profile")]
+        profile::hash_sqlite_read(sqlite_started.elapsed(), hash.len());
         let hash = TrieHash::from_bytes(block_id(&hash)?);
         self.node_hashes.borrow_mut().insert((block, index), hash);
         Ok(hash)
@@ -643,6 +861,8 @@ impl TrieStorage {
         let mut reader = Reader::new(bytes);
         let kind = reader.byte()?;
         let path = reader.path()?;
+        #[cfg(feature = "marf-profile")]
+        profile::path(path.len());
         if kind == LEAF_RECORD {
             let value = MarfValue::from_bytes(
                 reader
@@ -662,6 +882,8 @@ impl TrieStorage {
                 .map_err(|_| corrupt("child count"))?,
         ));
         let mut children = Vec::with_capacity(count);
+        #[cfg(feature = "marf-profile")]
+        profile::children(count);
         for _ in 0..count {
             let flags = reader.byte()?;
             let character = reader.byte()?;

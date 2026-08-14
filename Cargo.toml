@@ -24,6 +24,7 @@ members = [
     "crates/nano-conformance",
     "xtask",
 ]
+exclude = ["vendor/clarity-wasm"]
 default-members = ["crates/nano-node", "crates/nano-conformance", "xtask"]
 
 [workspace.package]
@@ -84,3 +85,9 @@ incremental = true
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# CI tests need release runtime semantics, not production link-time optimization.
+[profile.ci]
+inherits = "release"
+lto = "off"
+codegen-units = 16

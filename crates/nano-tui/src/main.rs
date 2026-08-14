@@ -369,6 +369,28 @@ fn mining_competition(state: &State) -> Option<&node::MiningCompetition> {
     latest_sortition(state)?.mining_competition.as_ref()
 }
 
+/// The candidate field, sized by what the losing commitments spent.
+fn competition_summary(
+    competition: &node::MiningCompetition,
+    winner: Option<&node::SortitionParticipant>,
+) -> String {
+    match competition.participants.len() {
+        0 => "0 candidate commitments".to_owned(),
+        1 => "1 candidate commitment".to_owned(),
+        count => {
+            let losing: u64 = competition
+                .participants
+                .iter()
+                .filter(|participant| {
+                    winner.is_none_or(|winner| !same_id(&participant.txid, &winner.txid))
+                })
+                .map(|participant| participant.burn_sats)
+                .sum();
+            format!("{count} candidates · losers burned {}", thousands(losing))
+        }
+    }
+}
+
 fn competition_winner(
     competition: &node::MiningCompetition,
 ) -> Option<&node::SortitionParticipant> {
@@ -726,12 +748,7 @@ fn draw_sortition(frame: &mut Frame, area: Rect, state: &State) {
     let winner = competition.and_then(competition_winner);
     let participants = competition.map_or_else(
         || "participant data unavailable · press m".to_owned(),
-        |competition| match competition.participants.len() {
-            0 => "0 candidate commitments".to_owned(),
-            1 => "1 candidate commitment".to_owned(),
-            2 => "2 candidates · 1 other".to_owned(),
-            count => format!("{count} candidates · {} others", count - 1),
-        },
+        |competition| competition_summary(competition, winner),
     );
     let winner_burn = winner.map_or_else(
         || "no winning commitment".to_owned(),
@@ -1636,7 +1653,7 @@ mod tests {
         assert!(rendered.contains("current miner & latest sortition"));
         assert!(rendered.contains("miner elected · new Stacks tenure"));
         assert!(rendered.contains("current miner"));
-        assert!(rendered.contains("2 candidates · 1 other"));
+        assert!(rendered.contains("2 candidates · losers burned 40,000"));
         assert!(rendered.contains("60,000 of 100,000 sats"));
         assert!(rendered.contains("tenure commit"));
         assert!(!rendered.contains("state root"));

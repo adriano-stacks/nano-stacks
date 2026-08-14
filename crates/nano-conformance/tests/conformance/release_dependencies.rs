@@ -46,7 +46,18 @@ fn workspace() -> std::path::PathBuf {
 
 fn tree(edges: &str) -> String {
     let output = Command::new(env!("CARGO"))
-        .args(["tree", "--package", "nano-node", "--edges", edges])
+        // CI asks Cargo to colour every stream. Keep that hostile setting in
+        // local tests too, then override it for the output parsed below.
+        .env("CARGO_TERM_COLOR", "always")
+        .args([
+            "tree",
+            "--color",
+            "never",
+            "--package",
+            "nano-node",
+            "--edges",
+            edges,
+        ])
         .current_dir(workspace())
         .output()
         .expect("cargo tree runs");

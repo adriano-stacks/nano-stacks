@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "pre-push: the worktree must be clean" >&2
+  git status --short >&2
+  exit 1
+fi
+
+# The push only has to be fast-gated; the hosted workflow runs the full
+# suite (clippy, scoreboard, fixtures, tests) on what lands.
+record=$(git rev-parse --git-path nano-fast-verified-tree)
+if [[ ! -r "$record" ]]; then
+  echo "pre-push: no commit has passed the fast gates" >&2
+  exit 1
+fi
+verified=$(<"$record")
+zero=0000000000000000000000000000000000000000
+
+while read -r local_ref local_oid _; do
+  if [[ "$local_oid" == "$zero" ]]; then
+    continue
+  fi
+  tree=$(git rev-parse "$local_oid^{tree}")
+  if [[ "$tree" != "$verified" ]]; then
+    echo "pre-push: $local_ref is not the tree verified before commit" >&2
+    echo "pre-push: commit it normally to run the gates; do not use --no-verify" >&2
+    exit 1
+  fi
+done

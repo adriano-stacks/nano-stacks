@@ -982,7 +982,8 @@ const PRINCIPAL_DEFAULT: &str = "
 #[test]
 fn a_narrowed_default_carrying_a_principal_reads_it_back() {
     let alice = "SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7";
-    let (compiled, interpreted) = both_in(PRINCIPAL_DEFAULT, "outbid", &[principal(alice), uint(5)]);
+    let (compiled, interpreted) =
+        both_in(PRINCIPAL_DEFAULT, "outbid", &[principal(alice), uint(5)]);
     assert!(
         !compiled.starts_with("failed:") && !compiled.starts_with("error:"),
         "outbid answered nothing: {compiled}"

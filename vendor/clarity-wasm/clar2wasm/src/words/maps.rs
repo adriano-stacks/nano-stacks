@@ -3,13 +3,12 @@ use std::collections::BTreeMap;
 use clarity::types::StacksEpochId;
 use clarity::vm::types::{TypeSignature, TypeSignatureExt};
 use clarity::vm::{ClarityName, SymbolicExpression};
-use clarity_types::ClarityTypeError;
 use walrus::ir::{BinaryOp, IfElse};
 use walrus::ValType;
 
 use super::{ComplexWord, Word};
 use crate::check_args;
-use crate::cost::{ChargeGenerator, WordCharge};
+use crate::cost::{charge_ok_or_throw_runtime_error, ChargeGenerator, WordCharge};
 use crate::error_mapping::ErrorMap;
 use crate::wasm_generator::{
     clar2wasm_ty, uses_packed_value, ArgumentsExt, GeneratorError, LiteralMemoryEntry,
@@ -132,7 +131,7 @@ impl ComplexWord for MapGet {
             Some(generator.borrow_local(ValType::I32))
         } else {
             let (key_ty, value_ty) = get_original_types(&generator.map_types_original, name)?;
-            charge_default_cost_value_and_key_size(
+            charge_ok_or_throw_runtime_error(
                 &value_ty.size().and_then(|a| key_ty.size().map(|b| a + b)),
                 generator,
                 builder,
@@ -202,7 +201,7 @@ impl ComplexWord for MapGet {
             let mut error_block = builder.dangling_instr_seq(None);
             if post205_cost_local.is_some() {
                 let (key_ty, value_ty) = get_original_types(&generator.map_types_original, name)?;
-                charge_default_cost_value_and_key_size(
+                charge_ok_or_throw_runtime_error(
                     &value_ty.size().and_then(|a| key_ty.size().map(|b| a + b)),
                     generator,
                     &mut error_block,
@@ -287,7 +286,7 @@ impl ComplexWord for MapSet {
             Some(generator.borrow_local(ValType::I32))
         } else {
             let (key_ty, value_ty) = get_original_types(&generator.map_types_original, name)?;
-            charge_default_cost_value_and_key_size(
+            charge_ok_or_throw_runtime_error(
                 &value_ty.size().and_then(|a| key_ty.size().map(|b| a + b)),
                 generator,
                 builder,
@@ -357,7 +356,7 @@ impl ComplexWord for MapSet {
             if post205_cost_local.is_some() {
                 // The cost in < 2.05 has already been handled before
                 let (key_ty, value_ty) = get_original_types(&generator.map_types_original, name)?;
-                charge_default_cost_value_and_key_size(
+                charge_ok_or_throw_runtime_error(
                     &value_ty.size().and_then(|a| key_ty.size().map(|b| a + b)),
                     generator,
                     &mut error_block,
@@ -440,7 +439,7 @@ impl ComplexWord for MapInsert {
             ))
         } else {
             let (key_ty, value_ty) = get_original_types(&generator.map_types_original, name)?;
-            charge_default_cost_value_and_key_size(
+            charge_ok_or_throw_runtime_error(
                 &value_ty.size().and_then(|a| key_ty.size().map(|b| a + b)),
                 generator,
                 builder,
@@ -522,7 +521,7 @@ impl ComplexWord for MapInsert {
             let mut error_block = builder.dangling_instr_seq(None);
             if post205_cost_local.is_some() {
                 let (key_ty, value_ty) = get_original_types(&generator.map_types_original, name)?;
-                charge_default_cost_value_and_key_size(
+                charge_ok_or_throw_runtime_error(
                     &value_ty.size().and_then(|a| key_ty.size().map(|b| a + b)),
                     generator,
                     &mut error_block,
@@ -587,7 +586,7 @@ impl ComplexWord for MapDelete {
             Some(generator.borrow_local(ValType::I32))
         } else {
             let (key_ty, _) = get_original_types(&generator.map_types_original, name)?;
-            charge_default_cost_value_and_key_size(&key_ty.size(), generator, builder, self)?;
+            charge_ok_or_throw_runtime_error(&key_ty.size(), generator, builder, self)?;
             None
         };
 
@@ -661,7 +660,7 @@ impl ComplexWord for MapDelete {
             // in epoch >= 2.05, we charge depending on the size of the key.
             if post205_cost_local.is_some() {
                 let (key_ty, _) = get_original_types(&generator.map_types_original, name)?;
-                charge_default_cost_value_and_key_size(
+                charge_ok_or_throw_runtime_error(
                     &key_ty.size(),
                     generator,
                     &mut error_block,
@@ -691,27 +690,6 @@ impl ComplexWord for MapDelete {
     }
 }
 
-/// helper function to compute the cost of value and key type sizes
-/// This function charges the the size of the value type + the size of the key type (non serialized)
-/// It is used for Get, Insert,and Set functions
-/// The two cases it is used in are:
-/// 1) for cost computation in epoch < 2.05
-/// 2) for cost computation in case of an interpreter error in epoch >= 2.05
-fn charge_default_cost_value_and_key_size(
-    cost: &Result<u32, ClarityTypeError>,
-    generator: &mut WasmGenerator,
-    builder: &mut walrus::InstrSeqBuilder,
-    word: &dyn ComplexWord,
-) -> Result<(), GeneratorError> {
-    if let Ok(cost) = cost {
-        word.charge(generator, builder, *cost)?;
-    } else {
-        builder
-            .i32_const(ErrorMap::SignatureTypeSizeCheckError as i32)
-            .call(generator.func_by_name("stdlib.runtime-error"));
-    }
-    Ok(())
-}
 type MapTypes = BTreeMap<ClarityName, (TypeSignature, TypeSignature)>;
 fn get_original_types(
     map_types: &MapTypes,
