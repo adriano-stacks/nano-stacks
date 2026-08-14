@@ -2855,6 +2855,7 @@ dependencies = [
 name = "nano-tui"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "clarity",
  "crossterm 0.29.0",
  "hex",
@@ -2865,6 +2866,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq 2.12.1",
+ "url",
 ]
 
 [[package]]

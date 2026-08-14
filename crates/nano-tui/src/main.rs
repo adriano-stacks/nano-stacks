@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -36,6 +37,7 @@ use ratatui::{
 };
 
 use node::{Node, Sortition, SyncStatus};
+use url::Url;
 
 /// How often the node is polled.
 ///
@@ -53,24 +55,40 @@ const HISTORY: usize = 200;
 /// one request per block.
 const FILL: usize = 50;
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "nano-tui",
+    about = "Read-only dashboard and explorer for a nano-stacks node",
+    after_help = "KEYS:\n  ↑/↓ select   enter/→ open   m mining   esc/← back   r refresh   q quit/back"
+)]
+struct Args {
+    /// HTTP RPC endpoint of the node to inspect.
+    #[arg(long, default_value = "http://127.0.0.1:20443")]
+    rpc_url: Url,
+
+    /// Optional Prometheus endpoint used by the Operations view.
+    #[arg(long)]
+    metrics_url: Option<Url>,
+
+    /// Render one 110x32 frame as text and exit.
+    #[arg(long)]
+    once: bool,
+}
+
 fn main() -> io::Result<()> {
-    let url = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "http://127.0.0.1:20443".to_owned());
-    if url == "--help" || url == "-h" {
-        println!(
-            "usage: nano-tui [rpc-url] [--once]\n               ↑/↓ select   enter/→ open   m mining   esc/← back   r refresh   q quit/back\n               --once renders one frame as text and exits, for a script or a log"
-        );
-        return Ok(());
-    }
+    let args = Args::parse();
+    // Parsed now so task 127 can consume one validated URL without changing the
+    // command-line contract established here.
+    drop(args.metrics_url);
+    let node = Node::new(args.rpc_url.as_str());
     // One frame as text, for a check that does not need a terminal at all: the same
     // draw against the same node, rendered into a buffer instead of onto a screen.
-    if std::env::args().any(|argument| argument == "--once") {
-        print!("{}", render_once(&Node::new(&url)));
+    if args.once {
+        print!("{}", render_once(&node));
         return Ok(());
     }
     let mut terminal = start()?;
-    let outcome = run(&mut terminal, &Node::new(&url));
+    let outcome = run(&mut terminal, &node);
     stop(&mut terminal)?;
     outcome
 }

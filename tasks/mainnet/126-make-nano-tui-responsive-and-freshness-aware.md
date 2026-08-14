@@ -1,7 +1,7 @@
 ---
 id: "126"
 title: "Make nano-tui responsive and freshness-aware"
-status: pending
+status: in-progress
 priority: high
 effort: medium
 type: feature
