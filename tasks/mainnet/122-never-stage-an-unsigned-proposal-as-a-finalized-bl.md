@@ -73,3 +73,30 @@ The original Hacknet remains preserved as failure evidence. Its unsigned staged
 row is not edited away. The final task item needs a new isolated network built
 from this source, because continuing the old state would test manual repair rather
 than prevention.
+
+## Fresh isolated reward-cycle evidence, 2026-08-14
+
+The `task122n` Hacknet was started from empty project state with a 15-block
+reward cycle and 10-block prepare phase. Nano imported an authenticated
+checkpoint at Stacks height 360, served the captured cycle-18 set, and derived
+the upcoming cycle-19 set from its own local burnchain during the prepare phase.
+The hosted stock signer registered for both cycles.
+
+After the network crossed into cycle 19, stock and nano agreed at Stacks height
+436 and block `6d6f48547f8e71d49d5b80839b48a6f0cacb39ab7da0c5fb737e08eafe35d37e`.
+The fetched finalized block was 535 bytes and carried two signer signatures.
+Nano's `staging.sqlite` contained zero rows before and after the verification
+gate, so no unsigned form shadowed the finalized block.
+
+```text
+hosted_signer::a_stock_signer_answers_proposals_through_nano        PASS
+hosted_signer::a_transaction_posted_to_nano_is_admitted_and_reported PASS
+hosted_signer::an_observer_on_nano_is_told_what_stacks_core_tells_its_own PASS
+hosted_signer suite                                                  3 passed
+shared stock/nano observer receipts                                  69 matched
+hosted cycle-19 signer threshold                                     7/10 weight
+staged rows before / after                                            0 / 0
+```
+
+This proves the fresh boundary and finalized-block behavior. The task remains
+open until the complete infrastructure qualification is green.
