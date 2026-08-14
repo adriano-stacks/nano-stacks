@@ -1838,22 +1838,39 @@ impl WasmGenerator {
         // Entering the function type-checks every argument it was given.
         self.charge_user_function_application(&mut func_body, function_type.args.len() as u32)?;
         let memory = self.get_memory()?;
-        for index in 0..parameters.len() {
+        let uses_argument_value_size = self
+            .executing_epoch()
+            .is_some_and(|epoch| epoch.uses_arg_size_for_cost());
+        for (index, (parameter_type, _, _)) in parameters.iter().enumerate() {
             let size = self.borrow_local(ValType::I32);
-            let offset = u32::try_from(index)
-                .ok()
-                .and_then(|index| index.checked_mul(4))
-                .ok_or_else(|| {
-                    GeneratorError::InternalError("function argument-size offset overflow".into())
+            if uses_argument_value_size {
+                let offset = u32::try_from(index)
+                    .ok()
+                    .and_then(|index| index.checked_mul(4))
+                    .ok_or_else(|| {
+                        GeneratorError::InternalError(
+                            "function argument-size offset overflow".into(),
+                        )
+                    })?;
+                func_body
+                    .global_get(self.argument_sizes)
+                    .load(
+                        memory,
+                        LoadKind::I32 { atomic: false },
+                        MemArg { align: 4, offset },
+                    )
+                    .local_set(*size);
+            } else {
+                let declared_size = i32::try_from(parameter_type.size().map_err(|error| {
+                    GeneratorError::TypeError(format!(
+                        "function parameter size is not realizable: {error}"
+                    ))
+                })?)
+                .map_err(|_| {
+                    GeneratorError::TypeError("function parameter size exceeds i32".into())
                 })?;
-            func_body
-                .global_get(self.argument_sizes)
-                .load(
-                    memory,
-                    LoadKind::I32 { atomic: false },
-                    MemArg { align: 4, offset },
-                )
-                .local_set(*size);
+                func_body.i32_const(declared_size).local_set(*size);
+            }
             self.charge_inner_type_check(&mut func_body, *size)?;
         }
 
