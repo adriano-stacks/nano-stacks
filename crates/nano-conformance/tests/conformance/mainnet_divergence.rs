@@ -390,6 +390,19 @@ fn normalized_event(event: &JsonValue) -> JsonValue {
     }
 }
 
+fn normalized_oracle_events(events: &[JsonValue]) -> Vec<JsonValue> {
+    events
+        .iter()
+        .cloned()
+        .map(|mut event| {
+            if let Some(body) = event.as_object_mut() {
+                body.retain(|_, value| value.as_str() != Some(""));
+            }
+            event
+        })
+        .collect()
+}
+
 fn observe(applied: &AppliedBlock, oracle: &Oracle, receipt_count: usize) -> Observation {
     assert_eq!(
         applied.receipts.len(),
@@ -720,7 +733,7 @@ fn assert_contract_call_matches_oracle(
             normalized_event(&serialized)
         })
         .collect::<Vec<_>>();
-    assert_eq!(events, oracle.events);
+    assert_eq!(events, normalized_oracle_events(&oracle.events));
 }
 
 const fn oracle_execution_cost(cost: &OracleCost) -> ExecutionCost {
@@ -1059,17 +1072,7 @@ fn the_mainnet_8724865_nested_trait_receipt_and_root_match_the_canonical_oracle(
     assert_eq!(first.state_root, *block.header.state_index_root.as_bytes());
     assert_eq!(first.result_hex, oracle.result.hex);
     assert_eq!(first.result_repr, oracle.result.repr);
-    let expected_events = oracle
-        .events
-        .iter()
-        .cloned()
-        .map(|mut event| {
-            if let Some(body) = event.as_object_mut() {
-                body.retain(|_, value| value.as_str() != Some(""));
-            }
-            event
-        })
-        .collect::<Vec<_>>();
+    let expected_events = normalized_oracle_events(&oracle.events);
     assert_eq!(first.events, expected_events);
     compare_engines_at_exact_fixture_prestate(
         &mut scratch,
