@@ -1972,7 +1972,10 @@ impl ChainState {
                 persistence: BlockPersistence::Discard,
             },
         )?;
-        Ok(ExecutedBlock { proposed, applied })
+        Ok(ExecutedBlock {
+            block: proposed,
+            applied,
+        })
     }
 
     /// Execute a fixture block and verify its state root without authenticating consensus.
