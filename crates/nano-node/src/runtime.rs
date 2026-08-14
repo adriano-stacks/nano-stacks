@@ -1356,7 +1356,6 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
         peer,
     )
     .await;
-    let [context, next_context] = signer_cycle_contexts(context);
     let mut signer_inputs = SignerCycleInputs {
         state,
         executor,
@@ -1366,17 +1365,24 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
         checkpoint,
     };
     publish_signer_cycle(&mut signer_inputs, context).await;
-    publish_signer_cycle(&mut signer_inputs, next_context).await;
+    if let Some(next_context) = upcoming_signer_cycle_context(context) {
+        publish_signer_cycle(&mut signer_inputs, next_context).await;
+    }
 }
 
-fn signer_cycle_contexts(
+fn upcoming_signer_cycle_context(
     context: nano_chainstate::BitcoinBlockContext,
-) -> [nano_chainstate::BitcoinBlockContext; 2] {
+) -> Option<nano_chainstate::BitcoinBlockContext> {
+    let current = nano_chainstate::signers::reward_cycle_at(context)?;
+    let upcoming = nano_chainstate::signers::prepare_phase_reward_cycle(context)?;
+    if upcoming == current {
+        return None;
+    }
     let cycle_length = u64::from(context.prepare_phase_length)
         .saturating_add(u64::from(context.reward_phase_length));
     let mut next = context;
     next.move_to_burn_block(context.height.saturating_add(cycle_length));
-    [context, next]
+    (nano_chainstate::signers::reward_cycle_at(next) == Some(upcoming)).then_some(next)
 }
 
 struct SignerCycleInputs<'a> {
@@ -4811,9 +4817,13 @@ authentication_history = "{}"
         context.prepare_phase_length = 100;
         context.reward_phase_length = 2_000;
 
-        let cycles =
-            super::signer_cycle_contexts(context).map(nano_chainstate::signers::reward_cycle_at);
-        assert_eq!(cycles, [Some(140), Some(141)]);
+        assert_eq!(super::upcoming_signer_cycle_context(context), None);
+        context.move_to_burn_block(962_051);
+        assert_eq!(
+            super::upcoming_signer_cycle_context(context)
+                .and_then(nano_chainstate::signers::reward_cycle_at),
+            Some(141)
+        );
 
         let state = super::RpcState::new(super::Network::MAINNET);
         let mut published = super::RewardCyclePublication::default();
