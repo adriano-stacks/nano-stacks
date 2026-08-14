@@ -858,6 +858,7 @@ verify() {
     verification_env=(
         "NANO_SIGNER_PUBLIC_KEY=$signer_key"
         "NANO_HACKNET_PEER=$(peer_url "$(stock_index "$index")")/"
+        "NANO_HACKNET_API=http://127.0.0.1:$STACKS_API_RPC_PORT/"
     )
     [ -z "$miner_key" ] || verification_env+=("NANO_MINER_PUBLIC_KEY=$miner_key")
     env -u NANO_MINER_PUBLIC_KEY "${verification_env[@]}" \
