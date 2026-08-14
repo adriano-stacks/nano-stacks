@@ -17,7 +17,11 @@
 mod node;
 
 use std::{
+    collections::HashSet,
     io,
+    process::ExitCode,
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -55,6 +59,290 @@ const HISTORY: usize = 200;
 /// one request per block.
 const FILL: usize = 50;
 
+#[derive(Clone, Copy)]
+enum Source {
+    Sync,
+    Info,
+    Pox,
+    Tenure,
+    Sortitions,
+}
+
+#[derive(Default)]
+struct SourceState {
+    updated: Option<Instant>,
+    pending: bool,
+    error: Option<String>,
+}
+
+impl SourceState {
+    const fn started(&mut self) {
+        self.pending = true;
+    }
+
+    fn succeeded(&mut self) {
+        self.updated = Some(Instant::now());
+        self.pending = false;
+        self.error = None;
+    }
+
+    fn failed(&mut self, error: &str) {
+        self.pending = false;
+        self.error = Some(one_line_error(error));
+    }
+
+    fn description(&self) -> String {
+        let age = self
+            .updated
+            .map(|updated| format!("{}s ago", updated.elapsed().as_secs()));
+        match (&age, &self.error, self.pending) {
+            (None, None, true) => "loading".to_owned(),
+            (None, None, false) => "waiting".to_owned(),
+            (None, Some(error), _) => format!("unavailable · {error}"),
+            (Some(age), Some(error), true) => format!("stale {age} · retrying · {error}"),
+            (Some(age), Some(error), false) => format!("stale {age} · {error}"),
+            (Some(age), None, true) => format!("refreshing · updated {age}"),
+            (Some(age), None, false) => format!("fresh {age}"),
+        }
+    }
+
+    const fn unavailable(&self) -> bool {
+        self.updated.is_none() && self.error.is_some()
+    }
+}
+
+#[derive(Default)]
+struct Sources {
+    sync: SourceState,
+    info: SourceState,
+    pox: SourceState,
+    tenure: SourceState,
+    sortitions: SourceState,
+    blocks: SourceState,
+}
+
+impl Sources {
+    const fn get_mut(&mut self, source: Source) -> &mut SourceState {
+        match source {
+            Source::Sync => &mut self.sync,
+            Source::Info => &mut self.info,
+            Source::Pox => &mut self.pox,
+            Source::Tenure => &mut self.tenure,
+            Source::Sortitions => &mut self.sortitions,
+        }
+    }
+
+    const fn unreachable(&self) -> bool {
+        self.sync.unavailable()
+            && self.info.unavailable()
+            && self.pox.unavailable()
+            && self.tenure.unavailable()
+            && self.sortitions.unavailable()
+    }
+
+    fn degraded(&self) -> bool {
+        [
+            &self.sync,
+            &self.info,
+            &self.pox,
+            &self.tenure,
+            &self.sortitions,
+            &self.blocks,
+        ]
+        .iter()
+        .any(|source| source.error.is_some())
+    }
+}
+
+enum PollUpdate {
+    Started(Source),
+    Sync(Result<SyncStatus, String>),
+    Info(Result<node::NodeInfo, String>),
+    Pox(Result<node::Pox, String>),
+    Tenure(Result<node::TenureInfo, String>),
+    Sortitions(Result<Vec<Sortition>, String>),
+}
+
+struct Poller {
+    updates: Receiver<PollUpdate>,
+    refresh: Sender<()>,
+}
+
+impl Poller {
+    fn start(node: Node) -> Self {
+        let (updates, receiver) = mpsc::channel();
+        let (refresh, commands) = mpsc::channel();
+        thread::spawn(move || {
+            loop {
+                let started = Instant::now();
+                poll_routes(&node, &updates);
+                let remaining = POLL.saturating_sub(started.elapsed());
+                match commands.recv_timeout(remaining) {
+                    Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+        Self {
+            updates: receiver,
+            refresh,
+        }
+    }
+
+    fn try_recv(&self) -> Option<PollUpdate> {
+        self.updates.try_recv().ok()
+    }
+
+    fn refresh(&self) {
+        let _ = self.refresh.send(());
+    }
+}
+
+fn poll_routes(node: &Node, updates: &Sender<PollUpdate>) {
+    for source in [
+        Source::Sync,
+        Source::Info,
+        Source::Pox,
+        Source::Tenure,
+        Source::Sortitions,
+    ] {
+        let _ = updates.send(PollUpdate::Started(source));
+    }
+    thread::scope(|scope| {
+        let send = updates.clone();
+        let sync_node = node.clone();
+        scope.spawn(move || {
+            let _ = send.send(PollUpdate::Sync(sync_node.sync_status()));
+        });
+        let send = updates.clone();
+        let info_node = node.clone();
+        scope.spawn(move || {
+            let _ = send.send(PollUpdate::Info(info_node.info()));
+        });
+        let send = updates.clone();
+        let pox_node = node.clone();
+        scope.spawn(move || {
+            let _ = send.send(PollUpdate::Pox(pox_node.pox()));
+        });
+        let send = updates.clone();
+        let tenure_node = node.clone();
+        scope.spawn(move || {
+            let _ = send.send(PollUpdate::Tenure(tenure_node.tenure()));
+        });
+        let send = updates.clone();
+        let sortitions_node = node.clone();
+        scope.spawn(move || {
+            let _ = send.send(PollUpdate::Sortitions(sortitions_node.sortitions()));
+        });
+    });
+}
+
+struct BlockRequest {
+    generation: u64,
+    tip: String,
+    height: u64,
+    known: Vec<String>,
+}
+
+enum BlockUpdate {
+    Block { generation: u64, block: node::Block },
+    Finished(u64),
+    Failed { generation: u64, error: String },
+}
+
+struct BlockLoader {
+    updates: Receiver<BlockUpdate>,
+    requests: Sender<BlockRequest>,
+}
+
+impl BlockLoader {
+    fn start(node: Node) -> Self {
+        let (updates, receiver) = mpsc::channel();
+        let (requests, commands) = mpsc::channel();
+        thread::spawn(move || load_blocks(&node, &commands, &updates));
+        Self {
+            updates: receiver,
+            requests,
+        }
+    }
+
+    fn request(&self, request: BlockRequest) {
+        let _ = self.requests.send(request);
+    }
+
+    fn try_recv(&self) -> Option<BlockUpdate> {
+        self.updates.try_recv().ok()
+    }
+}
+
+fn load_blocks(node: &Node, commands: &Receiver<BlockRequest>, updates: &Sender<BlockUpdate>) {
+    let mut pending = None;
+    'requests: loop {
+        let request = match pending.take() {
+            Some(request) => request,
+            None => match commands.recv() {
+                Ok(request) => request,
+                Err(_) => return,
+            },
+        };
+        let known = request.known.iter().collect::<HashSet<_>>();
+        let mut walk = Some(request.tip.clone());
+        let mut found = 0;
+        while let Some(id) = walk.take() {
+            match commands.try_recv() {
+                Ok(request) => {
+                    pending = commands.try_iter().last().or(Some(request));
+                    continue 'requests;
+                }
+                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Empty) => {}
+            }
+            if known.contains(&id) || found >= FILL {
+                break;
+            }
+            match node.block(&id, if found == 0 { request.height } else { 0 }) {
+                Ok(block) => {
+                    walk = Some(block.parent_id.clone());
+                    found += 1;
+                    if updates
+                        .send(BlockUpdate::Block {
+                            generation: request.generation,
+                            block,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = updates.send(BlockUpdate::Failed {
+                        generation: request.generation,
+                        error,
+                    });
+                    continue 'requests;
+                }
+            }
+        }
+        if updates
+            .send(BlockUpdate::Finished(request.generation))
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn one_line_error(error: &str) -> String {
+    const MAX: usize = 64;
+    let line = error.lines().next().unwrap_or("request failed");
+    if line.chars().count() <= MAX {
+        return line.to_owned();
+    }
+    let mut shortened = line.chars().take(MAX - 1).collect::<String>();
+    shortened.push('…');
+    shortened
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "nano-tui",
@@ -75,7 +363,17 @@ struct Args {
     once: bool,
 }
 
-fn main() -> io::Result<()> {
+fn main() -> ExitCode {
+    match try_main() {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("nano-tui: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn try_main() -> io::Result<ExitCode> {
     let args = Args::parse();
     // Parsed now so task 127 can consume one validated URL without changing the
     // command-line contract established here.
@@ -84,21 +382,29 @@ fn main() -> io::Result<()> {
     // One frame as text, for a check that does not need a terminal at all: the same
     // draw against the same node, rendered into a buffer instead of onto a screen.
     if args.once {
-        print!("{}", render_once(&node));
-        return Ok(());
+        let (rendered, code) = render_once(&node);
+        print!("{rendered}");
+        return Ok(code);
     }
     let mut terminal = start()?;
     let outcome = run(&mut terminal, &node);
     stop(&mut terminal)?;
-    outcome
+    outcome?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Draw one frame into a buffer and return it as lines of text.
-fn render_once(node: &Node) -> String {
+fn render_once(node: &Node) -> (String, ExitCode) {
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(110, 32))
         .expect("a buffer backend cannot fail to open");
-    let mut state = State::default();
-    state.refresh(node);
+    let mut state = snapshot(node);
+    let code = if state.sources.unreachable() {
+        ExitCode::from(3)
+    } else if state.sources.degraded() {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    };
     terminal
         .draw(|frame| draw(frame, &mut state, node))
         .expect("drawing into a buffer cannot fail");
@@ -110,7 +416,51 @@ fn render_once(node: &Node) -> String {
         }
         out.push('\n');
     }
-    out
+    (out, code)
+}
+
+fn snapshot(node: &Node) -> State {
+    let (updates, receiver) = mpsc::channel();
+    poll_routes(node, &updates);
+    drop(updates);
+    let mut state = State::default();
+    let mut block_request = None;
+    for update in receiver {
+        block_request = state.apply_poll(update).or(block_request);
+    }
+    if let Some(request) = block_request {
+        load_blocks_once(node, &mut state, request);
+    }
+    state
+}
+
+fn load_blocks_once(node: &Node, state: &mut State, request: BlockRequest) {
+    let known = request.known.iter().collect::<HashSet<_>>();
+    let mut walk = Some(request.tip);
+    let mut found = 0;
+    while let Some(id) = walk.take() {
+        if known.contains(&id) || found >= FILL {
+            break;
+        }
+        match node.block(&id, if found == 0 { request.height } else { 0 }) {
+            Ok(block) => {
+                walk = Some(block.parent_id.clone());
+                found += 1;
+                state.apply_block(BlockUpdate::Block {
+                    generation: request.generation,
+                    block,
+                });
+            }
+            Err(error) => {
+                state.apply_block(BlockUpdate::Failed {
+                    generation: request.generation,
+                    error,
+                });
+                return;
+            }
+        }
+    }
+    state.apply_block(BlockUpdate::Finished(request.generation));
 }
 
 fn start() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -126,7 +476,7 @@ fn stop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()>
     terminal.show_cursor()
 }
 
-/// Everything on the screen, and the one poll that produced it.
+/// Everything on the screen, including the last good answer from every route.
 #[derive(Default)]
 struct State {
     sync: Option<SyncStatus>,
@@ -140,30 +490,41 @@ struct State {
     selected_participant: ListState,
     screen: Screen,
     transaction_scroll: u16,
-    /// The last poll that answered at all, so a node that has just gone away is
-    /// visibly stale rather than silently frozen.
-    polled: Option<Instant>,
-    unreachable: bool,
+    sources: Sources,
+    requested_tip: Option<String>,
+    block_generation: u64,
+    backfill_inserted: usize,
 }
 
 impl State {
-    /// Take one poll's worth of answers, and pick up any block the tip moved past.
-    fn refresh(&mut self, node: &Node) {
-        let sync = node.sync_status();
-        self.unreachable = sync.is_none();
-        if sync.is_some() {
-            self.polled = Some(Instant::now());
+    fn apply_poll(&mut self, update: PollUpdate) -> Option<BlockRequest> {
+        match update {
+            PollUpdate::Started(source) => {
+                self.sources.get_mut(source).started();
+                return None;
+            }
+            PollUpdate::Sync(result) => {
+                apply_reading(&mut self.sync, &mut self.sources.sync, result);
+            }
+            PollUpdate::Info(result) => {
+                apply_reading(&mut self.info, &mut self.sources.info, result);
+            }
+            PollUpdate::Pox(result) => {
+                apply_reading(&mut self.pox, &mut self.sources.pox, result);
+            }
+            PollUpdate::Tenure(result) => {
+                apply_reading(&mut self.tenure, &mut self.sources.tenure, result);
+            }
+            PollUpdate::Sortitions(result) => match result {
+                Ok(sortitions) => {
+                    self.sortitions = sortitions;
+                    self.sources.sortitions.succeeded();
+                    select_current_participant(self);
+                }
+                Err(error) => self.sources.sortitions.failed(&error),
+            },
         }
-        self.sync = sync.or_else(|| self.sync.take());
-        self.info = node.info().or_else(|| self.info.take());
-        self.pox = node.pox().or_else(|| self.pox.take());
-        self.tenure = node.tenure().or_else(|| self.tenure.take());
-        if let Some(sortitions) = node.sortitions() {
-            self.sortitions = sortitions;
-            select_current_participant(self);
-        }
-        // Only the executed tip, and only when it moved: the explorer is a record of
-        // what this node ran, so a block enters it by having been executed here.
+
         let (Some(height), Some(tip)) = (
             self.sync
                 .as_ref()
@@ -172,49 +533,64 @@ impl State {
                 .as_ref()
                 .and_then(|sync| sync.executed_stacks_tip.clone()),
         ) else {
-            return;
+            return None;
         };
         if self.blocks.first().is_some_and(|block| block.id == tip) {
-            return;
+            self.requested_tip = Some(tip);
+            return None;
         }
-        // Walked back from the new tip through its parents, not sampled at it. The
-        // node executes several blocks between two polls whenever it is catching up
-        // -- and often when it is not -- so taking only the tip left holes in the
-        // list: 8,716,645, 8,716,644, 8,716,643, 8,716,641. A hole is not a small
-        // cosmetic problem here, because the list claims to be what this node
-        // executed, and a reader cannot tell a block that was skipped by the poll
-        // from one the node never ran.
-        let mut found = Vec::new();
-        let mut walk = Some(tip);
-        while let Some(id) = walk.take() {
-            if self.blocks.iter().any(|block| block.id == id) || found.len() >= FILL {
-                break;
+        if self.requested_tip.as_deref() == Some(&tip) && self.sources.blocks.pending {
+            return None;
+        }
+        self.block_generation = self.block_generation.wrapping_add(1);
+        self.requested_tip = Some(tip.clone());
+        self.backfill_inserted = 0;
+        self.sources.blocks.started();
+        Some(BlockRequest {
+            generation: self.block_generation,
+            tip,
+            height,
+            known: self.blocks.iter().map(|block| block.id.clone()).collect(),
+        })
+    }
+
+    fn apply_block(&mut self, update: BlockUpdate) {
+        match update {
+            BlockUpdate::Block { generation, block }
+                if generation == self.block_generation
+                    && !self.blocks.iter().any(|known| known.id == block.id) =>
+            {
+                let at = self.backfill_inserted.min(self.blocks.len());
+                self.blocks.insert(at, block);
+                self.backfill_inserted += 1;
+                self.blocks.truncate(HISTORY);
+                if let Some(index) = self.selected_block.selected() {
+                    self.selected_block
+                        .select(Some((index + 1).min(self.blocks.len() - 1)));
+                }
             }
-            // The height is read from the block's own header, except for the tip,
-            // whose height the node has already stated.
-            let Some(block) = node.block(&id, if found.is_empty() { height } else { 0 }) else {
-                break;
-            };
-            walk = Some(block.parent_id.clone());
-            found.push(block);
-        }
-        if found.is_empty() {
-            return;
-        }
-        // `found` is newest-first, and so is the list.
-        let added = found.len();
-        self.blocks.splice(0..0, found);
-        self.blocks.truncate(HISTORY);
-        // Keep the cursor on the block it was on, rather than letting new tips slide
-        // the selection out from under the reader.
-        if let Some(index) = self.selected_block.selected() {
-            self.selected_block
-                .select(Some((index + added).min(self.blocks.len() - 1)));
+            BlockUpdate::Finished(generation) if generation == self.block_generation => {
+                self.sources.blocks.succeeded();
+            }
+            BlockUpdate::Failed { generation, error } if generation == self.block_generation => {
+                self.sources.blocks.failed(&error);
+            }
+            BlockUpdate::Block { .. } | BlockUpdate::Finished(_) | BlockUpdate::Failed { .. } => {}
         }
     }
 
     fn behind(&self) -> Option<u64> {
         self.sync.as_ref().and_then(|sync| sync.blocks_behind)
+    }
+}
+
+fn apply_reading<T>(target: &mut Option<T>, source: &mut SourceState, result: Result<T, String>) {
+    match result {
+        Ok(value) => {
+            *target = Some(value);
+            source.succeeded();
+        }
+        Err(error) => source.failed(&error),
     }
 }
 
@@ -236,13 +612,16 @@ enum Action {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, node: &Node) -> io::Result<()> {
     let mut state = State::default();
-    // `None` rather than a time in the past: the first pass polls, and a clock that
-    // cannot go back that far is not a thing to reason about.
-    let mut last: Option<Instant> = None;
+    let poller = Poller::start(node.clone());
+    let blocks = BlockLoader::start(node.clone());
     loop {
-        if last.is_none_or(|last| last.elapsed() >= POLL) {
-            state.refresh(node);
-            last = Some(Instant::now());
+        while let Some(update) = poller.try_recv() {
+            if let Some(request) = state.apply_poll(update) {
+                blocks.request(request);
+            }
+        }
+        while let Some(update) = blocks.try_recv() {
+            state.apply_block(update);
         }
         terminal.draw(|frame| draw(frame, &mut state, node))?;
         if !event::poll(Duration::from_millis(200))? {
@@ -256,7 +635,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, node: &Node) -> io
         }
         match handle_key(&mut state, key.code) {
             Action::Quit => return Ok(()),
-            Action::Refresh => last = None,
+            Action::Refresh => poller.refresh(),
             Action::None => {}
         }
     }
@@ -559,25 +938,19 @@ fn draw_sync_status(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
         info.network_id
             .map_or_else(|| "?".to_owned(), |id| format!("{id:#010x}"))
     );
+    let unreachable = state.sources.unreachable();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(if state.unreachable {
+        .border_style(Style::default().fg(if unreachable {
             Color::Red
         } else {
             Color::DarkGray
         }));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let source_status = if state.unreachable {
-        "node unreachable".to_owned()
-    } else {
-        state.polled.map_or_else(
-            || "waiting for first poll".to_owned(),
-            |at| format!("polled {}s ago", at.elapsed().as_secs()),
-        )
-    };
-    let (lag, lag_colour) = sync_lag(state.behind(), state.unreachable);
+    let source_status = state.sources.sync.description();
+    let (lag, lag_colour) = sync_lag(state.behind(), state.sources.sync.unavailable());
     let lines = vec![
         Line::from(vec![
             label("verified locally  "),
@@ -600,7 +973,7 @@ fn draw_sync_status(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
             label("  ·  "),
             Span::styled(
                 source_status,
-                Style::default().fg(if state.unreachable {
+                Style::default().fg(if state.sources.sync.error.is_some() {
                     Color::Red
                 } else {
                     Color::DarkGray
@@ -626,6 +999,15 @@ fn draw_sync_status(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
             Span::styled(lag, Style::default().fg(lag_colour)),
             label("   bitcoin block "),
             number(info.burn_block_height, Color::Cyan),
+            label("  · info "),
+            Span::styled(
+                state.sources.info.description(),
+                Style::default().fg(if state.sources.info.error.is_some() {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                }),
+            ),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
@@ -666,7 +1048,11 @@ fn draw_tenure(frame: &mut Frame, area: Rect, state: &State) {
         ]),
     ]);
     frame.render_widget(
-        Paragraph::new(lines).block(bordered(" current tenure ")),
+        Paragraph::new(lines).block(bordered(&format!(
+            " current tenure — tenure {} · PoX {} ",
+            state.sources.tenure.description(),
+            state.sources.pox.description()
+        ))),
         area,
     );
 }
@@ -744,13 +1130,17 @@ fn tenure_history_lines(state: &State, tenure: &node::TenureInfo) -> Vec<Line<'s
 
 /// The burn view this node executed under, as *it* derived it.
 fn draw_sortition(frame: &mut Frame, area: Rect, state: &State) {
+    let title = format!(
+        " current miner & latest sortition — {} ",
+        state.sources.sortitions.description()
+    );
     let Some(latest) = latest_sortition(state) else {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "waiting for this node to derive a burnchain decision",
                 Style::default().fg(Color::DarkGray),
             )))
-            .block(bordered(" latest burnchain decision ")),
+            .block(bordered(&title)),
             area,
         );
         return;
@@ -828,10 +1218,7 @@ fn draw_sortition(frame: &mut Frame, area: Rect, state: &State) {
             value(active.and_then(|sortition| sortition.committed_block_hash.as_deref())),
         ]),
     ];
-    frame.render_widget(
-        Paragraph::new(lines).block(bordered(" current miner & latest sortition ")),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).block(bordered(&title)), area);
 }
 
 fn draw_mining(frame: &mut Frame, area: Rect, state: &mut State) {
@@ -1117,7 +1504,10 @@ fn draw_tenure_budget(frame: &mut Frame, area: Rect, state: &State) {
         ]),
     ];
     frame.render_widget(
-        Paragraph::new(lines).block(bordered(" current tenure execution budget ")),
+        Paragraph::new(lines).block(bordered(&format!(
+            " current tenure execution budget — {} ",
+            state.sources.pox.description()
+        ))),
         area,
     );
 }
@@ -1130,7 +1520,10 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &mut State) {
                 "waiting for this node to execute a block…",
                 Style::default().fg(Color::DarkGray),
             )))
-            .block(bordered(" executed blocks ")),
+            .block(bordered(&format!(
+                " executed blocks — {} ",
+                state.sources.blocks.description()
+            ))),
             area,
         );
         return;
@@ -1168,8 +1561,9 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &mut State) {
     // question to ask of a long-running dashboard, and the answer is bounded: this
     // keeps blocks in memory and nothing on disk.
     let title = format!(
-        " executed blocks — {} held, {HISTORY} max, nothing on disk ",
-        state.blocks.len()
+        " executed blocks — {} held, {HISTORY} max, nothing on disk · {} ",
+        state.blocks.len(),
+        state.sources.blocks.description()
     );
     frame.render_stateful_widget(
         List::new(items)
@@ -1394,10 +1788,10 @@ fn plain_value(text: Option<&str>, missing: &str) -> Span<'static> {
     )
 }
 
-fn sync_lag(behind: Option<u64>, unreachable: bool) -> (String, Color) {
-    if unreachable {
+fn sync_lag(behind: Option<u64>, sync_unavailable: bool) -> (String, Color) {
+    if sync_unavailable {
         return (
-            "unknown while the node is unreachable".to_owned(),
+            "unknown while sync status is unavailable".to_owned(),
             Color::Red,
         );
     }
@@ -1587,10 +1981,15 @@ fn thousands_u128(value: u128) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crossterm::event::KeyCode;
     use ratatui::{Terminal, backend::TestBackend};
 
-    use super::{Action, Screen, State, draw, handle_key, node, short, thousands};
+    use super::{
+        Action, BlockUpdate, PollUpdate, Poller, Screen, Source, State, draw, handle_key, node,
+        short, thousands,
+    };
 
     #[test]
     fn a_height_is_read_as_a_magnitude() {
@@ -1630,6 +2029,93 @@ mod tests {
         handle_key(&mut state, KeyCode::Esc);
         assert_eq!(state.screen, Screen::Blocks);
         assert_eq!(handle_key(&mut state, KeyCode::Char('q')), Action::Quit);
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_last_good_value_and_marks_it_stale() {
+        let mut state = State::default();
+        state.apply_poll(PollUpdate::Sync(Ok(node::SyncStatus {
+            executed_stacks_height: Some(42),
+            ..node::SyncStatus::default()
+        })));
+        state.apply_poll(PollUpdate::Started(Source::Sync));
+        state.apply_poll(PollUpdate::Sync(Err("sync route timed out".to_owned())));
+
+        assert_eq!(
+            state
+                .sync
+                .as_ref()
+                .and_then(|sync| sync.executed_stacks_height),
+            Some(42)
+        );
+        let freshness = state.sources.sync.description();
+        assert!(freshness.contains("stale 0s ago"));
+        assert!(freshness.contains("sync route timed out"));
+    }
+
+    #[test]
+    fn one_live_route_prevents_a_partial_failure_from_becoming_unreachable() {
+        let mut state = State::default();
+        for source in [
+            Source::Sync,
+            Source::Info,
+            Source::Pox,
+            Source::Tenure,
+            Source::Sortitions,
+        ] {
+            state.apply_poll(PollUpdate::Started(source));
+        }
+        state.apply_poll(PollUpdate::Sync(Err("sync failed".to_owned())));
+        state.apply_poll(PollUpdate::Info(Err("info failed".to_owned())));
+        state.apply_poll(PollUpdate::Pox(Err("pox failed".to_owned())));
+        state.apply_poll(PollUpdate::Tenure(Err("tenure failed".to_owned())));
+        state.apply_poll(PollUpdate::Sortitions(Err("sortitions failed".to_owned())));
+        assert!(state.sources.unreachable());
+
+        state.apply_poll(PollUpdate::Info(Ok(node::NodeInfo::default())));
+        assert!(!state.sources.unreachable());
+        assert!(state.sources.sync.unavailable());
+    }
+
+    #[test]
+    fn incremental_backfill_keeps_newest_first_and_the_cursor_on_its_block() {
+        let mut state = State::default();
+        state.blocks.push(block("old", "older", 40));
+        state.selected_block.select(Some(0));
+        state.block_generation = 7;
+        state.sources.blocks.started();
+
+        state.apply_block(BlockUpdate::Block {
+            generation: 7,
+            block: block("tip", "parent", 42),
+        });
+        state.apply_block(BlockUpdate::Block {
+            generation: 7,
+            block: block("parent", "old", 41),
+        });
+        state.apply_block(BlockUpdate::Finished(7));
+
+        assert_eq!(
+            state
+                .blocks
+                .iter()
+                .map(|block| block.id.as_str())
+                .collect::<Vec<_>>(),
+            ["tip", "parent", "old"]
+        );
+        assert_eq!(state.selected_block.selected(), Some(2));
+        assert!(state.sources.blocks.error.is_none());
+        assert!(!state.sources.blocks.pending);
+    }
+
+    #[test]
+    fn polling_announces_loading_before_waiting_for_the_node() {
+        let poller = Poller::start(node::Node::new("http://127.0.0.1:9"));
+        let update = poller
+            .updates
+            .recv_timeout(Duration::from_millis(200))
+            .expect("loading update before the request");
+        assert!(matches!(update, PollUpdate::Started(Source::Sync)));
     }
 
     #[test]
@@ -1927,6 +2413,19 @@ mod tests {
             timestamp: 2,
         });
         state
+    }
+
+    fn block(id: &str, parent_id: &str, height: u64) -> node::Block {
+        node::Block {
+            height,
+            id: id.to_owned(),
+            parent_id: parent_id.to_owned(),
+            consensus_hash: "tenure".to_owned(),
+            state_index_root: "root".to_owned(),
+            transactions: Vec::new(),
+            signatures: 0,
+            timestamp: 0,
+        }
     }
 
     fn tenure_block() -> node::Block {

@@ -176,6 +176,7 @@ pub struct TenureChange {
 }
 
 /// A node, and the answers it gave to the last poll.
+#[derive(Clone)]
 pub struct Node {
     url: String,
     agent: ureq::Agent,
@@ -196,49 +197,49 @@ impl Node {
         &self.url
     }
 
-    fn json<T: for<'a> Deserialize<'a>>(&self, route: &str) -> Option<T> {
+    fn json<T: for<'a> Deserialize<'a>>(&self, route: &str) -> Result<T, String> {
         self.agent
             .get(&format!("{}{route}", self.url))
             .call()
-            .ok()?
+            .map_err(|error| format!("{route}: {error}"))?
             .into_json()
-            .ok()
+            .map_err(|error| format!("{route}: {error}"))
     }
 
-    pub fn sync_status(&self) -> Option<SyncStatus> {
+    pub fn sync_status(&self) -> Result<SyncStatus, String> {
         self.json("/nano/sync_status")
     }
 
-    pub fn info(&self) -> Option<NodeInfo> {
+    pub fn info(&self) -> Result<NodeInfo, String> {
         self.json("/v2/info")
     }
 
-    pub fn pox(&self) -> Option<Pox> {
+    pub fn pox(&self) -> Result<Pox, String> {
         self.json("/v2/pox")
     }
 
-    pub fn tenure(&self) -> Option<TenureInfo> {
+    pub fn tenure(&self) -> Result<TenureInfo, String> {
         self.json("/v3/tenures/info")
     }
 
     /// The pair, because that is what the route serves and what a signer reads.
-    pub fn sortitions(&self) -> Option<Vec<Sortition>> {
+    pub fn sortitions(&self) -> Result<Vec<Sortition>, String> {
         self.json("/v3/sortitions/latest_and_last")
-            .or_else(|| self.json("/v3/sortitions"))
+            .or_else(|_| self.json("/v3/sortitions"))
     }
 
     /// A block, decoded rather than described: the bytes are consensus-serialized
     /// and `nano-codec` is what the node itself reads them with.
-    pub fn block(&self, block_id: &str, height: u64) -> Option<Block> {
+    pub fn block(&self, block_id: &str, height: u64) -> Result<Block, String> {
         let mut bytes = Vec::new();
         self.agent
             .get(&format!("{}/v3/blocks/{block_id}", self.url))
             .call()
-            .ok()?
+            .map_err(|error| format!("/v3/blocks/{block_id}: {error}"))?
             .into_reader()
             .read_to_end(&mut bytes)
-            .ok()?;
-        decode(&bytes, height)
+            .map_err(|error| format!("/v3/blocks/{block_id}: {error}"))?;
+        decode(&bytes, height).ok_or_else(|| format!("/v3/blocks/{block_id}: invalid block bytes"))
     }
 }
 

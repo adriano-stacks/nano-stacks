@@ -43,7 +43,9 @@ nix develop -c cargo run -p nano-tui -- --rpc-url http://127.0.0.1:20443
 Use the arrow keys to select, Enter or Right to open, Escape or Left to go back,
 `m` for the current miner election, `r` to refresh and `q` to quit. Add `--once`
 to print one 110x32 frame for a log or script. `--help` lists all command-line
-options, including the optional metrics endpoint.
+options, including the optional metrics endpoint. A one-frame check exits 0 when
+every source answered, 2 for a partial/degraded snapshot and 3 when the node is
+unreachable.
 
 [0]: https://github.com/stacks-network/hacknet
 [1]: https://github.com/stacks-network/stacks-core/
