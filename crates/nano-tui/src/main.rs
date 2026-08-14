@@ -359,7 +359,7 @@ fn one_line_error(error: &str) -> String {
 #[command(
     name = "nano-tui",
     about = "Read-only dashboard and explorer for a nano-stacks node",
-    after_help = "KEYS:\n  tab/shift-tab panel   ↑/↓ select   enter/→ open   m mining\n  esc/← back   r refresh   q quit/back"
+    after_help = "KEYS:\n  tab/shift-tab panel   ↑/↓ select   enter/→ open   m mining   o operations\n  esc/← back   r refresh   q quit/back"
 )]
 struct Args {
     /// HTTP RPC endpoint of the node to inspect.
@@ -504,7 +504,9 @@ struct State {
     overview_panel: OverviewPanel,
     standard_layout: bool,
     transaction_scroll: u16,
+    operations_scroll: u16,
     sources: Sources,
+    sync_baseline: Option<SyncStatus>,
     requested_tip: Option<String>,
     block_generation: u64,
     backfill_inserted: usize,
@@ -518,6 +520,9 @@ impl State {
                 return None;
             }
             PollUpdate::Sync(result) => {
+                if self.sync_baseline.is_none() {
+                    self.sync_baseline = result.as_ref().ok().cloned();
+                }
                 apply_reading(&mut self.sync, &mut self.sources.sync, result);
             }
             PollUpdate::Info(result) => {
@@ -615,6 +620,7 @@ enum Screen {
     Block,
     Transaction,
     Mining,
+    Operations,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -700,10 +706,20 @@ fn handle_key(state: &mut State, key: KeyCode) -> Action {
             };
             select_current_participant(state);
         }
+        KeyCode::Char('o') => {
+            state.screen = if state.screen == Screen::Operations {
+                Screen::Blocks
+            } else {
+                Screen::Operations
+            };
+            state.operations_scroll = 0;
+        }
         KeyCode::Char('q' | 'h') | KeyCode::Esc | KeyCode::Left => {
             match state.screen {
                 Screen::Blocks => return Action::Quit,
-                Screen::Block | Screen::Mining => state.screen = Screen::Blocks,
+                Screen::Block | Screen::Mining | Screen::Operations => {
+                    state.screen = Screen::Blocks;
+                }
                 Screen::Transaction => state.screen = Screen::Block,
             }
             state.transaction_scroll = 0;
@@ -720,7 +736,11 @@ fn handle_key(state: &mut State, key: KeyCode) -> Action {
                 state.transaction_scroll = 0;
                 state.screen = Screen::Transaction;
             }
-            Screen::Blocks | Screen::Block | Screen::Transaction | Screen::Mining => {}
+            Screen::Blocks
+            | Screen::Block
+            | Screen::Transaction
+            | Screen::Mining
+            | Screen::Operations => {}
         },
         KeyCode::Down | KeyCode::Char('j') => move_selection(state, 1),
         KeyCode::Up | KeyCode::Char('k') => move_selection(state, -1),
@@ -751,6 +771,11 @@ fn move_selection(state: &mut State, by: isize) {
                 mining_competition(state).map_or(0, |competition| competition.participants.len());
             move_list_selection(&mut state.selected_participant, participants, by);
         }
+        Screen::Operations => {
+            state.operations_scroll = state
+                .operations_scroll
+                .saturating_add_signed(i16::try_from(by).expect("key movement fits in i16"));
+        }
     }
 }
 
@@ -778,6 +803,7 @@ fn move_to_edge(state: &mut State, end: bool) {
                 mining_competition(state).map_or(0, |competition| competition.participants.len());
             select_edge(&mut state.selected_participant, participants, end);
         }
+        Screen::Operations => state.operations_scroll = if end { u16::MAX } else { 0 },
     }
 }
 
@@ -978,6 +1004,7 @@ fn draw(frame: &mut Frame, state: &mut State, node: &Node) {
         Screen::Transaction => draw_transaction(frame, areas[1], state),
         Screen::Mining if areas[1].height >= 22 => draw_mining(frame, areas[1], state),
         Screen::Mining => draw_standard_mining(frame, areas[1], state),
+        Screen::Operations => draw_operations(frame, areas[1], state),
         Screen::Blocks => unreachable!("handled by the dashboard layout"),
     }
     draw_keys(frame, areas[2], state);
@@ -1253,7 +1280,10 @@ fn draw_compact_sync_status(frame: &mut Frame, area: Rect, state: &State, node: 
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn role_names(roles: node::NodeRoles) -> String {
+fn role_names(roles: Option<node::NodeRoles>) -> String {
+    let Some(roles) = roles else {
+        return "unavailable".to_owned();
+    };
     let mut names = Vec::with_capacity(3);
     if roles.follower {
         names.push("follower");
@@ -1269,6 +1299,144 @@ fn role_names(roles: node::NodeRoles) -> String {
     } else {
         names.join("+")
     }
+}
+
+fn draw_operations(frame: &mut Frame, area: Rect, state: &mut State) {
+    let lines = operations_lines(state);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let visible = usize::from(area.height.saturating_sub(2));
+    let content = paragraph.line_count(area.width.saturating_sub(2));
+    let max_scroll = u16::try_from(content.saturating_sub(visible)).unwrap_or(u16::MAX);
+    state.operations_scroll = state.operations_scroll.min(max_scroll);
+    let title = format!(
+        " operations — RPC facts — scroll {}/{} ",
+        state.operations_scroll, max_scroll
+    );
+    frame.render_widget(
+        paragraph
+            .block(bordered(&title))
+            .scroll((state.operations_scroll, 0)),
+        area,
+    );
+}
+
+fn operations_lines(state: &State) -> Vec<Line<'static>> {
+    let sync = state.sync.as_ref();
+    let baseline = state.sync_baseline.as_ref();
+    let mut lines = vec![
+        detail("RPC data", state.sources.sync.description()),
+        detail("local roles", role_names(sync.and_then(|sync| sync.roles))),
+        Line::default(),
+        detail(
+            "history sources",
+            sync.and_then(|sync| sync.fetching_from_peers.as_ref())
+                .map_or_else(|| "unavailable".to_owned(), |peers| peers.join(", ")),
+        ),
+        detail(
+            "P2P sessions",
+            current_count(sync.and_then(|sync| sync.p2p_sessions)),
+        ),
+        detail(
+            "known P2P peers",
+            current_count(sync.and_then(|sync| sync.p2p_known_peers)),
+        ),
+        Line::default(),
+        Line::from(Span::styled(
+            "current work queues",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        detail(
+            "staged blocks",
+            current_count(sync.and_then(|sync| sync.staged_blocks)),
+        ),
+        detail(
+            "relay validation",
+            current_count(sync.and_then(|sync| sync.relay_offered)),
+        ),
+        detail(
+            "relay announcement",
+            current_count(sync.and_then(|sync| sync.relay_announcing)),
+        ),
+        detail(
+            "block ingestion",
+            current_count(sync.and_then(|sync| sync.queued_blocks)),
+        ),
+        detail(
+            "proposal validator",
+            current_count(sync.and_then(|sync| sync.queued_proposals)),
+        ),
+        detail(
+            "StackerDB relay",
+            current_count(sync.and_then(|sync| sync.queued_stackerdb_chunks)),
+        ),
+        detail(
+            "transaction relay",
+            current_count(sync.and_then(|sync| sync.queued_transactions)),
+        ),
+        detail(
+            "relay shed",
+            counter_change(
+                sync.and_then(|sync| sync.relay_dropped),
+                baseline.and_then(|sync| sync.relay_dropped),
+            ),
+        ),
+        Line::default(),
+        Line::from(Span::styled(
+            "event observers",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    match sync.and_then(|sync| sync.event_observers.as_ref()) {
+        None => lines.push(detail("configured", "unavailable".to_owned())),
+        Some(observers) if observers.is_empty() => {
+            lines.push(detail("configured", "0".to_owned()));
+        }
+        Some(observers) => {
+            lines.push(detail("configured", observers.len().to_string()));
+            for observer in observers {
+                let opened = baseline
+                    .and_then(|sync| sync.event_observers.as_ref())
+                    .and_then(|observers| {
+                        observers.iter().find(|opened| opened.url == observer.url)
+                    });
+                lines.push(detail(
+                    &observer.url,
+                    format!(
+                        "{} · delivered {} · dropped {} · {} undelivered now",
+                        if observer.reachable {
+                            "reachable"
+                        } else {
+                            "unreachable"
+                        },
+                        counter_change(Some(observer.delivered), opened.map(|item| item.delivered)),
+                        counter_change(Some(observer.dropped), opened.map(|item| item.dropped)),
+                        thousands(observer.undelivered)
+                    ),
+                ));
+            }
+        }
+    }
+    lines
+}
+
+fn current_count(value: Option<u64>) -> String {
+    value.map_or_else(|| "unavailable".to_owned(), thousands)
+}
+
+fn counter_change(current: Option<u64>, opened: Option<u64>) -> String {
+    current.zip(opened).map_or_else(
+        || "unavailable".to_owned(),
+        |(current, opened)| {
+            format!(
+                "+{} since opened",
+                thousands(current.saturating_sub(opened))
+            )
+        },
+    )
 }
 
 fn draw_tenure(frame: &mut Frame, area: Rect, state: &State) {
@@ -2006,16 +2174,23 @@ fn transaction_colour(kind: &str) -> Color {
 fn draw_keys(frame: &mut Frame, area: Rect, state: &State) {
     let keys = match state.screen {
         Screen::Blocks if state.standard_layout => {
-            "tab/shift-tab panel   enter/→ open block   ↑/↓ select   m mining   r refresh   q quit"
+            "tab/shift-tab panel   enter/→ open block   m mining   o operations   r refresh   q quit"
         }
-        Screen::Blocks => "enter/→ open block   m mining   ↑/↓ select   r refresh   q quit",
+        Screen::Blocks => {
+            "enter/→ open block   m mining   o operations   ↑/↓ select   r refresh   q quit"
+        }
         Screen::Block => {
-            "enter/→ open transaction   m mining   ↑/↓ select   esc/← back   r refresh"
+            "enter/→ open transaction   m mining   o operations   ↑/↓ select   esc/← back   r refresh"
         }
         Screen::Transaction => {
-            "↑/↓ scroll   m mining   pgup/pgdn page   home/end edges   esc/← back   r refresh"
+            "↑/↓ scroll   m mining   o operations   pgup/pgdn page   home/end edges   esc/← back   r refresh"
         }
-        Screen::Mining => "↑/↓ select participant   home/end edges   m/esc/← overview   r refresh",
+        Screen::Mining => {
+            "↑/↓ select participant   home/end edges   o operations   m/esc/← overview   r refresh"
+        }
+        Screen::Operations => {
+            "↑/↓ scroll   pgup/pgdn page   home/end edges   o/esc/← overview   r refresh"
+        }
     };
     frame.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray)))
@@ -2443,6 +2618,56 @@ mod tests {
     }
 
     #[test]
+    fn operations_distinguishes_current_zero_unavailable_and_session_counters() {
+        let mut state = dashboard_state();
+        let sync = state.sync.as_mut().expect("sync fixture");
+        sync.fetching_from_peers = Some(vec!["http://history.example:20443".to_owned()]);
+        sync.p2p_sessions = Some(4);
+        sync.p2p_known_peers = Some(9);
+        sync.staged_blocks = Some(0);
+        sync.relay_offered = Some(2);
+        sync.relay_announcing = Some(3);
+        sync.relay_dropped = Some(5);
+        sync.queued_blocks = None;
+        sync.queued_proposals = Some(0);
+        sync.queued_stackerdb_chunks = Some(1);
+        sync.queued_transactions = Some(0);
+        sync.event_observers = Some(vec![node::ObserverStatus {
+            url: "http://observer.example/events".to_owned(),
+            delivered: 12,
+            dropped: 2,
+            undelivered: 0,
+            reachable: true,
+        }]);
+        let mut baseline = sync.clone();
+        baseline.relay_dropped = Some(3);
+        let observer = baseline.event_observers.as_mut().expect("observer fixture");
+        observer[0].delivered = 10;
+        observer[0].dropped = 1;
+        state.sync_baseline = Some(baseline);
+
+        handle_key(&mut state, KeyCode::Char('o'));
+        let rendered = render(&mut state);
+
+        assert!(rendered.contains("operations — RPC facts"));
+        assert!(rendered.contains("staged blocks     0"));
+        assert!(rendered.contains("block ingestion   unavailable"));
+        assert!(rendered.contains("proposal validator0"));
+        assert!(rendered.contains("StackerDB relay   1"));
+        assert!(rendered.contains("relay shed        +2 since opened"));
+
+        handle_key(&mut state, KeyCode::End);
+        let rendered = render(&mut state);
+        assert!(rendered.contains("http://observer.example/events"));
+        assert!(rendered.contains("delivered +2 since opened"));
+        assert!(rendered.contains("dropped +1 since opened"));
+        assert!(rendered.contains("undelivered now"));
+
+        handle_key(&mut state, KeyCode::Esc);
+        assert_eq!(state.screen, Screen::Blocks);
+    }
+
+    #[test]
     fn mining_view_lists_and_inspects_every_participant() {
         let mut state = dashboard_state();
 
@@ -2544,11 +2769,11 @@ mod tests {
     fn dashboard_state() -> State {
         State {
             sync: Some(node::SyncStatus {
-                roles: node::NodeRoles {
+                roles: Some(node::NodeRoles {
                     follower: true,
                     signer: true,
                     miner: false,
-                },
+                }),
                 followed_stacks_height: Some(8_716_526),
                 selected_stacks_height: Some(8_716_525),
                 selected_from_peer: Some("http://192.0.2.123:20443".to_owned()),

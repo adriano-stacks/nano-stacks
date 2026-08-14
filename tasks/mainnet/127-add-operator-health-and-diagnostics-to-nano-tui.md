@@ -28,7 +28,7 @@ This is delivery slice 2 from task 125's usability study.
 
 ## Tasks
 
-- [ ] Publish this process's enabled follower, miner and signer roles through a
+- [x] Publish this process's enabled follower, miner and signer roles through a
       small nano-specific RPC field.
 - [ ] Derive conservative starting, syncing, healthy, degraded, stalled and
       unreachable states from named evidence and freshness.

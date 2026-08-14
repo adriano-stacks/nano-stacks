@@ -23,8 +23,7 @@ pub struct NodeRoles {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct SyncStatus {
-    #[serde(default)]
-    pub roles: NodeRoles,
+    pub roles: Option<NodeRoles>,
     /// What a peer said it had, which is not what this node did with it.
     pub followed_stacks_height: Option<u64>,
     /// The tip this node's own fork choice picked out of what peers offered.
@@ -34,10 +33,28 @@ pub struct SyncStatus {
     pub fetching_from_peers: Option<Vec<String>>,
     pub p2p_sessions: Option<u64>,
     pub p2p_known_peers: Option<u64>,
+    pub staged_blocks: Option<u64>,
+    pub relay_offered: Option<u64>,
+    pub relay_announcing: Option<u64>,
+    pub relay_dropped: Option<u64>,
+    pub queued_blocks: Option<u64>,
+    pub queued_proposals: Option<u64>,
+    pub queued_stackerdb_chunks: Option<u64>,
+    pub queued_transactions: Option<u64>,
+    pub event_observers: Option<Vec<ObserverStatus>>,
     /// The only one that means this node computed anything.
     pub executed_stacks_height: Option<u64>,
     pub executed_stacks_tip: Option<String>,
     pub blocks_behind: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ObserverStatus {
+    pub url: String,
+    pub delivered: u64,
+    pub dropped: u64,
+    pub undelivered: u64,
+    pub reachable: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
