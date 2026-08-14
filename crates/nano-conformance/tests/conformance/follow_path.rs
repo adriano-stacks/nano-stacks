@@ -1326,12 +1326,23 @@ async fn a_branch_that_parts_at_a_block_is_followed_onto_the_fork() {
     );
 
     drop(executor);
-    let (chainstate, _) = crate::restart::open(directory.path());
+    let (mut chainstate, _) = crate::restart::open(directory.path());
     let agreed_block = honest
         .iter()
         .find(|block| *block.block_id().as_bytes() == agreed)
         .expect("the common block is in the served chain")
         .clone();
+    let agreed_height = u32::try_from(agreed_block.header.chain_length)
+        .expect("the fixture height fits the state store");
+    chainstate
+        .discard_above(agreed_height)
+        .expect("restart gives back the abandoned states");
+    assert!(
+        chainstate
+            .recover_ledger_at(agreed)
+            .expect("restart recovers the surviving ledger"),
+        "the common block sealed a ledger"
+    );
     let mut executor = CheckpointExecutor::resume(chainstate, agreed_block, burnchain);
     nano_conformance::derive_sortitions(&mut executor, &fixtures(), directory.path());
 
