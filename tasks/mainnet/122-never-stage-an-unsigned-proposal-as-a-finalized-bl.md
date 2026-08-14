@@ -6,7 +6,7 @@ priority: critical
 effort: medium
 type: bug
 group: mainnet
-dependencies: ["079"]
+dependencies: ["079", "131"]
 tags: ["consensus", "signer", "rpc", "staging", "release"]
 created_at: "2026-08-14"
 ---

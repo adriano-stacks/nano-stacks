@@ -7,7 +7,7 @@ effort: large
 type: chore
 group: mainnet
 parent: "053"
-dependencies: ["037", "046", "047", "054", "079", "082", "107"]
+dependencies: ["037", "046", "047", "054", "079", "082", "107", "139"]
 tags: ["mainnet", "liveness", "operations", "release"]
 created_at: "2026-08-09"
 ---
@@ -22,7 +22,8 @@ Hold the same release binary at the public mainnet tip for one continuous
 ## Tasks
 
 - [ ] Start the hold only after the clean replay in task 037 and the no-hosted
-  P2P qualification in task 054 pass for the same release binary.
+  P2P qualification in task 054 pass for the same release binary, and after the
+  hardened follower's independent audit in task 139 closes.
 - [ ] Run with no hosted data service for 24 continuous hours.
 - [ ] Sample once per minute: Bitcoin tip, selected Stacks tip, followed tip,
   executed tip, peer count, queue depths, disk use, memory use, open file count,
