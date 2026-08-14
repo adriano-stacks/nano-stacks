@@ -906,6 +906,16 @@ enum BlockAuthentication {
     UnauthenticatedFixture,
 }
 
+impl BlockAuthentication {
+    const fn checks_before_execution(self) -> bool {
+        matches!(self, Self::Required | Self::Proposal)
+    }
+
+    const fn checks_signer_signatures(self) -> bool {
+        matches!(self, Self::Required)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlockPersistence {
     Seal,
@@ -2823,10 +2833,7 @@ impl ChainState {
         // asked of a followed block and not of a candidate. The miner's own
         // answer to each of them is the code that builds the block.
         let assembled = matches!(root, RootPolicy::Mine(_));
-        if matches!(
-            authentication,
-            BlockAuthentication::Required | BlockAuthentication::Proposal
-        ) {
+        if authentication.checks_before_execution() {
             self.check_before_executing(block, parent, bitcoin_context, operations, assembled)?;
         }
         self.vm
@@ -2853,7 +2860,7 @@ impl ChainState {
             // this point and nothing has been written — the MARF version opened
             // above is empty and is aborted with everything else if this fails —
             // so the block is still refused before any of it executes.
-            if !assembled && authentication == BlockAuthentication::Required {
+            if !assembled && authentication.checks_signer_signatures() {
                 self.check_signer_signatures(block, bitcoin_context)?;
             }
             self.vm.setup_block_metadata(block.header.timestamp)?;
