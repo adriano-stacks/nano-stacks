@@ -1,7 +1,7 @@
 ---
 id: "128"
 title: "Explain live Stacks protocol context in nano-tui"
-status: pending
+status: in-progress
 priority: high
 effort: medium
 type: feature
@@ -28,9 +28,9 @@ This is delivery slice 3 from task 125's usability study.
 
 ## Tasks
 
-- [ ] Organize the primary views as Overview, Activity, Election and Operations,
+- [x] Organize the primary views as Overview, Activity, Election and Operations,
       with stable number-key navigation.
-- [ ] Rename Mining to Election and keep the network miner distinct from this
+- [x] Rename Mining to Election and keep the network miner distinct from this
       process's roles.
 - [ ] Render the latest Bitcoin block -> commitment -> tenure -> Stacks-block
       relationship as one causal story, followed by what happens next.

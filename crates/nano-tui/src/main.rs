@@ -389,7 +389,7 @@ fn one_line_error(error: &str) -> String {
 #[command(
     name = "nano-tui",
     about = "Read-only dashboard and explorer for a nano-stacks node",
-    after_help = "KEYS:\n  tab/shift-tab panel   ↑/↓ select   enter/→ open   m mining   o operations\n  esc/← back   r refresh   q quit/back"
+    after_help = "VIEWS:\n  1 overview   2 activity   3 election   4 operations\n\nKEYS:\n  tab/shift-tab panel   ↑/↓ select   enter/→ open\n  esc/← back   r refresh   q quit/back   ? help"
 )]
 struct Args {
     /// HTTP RPC endpoint of the node to inspect.
@@ -957,10 +957,11 @@ fn apply_reading<T>(target: &mut Option<T>, source: &mut SourceState, result: Re
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Screen {
     #[default]
-    Blocks,
+    Overview,
+    Activity,
     Block,
     Transaction,
-    Mining,
+    Election,
     Operations,
 }
 
@@ -1033,23 +1034,33 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, node: &Node) -> io
 
 fn handle_key(state: &mut State, key: KeyCode) -> Action {
     match key {
-        KeyCode::Tab if state.screen == Screen::Blocks => {
+        KeyCode::Char('1') => state.screen = Screen::Overview,
+        KeyCode::Char('2') => state.screen = Screen::Activity,
+        KeyCode::Char('3') => {
+            state.screen = Screen::Election;
+            select_current_participant(state);
+        }
+        KeyCode::Char('4') => {
+            state.screen = Screen::Operations;
+            state.operations_scroll = 0;
+        }
+        KeyCode::Tab if state.screen == Screen::Overview => {
             state.overview_panel = state.overview_panel.next(false);
         }
-        KeyCode::BackTab if state.screen == Screen::Blocks => {
+        KeyCode::BackTab if state.screen == Screen::Overview => {
             state.overview_panel = state.overview_panel.next(true);
         }
         KeyCode::Char('m') => {
-            state.screen = if state.screen == Screen::Mining {
-                Screen::Blocks
+            state.screen = if state.screen == Screen::Election {
+                Screen::Overview
             } else {
-                Screen::Mining
+                Screen::Election
             };
             select_current_participant(state);
         }
         KeyCode::Char('o') => {
             state.screen = if state.screen == Screen::Operations {
-                Screen::Blocks
+                Screen::Overview
             } else {
                 Screen::Operations
             };
@@ -1057,16 +1068,17 @@ fn handle_key(state: &mut State, key: KeyCode) -> Action {
         }
         KeyCode::Char('q' | 'h') | KeyCode::Esc | KeyCode::Left => {
             match state.screen {
-                Screen::Blocks => return Action::Quit,
-                Screen::Block | Screen::Mining | Screen::Operations => {
-                    state.screen = Screen::Blocks;
+                Screen::Overview | Screen::Activity => return Action::Quit,
+                Screen::Block => state.screen = Screen::Activity,
+                Screen::Election | Screen::Operations => {
+                    state.screen = Screen::Overview;
                 }
                 Screen::Transaction => state.screen = Screen::Block,
             }
             state.transaction_scroll = 0;
         }
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match state.screen {
-            Screen::Blocks if !state.blocks.is_empty() => {
+            Screen::Activity if !state.blocks.is_empty() => {
                 if state.selected_block.selected().is_none() {
                     state.selected_block.select(Some(0));
                 }
@@ -1077,10 +1089,11 @@ fn handle_key(state: &mut State, key: KeyCode) -> Action {
                 state.transaction_scroll = 0;
                 state.screen = Screen::Transaction;
             }
-            Screen::Blocks
+            Screen::Overview
+            | Screen::Activity
             | Screen::Block
             | Screen::Transaction
-            | Screen::Mining
+            | Screen::Election
             | Screen::Operations => {}
         },
         KeyCode::Down | KeyCode::Char('j') => move_selection(state, 1),
@@ -1097,7 +1110,7 @@ fn handle_key(state: &mut State, key: KeyCode) -> Action {
 
 fn move_selection(state: &mut State, by: isize) {
     match state.screen {
-        Screen::Blocks => move_list_selection(&mut state.selected_block, state.blocks.len(), by),
+        Screen::Activity => move_list_selection(&mut state.selected_block, state.blocks.len(), by),
         Screen::Block => {
             let transactions = selected_block(state).map_or(0, |block| block.transactions.len());
             move_list_selection(&mut state.selected_transaction, transactions, by);
@@ -1107,7 +1120,7 @@ fn move_selection(state: &mut State, by: isize) {
                 .transaction_scroll
                 .saturating_add_signed(i16::try_from(by).expect("key movement fits in i16"));
         }
-        Screen::Mining => {
+        Screen::Election => {
             let participants =
                 mining_competition(state).map_or(0, |competition| competition.participants.len());
             move_list_selection(&mut state.selected_participant, participants, by);
@@ -1117,6 +1130,7 @@ fn move_selection(state: &mut State, by: isize) {
                 .operations_scroll
                 .saturating_add_signed(i16::try_from(by).expect("key movement fits in i16"));
         }
+        Screen::Overview => {}
     }
 }
 
@@ -1133,18 +1147,19 @@ fn move_list_selection(selected: &mut ListState, length: usize, by: isize) {
 
 fn move_to_edge(state: &mut State, end: bool) {
     match state.screen {
-        Screen::Blocks => select_edge(&mut state.selected_block, state.blocks.len(), end),
+        Screen::Activity => select_edge(&mut state.selected_block, state.blocks.len(), end),
         Screen::Block => {
             let transactions = selected_block(state).map_or(0, |block| block.transactions.len());
             select_edge(&mut state.selected_transaction, transactions, end);
         }
         Screen::Transaction => state.transaction_scroll = if end { u16::MAX } else { 0 },
-        Screen::Mining => {
+        Screen::Election => {
             let participants =
                 mining_competition(state).map_or(0, |competition| competition.participants.len());
             select_edge(&mut state.selected_participant, participants, end);
         }
         Screen::Operations => state.operations_scroll = if end { u16::MAX } else { 0 },
+        Screen::Overview => {}
     }
 }
 
@@ -1317,7 +1332,7 @@ fn draw(frame: &mut Frame, state: &mut State, node: &Node) {
 
     let wide = area.width >= WIDE_WIDTH && area.height >= WIDE_HEIGHT && !state.sources.degraded();
     state.standard_layout = !wide;
-    if state.screen == Screen::Blocks {
+    if state.screen == Screen::Overview {
         if wide {
             draw_wide_overview(frame, state, node);
         } else {
@@ -1341,12 +1356,13 @@ fn draw(frame: &mut Frame, state: &mut State, node: &Node) {
         draw_compact_sync_status(frame, areas[0], state, node);
     }
     match state.screen {
+        Screen::Activity => draw_blocks(frame, areas[1], state),
         Screen::Block => draw_block(frame, areas[1], state),
         Screen::Transaction => draw_transaction(frame, areas[1], state),
-        Screen::Mining if areas[1].height >= 22 => draw_mining(frame, areas[1], state),
-        Screen::Mining => draw_standard_mining(frame, areas[1], state),
+        Screen::Election if areas[1].height >= 22 => draw_election(frame, areas[1], state),
+        Screen::Election => draw_standard_election(frame, areas[1], state),
         Screen::Operations => draw_operations(frame, areas[1], state),
-        Screen::Blocks => unreachable!("handled by the dashboard layout"),
+        Screen::Overview => unreachable!("handled by the dashboard layout"),
     }
     draw_keys(frame, areas[2], state);
 }
@@ -2166,7 +2182,7 @@ fn tenure_history_lines(state: &State, tenure: &node::TenureInfo) -> Vec<Line<'s
 /// The burn view this node executed under, as *it* derived it.
 fn draw_sortition(frame: &mut Frame, area: Rect, state: &State) {
     let title = format!(
-        " current miner & latest sortition — {} ",
+        " network miner & latest sortition — {} ",
         state.sources.sortitions.brief()
     );
     let Some(latest) = latest_sortition(state) else {
@@ -2232,7 +2248,7 @@ fn draw_sortition(frame: &mut Frame, area: Rect, state: &State) {
             Span::styled(outcome, Style::default().fg(colour)),
         ]),
         Line::from(vec![
-            label("current miner  "),
+            label("network miner  "),
             value(miner),
             label(miner_kind),
         ]),
@@ -2256,7 +2272,7 @@ fn draw_sortition(frame: &mut Frame, area: Rect, state: &State) {
     frame.render_widget(Paragraph::new(lines).block(bordered(&title)), area);
 }
 
-fn draw_mining(frame: &mut Frame, area: Rect, state: &mut State) {
+fn draw_election(frame: &mut Frame, area: Rect, state: &mut State) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2265,21 +2281,21 @@ fn draw_mining(frame: &mut Frame, area: Rect, state: &mut State) {
             Constraint::Length(8),
         ])
         .split(area);
-    draw_mining_summary(frame, areas[0], state);
+    draw_election_summary(frame, areas[0], state);
     draw_participants(frame, areas[1], state);
     draw_participant(frame, areas[2], state);
 }
 
-fn draw_standard_mining(frame: &mut Frame, area: Rect, state: &mut State) {
+fn draw_standard_election(frame: &mut Frame, area: Rect, state: &mut State) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(8), Constraint::Min(4)])
         .split(area);
-    draw_mining_summary(frame, areas[0], state);
+    draw_election_summary(frame, areas[0], state);
     draw_participants(frame, areas[1], state);
 }
 
-fn draw_mining_summary(frame: &mut Frame, area: Rect, state: &State) {
+fn draw_election_summary(frame: &mut Frame, area: Rect, state: &State) {
     let latest = latest_sortition(state);
     let active = active_sortition(state);
     let competition = latest.and_then(|sortition| sortition.mining_competition.as_ref());
@@ -2334,7 +2350,7 @@ fn draw_mining_summary(frame: &mut Frame, area: Rect, state: &State) {
             value(active.and_then(|sortition| sortition.stacks_parent_ch.as_deref())),
         ]),
         Line::from(vec![
-            label("current miner   "),
+            label("network miner   "),
             value(miner),
             label(miner_kind),
         ]),
@@ -2358,7 +2374,7 @@ fn draw_mining_summary(frame: &mut Frame, area: Rect, state: &State) {
         ]),
     ];
     frame.render_widget(
-        Paragraph::new(lines).block(bordered(" active tenure miner & election ")),
+        Paragraph::new(lines).block(bordered(" network election & active tenure ")),
         area,
     );
 }
@@ -2368,7 +2384,7 @@ fn draw_participants(frame: &mut Frame, area: Rect, state: &mut State) {
         state.selected_participant.select(None);
         frame.render_widget(
             Paragraph::new("this node has no retained participant data for this sortition")
-                .block(bordered(" sortition participants ")),
+                .block(bordered(" election participants ")),
             area,
         );
         return;
@@ -2377,7 +2393,7 @@ fn draw_participants(frame: &mut Frame, area: Rect, state: &mut State) {
         state.selected_participant.select(None);
         frame.render_widget(
             Paragraph::new("no candidate commitments were present in this Bitcoin block")
-                .block(bordered(" sortition participants ")),
+                .block(bordered(" election participants ")),
             area,
         );
         return;
@@ -2420,7 +2436,7 @@ fn draw_participants(frame: &mut Frame, area: Rect, state: &mut State) {
     frame.render_stateful_widget(
         List::new(items)
             .block(bordered(
-                " sortition participants — miner key · burn · effective weight · activity ",
+                " election participants — miner key · burn · effective weight · activity ",
             ))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
             .highlight_symbol("▍"),
@@ -2782,23 +2798,26 @@ fn transaction_colour(kind: &str) -> Color {
 
 fn draw_keys(frame: &mut Frame, area: Rect, state: &State) {
     let keys = match state.screen {
-        Screen::Blocks if state.standard_layout => {
-            "tab/shift-tab panel   enter/→ open block   m mining   o operations   r refresh   q quit"
+        Screen::Overview if state.standard_layout => {
+            "1 overview   2 activity   3 election   4 operations   tab panel   ? help   q quit"
         }
-        Screen::Blocks => {
-            "enter/→ open block   m mining   o operations   ↑/↓ select   r refresh   q quit"
+        Screen::Overview => {
+            "1 overview   2 activity   3 election   4 operations   tab panel   ? help   q quit"
+        }
+        Screen::Activity => {
+            "1 overview   2 activity   3 election   4 operations   enter open   ↑/↓ select   ? help"
         }
         Screen::Block => {
-            "enter/→ open transaction   m mining   o operations   ↑/↓ select   esc/← back   r refresh"
+            "1–4 views   enter open transaction   ↑/↓ select   esc/← back   r refresh   ? help"
         }
         Screen::Transaction => {
-            "↑/↓ scroll   m mining   o operations   pgup/pgdn page   home/end edges   esc/← back   r refresh"
+            "1–4 views   ↑/↓ scroll   pgup/pgdn page   home/end edges   esc/← back   ? help"
         }
-        Screen::Mining => {
-            "↑/↓ select participant   home/end edges   o operations   m/esc/← overview   r refresh"
+        Screen::Election => {
+            "1 overview   2 activity   3 election   4 operations   ↑/↓ participant   ? help"
         }
         Screen::Operations => {
-            "↑/↓ scroll   pgup/pgdn page   home/end edges   o/esc/← overview   r refresh"
+            "1 overview   2 activity   3 election   4 operations   ↑/↓ scroll   ? help"
         }
     };
     frame.render_widget(
@@ -3081,8 +3100,26 @@ mod tests {
         handle_key(&mut state, KeyCode::Esc);
         assert_eq!(state.screen, Screen::Block);
         handle_key(&mut state, KeyCode::Esc);
-        assert_eq!(state.screen, Screen::Blocks);
+        assert_eq!(state.screen, Screen::Activity);
         assert_eq!(handle_key(&mut state, KeyCode::Char('q')), Action::Quit);
+    }
+
+    #[test]
+    fn number_keys_select_the_four_primary_views_from_anywhere() {
+        let mut state = dashboard_state();
+
+        handle_key(&mut state, KeyCode::Char('2'));
+        assert_eq!(state.screen, Screen::Activity);
+        handle_key(&mut state, KeyCode::Char('3'));
+        assert_eq!(state.screen, Screen::Election);
+        handle_key(&mut state, KeyCode::Char('4'));
+        assert_eq!(state.screen, Screen::Operations);
+        handle_key(&mut state, KeyCode::Char('1'));
+        assert_eq!(state.screen, Screen::Overview);
+
+        state.screen = Screen::Transaction;
+        handle_key(&mut state, KeyCode::Char('3'));
+        assert_eq!(state.screen, Screen::Election);
     }
 
     #[test]
@@ -3312,9 +3349,9 @@ mod tests {
 
         handle_key(&mut state, KeyCode::Tab);
         let sortition = render(&mut state);
-        assert!(sortition.contains("current miner & latest sortition"));
+        assert!(sortition.contains("network miner & latest sortition"));
         assert!(sortition.contains("miner elected · new Stacks tenure"));
-        assert!(sortition.contains("current miner"));
+        assert!(sortition.contains("network miner"));
         assert!(sortition.contains("2 candidates · losers burned 40,000"));
         assert!(sortition.contains("60,000 of 100,000 sats"));
         assert!(sortition.contains("tenure commit"));
@@ -3376,7 +3413,7 @@ mod tests {
         assert!(rendered.contains("undelivered now"));
 
         handle_key(&mut state, KeyCode::Esc);
-        assert_eq!(state.screen, Screen::Blocks);
+        assert_eq!(state.screen, Screen::Overview);
     }
 
     #[test]
@@ -3427,12 +3464,12 @@ mod tests {
         let mut state = dashboard_state();
 
         handle_key(&mut state, KeyCode::Char('m'));
-        assert_eq!(state.screen, Screen::Mining);
+        assert_eq!(state.screen, Screen::Election);
         assert_eq!(state.selected_participant.selected(), Some(0));
         let winner = render(&mut state);
-        assert!(winner.contains("active tenure miner & election"));
+        assert!(winner.contains("network election & active tenure"));
         assert!(winner.contains("2 candidate commitments"));
-        assert!(winner.contains("sortition participants"));
+        assert!(winner.contains("election participants"));
         assert!(winner.contains("WIN"));
         assert!(winner.contains("winning participant details"));
         assert!(winner.contains("50,000 effective / 60,000 raw sats"));
@@ -3446,7 +3483,7 @@ mod tests {
         assert!(competitor.contains("40,000 effective / 40,000 raw sats"));
 
         handle_key(&mut state, KeyCode::Esc);
-        assert_eq!(state.screen, Screen::Blocks);
+        assert_eq!(state.screen, Screen::Overview);
     }
 
     #[test]
@@ -3494,12 +3531,13 @@ mod tests {
         let standard = render_at(&mut standard, 80, 24);
         assert!(standard.contains("verified locally"));
         assert!(standard.contains("blocks data freshness"));
-        assert!(standard.contains("tab/shift-tab panel"));
+        assert!(standard.contains("1 overview"));
+        assert!(standard.contains("tab panel"));
 
         let mut wide = dashboard_state();
         let wide = render_at(&mut wide, 160, 40);
         assert!(wide.contains("current tenure"));
-        assert!(wide.contains("current miner & latest sortition"));
+        assert!(wide.contains("network miner & latest sortition"));
         assert!(wide.contains("current tenure execution budget"));
 
         let mut small = dashboard_state();
@@ -3687,7 +3725,10 @@ mod tests {
     }
 
     fn explorer_state() -> State {
-        let mut state = State::default();
+        let mut state = State {
+            screen: Screen::Activity,
+            ..State::default()
+        };
         state.blocks.push(node::Block {
             height: 42,
             id: "block".to_owned(),
