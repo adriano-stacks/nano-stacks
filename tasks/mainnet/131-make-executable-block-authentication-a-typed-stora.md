@@ -1,7 +1,7 @@
 ---
 id: "131"
 title: "Make executable block authentication a typed storage invariant"
-status: pending
+status: in-progress
 priority: critical
 effort: medium
 dependencies: ["079"]
