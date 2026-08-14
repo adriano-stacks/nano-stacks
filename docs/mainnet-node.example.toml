@@ -1,0 +1,42 @@
+# This file passes the syntax check. It cannot start as written.
+# Replace all paths, hashes, and Bitcoin RPC values first.
+
+[node]
+working_dir = "/var/lib/nano-stacks"
+network = "mainnet"
+
+# Keep RPC and metrics on this machine by default.
+rpc_bind = "127.0.0.1:20443"
+metrics_bind = "127.0.0.1:9153"
+
+# Mainnet P2P seeds are built in. No Stacks HTTP peer is needed.
+# Add this line if other nodes must be able to connect to this node:
+# p2p_bind = "0.0.0.0:20444"
+
+[burnchain]
+# This example uses a local, synced Bitcoin Core node.
+rpc_url = "http://127.0.0.1:8332"
+rpc_user = "REPLACE_WITH_BITCOIN_RPC_USER"
+rpc_password = "REPLACE_WITH_BITCOIN_RPC_PASSWORD"
+magic = "X2"
+pox_5_activation_height = 960230
+
+[checkpoint]
+# checkpoint.toml, marf.sqlite.blobs, and block-headers.sqlite must be next
+# to this file.
+marf = "/path/to/mainnet-checkpoint/marf.sqlite"
+
+# Copy these two values from checkpoint.toml.
+source_state_id = "0000000000000000000000000000000000000000000000000000000000000000"
+state_root = "0000000000000000000000000000000000000000000000000000000000000000"
+
+# This is the first block after the checkpoint.
+anchor_block = "/path/to/mainnet-checkpoint/anchor-block.bin"
+# Copy first_bitcoin_height from checkpoint.toml.
+anchor_bitcoin_height = 0
+
+tenure_accounting = "/path/to/mainnet-checkpoint/native-effects.json"
+attesting_block = "/path/to/mainnet-checkpoint/block.bin"
+attesting_reward_set = "/path/to/mainnet-checkpoint/reward-set.json"
+sortition = "/path/to/mainnet-checkpoint/sortition"
+authentication_history = "/path/to/mainnet-checkpoint/authentication-history"

@@ -9,7 +9,11 @@ This document is the operator's half: which knobs there are, what each one costs
 if it is wrong, and what to do when the peer table or the served inventory goes
 bad.
 
-## The shortest configuration that works
+## The shortest mainnet network section
+
+This is only the `[node]` part of the file. It is not a full node
+configuration. See [Run a mainnet node](running-a-mainnet-node.md) for the full
+file and the start commands.
 
 ```toml
 [node]

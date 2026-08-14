@@ -33,6 +33,7 @@
               pkgs.rustfmt
               pkgs.shellcheck
               pkgs.sqlite
+              pkgs.zstd
             ];
 
             # Temporary files go to disk, not to RAM.

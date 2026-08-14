@@ -23,5 +23,13 @@ It’s a Stacks node, that:
 - Reimplements the full Stacks protocol from scratch, while relying on
   external libraries for what’s outside the business domain.
 
+## Run it
+
+See [Run a mainnet node](docs/running-a-mainnet-node.md) for the full follower
+setup, covering the checkpoint files, Bitcoin access, configuration, build,
+start, health checks, and restart. See [Build a mainnet
+checkpoint](docs/build-mainnet-checkpoint.md) for how to download and convert
+the Hiro archive as a checkpoint.
+
 [0]: https://github.com/stacks-network/hacknet
 [1]: https://github.com/stacks-network/stacks-core/
