@@ -14,8 +14,17 @@ use serde::Deserialize;
 /// blocks on it stops redrawing — which looks exactly like the node being dead.
 const TIMEOUT: Duration = Duration::from_secs(4);
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+pub struct NodeRoles {
+    pub follower: bool,
+    pub signer: bool,
+    pub miner: bool,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct SyncStatus {
+    #[serde(default)]
+    pub roles: NodeRoles,
     /// What a peer said it had, which is not what this node did with it.
     pub followed_stacks_height: Option<u64>,
     /// The tip this node's own fork choice picked out of what peers offered.

@@ -229,6 +229,7 @@ impl Executed {
 #[derive(Clone)]
 pub struct RpcState {
     metrics: NodeMetrics,
+    roles: NodeRoles,
     /// What the peer said, kept so that catching up is measurable and read by
     /// nothing else. Serving the peer's height as this node's own is how a node
     /// that had executed nothing at all reported itself within three blocks of
@@ -325,6 +326,7 @@ impl RpcState {
         let (events, _) = broadcast::channel(256);
         Self {
             metrics: NodeMetrics::default(),
+            roles: NodeRoles::default(),
             followed: Arc::new(RwLock::new(None)),
             followed_height: Arc::new(RwLock::new(None)),
             selected: Arc::new(RwLock::new(None)),
@@ -347,6 +349,13 @@ impl RpcState {
             proposal_token: None,
             observers: None,
         }
+    }
+
+    /// Record the roles this process was configured to perform.
+    #[must_use]
+    pub const fn with_roles(mut self, roles: NodeRoles) -> Self {
+        self.roles = roles;
+        self
     }
 
     /// The lock-free observations served on the separate metrics listener.
@@ -868,6 +877,7 @@ async fn sync_status(
         .map(|executed| executed.tip.clone());
     let observed_height = followed.max(selected.as_ref().map(|selected| selected.stacks_height));
     Ok(axum::Json(SyncStatusWire {
+        roles: state.roles,
         followed_stacks_height: followed,
         selected_stacks_height: selected.as_ref().map(|selected| selected.stacks_height),
         selected_stacks_tip: selected
@@ -2266,8 +2276,17 @@ pub struct QueueReport {
     pub queued_transactions: Option<usize>,
 }
 
+/// Roles performed by this node process.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct NodeRoles {
+    pub follower: bool,
+    pub signer: bool,
+    pub miner: bool,
+}
+
 #[derive(Serialize)]
 struct SyncStatusWire {
+    roles: NodeRoles,
     followed_stacks_height: Option<u64>,
     selected_stacks_height: Option<u64>,
     selected_stacks_tip: Option<String>,
@@ -3533,6 +3552,32 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn sync_status_reports_configured_roles() {
+        let state = RpcState::new(NETWORK).with_roles(super::NodeRoles {
+            follower: true,
+            signer: true,
+            miner: false,
+        });
+
+        let status = body_json(
+            router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/nano/sync_status")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+
+        assert_eq!(status["roles"]["follower"], json!(true));
+        assert_eq!(status["roles"]["signer"], json!(true));
+        assert_eq!(status["roles"]["miner"], json!(false));
     }
 
     /// A peer, a local burnchain, and execution are three separate facts.

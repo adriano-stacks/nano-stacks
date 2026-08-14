@@ -1085,9 +1085,10 @@ fn draw_sync_status(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
     let sync = state.sync.clone().unwrap_or_default();
     let info = state.info.clone().unwrap_or_default();
     let title = format!(
-        " {} — {} — chain {} ",
+        " {} — {} — local {} — chain {} ",
         info.server_version.as_deref().unwrap_or("nano-stacks"),
         node.url(),
+        role_names(sync.roles),
         info.network_id
             .map_or_else(|| "?".to_owned(), |id| format!("{id:#010x}"))
     );
@@ -1178,7 +1179,11 @@ fn draw_compact_sync_status(frame: &mut Frame, area: Rect, state: &State, node: 
         .unwrap_or("nano-stacks");
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {version} — {} ", node.url()))
+        .title(format!(
+            " {version} — {} — local {} ",
+            node.url(),
+            role_names(sync.roles)
+        ))
         .border_style(Style::default().fg(if state.sources.unreachable() {
             Color::Red
         } else {
@@ -1246,6 +1251,24 @@ fn draw_compact_sync_status(frame: &mut Frame, area: Rect, state: &State, node: 
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn role_names(roles: node::NodeRoles) -> String {
+    let mut names = Vec::with_capacity(3);
+    if roles.follower {
+        names.push("follower");
+    }
+    if roles.signer {
+        names.push("signer");
+    }
+    if roles.miner {
+        names.push("miner");
+    }
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join("+")
+    }
 }
 
 fn draw_tenure(frame: &mut Frame, area: Rect, state: &State) {
@@ -2390,6 +2413,7 @@ mod tests {
         assert!(sync.contains("last peer report"));
         assert!(sync.contains("http://192.0.2.123:20443"));
         assert!(sync.contains("2 blocks behind"));
+        assert!(sync.contains("local follower+signer"));
 
         handle_key(&mut state, KeyCode::Tab);
         let tenure = render(&mut state);
@@ -2520,6 +2544,11 @@ mod tests {
     fn dashboard_state() -> State {
         State {
             sync: Some(node::SyncStatus {
+                roles: node::NodeRoles {
+                    follower: true,
+                    signer: true,
+                    miner: false,
+                },
                 followed_stacks_height: Some(8_716_526),
                 selected_stacks_height: Some(8_716_525),
                 selected_from_peer: Some("http://192.0.2.123:20443".to_owned()),

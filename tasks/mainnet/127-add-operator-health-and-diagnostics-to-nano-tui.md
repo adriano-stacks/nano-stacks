@@ -1,7 +1,7 @@
 ---
 id: "127"
 title: "Add operator health and diagnostics to nano-tui"
-status: pending
+status: in-progress
 priority: high
 effort: medium
 type: feature

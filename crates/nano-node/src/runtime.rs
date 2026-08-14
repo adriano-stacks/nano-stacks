@@ -2483,6 +2483,11 @@ async fn start_rpc(
         submitted,
     } = wiring;
     let mut state = RpcState::new(network)
+        .with_roles(nano_rpc::NodeRoles {
+            follower: config.node.rpc_bind.is_some() || config.miner.is_some(),
+            signer: config.signer.is_some(),
+            miner: config.miner.is_some(),
+        })
         .with_mempool(mempool)
         .with_block_sink(blocks)
         .with_chunk_relay(chunks)
