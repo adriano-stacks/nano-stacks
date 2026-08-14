@@ -600,13 +600,27 @@ fn a_transaction_naming_another_chain_is_rejected() {
 /// constructed to make the point.
 #[test]
 fn pox_treatment_is_not_consensus_under_a_waterfall_reward_set() {
-    let document: serde_json::Value = serde_json::from_slice(
-        &fs::read(fixtures().join("stacker_set/cycle-22.json")).expect("the published set"),
-    )
-    .expect("the published set parses");
-    let set: blockstack_lib::chainstate::stacks::boot::RewardSet =
-        serde_json::from_value(document["stacker_set"].clone())
-            .expect("stacks-core reads its own published reward set");
+    let mut documents = fs::read_dir(fixtures().join("stacker_set"))
+        .expect("the published sets")
+        .map(|entry| entry.expect("a published-set entry").path())
+        .collect::<Vec<_>>();
+    documents.sort();
+    let set = documents
+        .into_iter()
+        .map(|path| {
+            let document: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).expect("the published set"))
+                    .expect("the published set parses");
+            serde_json::from_value(document["stacker_set"].clone())
+                .expect("stacks-core reads its own published reward set")
+        })
+        .find(|set| {
+            matches!(
+                set,
+                blockstack_lib::chainstate::stacks::boot::RewardSet::Waterfall(_)
+            )
+        })
+        .expect("the capture carries a published waterfall set");
     assert!(
         matches!(
             set,
