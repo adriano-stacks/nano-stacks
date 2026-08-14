@@ -48,6 +48,8 @@ use url::Url;
 /// A mainnet block lands every few seconds at best, so this is fast enough to look
 /// live and slow enough that the dashboard is never the reason a node is busy.
 const POLL: Duration = Duration::from_secs(2);
+const STALL_AFTER: Duration = Duration::from_secs(30);
+const OLD_SEAL: Duration = Duration::from_mins(2);
 
 /// How many executed blocks the explorer keeps.
 const HISTORY: usize = 200;
@@ -166,6 +168,19 @@ impl Sources {
         ]
         .iter()
         .any(|source| source.error.is_some())
+    }
+
+    fn rpc_error(&self) -> Option<(&'static str, &str)> {
+        [
+            ("sync status", &self.sync),
+            ("node info", &self.info),
+            ("PoX", &self.pox),
+            ("tenure", &self.tenure),
+            ("sortition", &self.sortitions),
+            ("block archive", &self.blocks),
+        ]
+        .into_iter()
+        .find_map(|(name, source)| source.error.as_deref().map(|error| (name, error)))
     }
 }
 
@@ -520,6 +535,7 @@ struct State {
     operations_scroll: u16,
     sources: Sources,
     sync_baseline: Option<SyncStatus>,
+    progress: ProgressState,
     metrics: Option<node::Metrics>,
     metrics_baseline: Option<node::Metrics>,
     metrics_enabled: bool,
@@ -537,6 +553,9 @@ impl State {
                 return None;
             }
             PollUpdate::Sync(result) => {
+                if let Ok(sync) = &result {
+                    self.progress.observe(sync.executed_stacks_height);
+                }
                 if self.sync_baseline.is_none() {
                     self.sync_baseline = result.as_ref().ok().cloned();
                 }
@@ -623,6 +642,305 @@ impl State {
 
     fn behind(&self) -> Option<u64> {
         self.sync.as_ref().and_then(|sync| sync.blocks_behind)
+    }
+}
+
+#[derive(Default)]
+struct ProgressState {
+    height: Option<u64>,
+    changed: Option<Instant>,
+}
+
+impl ProgressState {
+    fn observe(&mut self, height: Option<u64>) {
+        if height.is_some() && height != self.height {
+            self.height = height;
+            self.changed = Some(Instant::now());
+        }
+    }
+
+    fn unchanged_for(&self) -> Option<Duration> {
+        self.changed.map(|changed| changed.elapsed())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Health {
+    Starting,
+    Syncing,
+    Healthy,
+    Degraded,
+    Stalled,
+    Unreachable,
+}
+
+impl Health {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "STARTING",
+            Self::Syncing => "SYNCING",
+            Self::Healthy => "HEALTHY",
+            Self::Degraded => "DEGRADED",
+            Self::Stalled => "STALLED",
+            Self::Unreachable => "UNREACHABLE",
+        }
+    }
+
+    const fn colour(self) -> Color {
+        match self {
+            Self::Healthy => Color::Green,
+            Self::Starting | Self::Syncing => Color::Yellow,
+            Self::Degraded | Self::Stalled | Self::Unreachable => Color::Red,
+        }
+    }
+}
+
+struct HealthSummary {
+    state: Health,
+    reason: String,
+}
+
+fn health_summary(state: &State) -> HealthSummary {
+    if state.sources.unreachable() {
+        return health(Health::Unreachable, "no RPC route answered");
+    }
+    if let Some((source, error)) = state.sources.rpc_error() {
+        return health(Health::Degraded, format!("{source} failed: {error}"));
+    }
+    let Some(sync) = state.sync.as_ref() else {
+        return health(Health::Starting, "waiting for the first sync status");
+    };
+    if let Some(reason) = observer_problem(sync, state.sync_baseline.as_ref()) {
+        return health(Health::Degraded, reason);
+    }
+    if let Some(reason) = metrics_problem(
+        sync,
+        state.metrics.as_ref(),
+        state.metrics_baseline.as_ref(),
+    ) {
+        return health(Health::Degraded, reason);
+    }
+    if let Some(reason) = stall_problem(state) {
+        return health(Health::Stalled, reason);
+    }
+    match (sync.executed_stacks_height, sync.blocks_behind) {
+        (None, _) => health(
+            Health::Starting,
+            "waiting for the first locally executed block",
+        ),
+        (Some(_), Some(behind)) if behind > 0 => health(
+            Health::Syncing,
+            format!("{} blocks behind the peer-reported tip", thousands(behind)),
+        ),
+        (Some(_), Some(0)) => health(Health::Healthy, "local execution matches the peer tip"),
+        (Some(_), None) => health(Health::Starting, "waiting for peer lag evidence"),
+        (Some(_), Some(_)) => unreachable!("positive lag handled above"),
+    }
+}
+
+fn health(state: Health, reason: impl Into<String>) -> HealthSummary {
+    HealthSummary {
+        state,
+        reason: reason.into(),
+    }
+}
+
+fn observer_problem(sync: &SyncStatus, baseline: Option<&SyncStatus>) -> Option<String> {
+    let observers = sync.event_observers.as_ref()?;
+    for observer in observers {
+        if !observer.reachable {
+            return Some(format!("event observer {} is unreachable", observer.url));
+        }
+        let opened = baseline
+            .and_then(|sync| sync.event_observers.as_ref())
+            .and_then(|observers| observers.iter().find(|opened| opened.url == observer.url));
+        if opened.is_some_and(|opened| observer.dropped > opened.dropped) {
+            return Some(format!("event observer {} dropped events", observer.url));
+        }
+        if opened.is_some_and(|opened| observer.undelivered > opened.undelivered) {
+            return Some(format!("event observer {} backlog grew", observer.url));
+        }
+    }
+    None
+}
+
+fn metrics_problem(
+    sync: &SyncStatus,
+    metrics: Option<&node::Metrics>,
+    opened: Option<&node::Metrics>,
+) -> Option<String> {
+    let metrics = metrics?;
+    let refusal_reasons = [
+        (
+            "compiler-gap block refusal",
+            metrics.refusal_compiler_gap,
+            opened.and_then(|metrics| metrics.refusal_compiler_gap),
+        ),
+        (
+            "state-root mismatch refusal",
+            metrics.refusal_root_mismatch,
+            opened.and_then(|metrics| metrics.refusal_root_mismatch),
+        ),
+        (
+            "signature refusal",
+            metrics.refusal_signature,
+            opened.and_then(|metrics| metrics.refusal_signature),
+        ),
+        (
+            "missing-context refusal",
+            metrics.refusal_missing_context,
+            opened.and_then(|metrics| metrics.refusal_missing_context),
+        ),
+        (
+            "unclassified block refusal",
+            metrics.refusal_other,
+            opened.and_then(|metrics| metrics.refusal_other),
+        ),
+        (
+            "pushed-block refusal",
+            metrics.pushed_blocks_refused,
+            opened.and_then(|metrics| metrics.pushed_blocks_refused),
+        ),
+        (
+            "unanswered sync round",
+            metrics.sync_rounds_unanswered,
+            opened.and_then(|metrics| metrics.sync_rounds_unanswered),
+        ),
+        (
+            "unanswered StackerDB round",
+            metrics.stackerdb_rounds_unanswered,
+            opened.and_then(|metrics| metrics.stackerdb_rounds_unanswered),
+        ),
+    ];
+    if let Some((reason, _, _)) = refusal_reasons
+        .into_iter()
+        .find(|(_, current, baseline)| metric_increased(*current, *baseline))
+    {
+        return Some(format!("new {reason} since opened"));
+    }
+    let roles = sync.roles?;
+    if roles.follower && metrics.serving_followers == Some(0.0) {
+        return Some("follower has 0 serving peers".to_owned());
+    }
+    if (roles.signer || sync.queued_proposals.is_some())
+        && metrics.serving_proposal_validators == Some(0.0)
+    {
+        return Some("proposal validator has 0 serving peers".to_owned());
+    }
+    if (roles.signer || sync.queued_stackerdb_chunks.is_some())
+        && metrics.serving_stackerdb_replicas == Some(0.0)
+    {
+        return Some("StackerDB replication has 0 serving peers".to_owned());
+    }
+    None
+}
+
+fn metric_increased(current: Option<f64>, opened: Option<f64>) -> bool {
+    current
+        .zip(opened)
+        .is_some_and(|(current, opened)| current > opened)
+}
+
+fn stall_problem(state: &State) -> Option<String> {
+    let behind = state.behind().unwrap_or_default();
+    let progress_old = state
+        .progress
+        .unchanged_for()
+        .is_some_and(|elapsed| elapsed >= STALL_AFTER);
+    let seal_old = sealed_age(state).is_some_and(|elapsed| elapsed >= OLD_SEAL);
+    if behind == 0 && !progress_old {
+        return None;
+    }
+    if !progress_old && !seal_old {
+        return None;
+    }
+    if let Some((queue, growth)) = growing_queue(state) {
+        return Some(format!(
+            "{queue} grew by {} while execution did not advance",
+            thousands(growth)
+        ));
+    }
+    (behind > 0).then(|| {
+        format!(
+            "executed height has not advanced while {} blocks behind",
+            thousands(behind)
+        )
+    })
+}
+
+fn growing_queue(state: &State) -> Option<(&'static str, u64)> {
+    let current = state.sync.as_ref()?;
+    let opened = state.sync_baseline.as_ref()?;
+    [
+        (
+            "staged block queue",
+            current.staged_blocks,
+            opened.staged_blocks,
+        ),
+        (
+            "relay validation queue",
+            current.relay_offered,
+            opened.relay_offered,
+        ),
+        (
+            "relay announcement queue",
+            current.relay_announcing,
+            opened.relay_announcing,
+        ),
+        (
+            "block ingestion queue",
+            current.queued_blocks,
+            opened.queued_blocks,
+        ),
+        (
+            "proposal validator queue",
+            current.queued_proposals,
+            opened.queued_proposals,
+        ),
+        (
+            "StackerDB relay queue",
+            current.queued_stackerdb_chunks,
+            opened.queued_stackerdb_chunks,
+        ),
+        (
+            "transaction relay queue",
+            current.queued_transactions,
+            opened.queued_transactions,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(name, current, opened)| {
+        current
+            .zip(opened)
+            .and_then(|(current, opened)| (current > opened).then_some((name, current - opened)))
+    })
+}
+
+fn sealed_timestamp(state: &State) -> Option<u64> {
+    state
+        .metrics
+        .as_ref()
+        .and_then(|metrics| metrics.last_sealed_timestamp_seconds)
+        .filter(|timestamp| *timestamp > 0)
+        .or_else(|| state.blocks.first().map(|block| block.timestamp))
+}
+
+fn sealed_age(state: &State) -> Option<Duration> {
+    let sealed = sealed_timestamp(state)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(Duration::from_secs(now.saturating_sub(sealed)))
+}
+
+fn duration_age(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
     }
 }
 
@@ -1008,7 +1326,7 @@ fn draw(frame: &mut Frame, state: &mut State, node: &Node) {
         return;
     }
 
-    let header_height = if wide { 8 } else { 7 };
+    let header_height = if wide { 9 } else { 8 };
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1037,7 +1355,7 @@ fn draw_wide_overview(frame: &mut Frame, state: &mut State, node: &Node) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),
+            Constraint::Length(9),
             Constraint::Length(11),
             Constraint::Length(6),
             Constraint::Min(6),
@@ -1060,7 +1378,7 @@ fn draw_standard_overview(frame: &mut Frame, state: &mut State, node: &Node) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Min(6),
             Constraint::Length(1),
         ])
@@ -1134,6 +1452,7 @@ fn draw_too_small(frame: &mut Frame, area: Rect, width: u16, height: u16) {
 fn draw_sync_status(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
     let sync = state.sync.clone().unwrap_or_default();
     let info = state.info.clone().unwrap_or_default();
+    let health = health_summary(state);
     let title = format!(
         " {} — {} — local {} — chain {} ",
         info.server_version.as_deref().unwrap_or("nano-stacks"),
@@ -1142,20 +1461,16 @@ fn draw_sync_status(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
         info.network_id
             .map_or_else(|| "?".to_owned(), |id| format!("{id:#010x}"))
     );
-    let unreachable = state.sources.unreachable();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(if unreachable {
-            Color::Red
-        } else {
-            Color::DarkGray
-        }));
+        .border_style(Style::default().fg(health.state.colour()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let source_status = state.sources.sync.description();
     let (lag, lag_colour) = sync_lag(state.behind(), state.sources.sync.unavailable());
     let lines = vec![
+        health_line(&health, state),
         Line::from(vec![
             label("verified locally  "),
             number(sync.executed_stacks_height, Color::Green),
@@ -1220,6 +1535,7 @@ fn draw_sync_status(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
 fn draw_compact_sync_status(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
     let sync = state.sync.clone().unwrap_or_default();
     let info = state.info.clone().unwrap_or_default();
+    let health = health_summary(state);
     let version = info
         .server_version
         .as_deref()
@@ -1234,11 +1550,7 @@ fn draw_compact_sync_status(frame: &mut Frame, area: Rect, state: &State, node: 
             node.url(),
             role_names(sync.roles)
         ))
-        .border_style(Style::default().fg(if state.sources.unreachable() {
-            Color::Red
-        } else {
-            Color::DarkGray
-        }));
+        .border_style(Style::default().fg(health.state.colour()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let lag = match (state.sources.sync.unavailable(), state.behind()) {
@@ -1249,6 +1561,7 @@ fn draw_compact_sync_status(frame: &mut Frame, area: Rect, state: &State, node: 
         (false, None) => "lag unknown".to_owned(),
     };
     let lines = vec![
+        health_line(&health, state),
         Line::from(vec![
             label("node data  "),
             Span::styled(
@@ -1303,6 +1616,26 @@ fn draw_compact_sync_status(frame: &mut Frame, area: Rect, state: &State, node: 
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn health_line(summary: &HealthSummary, state: &State) -> Line<'static> {
+    let sealed = sealed_age(state).map_or_else(
+        || "unavailable".to_owned(),
+        |elapsed| format!("{} ago", duration_age(elapsed)),
+    );
+    Line::from(vec![
+        label("health     "),
+        Span::styled(
+            summary.state.label(),
+            Style::default()
+                .fg(summary.state.colour())
+                .add_modifier(Modifier::BOLD),
+        ),
+        label(" · "),
+        Span::raw(summary.reason.clone()),
+        label(" · last sealed "),
+        Span::raw(sealed),
+    ])
+}
+
 fn role_names(roles: Option<node::NodeRoles>) -> String {
     let Some(roles) = roles else {
         return "unavailable".to_owned();
@@ -1346,7 +1679,12 @@ fn draw_operations(frame: &mut Frame, area: Rect, state: &mut State) {
 fn operations_lines(state: &State) -> Vec<Line<'static>> {
     let sync = state.sync.as_ref();
     let baseline = state.sync_baseline.as_ref();
+    let health = health_summary(state);
     let mut lines = vec![
+        detail(
+            "derived health",
+            format!("{} · {}", health.state.label(), health.reason),
+        ),
         detail("RPC data", state.sources.sync.description()),
         detail("local roles", role_names(sync.and_then(|sync| sync.roles))),
         Line::default(),
@@ -2697,14 +3035,14 @@ fn thousands_u128(value: u128) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crossterm::event::KeyCode;
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{
-        Action, BlockUpdate, PollUpdate, Poller, Screen, Source, State, draw, handle_key, node,
-        short, thousands,
+        Action, BlockUpdate, Health, PollUpdate, Poller, STALL_AFTER, Screen, Source, State, draw,
+        handle_key, health_summary, node, short, thousands,
     };
 
     #[test]
@@ -2787,6 +3125,7 @@ mod tests {
         state.apply_poll(PollUpdate::Tenure(Err("tenure failed".to_owned())));
         state.apply_poll(PollUpdate::Sortitions(Err("sortitions failed".to_owned())));
         assert!(state.sources.unreachable());
+        assert_eq!(health_summary(&state).state, Health::Unreachable);
 
         state.apply_poll(PollUpdate::Info(Ok(node::NodeInfo::default())));
         assert!(!state.sources.unreachable());
@@ -2809,6 +3148,87 @@ mod tests {
                 .description()
                 .contains("connection refused")
         );
+        assert_ne!(health_summary(&state).state, Health::Degraded);
+    }
+
+    #[test]
+    fn health_distinguishes_healthy_catch_up_and_starting() {
+        let mut state = dashboard_state();
+        assert_eq!(health_summary(&state).state, Health::Syncing);
+
+        state.sync.as_mut().expect("sync fixture").blocks_behind = Some(0);
+        assert_eq!(health_summary(&state).state, Health::Healthy);
+
+        state
+            .sync
+            .as_mut()
+            .expect("sync fixture")
+            .executed_stacks_height = None;
+        assert_eq!(health_summary(&state).state, Health::Starting);
+    }
+
+    #[test]
+    fn a_growing_queue_and_stationary_height_are_stalled() {
+        let mut state = dashboard_state();
+        state.progress.height = Some(8_716_524);
+        state.progress.changed = Some(
+            Instant::now()
+                .checked_sub(STALL_AFTER + Duration::from_secs(1))
+                .expect("test instant is old enough"),
+        );
+        state.sync.as_mut().expect("sync fixture").staged_blocks = Some(4);
+        let mut baseline = state.sync.clone().expect("sync fixture");
+        baseline.staged_blocks = Some(1);
+        state.sync_baseline = Some(baseline);
+
+        let health = health_summary(&state);
+        assert_eq!(health.state, Health::Stalled);
+        assert!(health.reason.contains("staged block queue grew by 3"));
+    }
+
+    #[test]
+    fn new_refusals_and_missing_role_peers_name_the_subsystem() {
+        let mut state = dashboard_state();
+        state.metrics_baseline = Some(node::Metrics {
+            refusal_signature: Some(2.0),
+            ..node::Metrics::default()
+        });
+        state.metrics = Some(node::Metrics {
+            refusal_signature: Some(3.0),
+            serving_followers: Some(1.0),
+            ..node::Metrics::default()
+        });
+
+        let refusal = health_summary(&state);
+        assert_eq!(refusal.state, Health::Degraded);
+        assert!(refusal.reason.contains("signature refusal"));
+
+        state.metrics_baseline = Some(node::Metrics::default());
+        state.metrics = Some(node::Metrics {
+            serving_followers: Some(0.0),
+            ..node::Metrics::default()
+        });
+        let peer = health_summary(&state);
+        assert_eq!(peer.state, Health::Degraded);
+        assert_eq!(peer.reason, "follower has 0 serving peers");
+    }
+
+    #[test]
+    fn an_unreachable_event_observer_degrades_delivery_health() {
+        let mut state = dashboard_state();
+        state.sync.as_mut().expect("sync fixture").event_observers =
+            Some(vec![node::ObserverStatus {
+                url: "http://observer.example/events".to_owned(),
+                delivered: 0,
+                dropped: 0,
+                undelivered: 0,
+                reachable: false,
+            }]);
+
+        let health = health_summary(&state);
+        assert_eq!(health.state, Health::Degraded);
+        assert!(health.reason.contains("observer.example"));
+        assert!(health.reason.contains("unreachable"));
     }
 
     #[test]
@@ -2878,6 +3298,9 @@ mod tests {
         assert!(sync.contains("http://192.0.2.123:20443"));
         assert!(sync.contains("2 blocks behind"));
         assert!(sync.contains("local follower+signer"));
+        assert!(sync.contains("SYNCING"));
+        assert!(sync.contains("last sealed"));
+        assert!(sync.contains("chain 0x00000001"));
 
         handle_key(&mut state, KeyCode::Tab);
         let tenure = render(&mut state);
@@ -3099,7 +3522,7 @@ mod tests {
     }
 
     fn dashboard_state() -> State {
-        State {
+        let mut state = State {
             sync: Some(node::SyncStatus {
                 roles: Some(node::NodeRoles {
                     follower: true,
@@ -3123,7 +3546,12 @@ mod tests {
             sortitions: sortitions(),
             blocks: vec![tenure_block()],
             ..State::default()
-        }
+        };
+        state.blocks[0].timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_secs();
+        state
     }
 
     fn tenure_info() -> node::TenureInfo {

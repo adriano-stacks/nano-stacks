@@ -72,7 +72,7 @@ pub struct Metrics {
     pub serving_followers: Option<f64>,
     pub serving_proposal_validators: Option<f64>,
     pub serving_stackerdb_replicas: Option<f64>,
-    pub last_sealed_timestamp_seconds: Option<f64>,
+    pub last_sealed_timestamp_seconds: Option<u64>,
     pub mempool_transactions: Option<f64>,
     pub last_block_transactions: Option<f64>,
     pub last_block_read_count: Option<f64>,
@@ -129,7 +129,7 @@ impl Metrics {
                     _ => {}
                 },
                 "nano_last_sealed_timestamp_seconds" => {
-                    metrics.last_sealed_timestamp_seconds = Some(value);
+                    metrics.last_sealed_timestamp_seconds = seconds(value);
                 }
                 "nano_mempool_transactions" => metrics.mempool_transactions = Some(value),
                 "nano_last_block_transaction_count" => {
@@ -204,6 +204,12 @@ fn sum_present<const N: usize>(values: [Option<f64>; N]) -> Option<f64> {
         .into_iter()
         .flatten()
         .reduce(|total, value| total + value)
+}
+
+fn seconds(value: f64) -> Option<u64> {
+    Duration::try_from_secs_f64(value)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -789,7 +795,7 @@ nano_block_execution_seconds_count 3
         assert_eq!(metrics.refusal_signature, Some(3.0));
         assert_eq!(metrics.refusal_total(), Some(3.0));
         assert_eq!(metrics.serving_proposal_validators, Some(2.0));
-        assert_eq!(metrics.last_sealed_timestamp_seconds, Some(1_786_310_400.0));
+        assert_eq!(metrics.last_sealed_timestamp_seconds, Some(1_786_310_400));
         assert_eq!(metrics.last_block_runtime, Some(0.125));
         assert_eq!(metrics.block_execution_seconds_sum, Some(0.75));
         assert_eq!(metrics.block_execution_seconds_count, Some(3.0));

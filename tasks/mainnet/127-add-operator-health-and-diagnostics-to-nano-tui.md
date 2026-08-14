@@ -30,9 +30,9 @@ This is delivery slice 2 from task 125's usability study.
 
 - [x] Publish this process's enabled follower, miner and signer roles through a
       small nano-specific RPC field.
-- [ ] Derive conservative starting, syncing, healthy, degraded, stalled and
+- [x] Derive conservative starting, syncing, healthy, degraded, stalled and
       unreachable states from named evidence and freshness.
-- [ ] Put health, reason, last-sealed age, lag, network and local roles in the
+- [x] Put health, reason, last-sealed age, lag, network and local roles in the
       persistent header.
 - [x] Add an Operations view for staged work, relay and role queues, peers,
       StackerDB/proposal coverage and event-observer delivery.
@@ -40,9 +40,9 @@ This is delivery slice 2 from task 125's usability study.
       mempool, last-block execution/cost and cache memory.
 - [x] Render counters as changes or rates since the TUI opened and gauges as
       current state; never alert on an unexplained lifetime total.
-- [ ] Show the facts used by every derived status and make missing optional
+- [x] Show the facts used by every derived status and make missing optional
       metrics explicit without degrading RPC health.
-- [ ] Cover healthy, catch-up, stalled, refusal, queue pressure, observer failure,
+- [x] Cover healthy, catch-up, stalled, refusal, queue pressure, observer failure,
       missing metrics and mixed-role nodes.
 - [ ] Run rustfmt, tests and strict clippy without warnings.
 
