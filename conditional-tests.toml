@@ -556,6 +556,30 @@ requires = "capture with at least two tenures or NANO_MAINNET_CAPTURE as used by
 policy = "required"
 
 [[conditional]]
+site = "tenure_vrf_enforcement::a_mid_tenure_block_must_still_be_signed_by_the_winning_miner#1"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with a mid-tenure block after the second tenure"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::a_mid_tenure_block_must_still_be_signed_by_the_winning_miner#2"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture with leader-key registration and signing-key hash for the mid-tenure block"
+policy = "required"
+
+[[conditional]]
+site = "tenure_vrf_enforcement::a_mid_tenure_block_must_still_be_signed_by_the_winning_miner#3"
+class = "infrastructure"
+owner = "076"
+job = "release-qualification"
+requires = "capture whose winning registration carries a block-signing key hash"
+policy = "required"
+
+[[conditional]]
 site = "tenure_vrf_enforcement::a_tenure_with_its_own_leader_key_is_accepted#1"
 class = "infrastructure"
 owner = "076"

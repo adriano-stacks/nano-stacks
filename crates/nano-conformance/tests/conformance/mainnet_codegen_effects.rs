@@ -311,9 +311,8 @@ fn assert_deployment_surfaces(name: &str, source: &str) {
     .expect("deploy with the interpreter");
     let interpreted_root = store.seal().expect("seal the interpreted state").0;
 
-    assert_ne!(
-        interpreted.cost,
-        ExecutionCost::ZERO,
+    assert!(
+        interpreted.cost != ExecutionCost::ZERO,
         "a free tracker would make the cost comparison vacuous"
     );
     assert_eq!(compiled, interpreted, "deployment receipts disagree");
