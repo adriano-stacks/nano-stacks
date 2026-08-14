@@ -106,6 +106,18 @@ impl SourceState {
         }
     }
 
+    fn brief(&self) -> String {
+        let age = self.updated.map(|updated| updated.elapsed().as_secs());
+        match (age, self.error.is_some(), self.pending) {
+            (None, false, true) => "loading".to_owned(),
+            (None, false, false) => "waiting".to_owned(),
+            (None, true, _) => "unavailable".to_owned(),
+            (Some(age), true, _) => format!("stale {age}s"),
+            (Some(age), false, true) => format!("refreshing · {age}s old"),
+            (Some(age), false, false) => format!("fresh {age}s"),
+        }
+    }
+
     const fn unavailable(&self) -> bool {
         self.updated.is_none() && self.error.is_some()
     }
@@ -333,7 +345,7 @@ fn load_blocks(node: &Node, commands: &Receiver<BlockRequest>, updates: &Sender<
 }
 
 fn one_line_error(error: &str) -> String {
-    const MAX: usize = 64;
+    const MAX: usize = 42;
     let line = error.lines().next().unwrap_or("request failed");
     if line.chars().count() <= MAX {
         return line.to_owned();
@@ -347,7 +359,7 @@ fn one_line_error(error: &str) -> String {
 #[command(
     name = "nano-tui",
     about = "Read-only dashboard and explorer for a nano-stacks node",
-    after_help = "KEYS:\n  ↑/↓ select   enter/→ open   m mining   esc/← back   r refresh   q quit/back"
+    after_help = "KEYS:\n  tab/shift-tab panel   ↑/↓ select   enter/→ open   m mining\n  esc/← back   r refresh   q quit/back"
 )]
 struct Args {
     /// HTTP RPC endpoint of the node to inspect.
@@ -489,6 +501,8 @@ struct State {
     selected_transaction: ListState,
     selected_participant: ListState,
     screen: Screen,
+    overview_panel: OverviewPanel,
+    standard_layout: bool,
     transaction_scroll: u16,
     sources: Sources,
     requested_tip: Option<String>,
@@ -603,6 +617,35 @@ enum Screen {
     Mining,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum OverviewPanel {
+    #[default]
+    Blocks,
+    Tenure,
+    Sortition,
+    Budget,
+}
+
+impl OverviewPanel {
+    const fn next(self, backwards: bool) -> Self {
+        match (self, backwards) {
+            (Self::Blocks, false) | (Self::Sortition, true) => Self::Tenure,
+            (Self::Tenure, false) | (Self::Budget, true) => Self::Sortition,
+            (Self::Sortition, false) | (Self::Blocks, true) => Self::Budget,
+            (Self::Budget, false) | (Self::Tenure, true) => Self::Blocks,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Blocks => "blocks",
+            Self::Tenure => "tenure",
+            Self::Sortition => "sortition",
+            Self::Budget => "budget",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action {
     None,
@@ -643,6 +686,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, node: &Node) -> io
 
 fn handle_key(state: &mut State, key: KeyCode) -> Action {
     match key {
+        KeyCode::Tab if state.screen == Screen::Blocks => {
+            state.overview_panel = state.overview_panel.next(false);
+        }
+        KeyCode::BackTab if state.screen == Screen::Blocks => {
+            state.overview_panel = state.overview_panel.next(true);
+        }
         KeyCode::Char('m') => {
             state.screen = if state.screen == Screen::Mining {
                 Screen::Blocks
@@ -887,25 +936,54 @@ fn selected_transaction(state: &State) -> Option<&node::Transaction> {
 }
 
 fn draw(frame: &mut Frame, state: &mut State, node: &Node) {
-    if state.screen != Screen::Blocks {
-        let areas = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(8),
-                Constraint::Min(6),
-                Constraint::Length(1),
-            ])
-            .split(frame.area());
-        draw_sync_status(frame, areas[0], state, node);
-        match state.screen {
-            Screen::Block => draw_block(frame, areas[1], state),
-            Screen::Transaction => draw_transaction(frame, areas[1], state),
-            Screen::Mining => draw_mining(frame, areas[1], state),
-            Screen::Blocks => unreachable!("handled by the dashboard layout"),
-        }
-        draw_keys(frame, areas[2], state);
+    const MIN_WIDTH: u16 = 80;
+    const MIN_HEIGHT: u16 = 24;
+    const WIDE_WIDTH: u16 = 150;
+    const WIDE_HEIGHT: u16 = 32;
+
+    let area = frame.area();
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        state.standard_layout = true;
+        draw_too_small(frame, area, MIN_WIDTH, MIN_HEIGHT);
         return;
     }
+
+    let wide = area.width >= WIDE_WIDTH && area.height >= WIDE_HEIGHT && !state.sources.degraded();
+    state.standard_layout = !wide;
+    if state.screen == Screen::Blocks {
+        if wide {
+            draw_wide_overview(frame, state, node);
+        } else {
+            draw_standard_overview(frame, state, node);
+        }
+        return;
+    }
+
+    let header_height = if wide { 8 } else { 7 };
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_height),
+            Constraint::Min(6),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    if wide {
+        draw_sync_status(frame, areas[0], state, node);
+    } else {
+        draw_compact_sync_status(frame, areas[0], state, node);
+    }
+    match state.screen {
+        Screen::Block => draw_block(frame, areas[1], state),
+        Screen::Transaction => draw_transaction(frame, areas[1], state),
+        Screen::Mining if areas[1].height >= 22 => draw_mining(frame, areas[1], state),
+        Screen::Mining => draw_standard_mining(frame, areas[1], state),
+        Screen::Blocks => unreachable!("handled by the dashboard layout"),
+    }
+    draw_keys(frame, areas[2], state);
+}
+
+fn draw_wide_overview(frame: &mut Frame, state: &mut State, node: &Node) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -926,6 +1004,81 @@ fn draw(frame: &mut Frame, state: &mut State, node: &Node) {
     draw_tenure_budget(frame, areas[2], state);
     draw_blocks(frame, areas[3], state);
     draw_keys(frame, areas[4], state);
+}
+
+fn draw_standard_overview(frame: &mut Frame, state: &mut State, node: &Node) {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Min(6),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+    draw_compact_sync_status(frame, areas[0], state, node);
+    draw_standard_panel(frame, areas[1], state);
+    draw_keys(frame, areas[2], state);
+}
+
+fn draw_standard_panel(frame: &mut Frame, area: Rect, state: &mut State) {
+    let freshness_height = if state.overview_panel == OverviewPanel::Tenure {
+        4
+    } else {
+        3
+    };
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(freshness_height), Constraint::Min(3)])
+        .split(area);
+    let freshness = match state.overview_panel {
+        OverviewPanel::Blocks => format!("blocks {}", state.sources.blocks.description()),
+        OverviewPanel::Tenure => format!(
+            "tenure {} · PoX {}",
+            state.sources.tenure.description(),
+            state.sources.pox.description()
+        ),
+        OverviewPanel::Sortition => {
+            format!("sortition {}", state.sources.sortitions.description())
+        }
+        OverviewPanel::Budget => format!("PoX {}", state.sources.pox.description()),
+    };
+    frame.render_widget(
+        Paragraph::new(freshness)
+            .wrap(Wrap { trim: false })
+            .block(bordered(&format!(
+                " {} data freshness ",
+                state.overview_panel.name()
+            ))),
+        areas[0],
+    );
+    match state.overview_panel {
+        OverviewPanel::Blocks => draw_blocks(frame, areas[1], state),
+        OverviewPanel::Tenure => draw_tenure(frame, areas[1], state),
+        OverviewPanel::Sortition => draw_sortition(frame, areas[1], state),
+        OverviewPanel::Budget => draw_tenure_budget(frame, areas[1], state),
+    }
+}
+
+fn draw_too_small(frame: &mut Frame, area: Rect, width: u16, height: u16) {
+    let lines = vec![
+        Line::from(Span::styled(
+            "terminal too small",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(
+            "current {}x{} · required {width}x{height}",
+            area.width, area.height
+        )),
+        Line::from("resize the terminal · q quit"),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .block(bordered(" nano-tui ")),
+        area,
+    );
 }
 
 fn draw_sync_status(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
@@ -1013,6 +1166,88 @@ fn draw_sync_status(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn draw_compact_sync_status(frame: &mut Frame, area: Rect, state: &State, node: &Node) {
+    let sync = state.sync.clone().unwrap_or_default();
+    let info = state.info.clone().unwrap_or_default();
+    let version = info
+        .server_version
+        .as_deref()
+        .unwrap_or("nano-stacks")
+        .split(" (")
+        .next()
+        .unwrap_or("nano-stacks");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {version} — {} ", node.url()))
+        .border_style(Style::default().fg(if state.sources.unreachable() {
+            Color::Red
+        } else {
+            Color::DarkGray
+        }));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lag = match (state.sources.sync.unavailable(), state.behind()) {
+        (true, _) => "lag unavailable".to_owned(),
+        (false, Some(0)) => "at peer-reported tip".to_owned(),
+        (false, Some(1)) => "1 block behind".to_owned(),
+        (false, Some(behind)) => format!("{} blocks behind", thousands(behind)),
+        (false, None) => "lag unknown".to_owned(),
+    };
+    let lines = vec![
+        Line::from(vec![
+            label("node data  "),
+            Span::styled(
+                state.sources.sync.description(),
+                Style::default().fg(if state.sources.sync.error.is_some() {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            label(" · info "),
+            Span::raw(state.sources.info.brief()),
+        ]),
+        Line::from(vec![
+            label("verified locally  "),
+            number(sync.executed_stacks_height, Color::Green),
+            label(" · executed and checked by this node"),
+        ]),
+        Line::from(vec![
+            label("last peer report  "),
+            number(sync.followed_stacks_height, Color::White),
+            label(" · last fork choice "),
+            number(sync.selected_stacks_height, Color::Yellow),
+            label(" · "),
+            Span::raw(lag),
+        ]),
+        Line::from(vec![
+            label("source     "),
+            plain_value(sync.selected_from_peer.as_deref(), "none"),
+        ]),
+        Line::from(vec![
+            label("peers      "),
+            number(
+                sync.fetching_from_peers
+                    .as_ref()
+                    .map(|peers| peers.len() as u64),
+                Color::Green,
+            ),
+            label(" serving · "),
+            number(sync.p2p_sessions, Color::White),
+            label("/"),
+            number(sync.p2p_known_peers, Color::DarkGray),
+            label(" P2P · Bitcoin "),
+            number(info.burn_block_height, Color::Cyan),
+            label(" · chain "),
+            Span::raw(
+                info.network_id
+                    .map_or_else(|| "?".to_owned(), |id| format!("{id:#010x}")),
+            ),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_tenure(frame: &mut Frame, area: Rect, state: &State) {
     let tenure = state.tenure.clone().unwrap_or_default();
     let pox = state.pox.clone().unwrap_or_default();
@@ -1050,8 +1285,8 @@ fn draw_tenure(frame: &mut Frame, area: Rect, state: &State) {
     frame.render_widget(
         Paragraph::new(lines).block(bordered(&format!(
             " current tenure — tenure {} · PoX {} ",
-            state.sources.tenure.description(),
-            state.sources.pox.description()
+            state.sources.tenure.brief(),
+            state.sources.pox.brief()
         ))),
         area,
     );
@@ -1132,7 +1367,7 @@ fn tenure_history_lines(state: &State, tenure: &node::TenureInfo) -> Vec<Line<'s
 fn draw_sortition(frame: &mut Frame, area: Rect, state: &State) {
     let title = format!(
         " current miner & latest sortition — {} ",
-        state.sources.sortitions.description()
+        state.sources.sortitions.brief()
     );
     let Some(latest) = latest_sortition(state) else {
         frame.render_widget(
@@ -1211,7 +1446,7 @@ fn draw_sortition(frame: &mut Frame, area: Rect, state: &State) {
         ]),
         Line::from(vec![label("competition    "), Span::raw(participants)]),
         Line::from(vec![label("winner burn    "), Span::raw(winner_burn)]),
-        Line::from(vec![label("relative weight"), Span::raw(relative_weight)]),
+        Line::from(vec![label("relative weight "), Span::raw(relative_weight)]),
         Line::from(vec![label("sample window  "), Span::raw(sampling)]),
         Line::from(vec![
             label("tenure commit  "),
@@ -1233,6 +1468,15 @@ fn draw_mining(frame: &mut Frame, area: Rect, state: &mut State) {
     draw_mining_summary(frame, areas[0], state);
     draw_participants(frame, areas[1], state);
     draw_participant(frame, areas[2], state);
+}
+
+fn draw_standard_mining(frame: &mut Frame, area: Rect, state: &mut State) {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Min(4)])
+        .split(area);
+    draw_mining_summary(frame, areas[0], state);
+    draw_participants(frame, areas[1], state);
 }
 
 fn draw_mining_summary(frame: &mut Frame, area: Rect, state: &State) {
@@ -1506,7 +1750,7 @@ fn draw_tenure_budget(frame: &mut Frame, area: Rect, state: &State) {
     frame.render_widget(
         Paragraph::new(lines).block(bordered(&format!(
             " current tenure execution budget — {} ",
-            state.sources.pox.description()
+            state.sources.pox.brief()
         ))),
         area,
     );
@@ -1522,7 +1766,7 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &mut State) {
             )))
             .block(bordered(&format!(
                 " executed blocks — {} ",
-                state.sources.blocks.description()
+                state.sources.blocks.brief()
             ))),
             area,
         );
@@ -1563,7 +1807,7 @@ fn draw_blocks(frame: &mut Frame, area: Rect, state: &mut State) {
     let title = format!(
         " executed blocks — {} held, {HISTORY} max, nothing on disk · {} ",
         state.blocks.len(),
-        state.sources.blocks.description()
+        state.sources.blocks.brief()
     );
     frame.render_stateful_widget(
         List::new(items)
@@ -1738,6 +1982,9 @@ fn transaction_colour(kind: &str) -> Color {
 
 fn draw_keys(frame: &mut Frame, area: Rect, state: &State) {
     let keys = match state.screen {
+        Screen::Blocks if state.standard_layout => {
+            "tab/shift-tab panel   enter/→ open block   ↑/↓ select   m mining   r refresh   q quit"
+        }
         Screen::Blocks => "enter/→ open block   m mining   ↑/↓ select   r refresh   q quit",
         Screen::Block => {
             "enter/→ open transaction   m mining   ↑/↓ select   esc/← back   r refresh"
@@ -2135,32 +2382,40 @@ mod tests {
     #[test]
     fn dashboard_explains_sync_state_and_shows_the_whole_peer() {
         let mut state = dashboard_state();
-        let rendered = render(&mut state);
+        let sync = render(&mut state);
 
-        assert!(rendered.contains("verified locally"));
-        assert!(rendered.contains("executed and checked by this node"));
-        assert!(rendered.contains("last fork choice"));
-        assert!(rendered.contains("last peer report"));
-        assert!(rendered.contains("http://192.0.2.123:20443"));
-        assert!(rendered.contains("2 verified blocks behind"));
-        assert!(rendered.contains("current tenure"));
-        assert!(rendered.contains("tip 8,716,524 · loaded 1; no start"));
-        assert!(rendered.contains("extensions"));
-        assert!(rendered.contains("runtime limit reached"));
-        assert!(rendered.contains("prepare +10 · reward +110 burn blocks"));
-        assert!(rendered.contains("current tenure execution budget"));
-        assert!(rendered.contains("5B runtime"));
-        assert!(
-            rendered.contains("reset at block 8,716,524 after 12 tenure blocks · runtime only")
-        );
-        assert!(rendered.contains("not exposed by this node's RPC"));
-        assert!(rendered.contains("current miner & latest sortition"));
-        assert!(rendered.contains("miner elected · new Stacks tenure"));
-        assert!(rendered.contains("current miner"));
-        assert!(rendered.contains("2 candidates · losers burned 40,000"));
-        assert!(rendered.contains("60,000 of 100,000 sats"));
-        assert!(rendered.contains("tenure commit"));
-        assert!(!rendered.contains("state root"));
+        assert!(sync.contains("verified locally"));
+        assert!(sync.contains("executed and checked by this node"));
+        assert!(sync.contains("last fork choice"));
+        assert!(sync.contains("last peer report"));
+        assert!(sync.contains("http://192.0.2.123:20443"));
+        assert!(sync.contains("2 blocks behind"));
+
+        handle_key(&mut state, KeyCode::Tab);
+        let tenure = render(&mut state);
+        assert!(tenure.contains("current tenure"));
+        assert!(tenure.contains("tip 8,716,524 · loaded 1; no start"));
+        assert!(tenure.contains("extensions"));
+        assert!(tenure.contains("runtime limit reached"));
+        assert!(tenure.contains("prepare +10 · reward +110 burn blocks"));
+
+        handle_key(&mut state, KeyCode::Tab);
+        let sortition = render(&mut state);
+        assert!(sortition.contains("current miner & latest sortition"));
+        assert!(sortition.contains("miner elected · new Stacks tenure"));
+        assert!(sortition.contains("current miner"));
+        assert!(sortition.contains("2 candidates · losers burned 40,000"));
+        assert!(sortition.contains("60,000 of 100,000 sats"));
+        assert!(sortition.contains("tenure commit"));
+        assert!(!sortition.contains("relative weight60.0%"));
+
+        handle_key(&mut state, KeyCode::Tab);
+        let budget = render(&mut state);
+        assert!(budget.contains("current tenure execution budget"));
+        assert!(budget.contains("5B runtime"));
+        assert!(budget.contains("reset at block 8,716,524 after 12 tenure blocks · runtime only"));
+        assert!(budget.contains("not exposed by this node's RPC"));
+        assert!(!budget.contains("state root"));
     }
 
     #[test]
@@ -2212,6 +2467,7 @@ mod tests {
     #[test]
     fn a_sortitionless_burn_block_keeps_the_last_elected_miner_current() {
         let mut state = dashboard_state();
+        state.overview_panel = super::OverviewPanel::Sortition;
         state.sortitions[0].elected = Some(false);
         state.sortitions[0].miner_pk_hash160 = None;
         state.sortitions[0]
@@ -2226,6 +2482,39 @@ mod tests {
         assert!(rendered.contains("no election · current tenure continued"));
         assert!(rendered.contains("9999999999…999999"));
         assert!(rendered.contains("960,238  bitcoin block"));
+    }
+
+    #[test]
+    fn layouts_cover_standard_wide_and_too_small_terminals() {
+        let mut standard = dashboard_state();
+        let standard = render_at(&mut standard, 80, 24);
+        assert!(standard.contains("verified locally"));
+        assert!(standard.contains("blocks data freshness"));
+        assert!(standard.contains("tab/shift-tab panel"));
+
+        let mut wide = dashboard_state();
+        let wide = render_at(&mut wide, 160, 40);
+        assert!(wide.contains("current tenure"));
+        assert!(wide.contains("current miner & latest sortition"));
+        assert!(wide.contains("current tenure execution budget"));
+
+        let mut small = dashboard_state();
+        let small = render_at(&mut small, 79, 23);
+        assert!(small.contains("terminal too small"));
+        assert!(small.contains("current 79x23 · required 80x24"));
+    }
+
+    #[test]
+    fn a_standard_panel_shows_the_full_failure_beside_stale_data() {
+        let mut state = dashboard_state();
+        state.overview_panel = super::OverviewPanel::Tenure;
+        state.sources.tenure.succeeded();
+        state.sources.tenure.failed("tenure request timed out");
+
+        let rendered = render_at(&mut state, 80, 24);
+        assert!(rendered.contains("stale 0s ago"));
+        assert!(rendered.contains("tenure request timed out"));
+        assert!(rendered.contains("tip 8,716,524"));
     }
 
     fn dashboard_state() -> State {
@@ -2366,7 +2655,11 @@ mod tests {
     }
 
     fn render(state: &mut State) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(110, 32)).expect("test terminal");
+        render_at(state, 110, 32)
+    }
+
+    fn render_at(state: &mut State, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         terminal
             .draw(|frame| draw(frame, state, &node::Node::new("http://node")))
             .expect("render state");
