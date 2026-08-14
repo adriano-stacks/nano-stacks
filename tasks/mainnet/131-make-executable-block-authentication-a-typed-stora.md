@@ -9,6 +9,7 @@ tags: ["mainnet", "consensus", "staging", "signer", "safety"]
 created_at: 2026-08-14
 parent: 053
 type: bug
+touches: ["crates/nano-chainstate", "crates/nano-node", "crates/nano-conformance"]
 ---
 
 # Make executable block authentication a typed storage invariant
