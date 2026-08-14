@@ -32,7 +32,7 @@ This is delivery slice 3 from task 125's usability study.
       with stable number-key navigation.
 - [x] Rename Mining to Election and keep the network miner distinct from this
       process's roles.
-- [ ] Render the latest Bitcoin block -> commitment -> tenure -> Stacks-block
+- [x] Render the latest Bitcoin block -> commitment -> tenure -> Stacks-block
       relationship as one causal story, followed by what happens next.
 - [ ] Add contextual `?` help for every view: meaning, relevance, provenance and
       local keys.
@@ -40,7 +40,7 @@ This is delivery slice 3 from task 125's usability study.
       extension, election/sortition, fork choice, signer, PoX phase, state root
       and uSTX.
 - [ ] Prefer human units and times while retaining exact values in details.
-- [ ] Retain commitment sampling and relative-weight detail without describing
+- [x] Retain commitment sampling and relative-weight detail without describing
       the value as win probability.
 - [ ] Cover help/navigation, missing context and the full story at supported
       terminal sizes.

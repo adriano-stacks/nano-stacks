@@ -389,7 +389,7 @@ fn one_line_error(error: &str) -> String {
 #[command(
     name = "nano-tui",
     about = "Read-only dashboard and explorer for a nano-stacks node",
-    after_help = "VIEWS:\n  1 overview   2 activity   3 election   4 operations\n\nKEYS:\n  tab/shift-tab panel   ↑/↓ select   enter/→ open\n  esc/← back   r refresh   q quit/back   ? help"
+    after_help = "VIEWS:\n  1 overview   2 activity   3 election   4 operations\n\nKEYS:\n  ↑/↓ select   enter/→ open   esc/← back\n  r refresh   q quit/back   ? help"
 )]
 struct Args {
     /// HTTP RPC endpoint of the node to inspect.
@@ -529,7 +529,6 @@ struct State {
     selected_transaction: ListState,
     selected_participant: ListState,
     screen: Screen,
-    overview_panel: OverviewPanel,
     standard_layout: bool,
     transaction_scroll: u16,
     operations_scroll: u16,
@@ -965,35 +964,6 @@ enum Screen {
     Operations,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum OverviewPanel {
-    #[default]
-    Blocks,
-    Tenure,
-    Sortition,
-    Budget,
-}
-
-impl OverviewPanel {
-    const fn next(self, backwards: bool) -> Self {
-        match (self, backwards) {
-            (Self::Blocks, false) | (Self::Sortition, true) => Self::Tenure,
-            (Self::Tenure, false) | (Self::Budget, true) => Self::Sortition,
-            (Self::Sortition, false) | (Self::Blocks, true) => Self::Budget,
-            (Self::Budget, false) | (Self::Tenure, true) => Self::Blocks,
-        }
-    }
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Blocks => "blocks",
-            Self::Tenure => "tenure",
-            Self::Sortition => "sortition",
-            Self::Budget => "budget",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action {
     None,
@@ -1043,12 +1013,6 @@ fn handle_key(state: &mut State, key: KeyCode) -> Action {
         KeyCode::Char('4') => {
             state.screen = Screen::Operations;
             state.operations_scroll = 0;
-        }
-        KeyCode::Tab if state.screen == Screen::Overview => {
-            state.overview_panel = state.overview_panel.next(false);
-        }
-        KeyCode::BackTab if state.screen == Screen::Overview => {
-            state.overview_panel = state.overview_panel.next(true);
         }
         KeyCode::Char('m') => {
             state.screen = if state.screen == Screen::Election {
@@ -1197,28 +1161,6 @@ fn mining_competition(state: &State) -> Option<&node::MiningCompetition> {
     latest_sortition(state)?.mining_competition.as_ref()
 }
 
-/// The candidate field, sized by what the losing commitments spent.
-fn competition_summary(
-    competition: &node::MiningCompetition,
-    winner: Option<&node::SortitionParticipant>,
-) -> String {
-    match competition.participants.len() {
-        0 => "0 candidate commitments".to_owned(),
-        1 => "1 candidate commitment".to_owned(),
-        count => {
-            let losing: u64 = competition
-                .participants
-                .iter()
-                .filter(|participant| {
-                    winner.is_none_or(|winner| !same_id(&participant.txid, &winner.txid))
-                })
-                .map(|participant| participant.burn_sats)
-                .sum();
-            format!("{count} candidates · losers burned {}", thousands(losing))
-        }
-    }
-}
-
 fn competition_winner(
     competition: &node::MiningCompetition,
 ) -> Option<&node::SortitionParticipant> {
@@ -1333,11 +1275,7 @@ fn draw(frame: &mut Frame, state: &mut State, node: &Node) {
     let wide = area.width >= WIDE_WIDTH && area.height >= WIDE_HEIGHT && !state.sources.degraded();
     state.standard_layout = !wide;
     if state.screen == Screen::Overview {
-        if wide {
-            draw_wide_overview(frame, state, node);
-        } else {
-            draw_standard_overview(frame, state, node);
-        }
+        draw_overview(frame, state, node, wide);
         return;
     }
 
@@ -1367,80 +1305,328 @@ fn draw(frame: &mut Frame, state: &mut State, node: &Node) {
     draw_keys(frame, areas[2], state);
 }
 
-fn draw_wide_overview(frame: &mut Frame, state: &mut State, node: &Node) {
+fn draw_overview(frame: &mut Frame, state: &State, node: &Node, wide: bool) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9),
-            Constraint::Length(11),
-            Constraint::Length(6),
-            Constraint::Min(6),
+            Constraint::Length(if wide { 9 } else { 8 }),
+            Constraint::Min(8),
             Constraint::Length(1),
         ])
         .split(frame.area());
-    draw_sync_status(frame, areas[0], state, node);
-    let middle = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(areas[1]);
-    draw_tenure(frame, middle[0], state);
-    draw_sortition(frame, middle[1], state);
-    draw_tenure_budget(frame, areas[2], state);
-    draw_blocks(frame, areas[3], state);
-    draw_keys(frame, areas[4], state);
-}
-
-fn draw_standard_overview(frame: &mut Frame, state: &mut State, node: &Node) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8),
-            Constraint::Min(6),
-            Constraint::Length(1),
-        ])
-        .split(frame.area());
-    draw_compact_sync_status(frame, areas[0], state, node);
-    draw_standard_panel(frame, areas[1], state);
+    if wide {
+        draw_sync_status(frame, areas[0], state, node);
+    } else {
+        draw_compact_sync_status(frame, areas[0], state, node);
+    }
+    draw_protocol_story(frame, areas[1], state);
     draw_keys(frame, areas[2], state);
 }
 
-fn draw_standard_panel(frame: &mut Frame, area: Rect, state: &mut State) {
-    let freshness_height = if state.overview_panel == OverviewPanel::Tenure {
-        4
+fn draw_protocol_story(frame: &mut Frame, area: Rect, state: &State) {
+    let lines = if area.width < 150 {
+        compact_protocol_story(state)
     } else {
-        3
-    };
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(freshness_height), Constraint::Min(3)])
-        .split(area);
-    let freshness = match state.overview_panel {
-        OverviewPanel::Blocks => format!("blocks {}", state.sources.blocks.description()),
-        OverviewPanel::Tenure => format!(
-            "tenure {} · PoX {}",
-            state.sources.tenure.description(),
-            state.sources.pox.description()
-        ),
-        OverviewPanel::Sortition => {
-            format!("sortition {}", state.sources.sortitions.description())
-        }
-        OverviewPanel::Budget => format!("PoX {}", state.sources.pox.description()),
+        protocol_story(state)
     };
     frame.render_widget(
-        Paragraph::new(freshness)
+        Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(bordered(&format!(
-                " {} data freshness ",
-                state.overview_panel.name()
-            ))),
-        areas[0],
+            .block(bordered(" how Bitcoin decisions become Stacks activity ")),
+        area,
     );
-    match state.overview_panel {
-        OverviewPanel::Blocks => draw_blocks(frame, areas[1], state),
-        OverviewPanel::Tenure => draw_tenure(frame, areas[1], state),
-        OverviewPanel::Sortition => draw_sortition(frame, areas[1], state),
-        OverviewPanel::Budget => draw_tenure_budget(frame, areas[1], state),
-    }
+}
+
+fn compact_protocol_story(state: &State) -> Vec<Line<'static>> {
+    let latest = latest_sortition(state);
+    let competition = latest.and_then(|sortition| sortition.mining_competition.as_ref());
+    let decision = latest.and_then(|sortition| sortition.elected).map_or_else(
+        || "decision unavailable".to_owned(),
+        |elected| {
+            let height = latest
+                .and_then(|sortition| sortition.burn_block_height)
+                .map_or_else(|| "?".to_owned(), thousands);
+            if elected {
+                format!(
+                    "Bitcoin block {height}: new network miner elected from {} commitments",
+                    competition.map_or(0, |competition| competition.participants.len())
+                )
+            } else {
+                format!("Bitcoin block {height}: no successor; active tenure continued")
+            }
+        },
+    );
+    let commitment = competition.and_then(competition_winner).map_or_else(
+        || "no winning commitment retained".to_owned(),
+        |winner| {
+            format!(
+                "winner {} · {} sats · {} relative weight ({}-block sample; not win probability)",
+                winner
+                    .signing_key_hash
+                    .as_deref()
+                    .or(winner.vrf_public_key.as_deref())
+                    .map_or_else(|| "key unavailable".to_owned(), short),
+                thousands(winner.burn_sats),
+                participant_weight(winner, competition.expect("winner has competition")),
+                competition.map_or(0, |competition| competition.sampled_window_blocks)
+            )
+        },
+    );
+    let active = active_sortition(state);
+    let (miner, _) = active.map_or((None, ""), miner_identity);
+    let tenure = state.tenure.clone().unwrap_or_default();
+    let tenure = format!(
+        "tenure {} · network miner {} · tip {}",
+        tenure
+            .consensus_hash
+            .as_deref()
+            .map_or_else(|| "unavailable".to_owned(), short),
+        miner.map_or_else(|| "unavailable".to_owned(), short),
+        tenure.tip_height.map_or_else(|| "?".to_owned(), thousands)
+    );
+    let next = latest
+        .and_then(|sortition| sortition.burn_block_height)
+        .and_then(|height| height.checked_add(1))
+        .map_or_else(
+            || "next Bitcoin block".to_owned(),
+            |height| format!("Bitcoin block {}", thousands(height)),
+        );
+    vec![
+        detail("1 Bitcoin decision", decision),
+        detail("2 commitment", commitment),
+        detail("3 tenure", tenure),
+        detail("4 Stacks blocks", compact_activity_story(state)),
+        detail(
+            "next boundary",
+            format!("{next}: may elect a successor; otherwise tenure continues"),
+        ),
+        detail("PoX schedule", compact_pox_story(state)),
+        detail(
+            "data freshness",
+            format!(
+                "sortition {} · tenure {} · blocks {}",
+                state.sources.sortitions.description(),
+                state.sources.tenure.description(),
+                state.sources.blocks.description()
+            ),
+        ),
+    ]
+}
+
+fn compact_activity_story(state: &State) -> String {
+    let blocks = state
+        .tenure
+        .as_ref()
+        .and_then(|tenure| tenure.consensus_hash.as_deref())
+        .map_or_else(Vec::new, |tenure| tenure_blocks(state, tenure));
+    let Some(newest) = blocks.first() else {
+        return "no locally executed blocks loaded for this tenure".to_owned();
+    };
+    let oldest = blocks.last().expect("non-empty blocks have a last item");
+    format!(
+        "{} locally executed · {}→{} · {} extensions",
+        blocks.len(),
+        thousands(oldest.height),
+        thousands(newest.height),
+        tenure_extensions(&blocks).len()
+    )
+}
+
+fn compact_pox_story(state: &State) -> String {
+    let pox = state.pox.clone().unwrap_or_default();
+    let current = pox.current_cycle.as_ref().and_then(|cycle| cycle.id);
+    pox.next_cycle.as_ref().map_or_else(
+        || "boundary unavailable".to_owned(),
+        |next| {
+            format!(
+                "cycle {}→{} · {}",
+                current.map_or_else(|| "?".to_owned(), |cycle| cycle.to_string()),
+                next.id
+                    .map_or_else(|| "?".to_owned(), |cycle| cycle.to_string()),
+                cycle_phases(
+                    next.blocks_until_prepare_phase,
+                    next.blocks_until_reward_phase
+                )
+            )
+        },
+    )
+}
+
+fn protocol_story(state: &State) -> Vec<Line<'static>> {
+    vec![
+        detail("1 Bitcoin decision", bitcoin_decision_story(state)),
+        detail("2 commitment", commitment_story(state)),
+        detail("3 tenure", tenure_story(state)),
+        detail("4 Stacks blocks", stacks_activity_story(state)),
+        detail("next boundary", next_boundary_story(state)),
+        detail("PoX schedule", pox_schedule_story(state)),
+        detail(
+            "data freshness",
+            format!(
+                "sortition {} · tenure {} · blocks {}",
+                state.sources.sortitions.description(),
+                state.sources.tenure.description(),
+                state.sources.blocks.description()
+            ),
+        ),
+    ]
+}
+
+fn bitcoin_decision_story(state: &State) -> String {
+    let latest = latest_sortition(state);
+    let height = latest
+        .and_then(|sortition| sortition.burn_block_height)
+        .map_or_else(|| "?".to_owned(), thousands);
+    latest
+        .and_then(|sortition| sortition.elected)
+        .map_or_else(
+            || "decision unavailable".to_owned(),
+            |elected| {
+                if elected {
+                    let candidates = latest
+                        .and_then(|sortition| sortition.mining_competition.as_ref())
+                        .map_or(0, |competition| competition.participants.len());
+                    format!(
+                        "Bitcoin block {height} elected a new network miner from {candidates} candidate commitments"
+                    )
+                } else {
+                    format!(
+                        "Bitcoin block {height} elected no successor; the active tenure continued"
+                    )
+                }
+            },
+        )
+}
+
+fn commitment_story(state: &State) -> String {
+    let latest = latest_sortition(state);
+    let competition = latest.and_then(|sortition| sortition.mining_competition.as_ref());
+    let Some((competition, winner)) = competition.and_then(|competition| {
+        competition_winner(competition).map(|winner| (competition, winner))
+    }) else {
+        return "no winning commitment retained for this Bitcoin decision".to_owned();
+    };
+    let miner = winner
+        .signing_key_hash
+        .as_deref()
+        .or(winner.vrf_public_key.as_deref())
+        .map_or_else(|| "miner key unavailable".to_owned(), short);
+    format!(
+        "{miner} burned {} sats in commitment {} · block {} · {} relative weight in a {}-block sample, not a win probability · decided {}",
+        thousands(winner.burn_sats),
+        short(&winner.txid),
+        latest
+            .and_then(|sortition| sortition.committed_block_hash.as_deref())
+            .map_or_else(|| "unavailable".to_owned(), short),
+        participant_weight(winner, competition),
+        competition.sampled_window_blocks,
+        relative_time(latest.and_then(|sortition| sortition.burn_header_timestamp))
+    )
+}
+
+fn tenure_story(state: &State) -> String {
+    let active = active_sortition(state);
+    let (miner, _) = active.map_or((None, ""), miner_identity);
+    let tenure = state.tenure.clone().unwrap_or_default();
+    format!(
+        "tenure {} is led by network miner {} · elected at Bitcoin block {} · tip {} · start {} · parent {} / {} · reward cycle {}",
+        tenure
+            .consensus_hash
+            .as_deref()
+            .map_or_else(|| "unavailable".to_owned(), short),
+        miner.map_or_else(|| "unavailable".to_owned(), short),
+        active
+            .and_then(|sortition| sortition.burn_block_height)
+            .map_or_else(|| "?".to_owned(), thousands),
+        tenure.tip_height.map_or_else(|| "?".to_owned(), thousands),
+        tenure
+            .tenure_start_block_id
+            .as_deref()
+            .map_or_else(|| "unavailable".to_owned(), short),
+        tenure
+            .parent_consensus_hash
+            .as_deref()
+            .map_or_else(|| "unavailable".to_owned(), short),
+        tenure
+            .parent_tenure_start_block_id
+            .as_deref()
+            .map_or_else(|| "unavailable".to_owned(), short),
+        tenure
+            .reward_cycle
+            .map_or_else(|| "?".to_owned(), |cycle| cycle.to_string())
+    )
+}
+
+fn stacks_activity_story(state: &State) -> String {
+    let blocks = state
+        .tenure
+        .as_ref()
+        .and_then(|tenure| tenure.consensus_hash.as_deref())
+        .map_or_else(Vec::new, |tenure| tenure_blocks(state, tenure));
+    let Some(newest) = blocks.first() else {
+        return "no locally executed blocks from this tenure are loaded".to_owned();
+    };
+    let oldest = blocks
+        .last()
+        .expect("a non-empty block slice has a last item");
+    format!(
+        "{} locally executed · heights {}→{} · latest has {} transactions · {} tenure extensions",
+        blocks.len(),
+        thousands(oldest.height),
+        thousands(newest.height),
+        newest.transactions.len(),
+        tenure_extensions(&blocks).len()
+    )
+}
+
+fn next_boundary_story(state: &State) -> String {
+    let next = latest_sortition(state)
+        .and_then(|sortition| sortition.burn_block_height)
+        .and_then(|height| height.checked_add(1))
+        .map_or_else(
+            || "the next Bitcoin block".to_owned(),
+            |height| format!("Bitcoin block {}", thousands(height)),
+        );
+    format!("{next} may elect a successor; without one, this tenure and its network miner continue")
+}
+
+fn pox_schedule_story(state: &State) -> String {
+    let pox = state.pox.clone().unwrap_or_default();
+    pox.next_cycle.as_ref().map_or_else(
+        || "PoX boundary unavailable".to_owned(),
+        |next| {
+            format!(
+                "cycle {}→{} · {} · stacked {} · epoch {} · budget {} runtime, {} reads / {} bytes, {} writes / {} bytes",
+                pox.current_cycle
+                    .as_ref()
+                    .and_then(|cycle| cycle.id)
+                    .map_or_else(|| "?".to_owned(), |cycle| cycle.to_string()),
+                next.id
+                    .map_or_else(|| "?".to_owned(), |cycle| cycle.to_string()),
+                cycle_phases(
+                    next.blocks_until_prepare_phase,
+                    next.blocks_until_reward_phase
+                ),
+                pox.current_cycle
+                    .as_ref()
+                    .and_then(|cycle| cycle.stacked_ustx)
+                    .map_or_else(
+                        || "unavailable".to_owned(),
+                        |amount| format!(
+                            "{} STX ({} uSTX)",
+                            thousands_u128(amount / 1_000_000),
+                            thousands_u128(amount)
+                        )
+                    ),
+                pox.current_epoch.as_deref().unwrap_or("unavailable"),
+                compact_limit(pox.current_budget().and_then(|budget| budget.runtime)),
+                count_limit(pox.current_budget().and_then(|budget| budget.read_count)),
+                byte_limit(pox.current_budget().and_then(|budget| budget.read_length)),
+                count_limit(pox.current_budget().and_then(|budget| budget.write_count)),
+                byte_limit(pox.current_budget().and_then(|budget| budget.write_length))
+            )
+        },
+    )
 }
 
 fn draw_too_small(frame: &mut Frame, area: Rect, width: u16, height: u16) {
@@ -2064,214 +2250,6 @@ fn execution_average(metrics: &node::Metrics, opened: Option<&node::Metrics>) ->
     }
 }
 
-fn draw_tenure(frame: &mut Frame, area: Rect, state: &State) {
-    let tenure = state.tenure.clone().unwrap_or_default();
-    let pox = state.pox.clone().unwrap_or_default();
-    let cycle = pox.current_cycle.unwrap_or_default();
-    let next = pox.next_cycle.unwrap_or_default();
-    let mut lines = tenure_history_lines(state, &tenure);
-    lines.extend([
-        Line::from(vec![
-            label("cycle        "),
-            number(cycle.id.or(tenure.reward_cycle), Color::Magenta),
-            label(" → "),
-            number(next.id, Color::DarkGray),
-        ]),
-        Line::from(vec![
-            label("phases       "),
-            Span::styled(
-                cycle_phases(
-                    next.blocks_until_prepare_phase,
-                    next.blocks_until_reward_phase,
-                ),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            label("stacked      "),
-            Span::styled(
-                cycle.stacked_ustx.map_or_else(
-                    || "unavailable".to_owned(),
-                    |stacked| format!("{} STX", thousands_u128(stacked / 1_000_000)),
-                ),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-    ]);
-    frame.render_widget(
-        Paragraph::new(lines).block(bordered(&format!(
-            " current tenure — tenure {} · PoX {} ",
-            state.sources.tenure.brief(),
-            state.sources.pox.brief()
-        ))),
-        area,
-    );
-}
-
-fn tenure_history_lines(state: &State, tenure: &node::TenureInfo) -> Vec<Line<'static>> {
-    let blocks = tenure
-        .consensus_hash
-        .as_deref()
-        .map_or_else(Vec::new, |tenure| tenure_blocks(state, tenure));
-    let start_height = tenure
-        .tenure_start_block_id
-        .as_deref()
-        .and_then(|start| blocks.iter().find(|block| same_id(&block.id, start)))
-        .map(|block| block.height);
-    let extensions = tenure_extensions(&blocks);
-    let span = tenure_span(tenure.tip_height, start_height, blocks.len());
-    let extension_count = if blocks.is_empty() {
-        "waiting for tenure blocks".to_owned()
-    } else if start_height.is_some() {
-        format!("{} observed in the full loaded tenure", extensions.len())
-    } else {
-        format!(
-            "{} observed in {} loaded blocks",
-            extensions.len(),
-            blocks.len()
-        )
-    };
-    let latest_extension = extensions.first().map_or_else(
-        || {
-            if start_height.is_some() {
-                "none observed · tenure-start budget".to_owned()
-            } else {
-                "none loaded · earlier reset unknown".to_owned()
-            }
-        },
-        |(height, change)| {
-            format!(
-                "{} · block {} after {} · reset {}",
-                change.cause,
-                thousands(*height),
-                change.previous_blocks,
-                change.reset
-            )
-        },
-    );
-    vec![
-        Line::from(vec![
-            label("span         "),
-            Span::styled(span, Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            label("tenure ID    "),
-            value(tenure.consensus_hash.as_deref()),
-        ]),
-        Line::from(vec![
-            label("started at   "),
-            value(tenure.tenure_start_block_id.as_deref()),
-        ]),
-        Line::from(vec![
-            label("parent       "),
-            value(tenure.parent_consensus_hash.as_deref()),
-            label(" · start "),
-            value(tenure.parent_tenure_start_block_id.as_deref()),
-        ]),
-        Line::from(vec![
-            label("extensions   "),
-            Span::styled(extension_count, Style::default().fg(Color::Magenta)),
-        ]),
-        Line::from(vec![
-            label("latest reset "),
-            Span::styled(latest_extension, Style::default().fg(Color::White)),
-        ]),
-    ]
-}
-
-/// The burn view this node executed under, as *it* derived it.
-fn draw_sortition(frame: &mut Frame, area: Rect, state: &State) {
-    let title = format!(
-        " network miner & latest sortition — {} ",
-        state.sources.sortitions.brief()
-    );
-    let Some(latest) = latest_sortition(state) else {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "waiting for this node to derive a burnchain decision",
-                Style::default().fg(Color::DarkGray),
-            )))
-            .block(bordered(&title)),
-            area,
-        );
-        return;
-    };
-    let (outcome, colour) = match latest.elected {
-        Some(true) => ("miner elected · new Stacks tenure", Color::Green),
-        Some(false) => ("no election · current tenure continued", Color::DarkGray),
-        None => ("election result unavailable", Color::Red),
-    };
-    let active = active_sortition(state);
-    let (miner, miner_kind) = active.map_or((None, ""), miner_identity);
-    let competition = latest.mining_competition.as_ref();
-    let winner = competition.and_then(competition_winner);
-    let participants = competition.map_or_else(
-        || "participant data unavailable · press m".to_owned(),
-        |competition| competition_summary(competition, winner),
-    );
-    let winner_burn = winner.map_or_else(
-        || "no winning commitment".to_owned(),
-        |winner| {
-            format!(
-                "{} of {} sats",
-                thousands(winner.burn_sats),
-                thousands(competition.map_or(0, |competition| competition.block_burn_sats))
-            )
-        },
-    );
-    let relative_weight = winner.map_or_else(
-        || "unavailable".to_owned(),
-        |winner| participant_weight(winner, competition.expect("a winner has a competition")),
-    );
-    let sampling = competition.map_or_else(
-        || "unavailable".to_owned(),
-        |competition| {
-            format!(
-                "{} burn blocks · median {} sats",
-                competition.sampled_window_blocks,
-                thousands(competition.window_median_burn_sats)
-            )
-        },
-    );
-    let lines = vec![
-        Line::from(vec![
-            label("bitcoin block  "),
-            number(latest.burn_block_height, Color::Cyan),
-            label(" · "),
-            Span::styled(
-                relative_time(latest.burn_header_timestamp),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        Line::from(vec![
-            label("outcome        "),
-            Span::styled(outcome, Style::default().fg(colour)),
-        ]),
-        Line::from(vec![
-            label("network miner  "),
-            value(miner),
-            label(miner_kind),
-        ]),
-        Line::from(vec![
-            label("tenure elected "),
-            number(
-                active.and_then(|sortition| sortition.burn_block_height),
-                Color::DarkGray,
-            ),
-            label("  bitcoin block"),
-        ]),
-        Line::from(vec![label("competition    "), Span::raw(participants)]),
-        Line::from(vec![label("winner burn    "), Span::raw(winner_burn)]),
-        Line::from(vec![label("relative weight "), Span::raw(relative_weight)]),
-        Line::from(vec![label("sample window  "), Span::raw(sampling)]),
-        Line::from(vec![
-            label("tenure commit  "),
-            value(active.and_then(|sortition| sortition.committed_block_hash.as_deref())),
-        ]),
-    ];
-    frame.render_widget(Paragraph::new(lines).block(bordered(&title)), area);
-}
-
 fn draw_election(frame: &mut Frame, area: Rect, state: &mut State) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
@@ -2491,83 +2469,6 @@ fn draw_participant(frame: &mut Frame, area: Rect, state: &State) {
         } else {
             " participant details "
         })),
-        area,
-    );
-}
-
-fn draw_tenure_budget(frame: &mut Frame, area: Rect, state: &State) {
-    let budget = state.pox.as_ref().and_then(node::Pox::current_budget);
-    let tenure = state.tenure.as_ref();
-    let blocks = tenure
-        .and_then(|tenure| tenure.consensus_hash.as_deref())
-        .map_or_else(Vec::new, |tenure| tenure_blocks(state, tenure));
-    let start = tenure.and_then(|tenure| tenure.tenure_start_block_id.as_deref());
-    let start_loaded =
-        start.is_some_and(|start| blocks.iter().any(|block| same_id(&block.id, start)));
-    let window = tenure_extensions(&blocks).first().map_or_else(
-        || {
-            if start_loaded {
-                format!(
-                    "tenure start {} · all dimensions",
-                    short(start.expect("a loaded start is present"))
-                )
-            } else if blocks.is_empty() {
-                "unavailable".to_owned()
-            } else {
-                "earlier reset outside loaded block history".to_owned()
-            }
-        },
-        |(height, change)| {
-            let reset = if change.reset == "all dimensions" {
-                change.reset.clone()
-            } else {
-                format!("{} only", change.reset)
-            };
-            format!(
-                "reset at block {} after {} tenure blocks · {reset}",
-                thousands(*height),
-                change.previous_blocks
-            )
-        },
-    );
-    let limits = budget.map_or_else(
-        || "unavailable from PoX info".to_owned(),
-        |budget| {
-            format!(
-                "{} runtime · {} reads · {} writes",
-                compact_limit(budget.runtime),
-                count_limit(budget.read_count),
-                count_limit(budget.write_count)
-            )
-        },
-    );
-    let data = budget.map_or_else(
-        || "unavailable from PoX info".to_owned(),
-        |budget| {
-            format!(
-                "{} read · {} written",
-                byte_limit(budget.read_length),
-                byte_limit(budget.write_length)
-            )
-        },
-    );
-    let lines = vec![
-        Line::from(vec![label("budget window    "), Span::raw(window)]),
-        Line::from(vec![label("operation limits "), Span::raw(limits)]),
-        Line::from(vec![label("data limits      "), Span::raw(data)]),
-        Line::from(vec![
-            label("used / remaining "),
-            Span::styled(
-                "not exposed by this node's RPC",
-                Style::default().fg(Color::Yellow),
-            ),
-        ]),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines).block(bordered(&format!(
-            " current tenure execution budget — {} ",
-            state.sources.pox.brief()
-        ))),
         area,
     );
 }
@@ -2799,10 +2700,10 @@ fn transaction_colour(kind: &str) -> Color {
 fn draw_keys(frame: &mut Frame, area: Rect, state: &State) {
     let keys = match state.screen {
         Screen::Overview if state.standard_layout => {
-            "1 overview   2 activity   3 election   4 operations   tab panel   ? help   q quit"
+            "1 overview   2 activity   3 election   4 operations   r refresh   ? help   q quit"
         }
         Screen::Overview => {
-            "1 overview   2 activity   3 election   4 operations   tab panel   ? help   q quit"
+            "1 overview   2 activity   3 election   4 operations   r refresh   ? help   q quit"
         }
         Screen::Activity => {
             "1 overview   2 activity   3 election   4 operations   enter open   ↑/↓ select   ? help"
@@ -2839,7 +2740,7 @@ fn field<'a>(name: &'a str, value: Option<&'a str>) -> Line<'a> {
 }
 
 fn detail(name: &str, value: String) -> Line<'static> {
-    Line::from(vec![label(&format!("{name:<18}")), Span::raw(value)])
+    Line::from(vec![label(&format!("{name:<18}  ")), Span::raw(value)])
 }
 
 fn detail_lines(name: &str, value: &str) -> Vec<Line<'static>> {
@@ -2934,23 +2835,6 @@ fn tenure_extensions<'a>(blocks: &[&'a node::Block]) -> Vec<(u64, &'a node::Tenu
 fn same_id(left: &str, right: &str) -> bool {
     left.trim_start_matches("0x")
         .eq_ignore_ascii_case(right.trim_start_matches("0x"))
-}
-
-fn tenure_span(tip: Option<u64>, start: Option<u64>, loaded: usize) -> String {
-    match (tip, start) {
-        (Some(tip), Some(start)) => format!(
-            "{}→{} · loaded {}/{}",
-            thousands(start),
-            thousands(tip),
-            loaded,
-            thousands(tip.saturating_sub(start) + 1)
-        ),
-        (Some(tip), None) if loaded > 0 => {
-            format!("tip {} · loaded {loaded}; no start", thousands(tip))
-        }
-        (Some(tip), None) => format!("tip {} · no blocks loaded", thousands(tip)),
-        (None, _) => "unavailable".to_owned(),
-    }
 }
 
 fn relative_time(timestamp: Option<u64>) -> String {
@@ -3326,44 +3210,38 @@ mod tests {
     #[test]
     fn dashboard_explains_sync_state_and_shows_the_whole_peer() {
         let mut state = dashboard_state();
-        let sync = render(&mut state);
+        let overview = render(&mut state);
 
-        assert!(sync.contains("verified locally"));
-        assert!(sync.contains("executed and checked by this node"));
-        assert!(sync.contains("last fork choice"));
-        assert!(sync.contains("last peer report"));
-        assert!(sync.contains("http://192.0.2.123:20443"));
-        assert!(sync.contains("2 blocks behind"));
-        assert!(sync.contains("local follower+signer"));
-        assert!(sync.contains("SYNCING"));
-        assert!(sync.contains("last sealed"));
-        assert!(sync.contains("chain 0x00000001"));
+        assert!(overview.contains("verified locally"));
+        assert!(overview.contains("executed and checked by this node"));
+        assert!(overview.contains("last fork choice"));
+        assert!(overview.contains("last peer report"));
+        assert!(overview.contains("http://192.0.2.123:20443"));
+        assert!(overview.contains("2 blocks behind"));
+        assert!(overview.contains("local follower+signer"));
+        assert!(overview.contains("SYNCING"));
+        assert!(overview.contains("last sealed"));
+        assert!(overview.contains("chain 0x00000001"));
+        assert!(overview.contains("1 Bitcoin decision"));
+        assert!(overview.contains("Bitcoin block 960,240: new network miner elected"));
+        assert!(overview.contains("2 commitment"));
+        assert!(overview.contains("60,000 sats"));
+        assert!(overview.contains("probability"));
+        assert!(overview.contains("3 tenure"));
+        assert!(overview.contains("4 Stacks blocks"));
+        assert!(overview.contains("1 locally executed"));
+        assert!(overview.contains("extensions"));
+        assert!(overview.contains("next boundary"));
+        assert!(overview.contains("Bitcoin block 960,241"));
+        assert!(overview.contains("prepare +10 · reward +110 burn blocks"));
 
-        handle_key(&mut state, KeyCode::Tab);
-        let tenure = render(&mut state);
-        assert!(tenure.contains("current tenure"));
-        assert!(tenure.contains("tip 8,716,524 · loaded 1; no start"));
-        assert!(tenure.contains("extensions"));
-        assert!(tenure.contains("runtime limit reached"));
-        assert!(tenure.contains("prepare +10 · reward +110 burn blocks"));
-
-        handle_key(&mut state, KeyCode::Tab);
-        let sortition = render(&mut state);
-        assert!(sortition.contains("network miner & latest sortition"));
-        assert!(sortition.contains("miner elected · new Stacks tenure"));
-        assert!(sortition.contains("network miner"));
-        assert!(sortition.contains("2 candidates · losers burned 40,000"));
-        assert!(sortition.contains("60,000 of 100,000 sats"));
-        assert!(sortition.contains("tenure commit"));
-        assert!(!sortition.contains("relative weight60.0%"));
-
-        handle_key(&mut state, KeyCode::Tab);
-        let budget = render(&mut state);
-        assert!(budget.contains("current tenure execution budget"));
-        assert!(budget.contains("5B runtime"));
-        assert!(budget.contains("reset at block 8,716,524 after 12 tenure blocks · runtime only"));
-        assert!(budget.contains("not exposed by this node's RPC"));
-        assert!(!budget.contains("state root"));
+        handle_key(&mut state, KeyCode::Char('3'));
+        let election = render(&mut state);
+        assert!(election.contains("network election & active tenure"));
+        assert!(election.contains("2 candidate commitments"));
+        assert!(
+            election.contains("relative share among candidate commitments; not win probability")
+        );
     }
 
     #[test]
@@ -3399,11 +3277,11 @@ mod tests {
         let rendered = render(&mut state);
 
         assert!(rendered.contains("operations — RPC facts"));
-        assert!(rendered.contains("staged blocks     0"));
-        assert!(rendered.contains("block ingestion   unavailable"));
-        assert!(rendered.contains("proposal validator0"));
-        assert!(rendered.contains("StackerDB relay   1"));
-        assert!(rendered.contains("relay shed        +2 since opened"));
+        assert!(rendered.contains("staged blocks       0"));
+        assert!(rendered.contains("block ingestion     unavailable"));
+        assert!(rendered.contains("proposal validator  0"));
+        assert!(rendered.contains("StackerDB relay     1"));
+        assert!(rendered.contains("relay shed          +2 since opened"));
 
         handle_key(&mut state, KeyCode::End);
         let rendered = render(&mut state);
@@ -3449,14 +3327,14 @@ mod tests {
 
         let rendered = render_at(&mut state, 110, 70);
 
-        assert!(rendered.contains("metrics data      fresh 0s ago"));
-        assert!(rendered.contains("proposal peers    2"));
-        assert!(rendered.contains("StackerDB peers   3"));
-        assert!(rendered.contains("refusals          +2 since opened"));
-        assert!(rendered.contains("peer failovers    +1 since opened"));
+        assert!(rendered.contains("metrics data        fresh 0s ago"));
+        assert!(rendered.contains("proposal peers      2"));
+        assert!(rendered.contains("StackerDB peers     3"));
+        assert!(rendered.contains("refusals            +2 since opened"));
+        assert!(rendered.contains("peer failovers      +1 since opened"));
         assert!(rendered.contains("0.300s average · 2 blocks since opened"));
         assert!(rendered.contains("25.0% of block limit"));
-        assert!(rendered.contains("cache memory      4.0 KiB current"));
+        assert!(rendered.contains("cache memory        4.0 KiB current"));
     }
 
     #[test]
@@ -3508,7 +3386,6 @@ mod tests {
     #[test]
     fn a_sortitionless_burn_block_keeps_the_last_elected_miner_current() {
         let mut state = dashboard_state();
-        state.overview_panel = super::OverviewPanel::Sortition;
         state.sortitions[0].elected = Some(false);
         state.sortitions[0].miner_pk_hash160 = None;
         state.sortitions[0]
@@ -3520,9 +3397,9 @@ mod tests {
             Some("9999999999999999999999999999999999999999".to_owned());
 
         let rendered = render(&mut state);
-        assert!(rendered.contains("no election · current tenure continued"));
+        assert!(rendered.contains("no successor; active tenure continued"));
         assert!(rendered.contains("9999999999…999999"));
-        assert!(rendered.contains("960,238  bitcoin block"));
+        assert!(rendered.contains("Bitcoin block 960,240"));
     }
 
     #[test]
@@ -3530,15 +3407,14 @@ mod tests {
         let mut standard = dashboard_state();
         let standard = render_at(&mut standard, 80, 24);
         assert!(standard.contains("verified locally"));
-        assert!(standard.contains("blocks data freshness"));
+        assert!(standard.contains("Bitcoin decisions become Stacks activity"));
         assert!(standard.contains("1 overview"));
-        assert!(standard.contains("tab panel"));
 
         let mut wide = dashboard_state();
         let wide = render_at(&mut wide, 160, 40);
-        assert!(wide.contains("current tenure"));
-        assert!(wide.contains("network miner & latest sortition"));
-        assert!(wide.contains("current tenure execution budget"));
+        assert!(wide.contains("Bitcoin block 960,240 elected a new network miner"));
+        assert!(wide.contains("4 Stacks blocks"));
+        assert!(wide.contains("Bitcoin block 960,241"));
 
         let mut small = dashboard_state();
         let small = render_at(&mut small, 79, 23);
@@ -3547,16 +3423,15 @@ mod tests {
     }
 
     #[test]
-    fn a_standard_panel_shows_the_full_failure_beside_stale_data() {
+    fn overview_shows_the_full_failure_beside_stale_data() {
         let mut state = dashboard_state();
-        state.overview_panel = super::OverviewPanel::Tenure;
         state.sources.tenure.succeeded();
         state.sources.tenure.failed("tenure request timed out");
 
         let rendered = render_at(&mut state, 80, 24);
         assert!(rendered.contains("stale 0s ago"));
         assert!(rendered.contains("tenure request timed out"));
-        assert!(rendered.contains("tip 8,716,524"));
+        assert!(rendered.contains("3 tenure"));
     }
 
     fn dashboard_state() -> State {
