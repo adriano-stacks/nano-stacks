@@ -596,7 +596,6 @@ fn transaction_payload(
         "txid": format!("0x{}", receipt.txid),
         "tx_index": index,
         "status": status,
-        "committed": receipt.committed,
         "raw_result": receipt
             .result
             .value
@@ -1125,7 +1124,7 @@ mod tests {
         let payload = transaction_payload(2, &raw, &receipt);
         assert_eq!(payload["tx_index"], 2);
         assert_eq!(payload["status"], "success");
-        assert_eq!(payload["committed"], true);
+        assert!(payload.get("committed").is_none());
         assert_eq!(payload["raw_result"], "0x0703");
         assert_eq!(payload["raw_tx"], format!("0x{}", hex::encode(raw)));
         assert_eq!(
