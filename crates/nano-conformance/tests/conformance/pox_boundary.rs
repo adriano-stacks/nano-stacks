@@ -89,6 +89,27 @@ fn bitcoin_blocks(snapshots: &[Captured]) -> BTreeMap<u64, BitcoinBlock> {
         .collect()
 }
 
+fn waterfall_payout(snapshots: &[Captured]) -> (u64, nano_address::PoxAddress) {
+    snapshots
+        .iter()
+        .find_map(|snapshot| {
+            let (addresses, _): (Vec<serde_json::Value>, u64) =
+                serde_json::from_str(&snapshot.pox_payouts).ok()?;
+            let encoded = addresses.first()?.get("Addr32")?.clone();
+            let (mainnet, kind, bytes): (bool, String, [u8; 32]) =
+                serde_json::from_value(encoded).ok()?;
+            (kind == "P2TR").then_some((
+                snapshot.block_height,
+                nano_address::PoxAddress::Addr32 {
+                    mainnet,
+                    address_type: nano_address::PoxAddressType32::P2tr,
+                    bytes,
+                },
+            ))
+        })
+        .expect("the post-waterfall seed carries its sBTC payout address")
+}
+
 fn boundary_window(snapshots: &[Captured]) -> (u64, u64, Vec<u64>) {
     let payouts = nano_node::payout_schedule(&pox()).expect("a payout schedule");
     let boundaries = snapshots
@@ -153,7 +174,13 @@ fn seeded_tracker(
         snapshot.winner_vrf_seed.is_some(),
         "the seed's winning commitment is in its own Bitcoin block"
     );
-    SortitionTracker::new(snapshot, history).expect("seed the tracker")
+    let mut tracker = SortitionTracker::new(snapshot, history).expect("seed the tracker");
+    tracker
+        .load_leader_keys(&fixtures().join("sortition"))
+        .expect("load the capture's leader-key registry");
+    let (starts_at, payout) = waterfall_payout(snapshots);
+    tracker.record_waterfall_payout(starts_at, starts_at, payout);
+    tracker
 }
 
 /// What the capture says the `PoX` history was at each of its boundaries.

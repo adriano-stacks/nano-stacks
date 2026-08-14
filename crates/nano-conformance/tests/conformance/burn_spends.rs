@@ -418,22 +418,37 @@ fn seeded_chain(
         serde_json::to_vec(&serde_json::json!({ "hashes": hashes })).expect("encodes"),
     )
     .expect("the history is written");
+    let snapshots = rows
+        .iter()
+        .filter(|snapshot| snapshot.block_height <= seed_height)
+        .map(|snapshot| {
+            serde_json::json!({
+                "block_height": snapshot.block_height,
+                "burn_header_hash": snapshot.burn_header_hash,
+                "sortition_id": snapshot.sortition_id,
+                "consensus_hash": snapshot.consensus_hash,
+                "sortition_hash": snapshot.sortition_hash,
+                "total_burn": snapshot.total_burn,
+                "sortition": snapshot.sortition,
+                "winning_block_txid": snapshot.winning_block_txid,
+                "winner_vrf_seed": (snapshot.block_height == seed_height)
+                    .then_some(&winner_vrf_seed),
+                "pox_payouts": snapshot.pox_payouts,
+            })
+        })
+        .collect::<Vec<_>>();
     fs::write(
         directory.join("snapshots.json"),
-        serde_json::to_vec(&serde_json::json!([{
-            "block_height": seed.block_height,
-            "burn_header_hash": seed.burn_header_hash,
-            "sortition_id": seed.sortition_id,
-            "consensus_hash": seed.consensus_hash,
-            "sortition_hash": seed.sortition_hash,
-            "total_burn": seed.total_burn,
-            "sortition": seed.sortition,
-            "winning_block_txid": seed.winning_block_txid,
-            "winner_vrf_seed": winner_vrf_seed,
-        }]))
-        .expect("encodes"),
+        serde_json::to_vec(&snapshots).expect("encodes"),
     )
     .expect("the seed is written");
+    fs::copy(
+        follow_path::fixtures()
+            .join("sortition")
+            .join(nano_node::sortition::LEADER_KEY_FILE),
+        directory.join(nano_node::sortition::LEADER_KEY_FILE),
+    )
+    .expect("the capture's leader-key registry is copied");
     nano_node::sortition::SortitionTracker::from_capture(directory)
         .expect("the seed starts a chain")
 }
