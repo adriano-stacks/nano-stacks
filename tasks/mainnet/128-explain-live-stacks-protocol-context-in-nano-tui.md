@@ -34,9 +34,9 @@ This is delivery slice 3 from task 125's usability study.
       process's roles.
 - [x] Render the latest Bitcoin block -> commitment -> tenure -> Stacks-block
       relationship as one causal story, followed by what happens next.
-- [ ] Add contextual `?` help for every view: meaning, relevance, provenance and
+- [x] Add contextual `?` help for every view: meaning, relevance, provenance and
       local keys.
-- [ ] Define every visible protocol term, starting with burn block, tenure,
+- [x] Define every visible protocol term, starting with burn block, tenure,
       extension, election/sortition, fork choice, signer, PoX phase, state root
       and uSTX.
 - [ ] Prefer human units and times while retaining exact values in details.

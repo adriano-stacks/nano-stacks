@@ -37,7 +37,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use node::{Node, Sortition, SyncStatus};
@@ -530,6 +530,8 @@ struct State {
     selected_participant: ListState,
     screen: Screen,
     standard_layout: bool,
+    help: bool,
+    help_scroll: u16,
     transaction_scroll: u16,
     operations_scroll: u16,
     sources: Sources,
@@ -964,6 +966,19 @@ enum Screen {
     Operations,
 }
 
+impl Screen {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Activity => "activity",
+            Self::Block => "block",
+            Self::Transaction => "transaction",
+            Self::Election => "election",
+            Self::Operations => "operations",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action {
     None,
@@ -1003,7 +1018,36 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, node: &Node) -> io
 }
 
 fn handle_key(state: &mut State, key: KeyCode) -> Action {
+    if state.help {
+        match key {
+            KeyCode::Char('?' | 'q' | 'h') | KeyCode::Esc | KeyCode::Left => {
+                state.help = false;
+                state.help_scroll = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.help_scroll = state.help_scroll.saturating_add(1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.help_scroll = state.help_scroll.saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                state.help_scroll = state.help_scroll.saturating_add(10);
+            }
+            KeyCode::PageUp => {
+                state.help_scroll = state.help_scroll.saturating_sub(10);
+            }
+            KeyCode::Home => state.help_scroll = 0,
+            KeyCode::End => state.help_scroll = u16::MAX,
+            _ => {}
+        }
+        return Action::None;
+    }
+
     match key {
+        KeyCode::Char('?') => {
+            state.help = true;
+            state.help_scroll = 0;
+        }
         KeyCode::Char('1') => state.screen = Screen::Overview,
         KeyCode::Char('2') => state.screen = Screen::Activity,
         KeyCode::Char('3') => {
@@ -1276,6 +1320,9 @@ fn draw(frame: &mut Frame, state: &mut State, node: &Node) {
     state.standard_layout = !wide;
     if state.screen == Screen::Overview {
         draw_overview(frame, state, node, wide);
+        if state.help {
+            draw_help(frame, state);
+        }
         return;
     }
 
@@ -1303,6 +1350,9 @@ fn draw(frame: &mut Frame, state: &mut State, node: &Node) {
         Screen::Overview => unreachable!("handled by the dashboard layout"),
     }
     draw_keys(frame, areas[2], state);
+    if state.help {
+        draw_help(frame, state);
+    }
 }
 
 fn draw_overview(frame: &mut Frame, state: &State, node: &Node, wide: bool) {
@@ -2697,6 +2747,155 @@ fn transaction_colour(kind: &str) -> Color {
     }
 }
 
+fn draw_help(frame: &mut Frame, state: &mut State) {
+    let area = frame.area();
+    let paragraph = Paragraph::new(help_lines(state.screen)).wrap(Wrap { trim: false });
+    let visible = usize::from(area.height.saturating_sub(2));
+    let content = paragraph.line_count(area.width.saturating_sub(2));
+    let max_scroll = u16::try_from(content.saturating_sub(visible)).unwrap_or(u16::MAX);
+    state.help_scroll = state.help_scroll.min(max_scroll);
+    let title = format!(
+        " help — {} — scroll {}/{} ",
+        state.screen.name(),
+        state.help_scroll,
+        max_scroll
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        paragraph
+            .block(bordered(&title))
+            .scroll((state.help_scroll, 0)),
+        area,
+    );
+}
+
+fn help_lines(screen: Screen) -> Vec<Line<'static>> {
+    let (meaning, relevance, provenance, controls) = view_help(screen);
+    let mut lines = vec![
+        help_heading("this view"),
+        detail("meaning", meaning.to_owned()),
+        detail("why it matters", relevance.to_owned()),
+        detail("data provenance", provenance.to_owned()),
+        detail("local controls", controls.to_owned()),
+        Line::default(),
+        help_heading("shared controls"),
+        detail(
+            "1 / 2 / 3 / 4",
+            "overview / activity / election / operations".to_owned(),
+        ),
+        detail("r", "request a fresh sample now".to_owned()),
+        detail("?", "open or close this help".to_owned()),
+        detail(
+            "q / esc / ←",
+            "close help, go back, or quit from a primary view".to_owned(),
+        ),
+        detail(
+            "↑↓ / j k",
+            "select or scroll; page and home/end move farther".to_owned(),
+        ),
+        Line::default(),
+        help_heading("protocol glossary"),
+    ];
+    lines.extend(glossary_lines());
+    lines
+}
+
+const fn view_help(screen: Screen) -> (&'static str, &'static str, &'static str, &'static str) {
+    match screen {
+        Screen::Overview => (
+            "The live protocol story from the current Bitcoin decision through this node's Stacks execution and the next PoX boundary.",
+            "Confirms that the node is following, selecting, and executing a coherent chain instead of merely hearing about a tip.",
+            "/nano/sync_status, /v3/sortitions/latest_and_last, /v3/tenures/info, /v3/blocks, and /v2/pox. Health and freshness are explicitly derived.",
+            "1–4 change primary view; r refreshes immediately; q exits.",
+        ),
+        Screen::Activity => (
+            "A bounded history of Stacks blocks this node has executed, newest first.",
+            "Lets an operator confirm continued block production and lets a reader open the exact transactions that changed state.",
+            "The executed tip from /nano/sync_status is loaded through /v3/blocks/:id and decoded locally with nano-codec.",
+            "↑/↓, j/k, page, and home/end select; enter or → opens a block; 1–4 change primary view.",
+        ),
+        Screen::Block => (
+            "One locally decoded Stacks block and its ordered transactions.",
+            "Connects chain progress to a precise parent, consensus decision, state root, and set of transaction intents.",
+            "/v3/blocks/:id from the configured node, decoded locally with nano-codec. Hashes are exact RPC data.",
+            "↑/↓ selects a transaction; enter or → opens it; esc or ← returns to activity; 1–4 change primary view.",
+        ),
+        Screen::Transaction => (
+            "The signed intent encoded by one transaction in the selected block.",
+            "Shows who authorized what, the fee and nonce ordering, and the payload. Intent alone does not prove execution success.",
+            "Transaction bytes from /v3/blocks/:id, decoded locally with nano-codec. Execution results are unavailable on this route.",
+            "↑/↓, j/k, page, and home/end scroll; esc or ← returns to the block; 1–4 change primary view.",
+        ),
+        Screen::Election => (
+            "The Bitcoin-anchored miner election for the active tenure and the node-reported candidate set.",
+            "Explains why one network miner may produce the next Stacks blocks and exposes the evidence behind that choice.",
+            "/v3/sortitions/latest_and_last (falling back to /v3/sortitions). Relative weight is derived from reported effective burn.",
+            "↑/↓, j/k, page, and home/end select a participant; esc or ← returns to overview; 1–4 change primary view.",
+        ),
+        Screen::Operations => (
+            "Node roles, peer counts, work queues, counters, process metrics, and an evidence-based health summary.",
+            "Separates slow chain progress from peer, queue, relay, signer, miner, or process pressure when diagnosing a node.",
+            "/nano/sync_status plus the optional Prometheus --metrics-url. Deltas compare the current session with its first sample.",
+            "↑/↓, j/k, page, and home/end scroll; esc or ← returns to overview; r refreshes; 1–4 change primary view.",
+        ),
+    }
+}
+
+fn glossary_lines() -> [Line<'static>; 11] {
+    [
+        detail(
+            "burn block",
+            "A Bitcoin block observed by Stacks; it is the clock and decision boundary for miner elections.".to_owned(),
+        ),
+        detail(
+            "commitment",
+            "A miner's Bitcoin-chain commitment used as evidence in the next Stacks miner election.".to_owned(),
+        ),
+        detail(
+            "election / sortition",
+            "The Bitcoin-anchored process that selects the network miner for a Stacks tenure.".to_owned(),
+        ),
+        detail(
+            "tenure",
+            "The interval in which one elected network miner may produce a sequence of Stacks blocks.".to_owned(),
+        ),
+        detail(
+            "extension",
+            "Continuation of the current tenure when its miner remains responsible for producing blocks.".to_owned(),
+        ),
+        detail(
+            "fork choice",
+            "The rule this node uses to select one chain when it knows competing Stacks histories.".to_owned(),
+        ),
+        detail(
+            "signer",
+            "A member of the reward-set committee that validates and signs Nakamoto blocks.".to_owned(),
+        ),
+        detail(
+            "PoX phase",
+            "A Proof of Transfer cycle interval, including prepare and reward phases anchored to Bitcoin.".to_owned(),
+        ),
+        detail(
+            "state root",
+            "A cryptographic digest of the Stacks state after executing a block.".to_owned(),
+        ),
+        detail("uSTX", "One millionth of one STX, the exact base unit.".to_owned()),
+        detail(
+            "relative weight",
+            "A candidate's share of reported effective burn in this sample; it is context, not a win probability.".to_owned(),
+        ),
+    ]
+}
+
+fn help_heading(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_owned(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
 fn draw_keys(frame: &mut Frame, area: Rect, state: &State) {
     let keys = match state.screen {
         Screen::Overview if state.standard_layout => {
@@ -3004,6 +3203,38 @@ mod tests {
         state.screen = Screen::Transaction;
         handle_key(&mut state, KeyCode::Char('3'));
         assert_eq!(state.screen, Screen::Election);
+    }
+
+    #[test]
+    fn contextual_help_explains_every_view_and_its_provenance() {
+        for screen in [
+            Screen::Overview,
+            Screen::Activity,
+            Screen::Block,
+            Screen::Transaction,
+            Screen::Election,
+            Screen::Operations,
+        ] {
+            let mut state = dashboard_state();
+            state.screen = screen;
+
+            assert_eq!(handle_key(&mut state, KeyCode::Char('?')), Action::None);
+            let top = render_at(&mut state, 80, 24);
+            assert!(top.contains(&format!("help — {}", screen.name())));
+            assert!(top.contains("meaning"));
+            assert!(top.contains("why it matters"));
+            assert!(top.contains("data provenance"));
+            assert!(top.contains("local controls"));
+
+            handle_key(&mut state, KeyCode::End);
+            let bottom = render_at(&mut state, 80, 24);
+            assert!(bottom.contains("state root"));
+            assert!(bottom.contains("uSTX"));
+            assert!(bottom.contains("relative weight"));
+
+            assert_eq!(handle_key(&mut state, KeyCode::Char('q')), Action::None);
+            assert!(!state.help);
+        }
     }
 
     #[test]
