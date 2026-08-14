@@ -26,7 +26,7 @@ use nano_conformance::replay_captured_blocks;
 use serde_json::Value;
 
 fn fixtures() -> PathBuf {
-    nano_conformance::capture_root(&Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures"))
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
 /// One lock the chain applied: who, how much, until when.
