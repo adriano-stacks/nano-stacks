@@ -217,6 +217,14 @@ struct Executed {
     pox: PoxInfo,
 }
 
+impl Executed {
+    fn local_bitcoin_height(&self) -> u64 {
+        self.sortitions
+            .first()
+            .map_or(self.tip.bitcoin_height, |burn| burn.bitcoin_height)
+    }
+}
+
 /// The validated node state exposed by the public HTTP API.
 #[derive(Clone)]
 pub struct RpcState {
@@ -806,7 +814,7 @@ async fn executed(state: &RpcState) -> Result<Executed, RpcError> {
 
 fn read_only_bitcoin_context(executed: &Executed) -> nano_vm::BitcoinBlockContext {
     let mut context = executed.pox.bitcoin_context();
-    context.move_to_burn_block(executed.tip.bitcoin_height);
+    context.move_to_burn_block(executed.local_bitcoin_height());
     context
 }
 
@@ -824,10 +832,11 @@ async fn node_info(State(state): State<RpcState>) -> Result<axum::Json<NodeInfoW
     // which is the opposite of what this route is for.
     let network_id = state.network.chain_id();
     let executed = executed(&state).await?;
+    let burn_height = executed.local_bitcoin_height();
     let tip = executed.tip;
     let burn = executed.sortitions.first();
     Ok(axum::Json(NodeInfoWire {
-        burn_block_height: burn.map_or(tip.bitcoin_height, |burn| burn.bitcoin_height),
+        burn_block_height: burn_height,
         stacks_tip_height: tip.stacks_height,
         stacks_tip: tip.stacks_block_hash.to_string(),
         stacks_tip_consensus_hash: tip.consensus_hash.to_string(),
@@ -1193,6 +1202,7 @@ fn pox_info_json(
 /// unavailable route, never a plausible zero.
 async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<Value>, RpcError> {
     let executed = executed(&state).await?;
+    let burn_height = executed.local_bitcoin_height();
     let network = state.network;
     let bitcoin_context = read_only_bitcoin_context(&executed);
     let pox = executed.pox;
@@ -1200,7 +1210,7 @@ async fn pox_info(State(state): State<RpcState>) -> Result<axum::Json<Value>, Rp
         .pox_rpc
         .as_ref()
         .ok_or_else(|| pox_unavailable("PoX RPC constants were not installed at startup"))?;
-    let cycle = pox_cycle_position(&pox, executed.tip.bitcoin_height)?;
+    let cycle = pox_cycle_position(&pox, burn_height)?;
     let values = read_pox_chain_values(&state, network, bitcoin_context, &cycle).await?;
     let activation_threshold = u128::from(values.liquid_supply)
         .checked_mul(u128::from(configured.participation_threshold_pct))
@@ -3187,6 +3197,37 @@ mod tests {
         );
 
         assert_pox_calls(&calls.lock().expect("call log"));
+    }
+
+    #[tokio::test]
+    async fn pox_info_advances_with_the_local_burnchain_without_a_stacks_block() {
+        let (chain, _) = scripted_chain([
+            Ok(pox_contract_info(
+                Value::UInt(50_000),
+                Value::UInt(4_000_000),
+            )),
+            Ok(Value::UInt(1_250_000)),
+            Ok(Value::UInt(2_500_000)),
+        ]);
+        let state = pox_state(chain).await;
+        let mut burn = captured_view().tenures[0].sortition.clone();
+        burn.bitcoin_height = 21;
+        state.publish_local_sortitions(vec![burn]).await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/pox")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let pox = body_json(response).await;
+        assert_eq!(pox["current_burnchain_block_height"], json!(21));
+        assert_eq!(pox["reward_cycle_id"], json!(1));
+        assert_eq!(pox["current_cycle"]["id"], json!(1));
     }
 
     #[tokio::test]

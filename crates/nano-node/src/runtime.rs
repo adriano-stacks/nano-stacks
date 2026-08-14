@@ -764,7 +764,7 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
     else {
         return;
     };
-    let (sortitions, cache_usage, local_writers, registered_miners, notifications) = {
+    let (sortitions, cache_usage, local_writers, registered_miners, burn_height, notifications) = {
         let mut executor = executor.lock().await;
         // On Bitcoin's clock: a node at the chain tip with nothing staged still
         // has to derive and report the burn view its own tip stands on.
@@ -774,6 +774,7 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
             executor.cache_usage(),
             executor.local_miner_slot_writers(),
             executor.registered_local_miner_keys(),
+            executor.derived_bitcoin_height(),
             notifications,
         )
     };
@@ -790,6 +791,7 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
         local_writers,
         registered_miners: &registered_miners,
         published,
+        burn_height,
         peer,
         registry: config.node.pox_5_sbtc_registry_contract.as_deref(),
         checkpoint: &config.checkpoint,
@@ -1244,6 +1246,9 @@ struct RewardCycleInputs<'a> {
     /// Every miner key registered by this node's locally derived burnchain.
     registered_miners: &'a [nano_primitives::Hash160],
     published: &'a mut RewardCyclePublication,
+    /// The newest burn block this node derived locally, including a block under
+    /// which no Stacks block has executed yet.
+    burn_height: u64,
     peer: &'a SyncClient,
     /// Where this chain's sBTC registry is deployed, which decides whether the
     /// document can carry a waterfall payout address at all.
@@ -1332,11 +1337,12 @@ async fn publish_reward_cycle(inputs: RewardCycleInputs<'_>) {
         local_writers,
         registered_miners,
         published,
+        burn_height,
         peer,
         registry,
         checkpoint,
     } = inputs;
-    context.move_to_burn_block(executor.lock().await.bitcoin_height());
+    context.move_to_burn_block(burn_height);
     let Some(cycle) = nano_chainstate::signers::reward_cycle_at(context) else {
         return;
     };

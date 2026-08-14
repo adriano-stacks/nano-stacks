@@ -3212,6 +3212,15 @@ where
         )
     }
 
+    /// The newest burn block this node derived locally.
+    #[must_use]
+    pub fn derived_bitcoin_height(&self) -> u64 {
+        self.sortition.as_ref().map_or_else(
+            || self.bitcoin_height(),
+            |tracker| tracker.tip().bitcoin_height,
+        )
+    }
+
     /// Place an ancestor's tenure on this node's burnchain for a partial header backfill.
     pub(crate) fn local_ancestor_burn_context(
         &self,
