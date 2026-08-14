@@ -314,37 +314,44 @@ pub fn payout_schedule(pox: &PoxInfo) -> Option<nano_sortition::PayoutSchedule> 
 }
 
 fn tenure_inventories_from_history(
-    payouts: &nano_sortition::PayoutSchedule,
-    first: u64,
+    pox: &PoxInfo,
     through: u64,
-    length: u64,
     consensus_hash_at: impl Fn(u64) -> Option<nano_primitives::ConsensusHash>,
     executed: &std::collections::HashSet<nano_primitives::ConsensusHash>,
 ) -> Vec<TenureInventory> {
+    let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
+    if length == 0 {
+        return Vec::new();
+    }
     let Ok(length_u16) = u16::try_from(length) else {
         return Vec::new();
     };
-    if first > through {
+    let Some(first) = pox
+        .first_bitcoin_height
+        .checked_add(1)
+        .filter(|first| *first <= through)
+    else {
         return Vec::new();
-    }
+    };
 
-    (first..=through)
-        .filter(|height| payouts.starts_reward_cycle(*height))
-        .filter_map(|start| {
-            let cycle_start = consensus_hash_at(start)?;
-            let mut tenures = nano_primitives::BitVec::<2100>::zeros(length_u16).ok()?;
-            for offset in 0..length {
-                let height = start.checked_add(offset)?;
-                if height > through {
-                    break;
-                }
-                if consensus_hash_at(height).is_some_and(|hash| executed.contains(&hash)) {
-                    tenures.set(u16::try_from(offset).ok()?, true).ok()?;
-                }
+    std::iter::successors(Some(first), |start| {
+        start.checked_add(length).filter(|next| *next <= through)
+    })
+    .filter_map(|start| {
+        let cycle_start = consensus_hash_at(start)?;
+        let mut tenures = nano_primitives::BitVec::<2100>::zeros(length_u16).ok()?;
+        for offset in 0..length {
+            let height = start.checked_add(offset)?;
+            if height > through {
+                break;
             }
-            Some((start, cycle_start, tenures))
-        })
-        .collect()
+            if consensus_hash_at(height).is_some_and(|hash| executed.contains(&hash)) {
+                tenures.set(u16::try_from(offset).ok()?, true).ok()?;
+            }
+        }
+        Some((start, cycle_start, tenures))
+    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -352,7 +359,7 @@ mod tenure_inventory_tests {
     use std::collections::HashSet;
 
     use nano_primitives::ConsensusHash;
-    use nano_sortition::{PayoutSchedule, RewardCycleSchedule};
+    use nano_sync::PoxInfo;
 
     use super::tenure_inventories_from_history;
 
@@ -363,26 +370,30 @@ mod tenure_inventory_tests {
     }
 
     #[test]
-    fn inventories_include_known_empty_cycles_and_executed_tenures() {
-        let cycles = RewardCycleSchedule::new(0, 10, Some(30)).expect("a reward schedule");
-        let payouts = PayoutSchedule::new(cycles, 2).expect("a payout schedule");
-        let executed = HashSet::from([hash(12), hash(30), hash(42)]);
+    fn inventories_keep_wire_boundaries_after_the_waterfall() {
+        let pox = PoxInfo {
+            first_bitcoin_height: 0,
+            bitcoin_height: 42,
+            prepare_phase_length: 2,
+            reward_phase_length: 8,
+            reward_slots: 10,
+            rejection_fraction: None,
+            pox_5_activation_height: Some(30),
+            v1_unlock_height: None,
+            v2_unlock_height: None,
+            v3_unlock_height: None,
+        };
+        let executed = HashSet::from([hash(12), hash(31), hash(42)]);
 
-        let inventories = tenure_inventories_from_history(
-            &payouts,
-            0,
-            42,
-            10,
-            |height| Some(hash(height)),
-            &executed,
-        );
+        let inventories =
+            tenure_inventories_from_history(&pox, 42, |height| Some(hash(height)), &executed);
 
         assert_eq!(
             inventories
                 .iter()
                 .map(|(height, _, _)| *height)
                 .collect::<Vec<_>>(),
-            vec![1, 11, 21, 30, 40]
+            vec![1, 11, 21, 31, 41]
         );
         assert!(
             (0..inventories[0].2.len()).all(|offset| inventories[0].2.get(offset) == Some(false)),
@@ -390,7 +401,7 @@ mod tenure_inventory_tests {
         );
         assert_eq!(inventories[1].2.get(1), Some(true));
         assert_eq!(inventories[3].2.get(0), Some(true));
-        assert_eq!(inventories[4].2.get(2), Some(true));
+        assert_eq!(inventories[4].2.get(1), Some(true));
     }
 }
 
@@ -1070,7 +1081,7 @@ where
             .map_or(0, |header| u64::from(header.burn_block_height))
     }
 
-    /// The consensus hash that names the reward cycle this node's burn view sits in.
+    /// The consensus hash that names the inventory cycle this node's burn view sits in.
     ///
     /// This is how a `GetNakamotoInv` names a cycle — by the consensus hash of its
     /// *first sortition* — and it comes from this node's own derived sortition chain
@@ -1078,11 +1089,8 @@ where
     /// make that peer's view of the burnchain the thing nano's inventory requests are
     /// keyed on.
     ///
-    /// The boundary is found with the **cycle-keyed** rule and not the tip-keyed one.
-    /// `starts_reward_cycle` is waterfall-aware: a cycle opens at offset 0 once the
-    /// waterfall is on and at offset 1 before it, so a node that decided from where
-    /// its tip happens to sit would move the boundary part-way through a prepare
-    /// phase and name a cycle no peer recognises.
+    /// This wire boundary is always modulo one. It deliberately differs from the
+    /// waterfall-aware modulo-zero boundary used for Nakamoto signer accounting.
     #[must_use]
     pub fn cycle_start_consensus_hash(
         &self,
@@ -1095,20 +1103,10 @@ where
 
     /// The Bitcoin height the reward cycle this node's burn view sits in opens at.
     fn cycle_start_height(&self, pox: &PoxInfo) -> Option<u64> {
-        let payouts = payout_schedule(pox)?;
-        let mut height = self
+        let height = self
             .bitcoin_height()
             .min(self.sortition.as_ref()?.tip().bitcoin_height);
-        // The cycle is at most one length back, so the walk is bounded by the cycle
-        // and cannot run away on a schedule that never says yes.
-        let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
-        for _ in 0..=length {
-            if payouts.starts_reward_cycle(height) {
-                return Some(height);
-            }
-            height = height.checked_sub(1)?;
-        }
-        None
+        pox.inventory_cycle_start(height)
     }
 
     /// Which tenures of every locally known reward cycle this node has executed.
@@ -1136,10 +1134,6 @@ where
         let Some(tracker) = self.sortition.as_ref() else {
             return Vec::new();
         };
-        let Some(payouts) = payout_schedule(pox) else {
-            return Vec::new();
-        };
-        let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
         let through = self.bitcoin_height().min(tracker.tip().bitcoin_height);
         let executed: std::collections::HashSet<nano_primitives::ConsensusHash> = self
             .archive
@@ -1155,10 +1149,8 @@ where
             .into_iter()
             .collect();
         tenure_inventories_from_history(
-            &payouts,
-            pox.first_bitcoin_height,
+            pox,
             through,
-            length,
             |height| tracker.consensus_hash_at(height),
             &executed,
         )

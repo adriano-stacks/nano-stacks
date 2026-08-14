@@ -405,10 +405,8 @@ async fn mainnet_inventories_schedule_a_forward_download() {
 
 /// The reward cycle a node following this peer would be walking, and its name.
 ///
-/// The boundary comes from `payout_schedule`, which is the production rule and is
-/// waterfall-aware: a cycle opens at offset 0 once the waterfall is on and at offset 1
-/// before it, so a node that decided from where its tip happened to sit would move the
-/// boundary part-way through a prepare phase and name a cycle no peer recognises.
+/// The inventory wire keeps stacks-core's modulo-one reward-cycle boundary even after
+/// signer accounting moves to the waterfall's modulo-zero boundary.
 ///
 /// The consensus hash naming it comes from the peer, which production would not do —
 /// see the caller. What is under test here is the download.
@@ -416,11 +414,9 @@ async fn name_the_cycle(
     peer: &nano_sync::SyncClient,
 ) -> (u64, u64, nano_primitives::ConsensusHash) {
     let pox = peer.pox_info().await.expect("a peer states the calendar");
-    let payouts = nano_node::payout_schedule(&pox).expect("a payout schedule");
     let length = u64::from(pox.prepare_phase_length) + u64::from(pox.reward_phase_length);
-    let cycle_start = (0..=length)
-        .filter_map(|back| pox.bitcoin_height.checked_sub(back))
-        .find(|height| payouts.starts_reward_cycle(*height))
+    let cycle_start = pox
+        .inventory_cycle_start(pox.bitcoin_height)
         .expect("the cycle the peer's burn tip sits in opens somewhere");
     let naming = peer
         .sortition_at_height(cycle_start)

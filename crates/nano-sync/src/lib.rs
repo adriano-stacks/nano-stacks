@@ -436,6 +436,25 @@ impl PoxInfo {
         bitcoin_height.saturating_sub(self.first_bitcoin_height) / length.max(1)
     }
 
+    /// The burn height whose consensus hash names this cycle on the inventory wire.
+    ///
+    /// `GetNakamotoInv` keeps stacks-core's original modulo-one boundary even after
+    /// Nakamoto signer accounting moves to the waterfall's modulo-zero boundary.
+    #[must_use]
+    pub fn inventory_cycle_start(&self, bitcoin_height: u64) -> Option<u64> {
+        let length = u64::from(self.prepare_phase_length)
+            .checked_add(u64::from(self.reward_phase_length))?;
+        if length == 0 {
+            return None;
+        }
+        let offset = bitcoin_height
+            .checked_sub(self.first_bitcoin_height)?
+            .checked_sub(1)?;
+        self.first_bitcoin_height
+            .checked_add((offset / length).checked_mul(length)?)?
+            .checked_add(1)
+    }
+
     /// Convert the node response into the context required for VM execution.
     #[must_use]
     pub fn bitcoin_context(&self) -> BitcoinBlockContext {
@@ -2461,8 +2480,8 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        BlockUploadWire, BurnView, CandidateTip, RATE_LIMIT_RETRIES, RETRY_AFTER_CEILING, Signer,
-        SignerSet, SortitionInfoWire, StackerSetResponseWire, StackerSetWire, SyncClient,
+        BlockUploadWire, BurnView, CandidateTip, PoxInfo, RATE_LIMIT_RETRIES, RETRY_AFTER_CEILING,
+        Signer, SignerSet, SortitionInfoWire, StackerSetResponseWire, StackerSetWire, SyncClient,
         SyncError, TenureSource, choose_canonical_tip, parse_block_hash, parse_block_id,
         parse_consensus_hash, parse_prefixed_hash160, parse_sortition_info, parse_stacker_set,
         retry_after, validate_tenure, validate_tenure_transition,
@@ -2477,6 +2496,27 @@ mod tests {
             .expect("create sync client");
 
         assert!(Node::new(client).latest_tenure().is_none());
+    }
+
+    #[test]
+    fn inventory_cycles_keep_the_stock_modulo_one_boundary_after_the_waterfall() {
+        let calendar = PoxInfo {
+            first_bitcoin_height: 666_050,
+            bitcoin_height: 962_434,
+            prepare_phase_length: 100,
+            reward_phase_length: 2_000,
+            reward_slots: 4_000,
+            rejection_fraction: None,
+            pox_5_activation_height: Some(960_232),
+            v1_unlock_height: None,
+            v2_unlock_height: None,
+            v3_unlock_height: None,
+        };
+
+        assert_eq!(calendar.inventory_cycle_start(962_150), Some(960_051));
+        assert_eq!(calendar.inventory_cycle_start(962_151), Some(962_151));
+        assert_eq!(calendar.inventory_cycle_start(962_434), Some(962_151));
+        assert_eq!(calendar.inventory_cycle_start(666_050), None);
     }
 
     /// The same peer arrives configured with a trailing slash and discovered
