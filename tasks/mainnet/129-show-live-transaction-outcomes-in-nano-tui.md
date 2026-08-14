@@ -1,7 +1,7 @@
 ---
 id: "129"
 title: "Show live transaction outcomes in nano-tui"
-status: pending
+status: in-progress
 priority: medium
 effort: medium
 type: feature
