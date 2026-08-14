@@ -183,10 +183,9 @@ pub trait ExecutedBlocks: Send + Sync {
 /// state that is allowed to hold a candidate — which the node's executor is not.
 ///
 /// So the route asks rather than decides: it hands the block to whichever part of
-/// the node keeps such a state and waits for the answer, exactly as an uploaded
-/// block is handed to the executor. The refusal carries the code as well as the
-/// reason, because only the validator knows whether the block was wrong or this
-/// node was not ready to say.
+/// the node keeps such a state and waits for the answer. The refusal carries the
+/// code as well as the reason, because only the validator knows whether the block
+/// was wrong or this node was not ready to say.
 pub struct ProposalRequest {
     pub block: NakamotoBlock,
     pub verdict: tokio::sync::oneshot::Sender<Result<(), (String, ProposalRejectCode)>>,
@@ -279,7 +278,7 @@ pub struct RpcState {
     stacker_sets: Arc<RwLock<BTreeMap<u64, Value>>>,
     /// The `StackerDB` contracts this node replicates.
     stackerdb: Arc<RwLock<StackerDbStore>>,
-    /// Where an accepted block upload or proposal is handed to the node.
+    /// Where an accepted block upload is handed to the node.
     blocks: Option<mpsc::UnboundedSender<NakamotoBlock>>,
     /// The `authorization` header `/v3/block_proposal` demands.
     proposal_token: Option<String>,
@@ -445,7 +444,7 @@ impl RpcState {
         self
     }
 
-    /// Hand blocks accepted by upload or proposal to the node over this channel.
+    /// Hand blocks accepted by upload to the node over this channel.
     #[must_use]
     pub fn with_block_sink(mut self, blocks: mpsc::UnboundedSender<NakamotoBlock>) -> Self {
         self.blocks = Some(blocks);
@@ -1965,23 +1964,10 @@ async fn judge_proposal(
             ProposalRejectCode::UnknownParent,
         );
     }
-    // Admitted for execution: the offer is what gets the block onto this node's
-    // own chain once the network agrees on it, and it happens whether or not this
-    // node is able to vouch for the block first.
-    if let Err(error) = state.offer_block(block.clone()) {
-        return rejected(
-            format!("this node cannot take the block: {error:?}"),
-            ProposalRejectCode::ChainstateError,
-        );
-    }
     let Some(proposals) = &state.proposals else {
-        // Admitted, and that is all: a node with no proposal validator cannot run
-        // the block off its tip, and a signer must not read "we will look at it"
-        // as "we agree with it".
         return rejected(
             "this node validates a proposal by executing it, and has no proposal \
-             validator configured to execute this one; it has been admitted and its \
-             state root will be checked when the chain reaches it"
+             validator configured to execute this one"
                 .to_owned(),
             ProposalRejectCode::ChainstateError,
         );
@@ -2529,7 +2515,7 @@ mod tests {
 
     use super::{
         AccountEntry, ChainAccess, ChainAccessError, EventDispatcher, NakamotoBlock, PoxRpcConfig,
-        QueueReport, ReadOnlyCall, Router, RpcState, SealedTip, mpsc, router,
+        ProposalRequest, QueueReport, ReadOnlyCall, Router, RpcState, SealedTip, mpsc, router,
     };
 
     /// The tests reach for both `Value`s: Clarity's for a read-only answer, and
@@ -4250,15 +4236,18 @@ mod tests {
         blocks: Vec<NakamotoBlock>,
         received: Received,
         offered: mpsc::UnboundedReceiver<NakamotoBlock>,
+        proposed: mpsc::UnboundedReceiver<ProposalRequest>,
     }
 
     async fn proposal_node() -> ProposalNode {
         let (view, blocks) = view_with_blocks(3);
         let (url, received) = recording_observer().await;
         let (blocks_out, offered) = mpsc::unbounded_channel();
+        let (proposals, proposed) = mpsc::unbounded_channel();
         let state = RpcState::new(NETWORK)
             .with_block_admission(Arc::new(Mutex::new(RecordingAdmission::default())))
             .with_block_sink(blocks_out)
+            .with_proposal_validator(proposals)
             .with_observers(EventDispatcher::new(vec![url]))
             .with_proposal_token("t0ken".to_owned());
         state.publish(view).await;
@@ -4270,6 +4259,7 @@ mod tests {
             blocks,
             received,
             offered,
+            proposed,
         }
     }
 
@@ -4375,12 +4365,16 @@ mod tests {
             node.offered.try_recv().is_err(),
             "a refused proposal was admitted anyway"
         );
+        assert!(
+            node.proposed.try_recv().is_err(),
+            "a refused proposal reached the validator anyway"
+        );
     }
 
-    /// The two verdicts a well-formed proposal can get: `Ok` for a block this node
-    /// already executed, and a refusal for one it has only admitted.
+    /// An executed block and one the proposal validator executes can both be
+    /// vouched for, but neither re-enters the finalized block path.
     #[tokio::test]
-    async fn a_proposal_is_vouched_for_only_once_this_node_has_executed_it() {
+    async fn a_proposal_never_enters_the_finalized_block_sink() {
         let mut node = proposal_node().await;
 
         // Already executed, so its state root was already checked. Zero cost is
@@ -4395,21 +4389,31 @@ mod tests {
         assert_eq!(verdict["cost"]["runtime"], json!(0));
         assert_eq!(verdict["size"], json!(node.blocks[1].encode().len()));
 
-        // The extension of the tip is admitted for execution and *refused* rather
-        // than vouched for: nano validates a state root by executing the block,
-        // and it has not executed this one. A signer must not sign on a
-        // validation that did not happen.
+        // The extension of the tip is handed only to the proposal validator. Its
+        // block ID excludes signer signatures, so putting this unsigned proposal
+        // on the finalized block sink could hide the signed block behind the same
+        // ID and leave execution retrying the proposal forever.
         node.propose(
             json!({ "block": hex::encode(node.blocks[2].encode()) }),
             Some("t0ken"),
         )
         .await;
+        let proposal = node
+            .proposed
+            .recv()
+            .await
+            .expect("the validator received the proposal");
+        assert_eq!(proposal.block, node.blocks[2]);
+        proposal
+            .verdict
+            .send(Ok(()))
+            .expect("the validator answers");
         let verdict = node.verdict().await;
-        assert_eq!(verdict["result"], json!("Reject"));
-        assert_eq!(verdict["reason_code"], json!("ChainstateError"));
+        assert_eq!(verdict["result"], json!("Ok"));
         assert_eq!(
-            node.offered.try_recv().expect("the block was admitted"),
-            node.blocks[2]
+            node.offered.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "an unsigned proposal was offered as a finalized block"
         );
     }
 

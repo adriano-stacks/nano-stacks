@@ -5,7 +5,7 @@ title: "Cross a reward cycle boundary with a locally derived sortition chain"
 status: in-progress
 priority: critical
 effort: large
-dependencies: ["049", "077"]
+dependencies: ["049", "077", "122"]
 tags: ["mainnet", "sortition", "consensus", "release"]
 created_at: 2026-08-07
 type: bug

@@ -983,7 +983,7 @@ async fn prepare_to_follow(
     backfill_ancestors(executor, peer, pox, source).await
 }
 
-/// Take the blocks the public API admitted and stage them.
+/// Take the block uploads the public API admitted and stage them.
 ///
 /// Nothing is validated here on purpose: the route already put each one through
 /// `ChainState::authenticate_block`, and the executor checks its state root when
@@ -2354,7 +2354,7 @@ struct ApiWiring {
     /// The blocks this node kept because it executed them, which is what
     /// `/v3/blocks/:id` and `/v3/tenures/:id` answer from.
     archive: Option<Arc<crate::archive::Archive>>,
-    /// Where a block admitted over the public API is handed to the executor,
+    /// Where a block upload admitted over the public API is handed to the executor,
     /// drained by the follow loop into the same staging store the peer's blocks
     /// land in — so an upload and a followed block are the same thing from the
     /// moment they are authenticated.
