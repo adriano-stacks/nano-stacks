@@ -771,7 +771,7 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
     else {
         return;
     };
-    let (sortitions, cache_usage, local_writers, registered_miners, burn_height, notifications) = {
+    let (sortitions, cache_usage, notifications) = {
         let mut executor = executor.lock().await;
         // On Bitcoin's clock: a node at the chain tip with nothing staged still
         // has to derive and report the burn view its own tip stands on.
@@ -779,9 +779,6 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
         (
             executor.derived_sortitions(),
             executor.cache_usage(),
-            executor.local_miner_slot_writers(),
-            executor.registered_local_miner_keys(),
-            executor.derived_bitcoin_height(),
             notifications,
         )
     };
@@ -790,19 +787,9 @@ async fn publish_executed_round(publication: ExecutedPublication<'_>) {
         .publish_executed(sealed, sortitions, pox.clone())
         .await;
     executor.lock().await.announce_burn_blocks(&notifications);
-    publish_reward_cycle(RewardCycleInputs {
-        state,
-        executor,
-        network,
-        context: bitcoin_context(config, pox),
-        local_writers,
-        registered_miners: &registered_miners,
-        published,
-        burn_height,
-        peer,
-        registry: config.node.pox_5_sbtc_registry_contract.as_deref(),
-        checkpoint: &config.checkpoint,
-    })
+    publish_reward_cycles_for_current_execution(
+        state, executor, network, pox, config, published, peer,
+    )
     .await;
 }
 
@@ -1218,7 +1205,7 @@ fn now_unix() -> u64 {
 /// Which reward cycles this node has already answered for, so a walk of the
 /// pox-5 signer list happens once per cycle instead of once per round.
 #[derive(Default)]
-struct RewardCyclePublication {
+pub(crate) struct RewardCyclePublication {
     served: BTreeSet<u64>,
     /// The cycle whose derivation failure has been reported, so a chain with no
     /// pox-5 stackers says so once rather than every second.
@@ -1229,6 +1216,46 @@ struct RewardCyclePublication {
     /// contract clears every chunk in it, so this is only done when the writers
     /// change — doing it per round would drop the proposal a signer is reading.
     miner_writers: Option<Vec<nano_primitives::Hash160>>,
+}
+
+/// Publish the reward cycles represented by the shared executor, whichever
+/// role currently owns execution.
+///
+/// The follower and optional miner take turns advancing the same executor. The
+/// RPC surface must follow that executor rather than either role, or starting a
+/// miner silently stops `/v3/stacker_set` at the cycle last published by the
+/// follower.
+pub(crate) async fn publish_reward_cycles_for_current_execution(
+    state: &RpcState,
+    executor: &SharedExecutor,
+    network: Network,
+    pox: &PoxInfo,
+    config: &Config,
+    published: &mut RewardCyclePublication,
+    peer: &SyncClient,
+) {
+    let (local_writers, registered_miners, burn_height) = {
+        let executor = executor.lock().await;
+        (
+            executor.local_miner_slot_writers(),
+            executor.registered_local_miner_keys(),
+            executor.derived_bitcoin_height(),
+        )
+    };
+    publish_reward_cycle(RewardCycleInputs {
+        state,
+        executor,
+        network,
+        context: bitcoin_context(config, pox),
+        local_writers,
+        registered_miners: &registered_miners,
+        published,
+        burn_height,
+        peer,
+        registry: config.node.pox_5_sbtc_registry_contract.as_deref(),
+        checkpoint: &config.checkpoint,
+    })
+    .await;
 }
 
 /// What publishing a cycle reads, as one value for the same reason

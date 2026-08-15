@@ -131,6 +131,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
         mempool,
         metrics,
         rpc,
+        published: runtime::RewardCyclePublication::default(),
         tenure: None,
     };
     let funded = state.funded_wallet(&wallet)?;
@@ -154,6 +155,7 @@ async fn start(runtime: Runtime) -> Result<(), Box<dyn Error>> {
     // definition, so bulk history over a pool buys it nothing.
     let mut history = TenureSource::only(state.peer.clone());
     loop {
+        state.publish_reward_cycles(&executor).await;
         let mut executor = executor.lock().await;
         if let Err(error) = executor
             // No schedule, for the same reason it follows one peer: a miner sits at
@@ -307,10 +309,24 @@ struct State {
     mempool: Arc<Mutex<Mempool>>,
     metrics: nano_rpc::NodeMetrics,
     rpc: nano_rpc::RpcState,
+    published: runtime::RewardCyclePublication,
     tenure: Option<TenureState>,
 }
 
 impl State {
+    async fn publish_reward_cycles(&mut self, executor: &SharedExecutor) {
+        runtime::publish_reward_cycles_for_current_execution(
+            &self.rpc,
+            executor,
+            self.network,
+            &self.pox,
+            &self.config,
+            &mut self.published,
+            &self.peer,
+        )
+        .await;
+    }
+
     fn miner_principal(&self) -> PrincipalData {
         PrincipalData::Standard(
             StandardPrincipalData::new(
@@ -885,6 +901,13 @@ mod tests {
                 .matches("\n        publish_execution(&state, &mut executor).await;")
                 .count(),
             2
+        );
+        assert_eq!(
+            source
+                .matches("\n        state.publish_reward_cycles(&executor).await;")
+                .count(),
+            1,
+            "the miner must keep the reward-set RPC current while it owns execution"
         );
     }
 }
