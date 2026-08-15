@@ -17,12 +17,28 @@ pub const ENGINE_CONFIG_ID: &str = concat!(
     "profiler=none;debug-info=false;native-unwind-info=false;",
     "wasm-backtrace=true;wasm-backtrace-details=disable;address-map=true;",
     "fuel=false;epoch-interruption=false;max-wasm-stack=524288;allocator=ondemand;",
+    "store-memory=2147483648;store-table-elements=20;store-instances=1;",
+    "store-tables=1;store-memories=1;grow-failure=trap;",
     "enabled=reference-types,simd,bulk-memory,multi-value;",
     "disabled=threads,shared-everything-threads,function-references,gc,wide-arithmetic,",
     "relaxed-simd,tail-call,custom-page-sizes,multi-memory,memory64,extended-const,",
     "stack-switching,component-model,exceptions,wasi,winch,async,parallel-compilation,",
     "coredump,profiling"
 );
+
+pub const STORE_MEMORY_BYTES: usize = 2 * 1024 * 1024 * 1024;
+pub const STORE_TABLE_ELEMENTS: usize = 20;
+
+pub(crate) fn store_limits() -> wasmtime::StoreLimits {
+    wasmtime::StoreLimitsBuilder::new()
+        .memory_size(STORE_MEMORY_BYTES)
+        .table_elements(STORE_TABLE_ELEMENTS)
+        .instances(1)
+        .tables(1)
+        .memories(1)
+        .trap_on_grow_failure(true)
+        .build()
+}
 
 /// Construct the sole engine configuration used for consensus modules.
 pub fn consensus_engine() -> Result<Engine, wasmtime::Error> {
@@ -66,7 +82,11 @@ pub fn consensus_engine() -> Result<Engine, wasmtime::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{consensus_engine, ENGINE_CONFIG_ID, WASMTIME_VERSION};
+    use super::{
+        consensus_engine, store_limits, ENGINE_CONFIG_ID, STORE_MEMORY_BYTES, STORE_TABLE_ELEMENTS,
+        WASMTIME_VERSION,
+    };
+    use wasmtime::ResourceLimiter;
 
     fn refuses(wat: &str) {
         let engine = consensus_engine().expect("the checked-in engine configuration");
@@ -106,5 +126,48 @@ mod tests {
                 "engine identity omits {required}"
             );
         }
+    }
+
+    #[test]
+    fn stores_admit_the_generated_shape_and_refuse_every_excess() {
+        let engine = consensus_engine().expect("the checked-in engine configuration");
+        let module = |wat: &str| {
+            let wasm = wat::parse_str(wat).expect("valid WebAssembly text");
+            wasmtime::Module::new(&engine, wasm).expect("an enabled core module")
+        };
+        let store = || {
+            let mut store = wasmtime::Store::new(&engine, store_limits());
+            store.limiter(|limits| limits);
+            store
+        };
+
+        let mut admitted = store();
+        wasmtime::Instance::new(
+            &mut admitted,
+            &module("(module (memory 1) (table 20 funcref))"),
+            &[],
+        )
+        .expect("one generated memory and table are admitted");
+
+        let mut memory = store();
+        wasmtime::Instance::new(&mut memory, &module("(module (memory 32769))"), &[])
+            .expect_err("memory beyond the signed Wasm address boundary was admitted");
+
+        let mut table = store();
+        wasmtime::Instance::new(&mut table, &module("(module (table 21 funcref))"), &[])
+            .expect_err("a table larger than the standard table was admitted");
+
+        let empty = module("(module)");
+        let mut instances = store();
+        wasmtime::Instance::new(&mut instances, &empty, &[]).expect("the first instance");
+        wasmtime::Instance::new(&mut instances, &empty, &[])
+            .expect_err("a second instance was admitted to one execution store");
+
+        let limits = store_limits();
+        assert_eq!(limits.memories(), 1);
+        assert_eq!(limits.tables(), 1);
+        assert_eq!(limits.instances(), 1);
+        assert_eq!(STORE_MEMORY_BYTES, 2_147_483_648);
+        assert_eq!(STORE_TABLE_ELEMENTS, 20);
     }
 }

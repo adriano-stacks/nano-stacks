@@ -57,6 +57,7 @@ pub struct ClarityWasmContext<'a, 'b, 'hooks> {
     pub parsed_types: std::collections::HashMap<(i32, i32), TypeSignature>,
     pub module_cache: &'a ModuleCache,
     runtime_shapes: RuntimeShapeArena,
+    limits: wasmtime::StoreLimits,
 }
 
 /// The host-data type Wasmtime stores and its linkers compile against.
@@ -108,6 +109,7 @@ impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
             parsed_types: std::collections::HashMap::new(),
             module_cache,
             runtime_shapes: RuntimeShapeArena::default(),
+            limits: crate::engine::store_limits(),
         }
     }
 
@@ -139,6 +141,7 @@ impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
             parsed_types: std::collections::HashMap::new(),
             module_cache,
             runtime_shapes: RuntimeShapeArena::default(),
+            limits: crate::engine::store_limits(),
         }
     }
 
@@ -397,6 +400,10 @@ impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
     }
 }
 
+pub(crate) fn limit_store(store: &mut Store<StaticClarityWasmContext>) {
+    store.limiter(|context| &mut context.limits);
+}
+
 impl RuntimeShapeStore for ClarityWasmContext<'_, '_, '_> {
     fn runtime_shapes(&self) -> Option<&RuntimeShapeArena> {
         Some(&self.runtime_shapes)
@@ -456,6 +463,7 @@ pub fn initialize_contract(
         module_cache,
     );
     let mut store = Store::new(&engine, init_context.into_static());
+    limit_store(&mut store);
     // The host interface functions, from the cache's prebuilt template.
     let linker = module_cache.host_linker()?;
     let instance = linker
@@ -742,6 +750,7 @@ pub(crate) fn call_function_with_argument_sizes(
         module_cache,
     );
     let mut store = Store::new(&engine, context.into_static());
+    limit_store(&mut store);
     let instance_pre = crate::phases::time(crate::phases::Phase::LinkerSetup, || {
         module.instance_pre(module_cache)
     })?;

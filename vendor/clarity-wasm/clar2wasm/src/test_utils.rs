@@ -258,5 +258,6 @@ fn with_test_store<R>(
         &module_cache,
     );
     let mut store = Store::new(engine, context.into_static());
+    crate::initialize::limit_store(&mut store);
     f(&mut store)
 }

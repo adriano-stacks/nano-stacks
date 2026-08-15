@@ -34,7 +34,7 @@ surface that can affect the node.
       WASI, the component model, Winch, threads, relaxed SIMD, memory64,
       multi-memory, profiling and coredumps unless a checked-in Epoch 4.0 module
       proves it is required.
-- [ ] Put explicit limits on store memory, tables and instances. Any independent
+- [x] Put explicit limits on store memory, tables and instances. Any independent
       watchdog or fuel exhaustion must stop the node for investigation, never
       turn a host-speed limit into a consensus-invalid verdict.
 - [ ] Version and invalidate serialized native modules across every engine,
