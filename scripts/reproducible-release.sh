@@ -19,8 +19,21 @@ cleanup() {
   status=$?
   trap - EXIT
   case "$scratch" in
-    "$scratch_root"/reproducible-release.*) find "$scratch" -depth -delete ;;
-    *) echo "refusing to remove unexpected scratch path $scratch" >&2 ;;
+    "$scratch_root"/reproducible-release.*)
+      if test -d "$scratch"; then
+        if ! find "$scratch" -type d -exec chmod u+w {} +; then
+          echo "failed to make scratch directories removable: $scratch" >&2
+          status=1
+        elif ! find "$scratch" -depth -delete; then
+          echo "failed to remove scratch directory: $scratch" >&2
+          status=1
+        fi
+      fi
+      ;;
+    *)
+      echo "refusing to remove unexpected scratch path $scratch" >&2
+      status=1
+      ;;
   esac
   exit "$status"
 }
