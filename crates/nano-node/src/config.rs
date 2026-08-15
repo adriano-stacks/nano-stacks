@@ -17,10 +17,11 @@ use nano_primitives::{Network, TrieHash};
 use nano_rpc::PoxRpcConfig;
 use nano_stackerdb::StackerDbContract;
 use reqwest::Url;
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 /// A node's complete configuration.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub node: NodeConfig,
@@ -32,7 +33,7 @@ pub struct Config {
     pub miner: Option<MinerConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     /// Every file this node writes lives under here.
@@ -117,14 +118,14 @@ pub struct NodeConfig {
     pub startup_peer_wait_secs: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkName {
     Mainnet,
     Testnet,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BurnchainConfig {
     /// A Bitcoin Core JSON-RPC endpoint, when this node has one.
@@ -159,7 +160,7 @@ pub struct BurnchainConfig {
 }
 
 /// The state this node starts executing from, the first time it starts.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointConfig {
     /// The exported Clarity MARF.
@@ -197,7 +198,7 @@ pub struct CheckpointConfig {
     pub authentication_history: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SignerConfig {
     /// The Stacks key stacked into the reward set, hex-encoded.
@@ -207,7 +208,7 @@ pub struct SignerConfig {
     pub conflict_timeout_secs: u64,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MinerConfig {
     /// Bitcoin Core wallet funding the commitments, which must hold its keys.

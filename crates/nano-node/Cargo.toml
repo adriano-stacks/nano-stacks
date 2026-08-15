@@ -27,10 +27,12 @@ nano-sortition = { path = "../nano-sortition" }
 nano-stackerdb = { path = "../nano-stackerdb" }
 nano-p2p = { path = "../nano-p2p" }
 nano-sync = { path = "../nano-sync" }
+nano-vm = { path = "../nano-vm" }
 reqwest = { version = "0.13.4", default-features = false }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+schemars = "1.2.2"
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9.8"
 
@@ -42,7 +44,4 @@ name = "stacks-node"
 path = "src/main.rs"
 
 [dev-dependencies]
-# To build a state shaped like the mainnet one a resume has to recover: sealed
-# above the last block a ledger names. Already in the graph under nano-chainstate.
-nano-vm = { path = "../nano-vm" }
 tempfile = "3"

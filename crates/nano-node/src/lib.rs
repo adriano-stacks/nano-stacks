@@ -22,6 +22,15 @@ use nano_sync::{PoxInfo, SyncClient, SyncError, TenureSource};
 
 use crate::staging::{Staging, StagingError};
 
+/// The committed source revision compiled into this artifact.
+pub const SOURCE_REVISION: &str = env!("NANO_SOURCE_REVISION");
+
+/// The Rust compiler selected by the pinned build closure.
+pub const RUSTC_VERSION: &str = env!("NANO_RUSTC_VERSION");
+
+/// The target triple this artifact was compiled for.
+pub const BUILD_TARGET: &str = env!("NANO_BUILD_TARGET");
+
 /// Executes a validated tenure stream from an imported checkpoint state.
 /// How far back a burn-view walk goes before giving up: a tenure is bounded by
 /// the Bitcoin block that ends it, so this only has to outlast one.

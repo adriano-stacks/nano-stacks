@@ -10,11 +10,11 @@
   # now and this is the revision it holds.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/b7c2ada94fe99c15b0dbcf4d11fd7850b957a436";
 
-  outputs = { nixpkgs, ... }:
+  outputs = { self, nixpkgs, ... }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forEachSystem = nixpkgs.lib.genAttrs systems;
-    in {
+    in rec {
       devShells = forEachSystem (system:
         let pkgs = nixpkgs.legacyPackages.${system};
         in {
@@ -24,9 +24,12 @@
             packages = [
               pkgs.actionlint
               pkgs.cargo
+              pkgs.cargo-audit
+              pkgs.cargo-cyclonedx
               pkgs.clippy
               pkgs.curl
               pkgs.jq
+              pkgs.minisign
               pkgs.openssl
               pkgs.pkg-config
               pkgs.rustc
@@ -56,6 +59,94 @@
               fi
             '';
           };
+        });
+
+      packages = forEachSystem (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          sourceRevision = self.rev or (self.dirtyRev or "dirty");
+          stacksCoreVersions = pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/stacks-network/stacks-core/efc34a07a225c4b950ab9404a1652aa5e14affaf/versions.toml";
+            hash = "sha256-7mmEKZcNtkl13XfqevGUN8oPW+xHuTkkDiFdegbVRrY=";
+          };
+        in rec {
+          stacks-node = pkgs.rustPlatform.buildRustPackage {
+            pname = "nano-stacks";
+            version = "0.1.0-${builtins.substring 0 12 sourceRevision}";
+            src = self;
+            cargoHash = "sha256-hSWYWmhfqgkcduxdxfqeAUt6uJkGLrCxvWcmGro1DVg=";
+            cargoBuildFlags = [ "-p" "nano-node" "--bin" "stacks-node" ];
+            doCheck = false;
+
+            nativeBuildInputs = [
+              pkgs.cargo-cyclonedx
+              pkgs.jq
+              pkgs.pkg-config
+            ];
+            buildInputs = [ pkgs.openssl ];
+
+            NANO_SOURCE_REVISION = sourceRevision;
+            SOURCE_DATE_EPOCH = "1";
+
+            # stacks-common's build script reads this repository-root file. Cargo's
+            # standard git vendoring retains the crate but omits that sibling.
+            postPatch = ''
+              install -m644 ${stacksCoreVersions} \
+                "$cargoDepsCopy/source-git-0/versions.toml"
+            '';
+
+            postBuild = ''
+              cargo cyclonedx \
+                --manifest-path crates/nano-node/Cargo.toml \
+                --format json \
+                --spec-version 1.5 \
+                --all \
+                --override-filename nano-stacks-sbom \
+                --quiet
+              cargo tree --locked --offline \
+                -p nano-node \
+                --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} \
+                --edges normal,build,features \
+                --charset ascii \
+                > nano-stacks-dependencies.txt
+            '';
+
+            postInstall = ''
+              install -Dm644 crates/nano-node/nano-stacks-sbom.cdx.json \
+                "$out/share/nano-stacks/sbom.cdx.json"
+              install -Dm644 nano-stacks-dependencies.txt \
+                "$out/share/nano-stacks/dependencies.txt"
+              install -Dm644 release/systemd/nano-stacks.service \
+                "$out/share/nano-stacks/systemd/nano-stacks.service"
+              install -Dm644 release/container/Containerfile \
+                "$out/share/nano-stacks/container/Containerfile"
+              install -Dm644 release/README.md \
+                "$out/share/doc/nano-stacks/README.md"
+              "$out/bin/stacks-node" config-schema \
+                > "$out/share/nano-stacks/config.schema.json"
+              "$out/bin/stacks-node" build-identity \
+                > "$out/share/nano-stacks/build-identity.json"
+            '';
+          };
+
+          container = pkgs.dockerTools.buildLayeredImage {
+            name = "nano-stacks";
+            tag = builtins.substring 0 12 sourceRevision;
+            contents = [ stacks-node pkgs.cacert ];
+            config = {
+              Entrypoint = [ "${stacks-node}/bin/stacks-node" ];
+              Cmd = [ "start" "--config" "/etc/nano-stacks/config.toml" ];
+              Volumes = { "/var/lib/nano-stacks" = { }; };
+              WorkingDir = "/var/lib/nano-stacks";
+              StopSignal = "SIGTERM";
+              Labels = {
+                "org.opencontainers.image.revision" = sourceRevision;
+                "org.opencontainers.image.source" = self.sourceInfo.url or "nano-stacks";
+              };
+            };
+          };
+
+          default = stacks-node;
         });
     };
 }

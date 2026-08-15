@@ -3,7 +3,7 @@
 use std::{error::Error, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
-use nano_node::{config::Config, runtime};
+use nano_node::{BUILD_TARGET, RUSTC_VERSION, SOURCE_REVISION, config::Config, runtime};
 
 #[derive(Parser)]
 #[command(name = "stacks-node", about = "A Stacks epoch-4 node")]
@@ -24,6 +24,10 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Print the accepted configuration as JSON Schema.
+    ConfigSchema,
+    /// Print the immutable identities embedded in this artifact.
+    BuildIdentity,
 }
 
 /// The same allocator the replay tool measured: 14% off a mainnet replay, and
@@ -38,6 +42,8 @@ async fn main() -> ExitCode {
     let result = match command {
         Command::Start { config } => start(&config).await,
         Command::CheckConfig { config } => check(&config),
+        Command::ConfigSchema => config_schema(),
+        Command::BuildIdentity => build_identity(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -46,6 +52,28 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn config_schema() -> Result<(), Box<dyn Error>> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&schemars::schema_for!(Config))?
+    );
+    Ok(())
+}
+
+fn build_identity() -> Result<(), Box<dyn Error>> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "source_revision": SOURCE_REVISION,
+            "compiler_identity": nano_vm::COMPILER_IDENTITY,
+            "rustc": RUSTC_VERSION,
+            "target": BUILD_TARGET,
+            "wasmtime": "15.0.0",
+        }))?
+    );
+    Ok(())
 }
 
 async fn start(path: &PathBuf) -> Result<(), Box<dyn Error>> {

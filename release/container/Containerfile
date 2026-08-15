@@ -1,0 +1,9 @@
+ARG NANO_IMAGE
+FROM ${NANO_IMAGE}
+
+USER 65532:65532
+VOLUME ["/var/lib/nano-stacks"]
+WORKDIR /var/lib/nano-stacks
+ENTRYPOINT ["/bin/stacks-node"]
+CMD ["start", "--config", "/etc/nano-stacks/config.toml"]
+STOPSIGNAL SIGTERM
