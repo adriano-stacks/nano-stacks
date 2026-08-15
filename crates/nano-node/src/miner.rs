@@ -47,6 +47,8 @@ use crate::{
 const COMMITMENT_CHAIN_FILE: &str = "commit-chain.txt";
 /// Contract index carrying block responses.
 const RESPONSE_MESSAGE_ID: u32 = 1;
+/// Contract index carrying signer state-machine announcements.
+const STATE_MESSAGE_ID: u32 = 2;
 
 /// Everything the mining role runs on.
 pub struct Runtime {
@@ -715,6 +717,7 @@ impl State {
     ) -> Result<NakamotoBlock, Box<dyn Error>> {
         let reward_cycle = self.pox.reward_cycle(bitcoin_height);
         let signer_weights = executor.local_proposal_signers(context)?;
+        let tenure_consensus_hash = block.header.consensus_hash;
         let proposal = BlockProposal {
             block,
             bitcoin_height,
@@ -725,8 +728,29 @@ impl State {
             StackerDbClient::new(self.peer.base_url().clone())?,
             miner_contract(self.network),
             cycle_contract(self.network, reward_cycle, RESPONSE_MESSAGE_ID),
+            cycle_contract(self.network, reward_cycle, STATE_MESSAGE_ID),
             self.miner_key.clone(),
         );
+        let threshold = signer_weights.approval_threshold()?;
+        let readiness_deadline =
+            Instant::now() + Duration::from_secs(self.miner.signer_timeout_secs);
+        loop {
+            let weight = coordinator
+                .ready_signer_weight(tenure_consensus_hash, &signer_weights)
+                .await?;
+            if weight >= threshold {
+                break;
+            }
+            if Instant::now() >= readiness_deadline {
+                return Err(ProposalError::UnreadySigners {
+                    expected: tenure_consensus_hash,
+                    weight,
+                    threshold,
+                }
+                .into());
+            }
+            sleep(Duration::from_secs(self.config.node.poll_interval_secs)).await;
+        }
         coordinator.publish_proposal(&proposal).await?;
         println!("published the proposal to the miner slots this key owns");
 

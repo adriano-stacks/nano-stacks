@@ -14,7 +14,7 @@ pub use tenure::{
     extend_sortition_hash, total_burn_after,
 };
 
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 use bitcoin::{
     Amount, OutPoint, Sequence, Transaction, TxIn, Txid, consensus::encode::serialize_hex,
@@ -29,7 +29,7 @@ use nano_bitcoin::{
 use nano_chainstate::{SignerSetError, SignerWeights};
 use nano_crypto::{MessageSignature, StacksPrivateKey};
 use nano_stackerdb::{
-    BlockProposal, BlockResponse, Chunk, ChunkAck, SignerMessage, SignerMessageError,
+    BlockProposal, BlockResponse, Chunk, ChunkAck, CurrentMiner, SignerMessage, SignerMessageError,
     StackerDbClient, StackerDbClientError, StackerDbContract, StackerDbError,
 };
 use nano_sync::{SyncClient, SyncError};
@@ -420,6 +420,11 @@ pub enum ProposalError {
         reason: Option<String>,
         code: Option<u32>,
     },
+    UnreadySigners {
+        expected: nano_primitives::ConsensusHash,
+        weight: u32,
+        threshold: u32,
+    },
 }
 
 impl fmt::Display for ProposalError {
@@ -441,6 +446,14 @@ impl fmt::Display for ProposalError {
                 }
                 Ok(())
             }
+            Self::UnreadySigners {
+                expected,
+                weight,
+                threshold,
+            } => write!(
+                formatter,
+                "signers of weight {weight}/{threshold} have announced tenure {expected}"
+            ),
         }
     }
 }
@@ -453,7 +466,7 @@ impl std::error::Error for ProposalError {
             Self::Message(error) => Some(error),
             Self::SignerSet(error) => Some(error),
             Self::Sync(error) => Some(error),
-            Self::SlotVersionOverflow | Self::Rejected { .. } => None,
+            Self::SlotVersionOverflow | Self::Rejected { .. } | Self::UnreadySigners { .. } => None,
         }
     }
 }
@@ -493,6 +506,7 @@ pub struct ProposalCoordinator {
     client: StackerDbClient,
     miner_contract: StackerDbContract,
     signer_contract: StackerDbContract,
+    state_contract: StackerDbContract,
     miner_key: StacksPrivateKey,
 }
 
@@ -508,14 +522,36 @@ impl ProposalCoordinator {
         client: StackerDbClient,
         miner_contract: StackerDbContract,
         signer_contract: StackerDbContract,
+        state_contract: StackerDbContract,
         miner_key: StacksPrivateKey,
     ) -> Self {
         Self {
             client,
             miner_contract,
             signer_contract,
+            state_contract,
             miner_key,
         }
+    }
+
+    /// Return the weight that has announced this tenure as the active miner.
+    pub async fn ready_signer_weight(
+        &self,
+        expected: nano_primitives::ConsensusHash,
+        signer_set: &SignerWeights,
+    ) -> Result<u32, ProposalError> {
+        let slots = self.client.slot_versions(&self.state_contract).await?;
+        let mut messages = Vec::with_capacity(slots.len());
+        for slot in slots {
+            if let Some(bytes) = self
+                .client
+                .latest_chunk(&self.state_contract, slot.slot_id)
+                .await?
+            {
+                messages.push((slot.slot_id, bytes));
+            }
+        }
+        announced_signer_weight(expected, signer_set, messages)
     }
 
     /// Write a proposal to the miner proposal slot this miner owns.
@@ -617,6 +653,42 @@ impl ProposalCoordinator {
     }
 }
 
+fn announced_signer_weight(
+    expected: nano_primitives::ConsensusHash,
+    signer_set: &SignerWeights,
+    messages: impl IntoIterator<Item = (u32, Vec<u8>)>,
+) -> Result<u32, ProposalError> {
+    let mut counted = BTreeSet::new();
+    let mut weight = 0_u32;
+    for (slot_id, bytes) in messages {
+        let Ok(index) = usize::try_from(slot_id) else {
+            continue;
+        };
+        let Some((_, signer_weight)) = signer_set.entries().get(index) else {
+            continue;
+        };
+        if !counted.insert(slot_id) {
+            continue;
+        }
+        let Ok(SignerMessage::StateMachineUpdate(update)) = SignerMessage::decode(&bytes) else {
+            continue;
+        };
+        let CurrentMiner::Active {
+            tenure_consensus_hash,
+            ..
+        } = update.current_miner
+        else {
+            continue;
+        };
+        if tenure_consensus_hash == expected {
+            weight = weight
+                .checked_add(*signer_weight)
+                .ok_or(ProposalError::SignerSet(SignerSetError::WeightOverflow))?;
+        }
+    }
+    Ok(weight)
+}
+
 fn response_signatures(
     proposal: &BlockProposal,
     signer_set: &SignerWeights,
@@ -689,13 +761,16 @@ mod tests {
     }
 
     use bitcoin::{Amount, OutPoint, TxIn};
-    use nano_chainstate::{NakamotoBlock, NakamotoBlockHeader, Signer, SignerSet};
+    use nano_chainstate::{NakamotoBlock, NakamotoBlockHeader, Signer, SignerSet, SignerWeights};
     use nano_crypto::StacksPrivateKey;
-    use nano_primitives::{BitVec, ConsensusHash, Sha256Sum, StacksBlockId, TrieHash};
-    use nano_stackerdb::{BlockAcceptance, BlockProposal, BlockResponse, SignerMessage};
+    use nano_primitives::{BitVec, ConsensusHash, Hash160, Sha256Sum, StacksBlockId, TrieHash};
+    use nano_stackerdb::{
+        BlockAcceptance, BlockProposal, BlockResponse, CurrentMiner, SignerMessage,
+        StateMachineUpdate,
+    };
 
     use super::{
-        MinerError, finalize_block, funding_options, response_signatures,
+        MinerError, announced_signer_weight, finalize_block, funding_options, response_signatures,
         validate_funded_transaction,
     };
 
@@ -782,6 +857,58 @@ mod tests {
         assert_eq!(signatures, vec![second_response]);
         let finalized = finalize_block(&proposal, signatures);
         assert_eq!(finalized.header.signer_signatures, vec![second_response]);
+    }
+
+    #[test]
+    fn signer_readiness_waits_for_threshold_on_the_winning_tenure() {
+        let expected = ConsensusHash::from_bytes([7; 20]);
+        let stale = ConsensusHash::from_bytes([6; 20]);
+        let signers = SignerWeights::new(vec![
+            (Hash160::from_bytes([1; 20]), 3),
+            (Hash160::from_bytes([2; 20]), 3),
+            (Hash160::from_bytes([3; 20]), 4),
+        ])
+        .expect("valid signer weights");
+        let announcements = vec![
+            (0, state_announcement(stale)),
+            (1, state_announcement(expected)),
+            (1, state_announcement(expected)),
+            (9, state_announcement(expected)),
+        ];
+        assert_eq!(
+            announced_signer_weight(expected, &signers, announcements)
+                .expect("count signer readiness"),
+            3
+        );
+
+        let ready = vec![
+            (0, state_announcement(stale)),
+            (1, state_announcement(expected)),
+            (2, state_announcement(expected)),
+        ];
+        assert_eq!(
+            announced_signer_weight(expected, &signers, ready).expect("count threshold readiness"),
+            signers.approval_threshold().expect("approval threshold")
+        );
+    }
+
+    fn state_announcement(tenure: ConsensusHash) -> Vec<u8> {
+        SignerMessage::StateMachineUpdate(StateMachineUpdate {
+            active_protocol_version: 2,
+            local_supported_protocol_version: 2,
+            bitcoin_consensus_hash: tenure,
+            bitcoin_height: 419,
+            current_miner: CurrentMiner::Active {
+                public_key_hash: Hash160::from_bytes([4; 20]),
+                tenure_consensus_hash: tenure,
+                parent_tenure_consensus_hash: ConsensusHash::from_bytes([5; 20]),
+                parent_tenure_last_block: StacksBlockId::from_bytes([6; 32]),
+                parent_tenure_last_block_height: 1_276,
+            },
+            replay_transactions: Vec::new(),
+        })
+        .encode()
+        .expect("encode state announcement")
     }
 
     fn proposal(miner: &StacksPrivateKey) -> BlockProposal {
