@@ -512,13 +512,14 @@ host() {
     local index=${1:?participant index}
     local port=$HOST_RPC_PORT p2p_port=$HOST_P2P_PORT
     local endpoint=${NANO_HOSTED_SIGNER_PORT:-30003}
-    local sink=${NANO_SINK_PORT:-3801} key token image signer_container
+    local sink=${NANO_SINK_PORT:-3801} key token image signer_container peer
     local stock_sink=${NANO_STOCK_SINK_NAME:-$PROJECT-event-sink}
     [ -f "$RUN/checkpoint/checkpoint.toml" ] || die "run 'harness.sh checkpoint' first"
     [ "$(nano_state)" = "not running" ] || die "a nano participant is already running"
     [ -n "$(docker ps -q --filter "name=^${stock_sink}$")" ] ||
         die "run 'harness.sh observe' before hosting so stock receipts are retained"
     key=$(compose_value SIGNER_PRIVATE_KEY "stacks-signer-$index")
+    peer=$(peer_url "$(stock_index "$index")")
     token=$(sed -n 's/^auth_password = "\(.*\)"$/\1/p' "$SRC/docker/stacks/stacks-signer.toml")
     [ -n "$token" ] || die "the signer template sets no auth_password"
 
@@ -540,7 +541,7 @@ host() {
     NANO_PROPOSAL_TOKEN="$token" \
     NANO_EVENT_OBSERVERS="http://127.0.0.1:$endpoint,http://127.0.0.1:$sink" \
         nano_start "$index"
-    nano_ready "$port" || { nano_stop; die "nano did not come up; nothing was stopped"; }
+    nano_ready "$port" "$peer" || { nano_stop; die "nano did not come up; nothing was stopped"; }
     curl -sf --max-time 5 "http://127.0.0.1:$port/v2/info" |
         python3 -c 'import json,sys; print(json.load(sys.stdin)["stacks_tip_height"])' \
         > "$RUN/hosted-start-height"
@@ -567,27 +568,46 @@ host() {
         "$HOSTED_SIGNER" "$HOSTED_SIGNER" >&2
 }
 
-# Wait until nano can host a signer: a tip to serve, and the reward set derived.
+# Wait until nano can host a signer: a tip to serve, and both reward sets derived.
 #
-# The reward set is the gate that matters. Until nano has walked pox-5 for the
-# active cycle it configures no `signers-*` contract, so a signer pointed at it
-# holds no slot and writes nowhere — and the node it replaced would already be
-# stopped.
+# The stock participant stays up until prepare phase. Stopping it with only the
+# active set configured can strand the upcoming cycle before its signer has a
+# slot to write to.
 nano_ready() {
-    local port=${1:?rpc port} deadline=$((SECONDS + ${NANO_READY_SECS:-600})) cycle
+    local port=${1:?rpc port} peer=${2:?stock peer}
+    local deadline=$((SECONDS + ${NANO_READY_SECS:-600}))
+    local cycle upcoming nano_burn nano_tip peer_burn peer_tip
     while [ "$SECONDS" -lt "$deadline" ]; do
         nano_running || { printf 'nano exited: see %s\n' "$RUN/nano.log" >&2; return 1; }
-        cycle=$(curl -sf --max-time 5 "http://127.0.0.1:$port/v2/pox" 2>/dev/null |
-            python3 -c 'import json,sys;print(json.load(sys.stdin)["current_cycle"]["id"])' \
-            2>/dev/null || true)
-        if [ -n "$cycle" ] &&
-            curl -sf --max-time 5 "http://127.0.0.1:$port/v3/stacker_set/$cycle" > /dev/null; then
-            printf 'nano serves cycle %s and its signers\047 StackerDB contracts\n' "$cycle" >&2
+        read -r peer_burn peer_tip < <(
+            curl -sf --max-time 5 "$peer/v2/info" 2>/dev/null |
+                python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["burn_block_height"], d["stacks_tip"])' \
+                2>/dev/null || true
+        )
+        read -r nano_burn nano_tip < <(
+            curl -sf --max-time 5 "http://127.0.0.1:$port/v2/info" 2>/dev/null |
+                python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["burn_block_height"], d["stacks_tip"])' \
+                2>/dev/null || true
+        )
+        read -r cycle upcoming < <(
+            curl -sf --max-time 5 "http://127.0.0.1:$port/v2/pox" 2>/dev/null |
+                python3 -c 'import json,sys
+pox = json.load(sys.stdin)
+following = pox["next_cycle"]
+upcoming = following["id"] if following["blocks_until_prepare_phase"] <= 0 < following["blocks_until_reward_phase"] else ""
+print(pox["current_cycle"]["id"], upcoming)' 2>/dev/null || true
+        )
+        if [ -n "$peer_burn" ] && [ "$nano_burn" = "$peer_burn" ] &&
+            [ "$nano_tip" = "$peer_tip" ] && [ -n "$cycle" ] && [ -n "$upcoming" ] &&
+            curl -sf --max-time 5 "http://127.0.0.1:$port/v3/stacker_set/$cycle" > /dev/null &&
+            curl -sf --max-time 5 "http://127.0.0.1:$port/v3/stacker_set/$upcoming" > /dev/null; then
+            printf 'nano serves cycles %s and %s and their signers\047 StackerDB contracts\n' \
+                "$cycle" "$upcoming" >&2
             return 0
         fi
         sleep 5
     done
-    printf 'nano did not derive a reward set within the wait\n' >&2
+    printf 'nano did not catch the stock tip and derive both reward sets within the wait\n' >&2
     return 1
 }
 
