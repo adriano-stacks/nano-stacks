@@ -44,6 +44,12 @@ that does not say `PASS` and name that exact preliminary manifest, then signs a
 second complete checksum inventory containing the report. Any later byte or
 extra file makes verification fail.
 
+Before preparation, `scripts/reproducible-release.sh` builds the clean Git
+revision in two separate rootless Nix stores, compares their NAR hashes and a
+sorted SHA-256 inventory of every packaged file, and removes both stores. A NAR
+match includes file contents, modes and paths; the separate inventory makes a
+binary or packaged-data difference readable if the comparison ever fails.
+
 ## Capacity and shutdown contract
 
 Budget at least 24 GiB of memory, 65,536 file descriptors, and 750 GiB of durable

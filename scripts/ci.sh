@@ -53,6 +53,17 @@ run_gate() {
       set -e
       test "$status" -eq 2
       ;;
+    release-integrity)
+      cargo test --profile ci -p xtask --bin xtask \
+        release_artifact::tests::tracked_staged_untracked_and_ignored_source_are_each_dirty \
+        -- --exact
+      cargo test --profile ci -p xtask --test release_report \
+        an_artifact_from_another_revision_is_an_audit_failure -- --exact
+      cargo test --profile ci -p xtask --bin xtask release_candidate::tests -- --nocapture
+      ;;
+    reproducible-release)
+      scripts/reproducible-release.sh
+      ;;
     locks)
       git diff --exit-code -- flake.lock Cargo.lock vendor/clarity-wasm/Cargo.lock
       ;;
@@ -65,7 +76,7 @@ run_gate() {
 
 case "$gate" in
   all)
-    for name in toolchain workflow formatting clippy scoreboard fixtures tests release locks; do
+    for name in toolchain workflow formatting clippy scoreboard fixtures tests release release-integrity locks; do
       run_gate "$name"
     done
     ;;

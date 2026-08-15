@@ -61,6 +61,9 @@ jobs:
       - name: offline release evidence
         run: nix develop --command scripts/ci.sh release
 
+      - name: dirty stale and unsigned release inputs are rejected
+        run: nix develop --command scripts/ci.sh release-integrity
+
       - name: gates leave every pinned input unchanged
         run: nix develop --command scripts/ci.sh locks
 
@@ -107,7 +110,13 @@ jobs:
           trap cleanup EXIT
 
           test -n "${NANO_RELEASE_TMP:-}"
+          test -n "${NANO_RELEASE_OUTPUT:-}"
+          test -r "$NANO_RELEASE_CONFIG"
+          test -d "$NANO_RELEASE_ADVISORY_DB/.git"
+          test -r "$NANO_RELEASE_SECRET_KEY"
+          test -r "$NANO_RELEASE_PUBLIC_KEY"
           mkdir -p "$NANO_RELEASE_TMP"
+          mkdir -p "$NANO_RELEASE_OUTPUT"
           test "$(stat -c %d "$NANO_RELEASE_TMP")" = "$(stat -c %d "$NANO_MAINNET_MARF")"
           qualification_tmp=$(mktemp -d "$NANO_RELEASE_TMP/.qualification.XXXXXX")
           scratch_dirs+=("$qualification_tmp")
@@ -134,5 +143,25 @@ jobs:
           fresh_reflink 086
           fresh_reflink 098
           fresh_reflink 111
+
+          nix develop --command scripts/ci.sh reproducible-release
+
+          candidate="$NANO_RELEASE_OUTPUT/candidate-$GITHUB_SHA-$GITHUB_RUN_ID"
+          report="$NANO_RELEASE_OUTPUT/qualification-$GITHUB_SHA-$GITHUB_RUN_ID.txt"
+          nix develop --command cargo xtask release-candidate prepare \
+            --output "$candidate" \
+            --checkpoint "$NANO_MAINNET_CHECKPOINT" \
+            --config "$NANO_RELEASE_CONFIG" \
+            --advisory-db "$NANO_RELEASE_ADVISORY_DB" \
+            --secret-key "$NANO_RELEASE_SECRET_KEY" \
+            --public-key "$NANO_RELEASE_PUBLIC_KEY"
           nix develop --command cargo xtask release-report \
-            --capture "$NANO_MAINNET_CAPTURE" --state "$NANO_MAINNET_STATE"
+            --candidate "$candidate" --public-key "$NANO_RELEASE_PUBLIC_KEY" \
+            --capture "$NANO_MAINNET_CAPTURE" --state "$NANO_MAINNET_STATE" \
+            | tee "$report"
+          nix develop --command cargo xtask release-candidate finalize \
+            --candidate "$candidate" --report "$report" \
+            --secret-key "$NANO_RELEASE_SECRET_KEY" \
+            --public-key "$NANO_RELEASE_PUBLIC_KEY"
+          nix develop --command cargo xtask release-candidate verify \
+            --candidate "$candidate" --public-key "$NANO_RELEASE_PUBLIC_KEY"
