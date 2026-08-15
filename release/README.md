@@ -4,6 +4,46 @@ The release bundle contains one Nix-built `stacks-node`, its CycloneDX SBOM,
 resolved Cargo feature tree, generated configuration schema, and the profiles in
 this directory. Verify the signed manifest before installing any file.
 
+## Prepare, qualify, and verify
+
+The signing key stays outside the checkout. Its public key is the trust root an
+operator obtains independently. Preparing a candidate runs the pinned RustSec
+policy, records the clean Nix closure and copies the public package; it records
+only the SHA-256 of `config.toml`, because that file can contain passwords and
+private keys.
+
+```sh
+nix develop --command cargo xtask release-candidate prepare \
+  --output /srv/nano-release/candidate \
+  --checkpoint "$NANO_MAINNET_CHECKPOINT" \
+  --config "$NANO_RELEASE_CONFIG" \
+  --advisory-db "$NANO_RELEASE_ADVISORY_DB" \
+  --secret-key "$NANO_RELEASE_SECRET_KEY" \
+  --public-key "$NANO_RELEASE_PUBLIC_KEY"
+
+nix develop --command cargo xtask release-report \
+  --candidate /srv/nano-release/candidate \
+  --public-key "$NANO_RELEASE_PUBLIC_KEY" \
+  --capture "$NANO_MAINNET_CAPTURE" --state "$NANO_MAINNET_STATE" \
+  > /srv/nano-release/qualification-report.txt
+
+nix develop --command cargo xtask release-candidate finalize \
+  --candidate /srv/nano-release/candidate \
+  --report /srv/nano-release/qualification-report.txt \
+  --secret-key "$NANO_RELEASE_SECRET_KEY" \
+  --public-key "$NANO_RELEASE_PUBLIC_KEY"
+
+nix develop --command cargo xtask release-candidate verify \
+  --candidate /srv/nano-release/candidate \
+  --public-key /path/from/a/trusted/channel/minisign.pub
+```
+
+Qualification verifies the preliminary signature and the external config and
+checkpoint digests before and after every gate. Finalization refuses a report
+that does not say `PASS` and name that exact preliminary manifest, then signs a
+second complete checksum inventory containing the report. Any later byte or
+extra file makes verification fail.
+
 ## Capacity and shutdown contract
 
 Budget at least 24 GiB of memory, 65,536 file descriptors, and 750 GiB of durable

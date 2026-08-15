@@ -22,9 +22,13 @@ use nano_primitives::Network;
 use serde_json::json;
 
 mod release_artifact;
+mod release_candidate;
 mod release_inventory;
 
 use release_artifact::source_status;
+use release_candidate::{
+    CandidateVerification, verify_prepared_candidate, verify_qualification_inputs,
+};
 use release_inventory::ReleaseInventory;
 
 /// The chain a state directory on disk belongs to.
@@ -85,6 +89,9 @@ fn main() -> ExitCode {
     match command.as_deref() {
         Some("scoreboard") => print_scoreboard(),
         Some("release-report") => release_report(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("release-candidate") => {
+            release_candidate::command(&env::args().skip(2).collect::<Vec<_>>(), &workspace_root())
+        }
         Some("release-tree-status") => release_tree_status(env::args().nth(2).as_deref()),
         Some("infrastructure-tests") => infrastructure_tests(),
         Some("validate-fixtures") => validate_fixtures(),
@@ -138,7 +145,8 @@ fn main() -> ExitCode {
                  \x20 capture-fixtures  compiler-identity  decode-blocks  export-headers\n\
                  \x20 export-checkpoint-history  export-leader-keys  export-sortition\n\
                  \x20 freeze-receipts  public-key  seed-public-key\n\
-                 \x20 infrastructure-tests  release-report  release-tree-status  scoreboard\n\
+                 \x20 infrastructure-tests  release-candidate  release-report\n\
+                 \x20 release-tree-status  scoreboard\n\
                  \x20 snapshot-state\n\
                  \x20 validate-fixtures\n\
                  \x20 verify-block"
@@ -6242,6 +6250,47 @@ fn report_artifact(binary: &Path, source_revision: &str) -> bool {
     }
 }
 
+fn report_candidate(
+    directory: &Path,
+    public_key: &Path,
+    source_revision: &str,
+) -> Result<CandidateVerification, String> {
+    println!("\nrelease candidate");
+    let verified = verify_prepared_candidate(directory, public_key, Some(source_revision))?;
+    println!("  directory            {}", directory.display());
+    println!(
+        "  candidate manifest     sha256:{}",
+        verified.candidate_manifest_sha256
+    );
+    println!("  signed source        {}", verified.source_revision);
+    println!("  configuration        {}", verified.configuration_sha256);
+    println!("  checkpoint           {}", verified.checkpoint_sha256);
+    println!("  signature            PASS");
+    Ok(verified)
+}
+
+fn report_candidate_inputs(candidate: &CandidateVerification) -> bool {
+    let configuration = env::var_os("NANO_RELEASE_CONFIG").map(PathBuf::from);
+    let checkpoint = env::var_os("NANO_MAINNET_CHECKPOINT").map(PathBuf::from);
+    let (Some(configuration), Some(checkpoint)) = (configuration, checkpoint) else {
+        println!(
+            "  FAIL: NANO_RELEASE_CONFIG and NANO_MAINNET_CHECKPOINT must name the frozen \
+             qualification inputs"
+        );
+        return false;
+    };
+    match verify_qualification_inputs(candidate, &configuration, &checkpoint) {
+        Ok(()) => {
+            println!("  frozen inputs        PASS");
+            true
+        }
+        Err(error) => {
+            println!("  frozen inputs        FAIL: {error}");
+            false
+        }
+    }
+}
+
 /// Build the artifact this report hashes, rather than describing target/ leftovers.
 fn build_release_artifact() -> Option<PathBuf> {
     println!("\nbuild");
@@ -6660,28 +6709,84 @@ fn report_gates(capture: Option<&str>, state: Option<&Path>, inventory: &Release
     all_passed
 }
 
-fn release_report(arguments: &[String]) -> ExitCode {
-    let mut capture = env::var("NANO_MAINNET_CAPTURE").ok();
-    let mut state: Option<PathBuf> = None;
-    let mut artifact: Option<PathBuf> = None;
-    let mut run_gates = true;
+struct ReleaseReportOptions {
+    capture: Option<String>,
+    state: Option<PathBuf>,
+    artifact: Option<PathBuf>,
+    candidate: Option<PathBuf>,
+    public_key: Option<PathBuf>,
+    run_gates: bool,
+}
+
+fn release_report_options(arguments: &[String]) -> Result<ReleaseReportOptions, String> {
+    let mut options = ReleaseReportOptions {
+        capture: env::var("NANO_MAINNET_CAPTURE").ok(),
+        state: None,
+        artifact: None,
+        candidate: None,
+        public_key: None,
+        run_gates: true,
+    };
     let mut rest = arguments.iter();
     while let Some(flag) = rest.next() {
         match flag.as_str() {
-            "--capture" => capture = rest.next().cloned(),
-            "--state" => state = rest.next().map(PathBuf::from),
-            "--artifact" => artifact = rest.next().map(PathBuf::from),
-            "--no-gates" => run_gates = false,
-            other => {
-                eprintln!(
-                    "usage: cargo xtask release-report [--capture <dir>] [--state <dir>] \
-                     [--artifact <stacks-node>] [--no-gates]\nunexpected argument: {other}"
-                );
-                return ExitCode::from(2);
-            }
+            "--capture" => options.capture = rest.next().cloned(),
+            "--state" => options.state = rest.next().map(PathBuf::from),
+            "--artifact" => options.artifact = rest.next().map(PathBuf::from),
+            "--candidate" => options.candidate = rest.next().map(PathBuf::from),
+            "--public-key" => options.public_key = rest.next().map(PathBuf::from),
+            "--no-gates" => options.run_gates = false,
+            other => return Err(format!("unexpected argument: {other}")),
         }
     }
+    if options.artifact.is_some() && options.candidate.is_some() {
+        return Err("--artifact and --candidate are mutually exclusive".to_owned());
+    }
+    Ok(options)
+}
 
+fn initial_candidate(
+    options: &ReleaseReportOptions,
+    source_revision: &str,
+) -> Result<Option<CandidateVerification>, String> {
+    match (options.candidate.as_deref(), options.public_key.as_deref()) {
+        (Some(directory), Some(key)) => report_candidate(directory, key, source_revision).map(Some),
+        (None, None) if !options.run_gates => Ok(None),
+        (None, None) => Err("qualification requires --candidate and --public-key".to_owned()),
+        _ => Err("--candidate and --public-key must be supplied together".to_owned()),
+    }
+}
+
+fn candidate_still_frozen(
+    options: &ReleaseReportOptions,
+    before: Option<&CandidateVerification>,
+    source_revision: &str,
+) -> bool {
+    match (
+        before,
+        options.candidate.as_deref(),
+        options.public_key.as_deref(),
+    ) {
+        (Some(before), Some(directory), Some(key)) => {
+            println!("\nrelease candidate freeze");
+            match verify_prepared_candidate(directory, key, Some(source_revision)) {
+                Ok(after) if &after == before => report_candidate_inputs(&after),
+                Ok(_) => {
+                    println!("  FAIL: candidate identity changed during qualification");
+                    false
+                }
+                Err(error) => {
+                    println!("  FAIL: {error}");
+                    false
+                }
+            }
+        }
+        (None, None, None) if !options.run_gates => true,
+        _ => false,
+    }
+}
+
+fn release_report_header() {
     println!("nano-stacks release report");
     println!(
         "  generated            {} (unix {})",
@@ -6694,10 +6799,66 @@ fn release_report(arguments: &[String]) -> ExitCode {
     println!("  It is not evidence for holding mainnet tip for 24 hours, a live Bitcoin");
     println!("  reorganization, or a stock stacks-signer run against this binary.");
     println!("  Those require the named task-053 qualification runs.");
+}
+
+fn release_verdict(
+    run_gates: bool,
+    evidence: bool,
+    gates_passed: bool,
+    blocking: usize,
+) -> ExitCode {
+    if blocking > 0 {
+        println!(
+            "\n  {blocking} ignored or declared semantic differential(s) remain, so this \
+             report fails whatever else passed. See the release inventories."
+        );
+    }
+    if !run_gates {
+        return if evidence {
+            ExitCode::from(2)
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    if gates_passed && blocking == 0 && evidence {
+        println!("\nrelease qualification PASS");
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn release_report(arguments: &[String]) -> ExitCode {
+    let options = match release_report_options(arguments) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!(
+                "usage: cargo xtask release-report [--capture <dir>] [--state <dir>] \
+                 [--candidate <dir> --public-key <minisign.pub> | --artifact <stacks-node>] \
+                 [--no-gates]\nrelease-report: {error}"
+            );
+            return ExitCode::from(2);
+        }
+    };
+
+    release_report_header();
     let Ok(source_revision) = require_clean_revision() else {
         return ExitCode::FAILURE;
     };
-    if !report_capture_validation(capture.as_deref()) {
+    let verified_candidate = match initial_candidate(&options, &source_revision) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            println!("\nrelease candidate\n  FAIL: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let frozen_inputs = verified_candidate
+        .as_ref()
+        .is_none_or(|verified| !options.run_gates || report_candidate_inputs(verified));
+    if !frozen_inputs {
+        return ExitCode::FAILURE;
+    }
+    if !report_capture_validation(options.capture.as_deref()) {
         println!(
             "\nrelease qualification stopped: an invalid capture cannot support replay or \
              artifact evidence"
@@ -6709,19 +6870,26 @@ fn release_report(arguments: &[String]) -> ExitCode {
     let receipt_binding = report_receipt_binding();
     let historical_epoch_evidence = report_historical_epoch_evidence();
     let blocking = report_differentials(&inventory) + report_declared_differentials();
-    let artifact_path = artifact.or_else(build_release_artifact);
-    let built = artifact_path.is_some();
+    let artifact_path = verified_candidate
+        .as_ref()
+        .map(|candidate| candidate.binary.clone())
+        .or_else(|| options.artifact.clone())
+        .or_else(build_release_artifact);
     let artifact = artifact_path
         .as_deref()
         .is_some_and(|path| report_artifact(path, &source_revision));
-    let contract_arities = report_contract_arities(state.as_deref(), run_gates);
-    report_checkpoint(state.as_deref());
-    let scoreboard = report_scoreboard(state.as_deref(), run_gates);
+    let contract_arities = report_contract_arities(options.state.as_deref(), options.run_gates);
+    report_checkpoint(options.state.as_deref());
+    let scoreboard = report_scoreboard(options.state.as_deref(), options.run_gates);
     report_inputs();
-    let release_inventory = report_release_inventory(&inventory, run_gates);
+    let release_inventory = report_release_inventory(&inventory, options.run_gates);
 
-    let passed = if run_gates {
-        report_gates(capture.as_deref(), state.as_deref(), &inventory)
+    let passed = if options.run_gates {
+        report_gates(
+            options.capture.as_deref(),
+            options.state.as_deref(),
+            &inventory,
+        )
     } else {
         println!("\ngates");
         println!(
@@ -6730,43 +6898,17 @@ fn release_report(arguments: &[String]) -> ExitCode {
         );
         false
     };
+    let candidate_frozen =
+        candidate_still_frozen(&options, verified_candidate.as_ref(), &source_revision);
 
-    // A blocking ignore is a failed gate whether or not the gates that ran passed.
-    // Printing the count and exiting zero is how a waived cost differential rode
-    // along in a green report for as long as it did.
-    if blocking > 0 {
-        println!(
-            "\n  {blocking} ignored or declared semantic differential(s) remain, so this \
-             report fails whatever else passed. See the release inventories."
-        );
-    }
-    if !run_gates {
-        return if built
-            && artifact
-            && contract_arities
-            && scoreboard
-            && receipt_binding
-            && historical_epoch_evidence
-            && release_inventory
-        {
-            ExitCode::from(2)
-        } else {
-            ExitCode::FAILURE
-        };
-    }
-    if passed
-        && blocking == 0
-        && artifact
+    let evidence = artifact
         && contract_arities
         && scoreboard
         && receipt_binding
         && historical_epoch_evidence
         && release_inventory
-    {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+        && candidate_frozen;
+    release_verdict(options.run_gates, evidence, passed, blocking)
 }
 
 /// Freeze a bounded slice of an observer's `new_block` stream as a regression
