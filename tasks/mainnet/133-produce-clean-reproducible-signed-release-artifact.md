@@ -1,7 +1,7 @@
 ---
 id: "133"
 title: "Produce clean reproducible signed release artifacts"
-status: pending
+status: in-progress
 priority: critical
 effort: medium
 dependencies: ["074", "078"]
