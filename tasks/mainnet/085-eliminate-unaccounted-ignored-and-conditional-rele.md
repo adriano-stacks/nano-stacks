@@ -1,7 +1,7 @@
 ---
 title: "Eliminate unaccounted ignored and conditional release tests"
 id: "085"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["122"]
 tags: ["mainnet", "conformance", "ci", "release", "gates"]
 created_at: "2026-08-07"
+completed_at: 2026-08-15
 ---
 
 # Eliminate unaccounted ignored and conditional release tests
@@ -34,7 +35,7 @@ tests may not be waived.
       test until fixed, not two accepted expectations. The current inventories
       contain no semantic or unclassified ignore and no declared known
       differential.
-- [ ] Run infrastructure-only tests in named CI/release jobs with their fixtures or
+- [x] Run infrastructure-only tests in named CI/release jobs with their fixtures or
       services. A missing input must produce `could not run` and a failed release,
       never a green test count.
 - [x] Add a source-level gate that rejects a new ignore or conditional skip unless
