@@ -413,7 +413,7 @@ mod bitcoin_view_tests {
     };
     use nano_primitives::{ConsensusHash, Network, StacksBlockId};
 
-    use super::immediate_bitcoin_view;
+    use super::{adopted_bitcoin_view, immediate_bitcoin_view};
 
     #[test]
     fn a_resumed_continuation_inherits_its_parent_s_burn_view() {
@@ -465,6 +465,48 @@ mod bitcoin_view_tests {
             42,
         );
         assert_eq!(immediate_bitcoin_view(&other_tenure, &parent), None);
+    }
+
+    #[test]
+    fn a_mined_tenure_updates_the_view_its_continuations_inherit() {
+        let miner = StacksPrivateKey::from_seed(b"mined view inheritance");
+        let previous = ConsensusHash::from_bytes([1; 20]);
+        let view = ConsensusHash::from_bytes([2; 20]);
+        let tenure = TenureTip {
+            consensus_hash: ConsensusHash::from_bytes([3; 20]),
+            block_id: StacksBlockId::from_bytes([4; 32]),
+            height: 10,
+            bitcoin_spent: 30,
+            timestamp: 40,
+        };
+        let start = build_tenure_extend_block(
+            &tenure,
+            TenureExtension {
+                burn_view_consensus_hash: view,
+                blocks_in_tenure: 2,
+                nonce: 0,
+                now: 41,
+            },
+            Network::TESTNET,
+            &miner,
+            Vec::new(),
+        )
+        .expect("build the mined tenure block");
+        let continuation = build_tenure_continuation_block(
+            &TenureTip {
+                consensus_hash: start.header.consensus_hash,
+                block_id: start.block_id(),
+                height: start.header.chain_length,
+                bitcoin_spent: start.header.bitcoin_spent,
+                timestamp: start.header.timestamp,
+            },
+            Vec::new(),
+            42,
+        );
+
+        let adopted = adopted_bitcoin_view(Some(previous), &start);
+        assert_eq!(adopted, Some(view));
+        assert_eq!(adopted_bitcoin_view(adopted, &continuation), Some(view));
     }
 }
 
@@ -546,6 +588,13 @@ fn immediate_bitcoin_view(
             None
         }
     })
+}
+
+fn adopted_bitcoin_view(
+    current: Option<nano_primitives::ConsensusHash>,
+    block: &NakamotoBlock,
+) -> Option<nano_primitives::ConsensusHash> {
+    block.bitcoin_view_consensus_hash().or(current)
 }
 
 /// What one round of catching up actually did.
@@ -1079,9 +1128,14 @@ where
             .commit_authenticated_nakamoto_block(authenticated, self.waterfall_registry.as_deref())?
             .into_applied();
         self.remember_waterfall_payout(&applied, bitcoin_context);
-        self.tip = block;
-        self.bitcoin_height = bitcoin_context.height;
+        self.adopt_executed_tip(block, bitcoin_context);
         Ok(applied)
+    }
+
+    fn adopt_executed_tip(&mut self, block: NakamotoBlock, context: BitcoinBlockContext) {
+        self.bitcoin_view = adopted_bitcoin_view(self.bitcoin_view, &block);
+        self.tip = block;
+        self.bitcoin_height = context.height;
     }
 
     fn remember_waterfall_payout(&mut self, applied: &AppliedBlock, context: BitcoinBlockContext) {
@@ -2863,7 +2917,7 @@ where
                 self.waterfall_registry.as_deref(),
             )?;
         self.remember_waterfall_payout(&applied, bitcoin_context);
-        self.tip = block.clone();
+        self.adopt_executed_tip(block.clone(), bitcoin_context);
         Ok(applied)
     }
 
