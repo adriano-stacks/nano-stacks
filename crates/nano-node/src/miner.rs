@@ -17,7 +17,7 @@ use bitcoin::{Amount, OutPoint, Txid};
 use bitcoincore_rpc::Auth;
 use clarity::vm::types::{PrincipalData, StandardPrincipalData};
 use nano_address::StacksAddress;
-use nano_chainstate::{BitcoinBlockContext, NakamotoBlock, SignerSetError};
+use nano_chainstate::{BitcoinBlockContext, NakamotoBlock, SignerSetError, starts_new_tenure};
 use nano_crypto::{StacksPrivateKey, VrfPrivateKey};
 use std::sync::Arc;
 
@@ -734,12 +734,13 @@ impl State {
         let threshold = signer_weights.approval_threshold()?;
         let readiness_deadline =
             Instant::now() + Duration::from_secs(self.miner.signer_timeout_secs);
-        loop {
-            let weight = coordinator
-                .ready_signer_weight(tenure_consensus_hash, &signer_weights)
+        let readiness = loop {
+            let readiness = coordinator
+                .signer_readiness(tenure_consensus_hash, &signer_weights)
                 .await?;
-            if weight >= threshold {
-                break;
+            let weight = readiness.map_or(0, nano_miner::SignerReadiness::weight);
+            if let Some(readiness) = readiness.filter(|ready| ready.weight() >= threshold) {
+                break readiness;
             }
             if Instant::now() >= readiness_deadline {
                 return Err(ProposalError::UnreadySigners {
@@ -750,6 +751,9 @@ impl State {
                 .into());
             }
             sleep(Duration::from_secs(self.config.node.poll_interval_secs)).await;
+        };
+        if starts_new_tenure(&proposal.block) {
+            readiness.admit_tenure_start(&proposal.block)?;
         }
         coordinator.publish_proposal(&proposal).await?;
         println!("published the proposal to the miner slots this key owns");

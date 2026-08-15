@@ -26,8 +26,9 @@ use nano_bitcoin::{
     LeaderKeyRegistrationTransactionError, build_leader_commitment_transaction,
     build_leader_key_registration_transaction,
 };
-use nano_chainstate::{SignerSetError, SignerWeights};
+use nano_chainstate::{NakamotoBlock, SignerSetError, SignerWeights};
 use nano_crypto::{MessageSignature, StacksPrivateKey};
+use nano_primitives::{ConsensusHash, StacksBlockId, hash160};
 use nano_stackerdb::{
     BlockProposal, BlockResponse, Chunk, ChunkAck, CurrentMiner, SignerMessage, SignerMessageError,
     StackerDbClient, StackerDbClientError, StackerDbContract, StackerDbError,
@@ -421,9 +422,15 @@ pub enum ProposalError {
         code: Option<u32>,
     },
     UnreadySigners {
-        expected: nano_primitives::ConsensusHash,
+        expected: ConsensusHash,
         weight: u32,
         threshold: u32,
+    },
+    SignerParentMismatch {
+        announced_parent: StacksBlockId,
+        announced_parent_height: u64,
+        proposal_parent: StacksBlockId,
+        proposal_height: u64,
     },
 }
 
@@ -454,6 +461,17 @@ impl fmt::Display for ProposalError {
                 formatter,
                 "signers of weight {weight}/{threshold} have announced tenure {expected}"
             ),
+            Self::SignerParentMismatch {
+                announced_parent,
+                announced_parent_height,
+                proposal_parent,
+                proposal_height,
+            } => write!(
+                formatter,
+                "threshold signers stand on parent {announced_parent} at height \
+                 {announced_parent_height}, but the proposal at height {proposal_height} builds \
+                 on {proposal_parent}"
+            ),
         }
     }
 }
@@ -466,7 +484,10 @@ impl std::error::Error for ProposalError {
             Self::Message(error) => Some(error),
             Self::SignerSet(error) => Some(error),
             Self::Sync(error) => Some(error),
-            Self::SlotVersionOverflow | Self::Rejected { .. } | Self::UnreadySigners { .. } => None,
+            Self::SlotVersionOverflow
+            | Self::Rejected { .. }
+            | Self::UnreadySigners { .. }
+            | Self::SignerParentMismatch { .. } => None,
         }
     }
 }
@@ -510,6 +531,36 @@ pub struct ProposalCoordinator {
     miner_key: StacksPrivateKey,
 }
 
+/// The parent tip a threshold-coherent signer announcement stands on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SignerReadiness {
+    weight: u32,
+    parent_tenure_last_block: StacksBlockId,
+    parent_tenure_last_block_height: u64,
+}
+
+impl SignerReadiness {
+    #[must_use]
+    pub const fn weight(self) -> u32 {
+        self.weight
+    }
+
+    /// Refuse a tenure start assembled before the signers' canonical parent arrived.
+    pub fn admit_tenure_start(self, block: &NakamotoBlock) -> Result<(), ProposalError> {
+        let height_matches =
+            self.parent_tenure_last_block_height.checked_add(1) == Some(block.header.chain_length);
+        if block.header.parent_block_id == self.parent_tenure_last_block && height_matches {
+            return Ok(());
+        }
+        Err(ProposalError::SignerParentMismatch {
+            announced_parent: self.parent_tenure_last_block,
+            announced_parent_height: self.parent_tenure_last_block_height,
+            proposal_parent: block.header.parent_block_id,
+            proposal_height: block.header.chain_length,
+        })
+    }
+}
+
 /// Miners alternate between two writer slots by sortition parity, and each
 /// writer holds one slot per message kind.
 const MINER_SLOTS_PER_WRITER: u32 = 2;
@@ -534,12 +585,12 @@ impl ProposalCoordinator {
         }
     }
 
-    /// Return the weight that has announced this tenure as the active miner.
-    pub async fn ready_signer_weight(
+    /// Return the heaviest coherent announcement for this miner's tenure.
+    pub async fn signer_readiness(
         &self,
-        expected: nano_primitives::ConsensusHash,
+        expected: ConsensusHash,
         signer_set: &SignerWeights,
-    ) -> Result<u32, ProposalError> {
+    ) -> Result<Option<SignerReadiness>, ProposalError> {
         let slots = self.client.slot_versions(&self.state_contract).await?;
         let mut messages = Vec::with_capacity(slots.len());
         for slot in slots {
@@ -551,7 +602,12 @@ impl ProposalCoordinator {
                 messages.push((slot.slot_id, bytes));
             }
         }
-        announced_signer_weight(expected, signer_set, messages)
+        announced_signer_state(
+            expected,
+            hash160(&self.miner_key.public_key().to_bytes_compressed()),
+            signer_set,
+            messages,
+        )
     }
 
     /// Write a proposal to the miner proposal slot this miner owns.
@@ -653,13 +709,14 @@ impl ProposalCoordinator {
     }
 }
 
-fn announced_signer_weight(
-    expected: nano_primitives::ConsensusHash,
+fn announced_signer_state(
+    expected: ConsensusHash,
+    expected_miner: nano_primitives::Hash160,
     signer_set: &SignerWeights,
     messages: impl IntoIterator<Item = (u32, Vec<u8>)>,
-) -> Result<u32, ProposalError> {
+) -> Result<Option<SignerReadiness>, ProposalError> {
     let mut counted = BTreeSet::new();
-    let mut weight = 0_u32;
+    let mut announcements: Vec<(CurrentMiner, u32)> = Vec::new();
     for (slot_id, bytes) in messages {
         let Ok(index) = usize::try_from(slot_id) else {
             continue;
@@ -674,19 +731,43 @@ fn announced_signer_weight(
             continue;
         };
         let CurrentMiner::Active {
+            public_key_hash,
             tenure_consensus_hash,
             ..
-        } = update.current_miner
+        } = &update.current_miner
         else {
             continue;
         };
-        if tenure_consensus_hash == expected {
-            weight = weight
+        if *tenure_consensus_hash != expected || *public_key_hash != expected_miner {
+            continue;
+        }
+        if let Some((_, weight)) = announcements
+            .iter_mut()
+            .find(|(miner, _)| miner == &update.current_miner)
+        {
+            *weight = weight
                 .checked_add(*signer_weight)
                 .ok_or(ProposalError::SignerSet(SignerSetError::WeightOverflow))?;
+        } else {
+            announcements.push((update.current_miner, *signer_weight));
         }
     }
-    Ok(weight)
+    let Some((miner, weight)) = announcements.into_iter().max_by_key(|(_, weight)| *weight) else {
+        return Ok(None);
+    };
+    let CurrentMiner::Active {
+        parent_tenure_last_block,
+        parent_tenure_last_block_height,
+        ..
+    } = miner
+    else {
+        return Ok(None);
+    };
+    Ok(Some(SignerReadiness {
+        weight,
+        parent_tenure_last_block,
+        parent_tenure_last_block_height,
+    }))
 }
 
 fn response_signatures(
@@ -770,8 +851,8 @@ mod tests {
     };
 
     use super::{
-        MinerError, announced_signer_weight, finalize_block, funding_options, response_signatures,
-        validate_funded_transaction,
+        MinerError, ProposalError, announced_signer_state, finalize_block, funding_options,
+        response_signatures, validate_funded_transaction,
     };
 
     #[test]
@@ -876,8 +957,15 @@ mod tests {
             (9, state_announcement(expected)),
         ];
         assert_eq!(
-            announced_signer_weight(expected, &signers, announcements)
-                .expect("count signer readiness"),
+            announced_signer_state(
+                expected,
+                Hash160::from_bytes([4; 20]),
+                &signers,
+                announcements,
+            )
+            .expect("count signer readiness")
+            .expect("one coherent announcement")
+            .weight(),
             3
         );
 
@@ -887,12 +975,69 @@ mod tests {
             (2, state_announcement(expected)),
         ];
         assert_eq!(
-            announced_signer_weight(expected, &signers, ready).expect("count threshold readiness"),
+            announced_signer_state(expected, Hash160::from_bytes([4; 20]), &signers, ready,)
+                .expect("count threshold readiness")
+                .expect("one coherent announcement")
+                .weight(),
             signers.approval_threshold().expect("approval threshold")
         );
     }
 
+    #[test]
+    fn signer_readiness_keeps_conflicting_parent_tips_separate() {
+        let expected = ConsensusHash::from_bytes([7; 20]);
+        let canonical_parent = StacksBlockId::from_bytes([8; 32]);
+        let stale_parent = StacksBlockId::from_bytes([9; 32]);
+        let signers = SignerWeights::new(vec![
+            (Hash160::from_bytes([1; 20]), 3),
+            (Hash160::from_bytes([2; 20]), 3),
+            (Hash160::from_bytes([3; 20]), 4),
+        ])
+        .expect("valid signer weights");
+        let announcements = vec![
+            (0, state_announcement_on(expected, stale_parent, 1_275)),
+            (1, state_announcement_on(expected, canonical_parent, 1_276)),
+            (2, state_announcement_on(expected, canonical_parent, 1_276)),
+        ];
+
+        let readiness = announced_signer_state(
+            expected,
+            Hash160::from_bytes([4; 20]),
+            &signers,
+            announcements,
+        )
+        .expect("read signer state")
+        .expect("threshold signer state");
+        assert_eq!(
+            readiness.weight(),
+            signers.approval_threshold().expect("approval threshold")
+        );
+
+        let miner = StacksPrivateKey::from_seed(b"stale-parent miner");
+        let mut block = proposal(&miner).block;
+        block.header.parent_block_id = canonical_parent;
+        block.header.chain_length = 1_277;
+        readiness
+            .admit_tenure_start(&block)
+            .expect("canonical parent is admitted");
+
+        block.header.parent_block_id = stale_parent;
+        block.header.chain_length = 1_276;
+        assert!(matches!(
+            readiness.admit_tenure_start(&block),
+            Err(ProposalError::SignerParentMismatch { .. })
+        ));
+    }
+
     fn state_announcement(tenure: ConsensusHash) -> Vec<u8> {
+        state_announcement_on(tenure, StacksBlockId::from_bytes([6; 32]), 1_276)
+    }
+
+    fn state_announcement_on(
+        tenure: ConsensusHash,
+        parent: StacksBlockId,
+        parent_height: u64,
+    ) -> Vec<u8> {
         SignerMessage::StateMachineUpdate(StateMachineUpdate {
             active_protocol_version: 2,
             local_supported_protocol_version: 2,
@@ -902,8 +1047,8 @@ mod tests {
                 public_key_hash: Hash160::from_bytes([4; 20]),
                 tenure_consensus_hash: tenure,
                 parent_tenure_consensus_hash: ConsensusHash::from_bytes([5; 20]),
-                parent_tenure_last_block: StacksBlockId::from_bytes([6; 32]),
-                parent_tenure_last_block_height: 1_276,
+                parent_tenure_last_block: parent,
+                parent_tenure_last_block_height: parent_height,
             },
             replay_transactions: Vec::new(),
         })
