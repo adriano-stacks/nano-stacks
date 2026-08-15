@@ -1799,6 +1799,17 @@ where
         );
     }
 
+    fn keep_executed_block(&self, block: &NakamotoBlock) {
+        if let Some(archive) = self.archive.as_ref()
+            && let Err(error) = archive.keep(block)
+        {
+            eprintln!(
+                "cannot keep the executed block {} for serving: {error}",
+                block.block_id()
+            );
+        }
+    }
+
     /// Which tenure the rewards this block matured were earned in, and by whom.
     ///
     /// The three fields of a matured reward that a credit cannot be read backwards
@@ -2828,14 +2839,7 @@ where
             // said and stepped over — nothing here is consensus, and a node that
             // stopped executing over an archive write would be trading the chain
             // for a convenience.
-            if let Some(archive) = self.archive.as_ref()
-                && let Err(error) = archive.keep(&block)
-            {
-                eprintln!(
-                    "cannot keep the executed block {} for serving: {error}",
-                    block.block_id()
-                );
-            }
+            self.keep_executed_block(&block);
             staging.remove(block.block_id())?;
             timing.staging += phase.elapsed();
             executed += 1;
@@ -2918,6 +2922,8 @@ where
             )?;
         self.remember_waterfall_payout(&applied, bitcoin_context);
         self.adopt_executed_tip(block.clone(), bitcoin_context);
+        self.announce_block(block, &applied, bitcoin_context);
+        self.keep_executed_block(block);
         Ok(applied)
     }
 
