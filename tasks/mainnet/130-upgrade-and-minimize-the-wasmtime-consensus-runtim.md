@@ -37,7 +37,7 @@ surface that can affect the node.
 - [x] Put explicit limits on store memory, tables and instances. Any independent
       watchdog or fuel exhaustion must stop the node for investigation, never
       turn a host-speed limit into a consensus-invalid verdict.
-- [ ] Version and invalidate serialized native modules across every engine,
+- [x] Version and invalidate serialized native modules across every engine,
       target and configuration change. Decide whether the first mainnet artifact
       can omit the persistent native cache without missing its catch-up bound.
 - [x] Add mandatory `cargo audit` and dependency-policy gates. Every allowed

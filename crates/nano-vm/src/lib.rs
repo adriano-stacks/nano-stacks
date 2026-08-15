@@ -5961,7 +5961,15 @@ mod tests {
     #[test]
     fn a_cached_module_answers_what_a_compiled_one_does() {
         let directory = tempfile::tempdir().expect("a directory");
-        let entries = directory.path().join("native-modules").join("1");
+        let cache = directory.path().join("native-modules");
+        let entries = || {
+            std::fs::read_dir(&cache)
+                .expect("the cache root")
+                .next()
+                .expect("the current cache format")
+                .expect("the cache format entry")
+                .path()
+        };
         let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.counter")
             .expect("a contract identifier");
         let sender: PrincipalData = contract.issuer.clone().into();
@@ -5970,7 +5978,7 @@ mod tests {
                 .expect("call the contract")
         };
         let count = || {
-            std::fs::read_dir(&entries)
+            std::fs::read_dir(entries())
                 .expect("the cache directory")
                 .count()
         };
@@ -5999,7 +6007,7 @@ mod tests {
             ask(&mut vm)
         };
 
-        std::fs::remove_dir_all(&entries).expect("delete the cache");
+        std::fs::remove_dir_all(entries()).expect("delete the cache");
         let recompiled = {
             let mut vm = Vm::open(Network::TESTNET, directory.path()).expect("reopen");
             vm.begin_block(Some([21; 32]), [23; 32])
