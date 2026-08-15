@@ -112,7 +112,7 @@
             '';
 
             postInstall = ''
-              install -Dm644 nano-stacks-sbom.json \
+              install -Dm644 crates/nano-node/nano-stacks-sbom.json \
                 "$out/share/nano-stacks/sbom.cdx.json"
               install -Dm644 nano-stacks-dependencies.txt \
                 "$out/share/nano-stacks/dependencies.txt"
