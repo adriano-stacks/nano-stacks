@@ -34,6 +34,8 @@ BITCOIN_RPC=${BITCOIN_RPC:-http://127.0.0.1:$BITCOIN_RPC_PORT}
 HOSTED_SIGNER=${NANO_HOSTED_SIGNER_NAME:-${NANO_HACKNET_CONTAINER_PREFIX:-}nano-hosted-signer}
 HOST_RPC_PORT=${NANO_HOST_PORT:-24443}
 HOST_P2P_PORT=${NANO_HOST_P2P_PORT:-25444}
+# Hacknet funds Tester 1 at genesis and no service submits from it.
+HOSTED_SUBMITTER_KEY=${NANO_HOSTED_SUBMITTER_KEY:-38369c150fa7dd132a09a1baf78675a6af3e0612008f299612445f0a5c9f022601}
 STOCK_FOLLOWER=${NANO_STOCK_FOLLOWER_NAME:-$PROJECT-stock-follower}
 STOCK_FOLLOWER_RPC_PORT=${NANO_STOCK_FOLLOWER_RPC_PORT:-26443}
 STOCK_FOLLOWER_P2P_PORT=${NANO_STOCK_FOLLOWER_P2P_PORT:-26444}
@@ -838,8 +840,8 @@ verify_hosted() {
     [ -n "$(docker ps -q --filter "name=^${HOSTED_SIGNER}$")" ] ||
         die "the hosted stock signer is not running"
     key=$(compose_value SIGNER_PRIVATE_KEY "stacks-signer-$index")
-    # The signer account is funded by genesis and is not also driven by the
-    # traffic broadcaster, so its nonce remains available to this submitter.
+    # The submitter is separate from signer renewal and traffic accounts, so
+    # neither service can race this gate for its next nonce.
     log "verifying the stock signer, a submitter and an observer against nano"
     NANO_HOSTED_RPC="http://127.0.0.1:$port/" \
     NANO_HOSTED_SIGNER_PUBLIC_KEY=$(cd "$ROOT" && cargo -q xtask public-key "${key%01}") \
@@ -850,7 +852,7 @@ verify_hosted() {
     NANO_HACKNET_API="http://127.0.0.1:$STACKS_API_RPC_PORT/" \
     NANO_HOSTED_TXID_OUT="$RUN/hosted-txid" \
     NANO_HOSTED_TRANSACTION_OUT="$RUN/hosted-transaction" \
-    NANO_FUNDED_KEY="$key" \
+    NANO_FUNDED_KEY="$HOSTED_SUBMITTER_KEY" \
         cargo test --manifest-path "$ROOT/Cargo.toml" -p nano-conformance \
         --test conformance hosted_signer -- --ignored --nocapture --test-threads 1
 }
