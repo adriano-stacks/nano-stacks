@@ -25,12 +25,12 @@ surface that can affect the node.
 - [ ] Inventory the Wasmtime APIs, Cargo features and WebAssembly proposals used
       by production execution, compilation and the native-module cache. Classify
       every current RustSec advisory by production reachability.
-- [ ] Select a supported patched Wasmtime line and update `nano-vm`,
+- [x] Select a supported patched Wasmtime line and update `nano-vm`,
       `nano-wasm-cache` and vendored `clar2wasm` together.
-- [ ] Replace `Engine::default()` in production paths with one shared explicit
+- [x] Replace `Engine::default()` in production paths with one shared explicit
       engine configuration. Include the complete configuration in the compiler
       and release identity.
-- [ ] Disable every unused Cargo feature and WebAssembly proposal, including
+- [x] Disable every unused Cargo feature and WebAssembly proposal, including
       WASI, the component model, Winch, threads, relaxed SIMD, memory64,
       multi-memory, profiling and coredumps unless a checked-in Epoch 4.0 module
       proves it is required.

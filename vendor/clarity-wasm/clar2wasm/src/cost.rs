@@ -1045,9 +1045,9 @@ mod caf {
         initial: i64,
         caf: impl FnOnce(LocalId) -> (Caf, S),
     ) -> Result<i64, i64> {
-        use wasmtime::{Engine, Linker, Module, Store};
+        use wasmtime::{Linker, Module, Store};
 
-        let engine = Engine::default();
+        let engine = crate::consensus_engine().expect("the consensus engine");
         let binary = module_with_caf(caf);
         let module = Module::from_binary(&engine, &binary).unwrap();
 

@@ -21,7 +21,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use clar2wasm::NativeModuleStore;
+use clar2wasm::{ENGINE_CONFIG_ID, NativeModuleStore};
 use sha2::{Digest, Sha512_256};
 use wasmtime::{Engine, Module};
 
@@ -30,7 +30,7 @@ use wasmtime::{Engine, Module};
 /// Bump it when either changes: entries written under an older number become
 /// unreachable — a fresh miss, never a wrong hit — and can be deleted by
 /// removing their directory.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 /// Where under the state directory the entries live.
 const DIRECTORY: &str = "native-modules";
@@ -97,10 +97,15 @@ impl NativeModuleCache {
     /// that is already taken is a miss *forever* — `store` does not overwrite.
     /// So the level belongs in the name.
     fn entry(&self, engine: &Engine, wasm: &[u8]) -> PathBuf {
+        self.entry_with_identity(engine, wasm, ENGINE_CONFIG_ID)
+    }
+
+    fn entry_with_identity(&self, engine: &Engine, wasm: &[u8], identity: &str) -> PathBuf {
         let mut hasher = DefaultHasher::new();
         engine.precompile_compatibility_hash().hash(&mut hasher);
         let mut digest = Sha512_256::new();
         digest.update(hasher.finish().to_be_bytes());
+        digest.update(identity.as_bytes());
         digest.update(wasm);
         self.directory
             .join(format!("{:x}.cwasm", digest.finalize()))
@@ -164,7 +169,8 @@ impl NativeModuleStore for NativeModuleCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheStats, NativeModuleCache, NativeModuleStore};
+    use super::{CacheStats, FORMAT, NativeModuleCache, NativeModuleStore};
+    use clar2wasm::consensus_engine;
     use wasmtime::{Engine, Module, Store};
 
     /// A module with something to compute, so a reload can be shown to compute it.
@@ -189,7 +195,7 @@ mod tests {
     fn a_reloaded_module_answers_what_a_freshly_compiled_one_does() {
         let directory = tempfile::tempdir().expect("a directory");
         let cache = NativeModuleCache::open(directory.path()).expect("open the cache");
-        let engine = Engine::default();
+        let engine = consensus_engine().expect("the consensus engine");
         let wasm = wat::parse_str(adder(41)).expect("assemble the module");
 
         let fresh = Module::new(&engine, &wasm).expect("compile");
@@ -215,7 +221,7 @@ mod tests {
     fn changed_wasm_is_a_miss() {
         let directory = tempfile::tempdir().expect("a directory");
         let cache = NativeModuleCache::open(directory.path()).expect("open the cache");
-        let engine = Engine::default();
+        let engine = consensus_engine().expect("the consensus engine");
         let before = wat::parse_str(adder(41)).expect("assemble the module");
         let after = wat::parse_str(adder(99)).expect("assemble the changed module");
 
@@ -231,14 +237,28 @@ mod tests {
     #[test]
     fn a_bumped_format_is_a_miss() {
         let directory = tempfile::tempdir().expect("a directory");
-        let engine = Engine::default();
+        let engine = consensus_engine().expect("the consensus engine");
         let wasm = wat::parse_str(adder(41)).expect("assemble the module");
-        let before = NativeModuleCache::with_format(directory.path(), 1).expect("open the cache");
+        let before = NativeModuleCache::with_format(directory.path(), FORMAT - 1)
+            .expect("open the old cache");
         before.store(&wasm, &Module::new(&engine, &wasm).expect("compile"));
         assert!(before.load(&engine, &wasm).is_some());
 
-        let after = NativeModuleCache::with_format(directory.path(), 2).expect("open the cache");
+        let after = NativeModuleCache::open(directory.path()).expect("open the current cache");
         assert!(after.load(&engine, &wasm).is_none());
+    }
+
+    #[test]
+    fn another_checked_in_configuration_identity_has_its_own_entry() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let cache = NativeModuleCache::open(directory.path()).expect("open the cache");
+        let engine = consensus_engine().expect("the consensus engine");
+        let wasm = wat::parse_str(adder(41)).expect("assemble the module");
+
+        assert_ne!(
+            cache.entry(&engine, &wasm),
+            cache.entry_with_identity(&engine, &wasm, "different-checked-in-configuration")
+        );
     }
 
     /// Native code built at another optimisation level has to be a miss under
@@ -270,7 +290,7 @@ mod tests {
     fn a_corrupt_entry_is_a_miss() {
         let directory = tempfile::tempdir().expect("a directory");
         let cache = NativeModuleCache::open(directory.path()).expect("open the cache");
-        let engine = Engine::default();
+        let engine = consensus_engine().expect("the consensus engine");
         let wasm = wat::parse_str(adder(41)).expect("assemble the module");
         cache.store(&wasm, &Module::new(&engine, &wasm).expect("compile"));
         let entry = cache.entry(&engine, &wasm);

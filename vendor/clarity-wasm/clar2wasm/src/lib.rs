@@ -33,11 +33,14 @@ mod bitcoin;
 mod copy;
 mod debug_msg;
 pub mod duck_type;
+mod engine;
 mod error;
 mod error_mapping;
 mod layout;
 pub mod phases;
 pub mod runtime_shape;
+
+pub use engine::{consensus_engine, ENGINE_CONFIG_ID, WASMTIME_VERSION};
 
 #[cfg(feature = "developer-mode")]
 pub mod test_utils;
@@ -189,7 +192,7 @@ fn entry_weight(module: &CompiledContract) -> usize {
 /// Holds the `Engine` as well, because a `Module` may only be instantiated in a
 /// store of the engine that made it: sharing the modules means sharing the
 /// engine.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ModuleCache {
     engine: wasmtime::Engine,
     persistent: Option<Arc<dyn NativeModuleStore>>,
@@ -202,6 +205,22 @@ pub struct ModuleCache {
     /// The 223 host functions, registered once per cache instead of once per
     /// call. See [`ModuleCache::host_linker`] for the lifetime story.
     linker_template: std::cell::OnceCell<wasmtime::Linker<initialize::StaticClarityWasmContext>>,
+}
+
+impl Default for ModuleCache {
+    fn default() -> Self {
+        let engine = consensus_engine().unwrap_or_else(|error| {
+            panic!("the checked-in consensus Wasmtime configuration is invalid: {error}")
+        });
+        Self {
+            engine,
+            persistent: None,
+            contracts: HashMap::new(),
+            clock: Cell::new(0),
+            bytes: 0,
+            linker_template: std::cell::OnceCell::new(),
+        }
+    }
 }
 
 impl std::fmt::Debug for ModuleCache {

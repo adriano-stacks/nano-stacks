@@ -474,6 +474,15 @@ fn verify_identity(candidate: &Path, expected_revision: Option<&str>) -> Result<
             locked_wasmtime.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
+    let embedded_engine = identity["wasmtime_engine"]
+        .as_str()
+        .ok_or_else(|| "build identity has no Wasmtime engine configuration".to_owned())?;
+    if embedded_engine != nano_vm::WASMTIME_ENGINE_CONFIG {
+        return Err("build identity names a different Wasmtime engine configuration".to_owned());
+    }
+    if !embedded_engine.starts_with(&format!("wasmtime={embedded_wasmtime};")) {
+        return Err("Wasmtime engine configuration names a different runtime version".to_owned());
+    }
     Ok(revision.to_owned())
 }
 
@@ -1071,7 +1080,8 @@ mod tests {
                 "compiler_identity": format!("sha256:{}", "2".repeat(64)),
                 "rustc": "rustc test",
                 "target": "x86_64-unknown-linux-gnu",
-                "wasmtime": "47.0.3",
+                "wasmtime": nano_vm::WASMTIME_VERSION,
+                "wasmtime_engine": nano_vm::WASMTIME_ENGINE_CONFIG,
             }),
         );
         write_json_test(
@@ -1089,7 +1099,7 @@ mod tests {
                 &json!({
                     "bomFormat": "CycloneDX",
                     "metadata": { "component": { "name": "nano-node" } },
-                    "components": [{ "name": "wasmtime", "version": "47.0.3" }],
+                    "components": [{ "name": "wasmtime", "version": nano_vm::WASMTIME_VERSION }],
                 }),
             );
         }

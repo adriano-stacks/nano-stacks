@@ -189,7 +189,7 @@ impl WasmGenerator {
     /// Compiles and executes the current module and returns the value on top of the stack.
     /// If the value isn't of the type passed as a parameter, the function panics.
     pub fn execute_module(&mut self, return_ty: &TypeSignature) -> Value {
-        let engine = Engine::default();
+        let engine = crate::consensus_engine().expect("the consensus engine");
         let version = TestConfig::clarity_version();
         let epoch = TestConfig::epoch_for_version(version);
 

@@ -4740,8 +4740,11 @@ mod tests {
             true,
         )
         .expect("poc2 compiles");
-        wasmtime::Module::new(&wasmtime::Engine::default(), compiled.module.emit_wasm())
-            .expect("wasmtime loads the module");
+        wasmtime::Module::new(
+            &crate::consensus_engine().expect("the consensus engine"),
+            compiled.module.emit_wasm(),
+        )
+        .expect("wasmtime loads the module");
 
         // The measured peak is far under wasmtime's 50,000-locals limit: the
         // binding lives once and every read reuses the same slots. Before
@@ -4795,8 +4798,11 @@ mod tests {
         );
 
         // ...and the runtime accepts the module.
-        wasmtime::Module::new(&wasmtime::Engine::default(), compiled.module.emit_wasm())
-            .expect("wasmtime loads the module");
+        wasmtime::Module::new(
+            &crate::consensus_engine().expect("the consensus engine"),
+            compiled.module.emit_wasm(),
+        )
+        .expect("wasmtime loads the module");
     }
 
     #[test]
@@ -4841,8 +4847,11 @@ mod tests {
         );
 
         // ...and the runtime accepts the module.
-        wasmtime::Module::new(&wasmtime::Engine::default(), compiled.module.emit_wasm())
-            .expect("wasmtime loads the module");
+        wasmtime::Module::new(
+            &crate::consensus_engine().expect("the consensus engine"),
+            compiled.module.emit_wasm(),
+        )
+        .expect("wasmtime loads the module");
     }
 
     fn uint_tuple(fields: usize, values: bool) -> String {
@@ -4877,8 +4886,11 @@ mod tests {
         report
             .measure_emitted(&wasm)
             .unwrap_or_else(|error| panic!("{name} emitted locals are measurable: {error}"));
-        wasmtime::Module::new(&wasmtime::Engine::default(), wasm)
-            .unwrap_or_else(|error| panic!("{name} loads: {error}"));
+        wasmtime::Module::new(
+            &crate::consensus_engine().expect("the consensus engine"),
+            wasm,
+        )
+        .unwrap_or_else(|error| panic!("{name} loads: {error}"));
         report
     }
 
@@ -5049,8 +5061,11 @@ mod tests {
         )
         .expect("a function returning a wide tuple still compiles");
 
-        wasmtime::Module::new(&wasmtime::Engine::default(), compiled.module.emit_wasm())
-            .expect("wasmtime loads the packed-ABI module");
+        wasmtime::Module::new(
+            &crate::consensus_engine().expect("the consensus engine"),
+            compiled.module.emit_wasm(),
+        )
+        .expect("wasmtime loads the packed-ABI module");
     }
 
     #[test]
@@ -5130,8 +5145,11 @@ mod tests {
                 "{name}"
             );
             assert_eq!(compiled.arity_report.top_level_results, boundary, "{name}");
-            wasmtime::Module::new(&wasmtime::Engine::default(), compiled.module.emit_wasm())
-                .unwrap_or_else(|error| panic!("{name} boundary module loads: {error}"));
+            wasmtime::Module::new(
+                &crate::consensus_engine().expect("the consensus engine"),
+                compiled.module.emit_wasm(),
+            )
+            .unwrap_or_else(|error| panic!("{name} boundary module loads: {error}"));
         }
     }
 

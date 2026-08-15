@@ -60,6 +60,10 @@ pub use compiler_identity::compiler_identity_of;
 /// one that produced it.
 pub const COMPILER_IDENTITY: &str = env!("NANO_COMPILER_IDENTITY");
 
+/// The native runtime and complete configuration embedded in this build.
+pub const WASMTIME_VERSION: &str = clar2wasm::WASMTIME_VERSION;
+pub const WASMTIME_ENGINE_CONFIG: &str = clar2wasm::ENGINE_CONFIG_ID;
+
 /// The consensus execution-cost limit for an Epoch 4 block.
 ///
 /// Epoch 4 doubles what a block may read and leaves writing and runtime where
@@ -5468,7 +5472,7 @@ mod tests {
         let refused = loadable(
             &contract,
             CompiledContract::new(malformed, analysis),
-            &wasmtime::Engine::default(),
+            &clar2wasm::consensus_engine().expect("the consensus engine"),
         )
         .expect_err("the runtime rejects malformed Wasm")
         .to_string();
@@ -7321,7 +7325,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("a directory");
         let cache = nano_wasm_cache::NativeModuleCache::open(directory.path())
             .expect("open a native module cache");
-        let engine = wasmtime::Engine::default();
+        let engine = clar2wasm::consensus_engine().expect("the consensus engine");
         cache.store(
             &charging_then,
             &wasmtime::Module::new(&engine, &charging_then).expect("compile native code"),
