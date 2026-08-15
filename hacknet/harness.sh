@@ -838,7 +838,8 @@ verify_hosted() {
     [ -n "$(docker ps -q --filter "name=^${HOSTED_SIGNER}$")" ] ||
         die "the hosted stock signer is not running"
     key=$(compose_value SIGNER_PRIVATE_KEY "stacks-signer-$index")
-    # The first account the broadcaster sends transfers from, which genesis funds.
+    # The signer account is funded by genesis and is not also driven by the
+    # traffic broadcaster, so its nonce remains available to this submitter.
     log "verifying the stock signer, a submitter and an observer against nano"
     NANO_HOSTED_RPC="http://127.0.0.1:$port/" \
     NANO_HOSTED_SIGNER_PUBLIC_KEY=$(cd "$ROOT" && cargo -q xtask public-key "${key%01}") \
@@ -849,7 +850,7 @@ verify_hosted() {
     NANO_HACKNET_API="http://127.0.0.1:$STACKS_API_RPC_PORT/" \
     NANO_HOSTED_TXID_OUT="$RUN/hosted-txid" \
     NANO_HOSTED_TRANSACTION_OUT="$RUN/hosted-transaction" \
-    NANO_FUNDED_KEY="$(compose_value ACCOUNT_KEYS tx-broadcaster | cut -d, -f1)" \
+    NANO_FUNDED_KEY="$key" \
         cargo test --manifest-path "$ROOT/Cargo.toml" -p nano-conformance \
         --test conformance hosted_signer -- --ignored --nocapture --test-threads 1
 }
