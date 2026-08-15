@@ -1172,7 +1172,7 @@ fn move_to_edge(state: &mut State, end: bool) {
     }
 }
 
-fn select_edge(selected: &mut ListState, length: usize, end: bool) {
+const fn select_edge(selected: &mut ListState, length: usize, end: bool) {
     if length > 0 {
         selected.select(Some(if end { length - 1 } else { 0 }));
     }
