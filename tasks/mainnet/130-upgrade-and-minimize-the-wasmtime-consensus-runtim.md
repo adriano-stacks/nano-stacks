@@ -1,7 +1,7 @@
 ---
 id: "130"
 title: "Upgrade and minimize the Wasmtime consensus runtime"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["060", "078"]
