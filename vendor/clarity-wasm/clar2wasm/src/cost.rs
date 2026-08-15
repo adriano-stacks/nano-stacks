@@ -148,7 +148,7 @@ impl CostGlobals {
     ///
     /// The globals are defined by the standard library and initialized to
     /// `i64::MAX` per instance, exactly as the linker-created imports were.
-    pub fn from_instance<T>(
+    pub fn from_instance<T: 'static>(
         instance: &wasmtime::Instance,
         store: &mut impl AsContextMut<Data = T>,
     ) -> wasmtime::Result<Self> {
@@ -166,7 +166,7 @@ impl CostGlobals {
         })
     }
 
-    pub fn remaining_costs<T>(
+    pub fn remaining_costs<T: 'static>(
         &self,
         store: &mut impl AsContextMut<Data = T>,
     ) -> wasmtime::Result<CostMeter> {
@@ -199,7 +199,7 @@ impl CostGlobals {
         })
     }
 
-    pub fn set_remaining_costs<T>(
+    pub fn set_remaining_costs<T: 'static>(
         &self,
         store: &mut impl AsContextMut<Data = T>,
         meter: &CostMeter,

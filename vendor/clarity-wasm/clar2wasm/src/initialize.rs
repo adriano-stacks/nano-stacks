@@ -59,7 +59,26 @@ pub struct ClarityWasmContext<'a, 'b, 'hooks> {
     runtime_shapes: RuntimeShapeArena,
 }
 
+/// The host-data type Wasmtime stores and its linkers compile against.
+///
+/// Wasmtime requires store data to be `'static`. Actual execution still
+/// borrows one Clarity transaction context, so construction erases those
+/// lifetimes at the single store boundary below and every caller drops the
+/// store before the borrowed transaction context can go out of scope.
+pub type StaticClarityWasmContext = ClarityWasmContext<'static, 'static, 'static>;
+
 impl<'a, 'b, 'hooks> ClarityWasmContext<'a, 'b, 'hooks> {
+    pub(crate) fn into_static(self) -> StaticClarityWasmContext {
+        // SAFETY: `ClarityWasmContext` differs from its static form only in
+        // reference lifetimes. This conversion is private to local execution
+        // store construction; neither a store nor a reference to its data
+        // escapes the function that owns all source borrows.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::mem::transmute::<Self, StaticClarityWasmContext>(self)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_init(
         global_context: &'a mut GlobalContext<'b, 'hooks>,
@@ -436,7 +455,7 @@ pub fn initialize_contract(
         None,
         module_cache,
     );
-    let mut store = Store::new(&engine, init_context);
+    let mut store = Store::new(&engine, init_context.into_static());
     // The host interface functions, from the cache's prebuilt template.
     let linker = module_cache.host_linker()?;
     let instance = linker
@@ -722,7 +741,7 @@ pub(crate) fn call_function_with_argument_sizes(
         Some(&module.analysis),
         module_cache,
     );
-    let mut store = Store::new(&engine, context);
+    let mut store = Store::new(&engine, context.into_static());
     let instance_pre = crate::phases::time(crate::phases::Phase::LinkerSetup, || {
         module.instance_pre(module_cache)
     })?;

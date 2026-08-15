@@ -864,15 +864,9 @@ pub fn get_type_in_memory_size(ty: &TypeSignature, include_repr: bool) -> i32 {
 
 /// Push a placeholder value for Wasm type `ty` onto the data stack.
 pub fn placeholder_for_type(ty: ValType) -> Val {
-    match ty {
-        ValType::I32 => Val::I32(0),
-        ValType::I64 => Val::I64(0),
-        ValType::F32 => Val::F32(0),
-        ValType::F64 => Val::F64(0),
-        ValType::V128 => Val::V128(0.into()),
-        ValType::ExternRef => Val::ExternRef(None),
-        ValType::FuncRef => Val::FuncRef(None),
-    }
+    Val::default_for_ty(&ty).unwrap_or_else(|| {
+        unreachable!("compiler emitted a non-nullable reference result type: {ty}")
+    })
 }
 
 /// Write a value to the Wasm memory at `offset` given the provided Clarity

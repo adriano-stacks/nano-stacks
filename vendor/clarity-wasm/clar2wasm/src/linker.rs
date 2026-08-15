@@ -38,14 +38,15 @@ use stacks_common::util::secp256k1::{
 };
 use wasmtime::{
     AsContextMut, Caller, Engine, ExternRef, Global, GlobalType, Instance, Linker, Memory, Module,
-    Store, Trap, Val,
+    Rooted, Store, Trap, Val,
 };
 
 use crate::cost::{Cost, CostGlobals};
 use crate::error::WasmError;
 use crate::error_mapping::ErrorMap;
 use crate::initialize::{
-    admit_function_argument, call_function_with_argument_sizes, ClarityWasmContext,
+    admit_function_argument, call_function_with_argument_sizes,
+    StaticClarityWasmContext as ClarityWasmContext,
 };
 use crate::runtime_shape::RuntimeShapeStore;
 use crate::wasm_utils::*;
@@ -227,7 +228,7 @@ fn check_allowances(
     Ok(earliest)
 }
 
-pub fn link_cost_globals<T>(
+pub fn link_cost_globals<T: 'static>(
     linker: &mut Linker<T>,
     store: &mut impl AsContextMut<Data = T>,
 ) -> Result<CostGlobals, VmExecutionError> {
@@ -250,7 +251,7 @@ pub fn link_cost_globals<T>(
     })
 }
 
-fn link_global<T>(
+fn link_global<T: 'static>(
     linker: &mut Linker<T>,
     store: &mut impl AsContextMut<Data = T>,
     name: &str,
@@ -2204,18 +2205,19 @@ fn link_enter_as_contract_safe_fn(
         .func_wrap(
             "clarity",
             "enter_as_contract_safe",
-            |mut caller: Caller<'_, ClarityWasmContext>| -> Option<ExternRef> {
+            |mut caller: Caller<'_, ClarityWasmContext>| {
                 let contract_principal: PrincipalData = caller
                     .data()
                     .contract_context()
                     .contract_identifier
                     .clone()
                     .into();
+                let allowance = ExternRef::new(&mut caller, AllowanceContext::new())?;
                 caller.data_mut().global_context.begin();
                 caller.data_mut().push_sender(contract_principal.clone());
                 caller.data_mut().push_caller(contract_principal);
 
-                Some(ExternRef::new(AllowanceContext::new()))
+                Ok(Some(allowance))
             },
         )
         .map(|_| ())
@@ -2237,7 +2239,8 @@ fn link_exit_as_contract_safe_fn(
         .func_wrap(
             "clarity",
             "exit_as_contract_safe",
-            |mut caller: Caller<'_, ClarityWasmContext>, allowance_ref: Option<ExternRef>| {
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             allowance_ref: Option<Rooted<ExternRef>>| {
                 let epoch = caller.data().global_context.epoch_id;
 
                 // we need to restore the current caller and sender. We pop both and check if we did set
@@ -2249,7 +2252,7 @@ fn link_exit_as_contract_safe_fn(
                     owner?
                 };
 
-                let allowances = AllowanceContext::extract(&allowance_ref)?;
+                let allowances = AllowanceContext::extract(&caller, &allowance_ref)?;
 
                 let asset_map = caller.data_mut().global_context.get_readonly_asset_map()?;
 
@@ -2316,9 +2319,10 @@ fn link_enter_restrict_assets_fn(
             "clarity",
             "enter_restrict_assets",
             |mut caller: Caller<'_, ClarityWasmContext>| {
+                let allowance = ExternRef::new(&mut caller, AllowanceContext::new())?;
                 caller.data_mut().global_context.begin();
 
-                Some(ExternRef::new(AllowanceContext::new()))
+                Ok(Some(allowance))
             },
         )
         .map(|_| ())
@@ -2340,7 +2344,7 @@ fn link_exit_restrict_assets_fn(
             |mut caller: Caller<'_, ClarityWasmContext>,
              asset_owner_offset: i32,
              asset_owner_length: i32,
-             allowance_ref: Option<ExternRef>| {
+             allowance_ref: Option<Rooted<ExternRef>>| {
                 let memory = caller.data().memory.ok_or(WasmError::MemoryNotFound)?;
                 let epoch = caller.data().global_context.epoch_id;
                 let owner = read_from_wasm(
@@ -2352,7 +2356,7 @@ fn link_exit_restrict_assets_fn(
                     epoch,
                 )?
                 .expect_principal()?;
-                let allowances = AllowanceContext::extract(&allowance_ref)?;
+                let allowances = AllowanceContext::extract(&caller, &allowance_ref)?;
 
                 let asset_map = caller.data_mut().global_context.get_readonly_asset_map()?;
 
@@ -2413,14 +2417,23 @@ impl AllowanceContext {
         Self(std::sync::Mutex::new(Vec::new()))
     }
 
-    fn from_externref(externref: &Option<ExternRef>) -> Result<&Self, VmExecutionError> {
+    fn from_externref<'a>(
+        caller: &'a Caller<'_, ClarityWasmContext>,
+        externref: &Option<Rooted<ExternRef>>,
+    ) -> Result<&'a Self, VmExecutionError> {
         let externref = externref.as_ref().ok_or_else(|| {
             crate::error::wasm_error(WasmError::WasmGeneratorError(
                 "allowance context is missing".to_string(),
             ))
         })?;
         externref
-            .data()
+            .data(caller)
+            .map_err(|error| crate::error::wasm_error(WasmError::Runtime(error)))?
+            .ok_or_else(|| {
+                crate::error::wasm_error(WasmError::WasmGeneratorError(
+                    "allowance context has no host data".to_string(),
+                ))
+            })?
             .downcast_ref::<AllowanceContext>()
             .ok_or_else(|| {
                 crate::error::wasm_error(WasmError::WasmGeneratorError(
@@ -2429,8 +2442,12 @@ impl AllowanceContext {
             })
     }
 
-    fn push(externref: &Option<ExternRef>, allowance: Allowance) -> Result<(), VmExecutionError> {
-        let ctx = Self::from_externref(externref)?;
+    fn push(
+        caller: &Caller<'_, ClarityWasmContext>,
+        externref: &Option<Rooted<ExternRef>>,
+        allowance: Allowance,
+    ) -> Result<(), VmExecutionError> {
+        let ctx = Self::from_externref(caller, externref)?;
         ctx.0
             .lock()
             .map_err(|e| crate::error::wasm_error(WasmError::Expect(e.to_string())))?
@@ -2438,8 +2455,11 @@ impl AllowanceContext {
         Ok(())
     }
 
-    fn extract(externref: &Option<ExternRef>) -> Result<Vec<Allowance>, VmExecutionError> {
-        let ctx = Self::from_externref(externref)?;
+    fn extract(
+        caller: &Caller<'_, ClarityWasmContext>,
+        externref: &Option<Rooted<ExternRef>>,
+    ) -> Result<Vec<Allowance>, VmExecutionError> {
+        let ctx = Self::from_externref(caller, externref)?;
         Ok(std::mem::take(&mut *ctx.0.lock().map_err(|e| {
             crate::error::wasm_error(WasmError::Expect(e.to_string()))
         })?))
@@ -2456,8 +2476,8 @@ fn link_with_all_assets_unsafe_fn(
         .func_wrap(
             "clarity",
             "with_all_assets_unsafe",
-            |_caller: Caller<'_, ClarityWasmContext>, allowance_ref: Option<ExternRef>| {
-                AllowanceContext::push(&allowance_ref, Allowance::All)?;
+            |caller: Caller<'_, ClarityWasmContext>, allowance_ref: Option<Rooted<ExternRef>>| {
+                AllowanceContext::push(&caller, &allowance_ref, Allowance::All)?;
 
                 Ok(())
             },
@@ -2480,7 +2500,7 @@ fn link_with_ft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
             "clarity",
             "with_ft",
             |mut caller: Caller<'_, ClarityWasmContext>,
-             allowance_ref: Option<ExternRef>,
+             allowance_ref: Option<Rooted<ExternRef>>,
              contract_id_offset: i32,
              contract_id_length: i32,
              token_name_offset: i32,
@@ -2528,6 +2548,7 @@ fn link_with_ft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                 // this. Nothing needed the lookup either — unlike `with-nft`
                 // there is no list whose element type has to be recovered.
                 AllowanceContext::push(
+                    &caller,
                     &allowance_ref,
                     Allowance::Ft(FtAllowance {
                         asset: AssetIdentifier {
@@ -2559,7 +2580,7 @@ fn link_with_nft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
             "clarity",
             "with_nft",
             |mut caller: Caller<'_, ClarityWasmContext>,
-             allowance_ref: Option<ExternRef>,
+             allowance_ref: Option<Rooted<ExternRef>>,
              contract_id_offset: i32,
              contract_id_length: i32,
              token_name_offset: i32,
@@ -2639,6 +2660,7 @@ fn link_with_nft_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
                 };
 
                 AllowanceContext::push(
+                    &caller,
                     &allowance_ref,
                     Allowance::Nft(NftAllowance {
                         asset: asset_identifier,
@@ -2666,13 +2688,14 @@ fn link_with_stacking_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
         .func_wrap(
             "clarity",
             "with_stacking",
-            |_caller: Caller<'_, ClarityWasmContext>,
-             allowance_ref: Option<ExternRef>,
+            |caller: Caller<'_, ClarityWasmContext>,
+             allowance_ref: Option<Rooted<ExternRef>>,
              allowance_lo: i64,
              allowance_hi: i64| {
                 let allowance = ((allowance_hi as u128) << 64) | ((allowance_lo as u64) as u128);
 
                 AllowanceContext::push(
+                    &caller,
                     &allowance_ref,
                     Allowance::Stacking(StackingAllowance { amount: allowance }),
                 )?;
@@ -2694,8 +2717,8 @@ fn link_with_pox_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
         .func_wrap(
             "clarity",
             "with_pox",
-            |_caller: Caller<'_, ClarityWasmContext>, allowance_ref: Option<ExternRef>| {
-                AllowanceContext::push(&allowance_ref, Allowance::Pox)?;
+            |caller: Caller<'_, ClarityWasmContext>, allowance_ref: Option<Rooted<ExternRef>>| {
+                AllowanceContext::push(&caller, &allowance_ref, Allowance::Pox)?;
                 Ok(())
             },
         )
@@ -2716,13 +2739,14 @@ fn link_with_stx_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExe
         .func_wrap(
             "clarity",
             "with_stx",
-            |_caller: Caller<'_, ClarityWasmContext>,
-             allowance_ref: Option<ExternRef>,
+            |caller: Caller<'_, ClarityWasmContext>,
+             allowance_ref: Option<Rooted<ExternRef>>,
              amount_lo: i64,
              amount_hi: i64| {
                 let allowed_amount = ((amount_hi as u128) << 64) | ((amount_lo as u64) as u128);
 
                 AllowanceContext::push(
+                    &caller,
                     &allowance_ref,
                     Allowance::Stx(StxAllowance {
                         amount: allowed_amount,
@@ -4601,6 +4625,8 @@ fn handle_vm_execution_errors(
     caller: &mut Caller<'_, ClarityWasmContext>,
     error: VmExecutionError,
 ) -> Result<(), VmExecutionError> {
+    let error = ExternRef::new(&mut *caller, Mutex::new(Some(error)))
+        .map_err(|error| crate::error::wasm_error(WasmError::Runtime(error)))?;
     let linked_error = caller
         .get_export("linked-error")
         .ok_or(crate::error::wasm_error(WasmError::GlobalNotFound(
@@ -4610,10 +4636,7 @@ fn handle_vm_execution_errors(
         .ok_or(crate::error::wasm_error(WasmError::GlobalNotFound(
             "runtime-error-linked".to_owned(),
         )))?;
-    match linked_error.set(
-        caller.as_context_mut(),
-        Val::ExternRef(Some(ExternRef::new(Mutex::new(Some(error))))),
-    ) {
+    match linked_error.set(caller.as_context_mut(), Val::ExternRef(Some(error))) {
         Err(error) => Err(crate::error::wasm_error(WasmError::UnableToWriteMemory(
             error,
         ))),
@@ -7695,7 +7718,7 @@ fn link_principal_to_string_ascii(
         })
 }
 
-fn link_skip_list<T>(linker: &mut Linker<T>) -> Result<(), VmExecutionError> {
+fn link_skip_list<T: 'static>(linker: &mut Linker<T>) -> Result<(), VmExecutionError> {
     linker
         .func_wrap(
             "clarity",
@@ -7738,7 +7761,7 @@ fn link_skip_list<T>(linker: &mut Linker<T>) -> Result<(), VmExecutionError> {
 /// Link host-interface function, `log`, into the Wasm module.
 /// This function is used for debugging the Wasm, and should not be called in
 /// production.
-fn link_log<T>(linker: &mut Linker<T>) -> Result<(), VmExecutionError> {
+fn link_log<T: 'static>(linker: &mut Linker<T>) -> Result<(), VmExecutionError> {
     linker
         .func_wrap("", "log", |_: Caller<'_, T>, param: i64| {
             println!("log: {param}");
@@ -7752,7 +7775,7 @@ fn link_log<T>(linker: &mut Linker<T>) -> Result<(), VmExecutionError> {
 /// Link host-interface function, `debug_msg`, into the Wasm module.
 /// This function is used for debugging the Wasm, and should not be called in
 /// production.
-fn link_debug_msg<T>(linker: &mut Linker<T>) -> Result<(), VmExecutionError> {
+fn link_debug_msg<T: 'static>(linker: &mut Linker<T>) -> Result<(), VmExecutionError> {
     linker
         .func_wrap("", "debug_msg", |_caller: Caller<'_, T>, param: i32| {
             crate::debug_msg::recall(param, |s| println!("DEBUG: {s}"))
@@ -7766,7 +7789,7 @@ fn link_debug_msg<T>(linker: &mut Linker<T>) -> Result<(), VmExecutionError> {
         })
 }
 
-pub fn dummy_linker<T>(engine: &Engine) -> Result<Linker<T>, wasmtime::Error> {
+pub fn dummy_linker<T: 'static>(engine: &Engine) -> Result<Linker<T>, wasmtime::Error> {
     let mut linker = Linker::new(engine);
 
     linker.func_wrap(
@@ -8006,7 +8029,7 @@ pub fn dummy_linker<T>(engine: &Engine) -> Result<Linker<T>, wasmtime::Error> {
     linker.func_wrap(
         "clarity",
         "enter_as_contract_safe",
-        |_: Caller<'_, T>| -> Option<ExternRef> {
+        |_: Caller<'_, T>| -> Option<Rooted<ExternRef>> {
             println!("as-contract?: enter");
             None
         },
@@ -8015,7 +8038,7 @@ pub fn dummy_linker<T>(engine: &Engine) -> Result<Linker<T>, wasmtime::Error> {
     linker.func_wrap(
         "clarity",
         "exit_as_contract_safe",
-        |_: Caller<'_, T>, _allowance_ref: Option<ExternRef>| {
+        |_: Caller<'_, T>, _allowance_ref: Option<Rooted<ExternRef>>| {
             println!("as-contract?: exit");
             Ok((0i64, 0i64, 0i32))
         },
@@ -8029,7 +8052,7 @@ pub fn dummy_linker<T>(engine: &Engine) -> Result<Linker<T>, wasmtime::Error> {
     linker.func_wrap(
         "clarity",
         "enter_restrict_assets",
-        |_: Caller<'_, T>| -> Option<ExternRef> {
+        |_: Caller<'_, T>| -> Option<Rooted<ExternRef>> {
             println!("restrict-assets?: enter");
             None
         },
@@ -8041,7 +8064,7 @@ pub fn dummy_linker<T>(engine: &Engine) -> Result<Linker<T>, wasmtime::Error> {
         |_: Caller<'_, T>,
          _asset_owner_offset: i32,
          _asset_owner_length: i32,
-         _allowance_ref: Option<ExternRef>| {
+         _allowance_ref: Option<Rooted<ExternRef>>| {
             println!("restrict-assets?: exit");
             Ok((0i64, 0i64, 0i32))
         },
@@ -8055,7 +8078,7 @@ pub fn dummy_linker<T>(engine: &Engine) -> Result<Linker<T>, wasmtime::Error> {
     linker.func_wrap(
         "clarity",
         "with_all_assets_unsafe",
-        |_: Caller<'_, T>, _allowance_ref: Option<ExternRef>| {
+        |_: Caller<'_, T>, _allowance_ref: Option<Rooted<ExternRef>>| {
             println!("with_all_assets_unsafe: enter");
             Ok(())
         },
@@ -8073,7 +8096,7 @@ pub fn dummy_linker<T>(engine: &Engine) -> Result<Linker<T>, wasmtime::Error> {
     linker.func_wrap(
         "clarity",
         "with_ft",
-        |_allowance_ref: Option<ExternRef>,
+        |_allowance_ref: Option<Rooted<ExternRef>>,
          _contract_id_offset: i32,
          _contract_id_length: i32,
          _token_name_offset: i32,
@@ -8093,7 +8116,7 @@ pub fn dummy_linker<T>(engine: &Engine) -> Result<Linker<T>, wasmtime::Error> {
     linker.func_wrap(
         "clarity",
         "with_nft",
-        |_allowance_ref: Option<ExternRef>,
+        |_allowance_ref: Option<Rooted<ExternRef>>,
          _contract_id_offset: i32,
          _contract_id_length: i32,
          _token_name_offset: i32,
@@ -8116,7 +8139,7 @@ pub fn dummy_linker<T>(engine: &Engine) -> Result<Linker<T>, wasmtime::Error> {
     linker.func_wrap(
         "clarity",
         "with_stacking",
-        |_allowance_ref: Option<ExternRef>, _allowance_lo: i64, _allowance_hi: i64| {
+        |_allowance_ref: Option<Rooted<ExternRef>>, _allowance_lo: i64, _allowance_hi: i64| {
             println!("with_stacking: enter");
             Ok(())
         },
@@ -8130,13 +8153,13 @@ pub fn dummy_linker<T>(engine: &Engine) -> Result<Linker<T>, wasmtime::Error> {
     linker.func_wrap(
         "clarity",
         "with_pox",
-        |_allowance_ref: Option<ExternRef>| Ok(()),
+        |_allowance_ref: Option<Rooted<ExternRef>>| Ok(()),
     )?;
 
     linker.func_wrap(
         "clarity",
         "with_stx",
-        |_allowance_ref: Option<ExternRef>, _amount_lo: i64, _amount_hi: i64| {
+        |_allowance_ref: Option<Rooted<ExternRef>>, _amount_lo: i64, _amount_hi: i64| {
             println!("with_stx: enter");
             Ok(())
         },

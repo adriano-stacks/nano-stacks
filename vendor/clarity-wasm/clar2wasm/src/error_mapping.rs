@@ -169,7 +169,7 @@ pub(crate) fn resolve_error<S>(
 ) -> VmExecutionError
 where
     S: AsContextMut,
-    S::Data: RuntimeShapeStore,
+    S::Data: RuntimeShapeStore + 'static,
 {
     if let Some(vm_error) = e.root_cause().downcast_ref::<VmExecutionError>() {
         if let Some(vm_error) = clone_vm_execution_error(vm_error) {
@@ -404,24 +404,31 @@ where
                 )),
                 Some(global) => match global.get(store.as_context_mut()).unwrap_externref() {
                     None => crate::error::wasm_error(WasmError::Expect("".to_owned())),
-                    Some(linked_error_extern) => match linked_error_extern
-                        .data()
-                        .downcast_ref::<Mutex<Option<VmExecutionError>>>()
-                    {
-                        None => crate::error::wasm_error(WasmError::Expect(
-                            "runtime-error-linked should hold an error type".to_owned(),
-                        )),
-                        Some(error) => match error.lock() {
-                            Ok(mut error) => error.take().unwrap_or_else(|| {
-                                crate::error::wasm_error(WasmError::Expect(
-                                    "runtime-error-linked was already consumed".to_owned(),
-                                ))
-                            }),
-                            Err(_) => crate::error::wasm_error(WasmError::Expect(
-                                "runtime-error-linked is poisoned".to_owned(),
+                    Some(linked_error_extern) => {
+                        match linked_error_extern.data(store.as_context()) {
+                            Err(error) => crate::error::wasm_error(WasmError::Runtime(error)),
+                            Ok(None) => crate::error::wasm_error(WasmError::Expect(
+                                "runtime-error-linked should hold host data".to_owned(),
                             )),
-                        },
-                    },
+                            Ok(Some(linked_error)) => match linked_error
+                                .downcast_ref::<Mutex<Option<VmExecutionError>>>()
+                            {
+                                None => crate::error::wasm_error(WasmError::Expect(
+                                    "runtime-error-linked should hold an error type".to_owned(),
+                                )),
+                                Some(error) => match error.lock() {
+                                    Ok(mut error) => error.take().unwrap_or_else(|| {
+                                        crate::error::wasm_error(WasmError::Expect(
+                                            "runtime-error-linked was already consumed".to_owned(),
+                                        ))
+                                    }),
+                                    Err(_) => crate::error::wasm_error(WasmError::Expect(
+                                        "runtime-error-linked is poisoned".to_owned(),
+                                    )),
+                                },
+                            },
+                        }
+                    }
                 },
             }
         }

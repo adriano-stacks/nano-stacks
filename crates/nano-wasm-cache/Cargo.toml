@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 clar2wasm = { path = "../../vendor/clarity-wasm/clar2wasm" }
 sha2 = "0.10.9"
-wasmtime = "15.0.0"
+wasmtime = { version = "=36.0.13", default-features = false, features = ["cranelift", "gc", "gc-null", "runtime", "std"] }
 
 [dev-dependencies]
 tempfile = "3"

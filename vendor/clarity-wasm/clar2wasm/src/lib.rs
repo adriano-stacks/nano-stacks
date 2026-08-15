@@ -78,8 +78,7 @@ pub struct CompiledContract {
     /// The native module with its imports already resolved against the host
     /// linker, built at most once. Import resolution walked 223 names per
     /// call frame; a pre-resolved instantiation only allocates.
-    instance_pre:
-        OnceLock<wasmtime::InstancePre<initialize::ClarityWasmContext<'static, 'static, 'static>>>,
+    instance_pre: OnceLock<wasmtime::InstancePre<initialize::StaticClarityWasmContext>>,
 }
 
 impl Clone for CompiledContract {
@@ -127,17 +126,10 @@ impl CompiledContract {
 
     /// This contract's pre-resolved instantiation, built at most once.
     ///
-    /// Same lifetime story as [`ModuleCache::host_linker`]: the template's
-    /// `'static` context lifetimes are erased to the caller's, which is sound
-    /// for the same reasons — nothing of the context's lifetime lives in the
-    /// pre-resolved imports.
-    pub fn instance_pre<'a, 'b, 'hooks>(
+    pub fn instance_pre(
         &self,
         cache: &ModuleCache,
-    ) -> Result<
-        wasmtime::InstancePre<initialize::ClarityWasmContext<'a, 'b, 'hooks>>,
-        VmExecutionError,
-    > {
+    ) -> Result<wasmtime::InstancePre<initialize::StaticClarityWasmContext>, VmExecutionError> {
         if self.instance_pre.get().is_none() {
             let native = self.native(cache)?.clone();
             let linker = cache.host_linker()?;
@@ -151,13 +143,7 @@ impl CompiledContract {
             .get()
             .ok_or_else(|| crate::error::wasm_error(WasmError::ModuleNotFound))?
             .clone();
-        #[allow(unsafe_code)]
-        Ok(unsafe {
-            std::mem::transmute::<
-                wasmtime::InstancePre<initialize::ClarityWasmContext<'static, 'static, 'static>>,
-                wasmtime::InstancePre<initialize::ClarityWasmContext<'a, 'b, 'hooks>>,
-            >(pre)
-        })
+        Ok(pre)
     }
 }
 
@@ -215,9 +201,7 @@ pub struct ModuleCache {
     bytes: usize,
     /// The 223 host functions, registered once per cache instead of once per
     /// call. See [`ModuleCache::host_linker`] for the lifetime story.
-    linker_template: std::cell::OnceCell<
-        wasmtime::Linker<initialize::ClarityWasmContext<'static, 'static, 'static>>,
-    >,
+    linker_template: std::cell::OnceCell<wasmtime::Linker<initialize::StaticClarityWasmContext>>,
 }
 
 impl std::fmt::Debug for ModuleCache {
@@ -300,19 +284,9 @@ impl ModuleCache {
     /// not in the template: they are store-owned, so the caller defines them
     /// on its clone exactly as before.
     ///
-    /// The template is typed with `'static` context lifetimes and transmuted
-    /// to the caller's. SAFETY: the two types differ only in lifetimes, so
-    /// their layouts are identical. The linker itself never holds a
-    /// `ClarityWasmContext` — its host functions receive one through
-    /// `Caller<'_, _>` at invocation, use it for the duration of that call
-    /// frame, and capture nothing from it; the store owning the real context
-    /// is created after this transmute and dropped before the context's
-    /// borrows end. No value of the erased lifetime crosses the template's
-    /// lifetime in either direction.
-    pub fn host_linker<'a, 'b, 'hooks>(
+    pub fn host_linker(
         &self,
-    ) -> Result<wasmtime::Linker<initialize::ClarityWasmContext<'a, 'b, 'hooks>>, VmExecutionError>
-    {
+    ) -> Result<wasmtime::Linker<initialize::StaticClarityWasmContext>, VmExecutionError> {
         if self.linker_template.get().is_none() {
             let mut linker = wasmtime::Linker::new(&self.engine);
             crate::linker::link_host_functions(&mut linker)?;
@@ -327,13 +301,7 @@ impl ModuleCache {
                 ))
             })?
             .clone();
-        #[allow(unsafe_code)]
-        Ok(unsafe {
-            std::mem::transmute::<
-                wasmtime::Linker<initialize::ClarityWasmContext<'static, 'static, 'static>>,
-                wasmtime::Linker<initialize::ClarityWasmContext<'a, 'b, 'hooks>>,
-            >(template)
-        })
+        Ok(template)
     }
 
     /// Native code for `wasm`, from the persistent store if it has it.

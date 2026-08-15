@@ -70,7 +70,7 @@ fn build_identity() -> Result<(), Box<dyn Error>> {
             "compiler_identity": nano_vm::COMPILER_IDENTITY,
             "rustc": RUSTC_VERSION,
             "target": BUILD_TARGET,
-            "wasmtime": "15.0.0",
+            "wasmtime": "36.0.13",
         }))?
     );
     Ok(())
