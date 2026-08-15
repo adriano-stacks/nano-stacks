@@ -175,7 +175,7 @@ async fn a_stock_signer_answers_proposals_through_nano() {
     );
     let mut kinds: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut hosted_chunks = 0;
-    let mut accepted = None;
+    let mut accepted = BTreeMap::new();
     for (_, chunk) in &posted {
         if !chunk.verify(hash160(&expected)).unwrap_or(false) {
             continue;
@@ -191,7 +191,7 @@ async fn a_stock_signer_answers_proposals_through_nano() {
             SignerMessage::BlockPreCommit(_) => "block pre-commit",
             SignerMessage::BlockResponse(response) => match response {
                 BlockResponse::Accepted(acceptance) => {
-                    accepted = Some(acceptance.clone());
+                    accepted.insert(acceptance.signer_signature_hash, acceptance.clone());
                     "accepted block response"
                 }
                 BlockResponse::Rejected(rejection) => {
@@ -212,7 +212,14 @@ async fn a_stock_signer_answers_proposals_through_nano() {
     );
     println!("nano took {hosted_chunks} authenticated chunks from the signer it hosts: {kinds:?}");
 
-    let acceptance = require_accepted_response(accepted);
+    let (acceptance, height) = canonical_acceptance_after(&peer, &accepted, run.start_height)
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "the hosted signer accepted no canonical block above {} through nano",
+                run.start_height
+            )
+        });
     let recovered = acceptance
         .signature
         .recover(acceptance.signer_signature_hash.as_bytes())
@@ -223,23 +230,8 @@ async fn a_stock_signer_answers_proposals_through_nano() {
         "the acceptance nano took was not written by the signer it hosts"
     );
     println!(
-        "the hosted signer accepted block {} through nano, reporting itself as {}",
+        "the hosted signer accepted canonical block {height} ({}) through nano, reporting itself as {}",
         acceptance.signer_signature_hash, acceptance.server_version
-    );
-    // And the network counted it: the signature is in the header of a block the
-    // canonical chain carries, which only happens if nano passed the chunk on.
-    let height = canonical_block_height_with(&peer, acceptance.signer_signature_hash)
-        .await
-        .unwrap_or_else(|| {
-            panic!(
-                "block {} never became canonical, so nano did not carry the response to the miner",
-                acceptance.signer_signature_hash
-            )
-        });
-    assert!(
-        height > run.start_height,
-        "the matching acceptance names old block {height}, not one hosted above {}",
-        run.start_height
     );
 }
 
@@ -294,8 +286,12 @@ fn chunks_nano_took(events: &std::path::Path) -> Vec<(String, nano_stackerdb::Ch
     taken
 }
 
-/// Walk the canonical chain back looking for a block, and the signature in it.
-async fn canonical_block_height_with(peer: &SyncClient, digest: Sha256Sum) -> Option<u64> {
+/// Find the newest accepted response that became canonical after the handoff.
+async fn canonical_acceptance_after(
+    peer: &SyncClient,
+    accepted: &BTreeMap<Sha256Sum, BlockAcceptance>,
+    start_height: u64,
+) -> Option<(BlockAcceptance, u64)> {
     let deadline = Instant::now() + Duration::from_mins(5);
     loop {
         let tip = peer.tenure_info().await.expect("the peer reports its tip");
@@ -304,10 +300,13 @@ async fn canonical_block_height_with(peer: &SyncClient, digest: Sha256Sum) -> Op
             let Ok(block) = peer.block(block_id).await else {
                 break;
             };
-            if block.header.signer_signature_hash() == digest {
-                return Some(block.header.chain_length);
+            let height = block.header.chain_length;
+            if height > start_height
+                && let Some(acceptance) = accepted.get(&block.header.signer_signature_hash())
+            {
+                return Some((acceptance.clone(), height));
             }
-            if block.header.chain_length == 0 {
+            if height <= start_height {
                 break;
             }
             block_id = block.header.parent_block_id;
