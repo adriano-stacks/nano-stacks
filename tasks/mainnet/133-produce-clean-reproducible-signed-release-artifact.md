@@ -26,7 +26,7 @@ checkpoint and qualification evidence are inseparable.
       the tree is dirty.
 - [ ] Build the release as a Nix derivation from a clean source closure, not from
       a mutable working tree or pre-existing `target/` directory.
-- [ ] Build twice in independent clean stores and compare the binaries and all
+- [x] Build twice in independent clean stores and compare the binaries and all
       packaged data byte-for-byte. Explain and eliminate any nondeterminism.
 - [ ] Generate an SBOM and record the exact Cargo feature/dependency closure,
       Rust toolchain, Wasmtime configuration, clarity-wasm identity and target.
