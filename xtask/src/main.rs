@@ -21,8 +21,10 @@ use nano_chainstate::{
 use nano_primitives::Network;
 use serde_json::json;
 
+mod release_artifact;
 mod release_inventory;
 
+use release_artifact::source_status;
 use release_inventory::ReleaseInventory;
 
 /// The chain a state directory on disk belongs to.
@@ -83,6 +85,7 @@ fn main() -> ExitCode {
     match command.as_deref() {
         Some("scoreboard") => print_scoreboard(),
         Some("release-report") => release_report(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("release-tree-status") => release_tree_status(env::args().nth(2).as_deref()),
         Some("infrastructure-tests") => infrastructure_tests(),
         Some("validate-fixtures") => validate_fixtures(),
         Some("capture-fixtures") => capture_fixtures(&env::args().skip(2).collect::<Vec<_>>()),
@@ -135,7 +138,8 @@ fn main() -> ExitCode {
                  \x20 capture-fixtures  compiler-identity  decode-blocks  export-headers\n\
                  \x20 export-checkpoint-history  export-leader-keys  export-sortition\n\
                  \x20 freeze-receipts  public-key  seed-public-key\n\
-                 \x20 infrastructure-tests  release-report  scoreboard  snapshot-state\n\
+                 \x20 infrastructure-tests  release-report  release-tree-status  scoreboard\n\
+                 \x20 snapshot-state\n\
                  \x20 validate-fixtures\n\
                  \x20 verify-block"
             );
@@ -5590,6 +5594,27 @@ fn captured(program: &str, arguments: &[&str]) -> String {
     }
 }
 
+fn release_tree_status(root: Option<&str>) -> ExitCode {
+    let root = root.map_or_else(workspace_root, PathBuf::from);
+    match source_status(&root) {
+        Ok(status) => {
+            println!("revision {}", status.revision);
+            for change in &status.changes {
+                println!("{change}");
+            }
+            if status.clean() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(error) => {
+            eprintln!("release-tree-status: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// One row of the report's gate table.
 struct GateResult {
     command: String,
@@ -5753,22 +5778,28 @@ fn locked_version(crate_name: &str) -> String {
     "not in the lock file".to_owned()
 }
 
-fn report_revision() {
+fn report_revision() -> Option<String> {
     println!("\nrevision");
-    println!(
-        "  nano-stacks          {}",
-        captured("git", &["rev-parse", "HEAD"])
-    );
-    let dirty = !captured("git", &["status", "--porcelain"]).is_empty();
+    let status = match source_status(&workspace_root()) {
+        Ok(status) => status,
+        Err(error) => {
+            println!("  FAIL: {error}");
+            return None;
+        }
+    };
+    println!("  nano-stacks          {}", status.revision);
     println!(
         "  branch               {} ({})",
         captured("git", &["rev-parse", "--abbrev-ref", "HEAD"]),
-        if dirty {
-            "UNCOMMITTED CHANGES"
-        } else {
+        if status.clean() {
             "clean"
+        } else {
+            "BUILD-RELEVANT CHANGES"
         }
     );
+    for change in &status.changes {
+        println!("  FAIL                 {change}");
+    }
     println!(
         "  rustc                {}",
         captured("rustc", &["--version"])
@@ -5777,6 +5808,17 @@ fn report_revision() {
         "  cargo                {}",
         captured("cargo", &["--version"])
     );
+    status.clean().then_some(status.revision)
+}
+
+fn require_clean_revision() -> Result<String, ExitCode> {
+    report_revision().ok_or_else(|| {
+        println!(
+            "\nrelease qualification stopped: build-relevant source changes are not a \
+             reproducible release input"
+        );
+        ExitCode::FAILURE
+    })
 }
 
 /// A supplied release capture is evidence only if production can seed from it.
@@ -6159,7 +6201,7 @@ fn infrastructure_gate(environment: &[(&str, &str)]) -> GateResult {
     )
 }
 
-fn report_artifact(binary: &Path) -> bool {
+fn report_artifact(binary: &Path, source_revision: &str) -> bool {
     println!("\nartifact");
     match fs::read(binary) {
         Ok(bytes) => {
@@ -6172,6 +6214,9 @@ fn report_artifact(binary: &Path) -> bool {
             let embedded = bytes
                 .windows(nano_vm::COMPILER_IDENTITY.len())
                 .any(|window| window == nano_vm::COMPILER_IDENTITY.as_bytes());
+            let source = bytes
+                .windows(source_revision.len())
+                .any(|window| window == source_revision.as_bytes());
             println!(
                 "  embedded compiler    {}",
                 if embedded {
@@ -6180,7 +6225,15 @@ fn report_artifact(binary: &Path) -> bool {
                     "MISSING"
                 }
             );
-            embedded
+            println!(
+                "  embedded source      {}",
+                if source {
+                    source_revision
+                } else {
+                    "STALE OR MISSING"
+                }
+            );
+            embedded && source
         }
         Err(error) => {
             println!("  path                 {} ({error})", binary.display());
@@ -6190,20 +6243,30 @@ fn report_artifact(binary: &Path) -> bool {
 }
 
 /// Build the artifact this report hashes, rather than describing target/ leftovers.
-fn build_release_artifact() -> bool {
+fn build_release_artifact() -> Option<PathBuf> {
     println!("\nbuild");
-    let gate = run_gate(
-        "cargo",
-        &["build", "--release", "--bin", "stacks-node"],
-        &[],
-    );
-    println!("  {}", gate.command);
-    println!(
-        "    {:<6} {}",
-        if gate.passed { "pass" } else { "FAIL" },
-        gate.detail
-    );
-    gate.passed
+    let arguments = ["build", ".#stacks-node", "--no-link", "--print-out-paths"];
+    println!("  nix {}", arguments.join(" "));
+    let output = Command::new("nix")
+        .args(arguments)
+        .current_dir(workspace_root())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        println!(
+            "    FAIL   {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let output_path = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim();
+    println!("    pass   {output_path}");
+    Some(PathBuf::from(output_path).join("bin/stacks-node"))
 }
 
 fn report_contract_arities(state: Option<&Path>, qualifying: bool) -> bool {
@@ -6631,7 +6694,9 @@ fn release_report(arguments: &[String]) -> ExitCode {
     println!("  It is not evidence for holding mainnet tip for 24 hours, a live Bitcoin");
     println!("  reorganization, or a stock stacks-signer run against this binary.");
     println!("  Those require the named task-053 qualification runs.");
-    report_revision();
+    let Ok(source_revision) = require_clean_revision() else {
+        return ExitCode::FAILURE;
+    };
     if !report_capture_validation(capture.as_deref()) {
         println!(
             "\nrelease qualification stopped: an invalid capture cannot support replay or \
@@ -6644,10 +6709,11 @@ fn release_report(arguments: &[String]) -> ExitCode {
     let receipt_binding = report_receipt_binding();
     let historical_epoch_evidence = report_historical_epoch_evidence();
     let blocking = report_differentials(&inventory) + report_declared_differentials();
-    let built = artifact.is_some() || build_release_artifact();
-    let artifact_path =
-        artifact.unwrap_or_else(|| workspace_root().join("target/release/stacks-node"));
-    let artifact = report_artifact(&artifact_path);
+    let artifact_path = artifact.or_else(build_release_artifact);
+    let built = artifact_path.is_some();
+    let artifact = artifact_path
+        .as_deref()
+        .is_some_and(|path| report_artifact(path, &source_revision));
     let contract_arities = report_contract_arities(state.as_deref(), run_gates);
     report_checkpoint(state.as_deref());
     let scoreboard = report_scoreboard(state.as_deref(), run_gates);

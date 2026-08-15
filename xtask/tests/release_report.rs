@@ -1,5 +1,29 @@
 use std::{fs, path::Path, process::Command};
 
+fn source_revision() -> String {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask is under the workspace");
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace)
+        .output()
+        .expect("read source revision");
+    assert!(output.status.success(), "git rev-parse failed");
+    String::from_utf8(output.stdout)
+        .expect("UTF-8 revision")
+        .trim()
+        .to_owned()
+}
+
+fn test_artifact(path: &Path) {
+    fs::write(
+        path,
+        format!("{}\n{}\n", nano_vm::COMPILER_IDENTITY, source_revision()),
+    )
+    .expect("write identity-bearing artifact");
+}
+
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
@@ -224,7 +248,7 @@ fn a_red_scoreboard_makes_both_commands_fail() {
     // compiler identity, so this command tests the report verdict without asking
     // a test process to recursively invoke Cargo.
     let artifact = temporary.path().join("stacks-node");
-    fs::copy(xtask, &artifact).expect("copy an immutable test artifact");
+    test_artifact(&artifact);
     let report = Command::new(xtask)
         .args([
             "release-report",
@@ -298,6 +322,41 @@ fn an_invalid_checkpoint_seed_stops_before_replay_or_artifact_evidence() {
 }
 
 #[test]
+fn an_artifact_from_another_revision_is_an_audit_failure() {
+    let temporary = tempfile::tempdir().expect("temporary release inputs");
+    let fixtures = temporary.path().join("fixtures");
+    baseline_fixture(&fixtures);
+    let artifact = temporary.path().join("stacks-node");
+    fs::write(
+        &artifact,
+        format!("{}\n{}\n", nano_vm::COMPILER_IDENTITY, "0".repeat(40)),
+    )
+    .expect("write stale artifact");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args([
+            "release-report",
+            "--no-gates",
+            "--artifact",
+            artifact.to_str().expect("UTF-8 artifact path"),
+        ])
+        .env("NANO_FIXTURES", &fixtures)
+        .output()
+        .expect("run release report command");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stale artifact passed:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("embedded source      STALE OR MISSING"),
+        "the report did not name the stale artifact:\n{stdout}"
+    );
+}
+
+#[test]
 fn missing_checkpoint_authentication_stops_before_artifact_evidence() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -353,7 +412,7 @@ fn no_gates_is_non_qualifying_and_names_every_unexecuted_owner() {
     baseline_fixture(&fixtures);
     let xtask = Path::new(env!("CARGO_BIN_EXE_xtask"));
     let artifact = temporary.path().join("stacks-node");
-    fs::copy(xtask, &artifact).expect("copy an immutable test artifact");
+    test_artifact(&artifact);
 
     let output = Command::new(xtask)
         .args([
