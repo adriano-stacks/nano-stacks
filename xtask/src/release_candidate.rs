@@ -9,7 +9,10 @@ use std::{
 use nano_primitives::sha256;
 use serde_json::{Value, json};
 
-use crate::release_artifact::source_status;
+use crate::{
+    release_advisory::{ADVISORY_POLICY, AdvisoryPolicy},
+    release_artifact::source_status,
+};
 
 const ARTIFACT: &str = "artifact";
 const AUDIT: &str = "cargo-audit.json";
@@ -24,6 +27,7 @@ const REPORT: &str = "qualification-report.txt";
 const RELEASE_SUMS: &str = "release.SHA256SUMS";
 const RELEASE_SIGNATURE: &str = "release.SHA256SUMS.minisig";
 const SOURCE_INPUTS: &[&str] = &[
+    ADVISORY_POLICY,
     "Cargo.lock",
     "flake.lock",
     "flake.nix",
@@ -66,6 +70,7 @@ pub fn verify_qualification_inputs(
 
 pub fn command(arguments: &[String], workspace: &Path) -> ExitCode {
     let result = match arguments.first().map(String::as_str) {
+        Some("audit") => audit(&arguments[1..], workspace),
         Some("prepare") => prepare(&arguments[1..], workspace),
         Some("finalize") => finalize(&arguments[1..]),
         Some("verify") => verify(&arguments[1..]),
@@ -84,13 +89,32 @@ pub fn command(arguments: &[String], workspace: &Path) -> ExitCode {
 }
 
 fn usage() -> String {
-    "usage:\n  cargo xtask release-candidate prepare --output <dir> --checkpoint <dir-or-file> \
+    "usage:\n  cargo xtask release-candidate audit --advisory-db <RustSec.git>\n  cargo xtask release-candidate prepare --output <dir> --checkpoint <dir-or-file> \
      --config <config.toml> --advisory-db <RustSec.git> --secret-key <minisign.key> \
      --public-key <minisign.pub> [--artifact <nix-output>]\n  cargo xtask release-candidate \
      finalize --candidate <dir> --report <release-report.txt> --secret-key <minisign.key> \
      --public-key <minisign.pub>\n  cargo xtask release-candidate verify --candidate <dir> \
      --public-key <minisign.pub> [--prepared]"
         .to_owned()
+}
+
+fn audit(arguments: &[String], workspace: &Path) -> Result<String, String> {
+    let options = options(arguments)?;
+    reject_unknown(&options, &["--advisory-db"])?;
+    let advisory_db = required_path(&options, "--advisory-db")?;
+    let report = run_advisory_policy(workspace, &advisory_db)?;
+    let report: Value = serde_json::from_slice(&report)
+        .map_err(|error| format!("cannot reread cargo-audit report: {error}"))?;
+    let warnings = report["warnings"]
+        .as_object()
+        .into_iter()
+        .flat_map(|warnings| warnings.values())
+        .filter_map(Value::as_array)
+        .map(Vec::len)
+        .sum::<usize>();
+    Ok(format!(
+        "advisory policy PASS: no vulnerabilities; {warnings} exact, owned, unexpired exception(s)"
+    ))
 }
 
 fn prepare(arguments: &[String], workspace: &Path) -> Result<String, String> {
@@ -353,7 +377,10 @@ pub fn verify_prepared_candidate(
     )?;
     verify_checksums(candidate, PREPARED_SUMS, &prepared_exclusions())?;
     required_candidate_files(candidate)?;
-    verify_advisory_policy(&candidate.join(AUDIT))?;
+    verify_advisory_policy(
+        &candidate.join(AUDIT),
+        &candidate.join("source-inputs").join(ADVISORY_POLICY),
+    )?;
     verify_publisher_key(candidate, public_key)?;
     let source_revision = verify_identity(candidate, expected_revision)?;
     let configuration = read_json(&candidate.join(CONFIGURATION))?;
@@ -506,29 +533,14 @@ fn validate_artifact(artifact: &Path, revision: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_advisory_policy(report: &Path) -> Result<(), String> {
+fn verify_advisory_policy(report: &Path, policy: &Path) -> Result<(), String> {
     let report = read_json(report)?;
-    if report["vulnerabilities"]["found"] != false {
-        return Err(format!(
-            "advisory policy found {} vulnerable package(s)",
-            report["vulnerabilities"]["count"].as_u64().unwrap_or(0)
-        ));
-    }
-    let warnings = report["warnings"]
-        .as_object()
-        .ok_or_else(|| "cargo-audit report has no warnings object".to_owned())?;
-    let count = warnings
-        .values()
-        .filter_map(Value::as_array)
-        .map(Vec::len)
-        .sum::<usize>();
-    if count != 0 {
-        return Err(format!("advisory policy found {count} warning(s)"));
-    }
-    Ok(())
+    AdvisoryPolicy::load(policy)?.verify_report_now(&report)
 }
 
 fn run_advisory_policy(workspace: &Path, database: &Path) -> Result<Vec<u8>, String> {
+    let policy = AdvisoryPolicy::load(&workspace.join(ADVISORY_POLICY))?;
+    policy.verify_owners(workspace)?;
     let output = Command::new("cargo")
         .args([
             OsStr::new("audit"),
@@ -539,8 +551,6 @@ fn run_advisory_policy(workspace: &Path, database: &Path) -> Result<Vec<u8>, Str
             OsStr::new("Cargo.lock"),
             OsStr::new("--format"),
             OsStr::new("json"),
-            OsStr::new("--deny"),
-            OsStr::new("warnings"),
         ])
         .current_dir(workspace)
         .output()
@@ -548,28 +558,13 @@ fn run_advisory_policy(workspace: &Path, database: &Path) -> Result<Vec<u8>, Str
     let report: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("cargo audit did not emit JSON: {error}"))?;
     if !output.status.success() {
-        let vulnerable = report["vulnerabilities"]["count"].as_u64().unwrap_or(0);
-        let warnings = report["warnings"]
-            .as_object()
-            .into_iter()
-            .flat_map(|warnings| warnings.values())
-            .filter_map(Value::as_array)
-            .map(Vec::len)
-            .sum::<usize>();
         return Err(format!(
-            "cargo audit rejected the closure: {vulnerable} vulnerability(s), {warnings} warning(s)"
+            "cargo audit failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    verify_advisory_policy_value(&report)?;
+    policy.verify_report_now(&report)?;
     Ok(output.stdout)
-}
-
-fn verify_advisory_policy_value(report: &Value) -> Result<(), String> {
-    let temporary = tempfile::NamedTempFile::new()
-        .map_err(|error| format!("cannot stage advisory report: {error}"))?;
-    serde_json::to_writer(temporary.as_file(), report)
-        .map_err(|error| format!("cannot stage advisory report: {error}"))?;
-    verify_advisory_policy(temporary.path())
 }
 
 fn clean_git_revision(repository: &Path, name: &str) -> Result<String, String> {
@@ -988,11 +983,12 @@ mod tests {
 
     use serde_json::json;
 
+    use crate::release_advisory::ADVISORY_POLICY;
+
     use super::{
         ARTIFACT, AUDIT, CHECKPOINT, CLOSURE, CONFIGURATION, PREPARED_SIGNATURE, PREPARED_SUMS,
         PROVENANCE, PUBLISHER_KEY, REPORT, SOURCE_INPUTS, finalize, prepared_exclusions, sign,
-        verify_advisory_policy_value, verify_checksums, verify_final_candidate,
-        verify_prepared_candidate, write_checksum_file,
+        verify_checksums, verify_final_candidate, verify_prepared_candidate, write_checksum_file,
     };
 
     const REVISION: &str = "1111111111111111111111111111111111111111";
@@ -1043,8 +1039,12 @@ mod tests {
         fs::copy(&public_key, candidate.join(PUBLISHER_KEY)).expect("copy publisher key");
         fs::create_dir(candidate.join("source-inputs")).expect("create source inputs");
         for input in SOURCE_INPUTS {
-            fs::write(candidate.join("source-inputs").join(input), input)
-                .expect("write source input");
+            let path = candidate.join("source-inputs").join(input);
+            if *input == ADVISORY_POLICY {
+                write_json_test(&path, &green_policy());
+            } else {
+                fs::write(path, input).expect("write source input");
+            }
         }
         write_checksum_file(&candidate, PREPARED_SUMS, &prepared_exclusions())
             .expect("write candidate checksums");
@@ -1117,8 +1117,16 @@ mod tests {
 
     fn green_audit() -> serde_json::Value {
         json!({
+            "settings": { "ignore": [] },
             "vulnerabilities": { "found": false, "count": 0, "list": [] },
             "warnings": {},
+        })
+    }
+
+    fn green_policy() -> serde_json::Value {
+        json!({
+            "schema": "nano-stacks/advisory-policy/v1",
+            "exceptions": [],
         })
     }
 
@@ -1128,25 +1136,6 @@ mod tests {
             serde_json::to_vec(value).expect("serialize test JSON"),
         )
         .expect("write test JSON");
-    }
-
-    #[test]
-    fn advisory_policy_rejects_vulnerabilities_and_warnings() {
-        let green = json!({
-            "vulnerabilities": { "found": false, "count": 0, "list": [] },
-            "warnings": {},
-        });
-        assert!(verify_advisory_policy_value(&green).is_ok());
-        let vulnerable = json!({
-            "vulnerabilities": { "found": true, "count": 1, "list": [{}] },
-            "warnings": {},
-        });
-        assert!(verify_advisory_policy_value(&vulnerable).is_err());
-        let warned = json!({
-            "vulnerabilities": { "found": false, "count": 0, "list": [] },
-            "warnings": { "unsound": [{}] },
-        });
-        assert!(verify_advisory_policy_value(&warned).is_err());
     }
 
     #[test]
@@ -1204,6 +1193,7 @@ mod tests {
         let advisory = candidate(
             &json!({
                 "vulnerabilities": { "found": true, "count": 1, "list": [{}] },
+                "settings": { "ignore": [] },
                 "warnings": {},
             }),
             true,

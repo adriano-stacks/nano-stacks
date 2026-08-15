@@ -115,6 +115,7 @@ fn build_relevant(path: &Path) -> bool {
 
     let root_files = [
         ".gitignore",
+        "advisory-policy.json",
         "Cargo.lock",
         "Cargo.toml",
         "conditional-tests.toml",

@@ -1,0 +1,23 @@
+{
+  "schema": "nano-stacks/advisory-policy/v1",
+  "exceptions": [
+    {
+      "id": "RUSTSEC-2025-0161",
+      "package": "libsecp256k1",
+      "version": "0.7.2",
+      "scope": "non-release-target",
+      "reachability": "Pinned stacks-core selects this crate only for target_family=wasm; nano-stacks releases only x86_64-linux and aarch64-linux artifacts.",
+      "owner": "130",
+      "expires": "2026-09-15"
+    },
+    {
+      "id": "RUSTSEC-2020-0016",
+      "package": "net2",
+      "version": "0.2.39",
+      "scope": "test-only",
+      "reachability": "Only nano-conformance dev-dependencies select stackslib and its deprecated mio 0.6 transport; stacks-node does not link this crate.",
+      "owner": "130",
+      "expires": "2026-09-15"
+    }
+  ]
+}

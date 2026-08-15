@@ -24,6 +24,7 @@ rusqlite = { version = "0.31.0", features = ["bundled"] }
 nano-sync = { path = "../crates/nano-sync" }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
 tempfile = "3"
+time = { version = "0.3.54", features = ["parsing"] }
 
 [dev-dependencies]
 nano-sortition = { path = "../crates/nano-sortition" }

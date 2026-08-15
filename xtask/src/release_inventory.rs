@@ -482,7 +482,7 @@ fn function_name(line: &str) -> Option<String> {
         })
 }
 
-fn task_statuses(root: &Path, errors: &mut Vec<String>) -> BTreeMap<String, String> {
+pub fn task_statuses(root: &Path, errors: &mut Vec<String>) -> BTreeMap<String, String> {
     let mut found = BTreeMap::new();
     walk_tasks(&root.join("tasks"), &mut found, errors);
     found

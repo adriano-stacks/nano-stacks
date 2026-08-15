@@ -21,6 +21,7 @@ use nano_chainstate::{
 use nano_primitives::Network;
 use serde_json::json;
 
+mod release_advisory;
 mod release_artifact;
 mod release_candidate;
 mod release_inventory;

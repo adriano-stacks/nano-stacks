@@ -22,7 +22,7 @@ surface that can affect the node.
 
 ## Tasks
 
-- [ ] Inventory the Wasmtime APIs, Cargo features and WebAssembly proposals used
+- [x] Inventory the Wasmtime APIs, Cargo features and WebAssembly proposals used
       by production execution, compilation and the native-module cache. Classify
       every current RustSec advisory by production reachability.
 - [x] Select a supported patched Wasmtime line and update `nano-vm`,
@@ -40,7 +40,7 @@ surface that can affect the node.
 - [ ] Version and invalidate serialized native modules across every engine,
       target and configuration change. Decide whether the first mainnet artifact
       can omit the persistent native cache without missing its catch-up bound.
-- [ ] Add mandatory `cargo audit` and dependency-policy gates. Every allowed
+- [x] Add mandatory `cargo audit` and dependency-policy gates. Every allowed
       advisory must name its reachability, owner and expiry.
 - [ ] Replay the complete root, receipt, cost and ABI corpus on x86-64 and
       AArch64, including fresh compilation and cached-module reloads.
