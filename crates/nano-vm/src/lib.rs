@@ -4496,15 +4496,12 @@ fn deploy_contract_with_wasm_in_context(
         global
             .database
             .set_contract_data_size(&contract, data_size)?;
-        Ok::<_, ClarityEvalError>(initialized)
+        Ok::<_, ClarityEvalError>(())
     })();
-    let initialized = match initialized {
-        Ok(initialized) => initialized,
-        Err(error) => {
-            global.roll_back()?;
-            return Err(error);
-        }
-    };
+    if let Err(error) = initialized {
+        global.roll_back()?;
+        return Err(error);
+    }
     let (assets, events) = global.commit()?;
     let cost = global.cost_track.get_total();
     drop(global);
@@ -4513,7 +4510,7 @@ fn deploy_contract_with_wasm_in_context(
     modules.insert(contract, compiled);
 
     Ok(DeploymentOutcome::Success(Box::new(TransactionResult {
-        value: initialized.ret,
+        value: Some(Value::okay_true()),
         cost,
         assets: assets.unwrap_or_default(),
         events: events.map_or_else(Vec::new, |batch| batch.events),
@@ -5526,6 +5523,26 @@ mod tests {
             before,
             "the rejected deployment wrote state"
         );
+    }
+
+    #[test]
+    fn a_successful_deployment_receipt_is_okay_true() {
+        let contract =
+            QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.definition-only")
+                .expect("a contract identifier");
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        vm.begin_block(None, [0x98; 32]).expect("begin block");
+
+        let result = vm
+            .deploy_contract(
+                contract,
+                ClarityVersion::Clarity6,
+                "(define-public (answer) (ok true))",
+                LimitedCostTracker::new_free(),
+            )
+            .expect("deploy the contract");
+
+        assert_eq!(result.value, Some(Value::okay_true()));
     }
 
     #[test]
