@@ -1,7 +1,7 @@
 ---
 title: "Never stage an unsigned proposal as a finalized block"
 id: "122"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 type: bug
@@ -9,6 +9,7 @@ group: mainnet
 dependencies: ["079", "131"]
 tags: ["consensus", "signer", "rpc", "staging", "release"]
 created_at: "2026-08-14"
+completed_at: 2026-08-15
 ---
 
 # Never stage an unsigned proposal as a finalized block
