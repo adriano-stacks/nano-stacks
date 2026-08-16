@@ -91,7 +91,8 @@ pub fn command(arguments: &[String], workspace: &Path) -> ExitCode {
 fn usage() -> String {
     "usage:\n  cargo xtask release-candidate audit --advisory-db <RustSec.git>\n  cargo xtask release-candidate prepare --output <dir> --checkpoint <dir-or-file> \
      --config <config.toml> --advisory-db <RustSec.git> --secret-key <minisign.key> \
-     --public-key <minisign.pub> [--artifact <nix-output>]\n  cargo xtask release-candidate \
+     --public-key <minisign.pub> [--artifact <nix-output> \
+     --artifact-store <rootless-store-root>]\n  cargo xtask release-candidate \
      finalize --candidate <dir> --report <release-report.txt> --secret-key <minisign.key> \
      --public-key <minisign.pub>\n  cargo xtask release-candidate verify --candidate <dir> \
      --public-key <minisign.pub> [--prepared]"
@@ -129,6 +130,7 @@ fn prepare(arguments: &[String], workspace: &Path) -> Result<String, String> {
             "--secret-key",
             "--public-key",
             "--artifact",
+            "--artifact-store",
         ],
     )?;
     let output = required_path(&options, "--output")?;
@@ -150,14 +152,11 @@ fn prepare(arguments: &[String], workspace: &Path) -> Result<String, String> {
             source.changes.join(", ")
         ));
     }
-    let artifact = options
-        .get("--artifact")
-        .map(PathBuf::from)
-        .map_or_else(|| build_artifact(workspace), Ok)?;
+    let (artifact, store_path, artifact_store) = artifact_input(&options, workspace)?;
     validate_artifact(&artifact, &source.revision)?;
     let audit = run_advisory_policy(workspace, &advisory_db)?;
     let advisory_revision = clean_git_revision(&advisory_db, "advisory database")?;
-    let closure = nix_closure(&artifact)?;
+    let closure = nix_closure(&store_path, artifact_store.as_deref())?;
 
     let parent = output
         .parent()
@@ -595,8 +594,41 @@ fn build_artifact(workspace: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "Nix build printed no output path".to_owned())
 }
 
-fn nix_closure(artifact: &Path) -> Result<Value, String> {
-    let output = Command::new("nix")
+fn artifact_input(
+    options: &BTreeMap<&str, &str>,
+    workspace: &Path,
+) -> Result<(PathBuf, PathBuf, Option<PathBuf>), String> {
+    let Some(artifact) = options.get("--artifact").map(PathBuf::from) else {
+        if options.contains_key("--artifact-store") {
+            return Err("--artifact-store requires --artifact".to_owned());
+        }
+        let artifact = build_artifact(workspace)?;
+        return Ok((artifact.clone(), artifact, None));
+    };
+    let Some(store) = options.get("--artifact-store").map(PathBuf::from) else {
+        return Ok((artifact.clone(), artifact, None));
+    };
+    if !store.is_absolute() || !store.is_dir() {
+        return Err("--artifact-store must name an absolute store directory".to_owned());
+    }
+    if artifact.parent() != Some(Path::new("/nix/store")) {
+        return Err("a rootless-store artifact must be one direct /nix/store path".to_owned());
+    }
+    let name = artifact
+        .file_name()
+        .ok_or_else(|| "rootless-store artifact has no file name".to_owned())?;
+    let physical = store.join("nix/store").join(name);
+    Ok((physical, artifact, Some(store)))
+}
+
+fn nix_closure(artifact: &Path, store: Option<&Path>) -> Result<Value, String> {
+    let mut command = Command::new("nix");
+    let store_uri;
+    if let Some(store) = store {
+        store_uri = format!("local?root={}", store.display());
+        command.args([OsStr::new("--store"), OsStr::new(&store_uri)]);
+    }
+    let output = command
         .args([
             OsStr::new("path-info"),
             OsStr::new("--json"),
@@ -979,7 +1011,12 @@ fn tool_version(program: &str, arguments: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, fs, path::PathBuf, process::Command};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        path::PathBuf,
+        process::Command,
+    };
 
     use serde_json::json;
 
@@ -987,11 +1024,43 @@ mod tests {
 
     use super::{
         ARTIFACT, AUDIT, CHECKPOINT, CLOSURE, CONFIGURATION, PREPARED_SIGNATURE, PREPARED_SUMS,
-        PROVENANCE, PUBLISHER_KEY, REPORT, SOURCE_INPUTS, finalize, prepared_exclusions, sign,
-        verify_checksums, verify_final_candidate, verify_prepared_candidate, write_checksum_file,
+        PROVENANCE, PUBLISHER_KEY, REPORT, SOURCE_INPUTS, artifact_input, finalize,
+        prepared_exclusions, sign, verify_checksums, verify_final_candidate,
+        verify_prepared_candidate, write_checksum_file,
     };
 
     const REVISION: &str = "1111111111111111111111111111111111111111";
+
+    #[test]
+    fn a_rootless_store_resolves_only_one_direct_nix_output() {
+        let root = tempfile::tempdir().expect("temporary rootless store");
+        let store = root.path().to_str().expect("UTF-8 store path");
+        let options = BTreeMap::from([
+            (
+                "--artifact",
+                "/nix/store/11111111111111111111111111111111-node",
+            ),
+            ("--artifact-store", store),
+        ]);
+        let (physical, store_path, selected_store) =
+            artifact_input(&options, root.path()).expect("resolve rootless artifact");
+        assert_eq!(
+            physical,
+            root.path()
+                .join("nix/store/11111111111111111111111111111111-node")
+        );
+        assert_eq!(
+            store_path,
+            PathBuf::from("/nix/store/11111111111111111111111111111111-node")
+        );
+        assert_eq!(selected_store.as_deref(), Some(root.path()));
+
+        let traversal = BTreeMap::from([
+            ("--artifact", "/nix/store/../outside"),
+            ("--artifact-store", store),
+        ]);
+        assert!(artifact_input(&traversal, root.path()).is_err());
+    }
 
     struct SignedCandidate {
         root: tempfile::TempDir,

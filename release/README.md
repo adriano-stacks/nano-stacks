@@ -19,7 +19,9 @@ nix develop --command cargo xtask release-candidate prepare \
   --config "$NANO_RELEASE_CONFIG" \
   --advisory-db "$NANO_RELEASE_ADVISORY_DB" \
   --secret-key "$NANO_RELEASE_SECRET_KEY" \
-  --public-key "$NANO_RELEASE_PUBLIC_KEY"
+  --public-key "$NANO_RELEASE_PUBLIC_KEY" \
+  --artifact "$(<"$NANO_REPRODUCIBLE_STORE/output-path")" \
+  --artifact-store "$NANO_REPRODUCIBLE_STORE"
 
 nix develop --command cargo xtask release-report \
   --candidate /srv/nano-release/candidate \
@@ -44,15 +46,17 @@ that does not say `PASS` and name that exact preliminary manifest, then signs a
 second complete checksum inventory containing the report. Any later byte or
 extra file makes verification fail.
 
-Before preparation, `scripts/reproducible-release.sh` builds the clean Git
+Before preparation, set `NANO_REPRODUCIBLE_STORE` to an absent path on the
+disk-backed temporary filesystem. `scripts/reproducible-release.sh` builds the clean Git
 revision in two separate rootless Nix stores, compares their NAR hashes and a
 sorted SHA-256 inventory of every packaged file, and removes both stores. A NAR
 match includes file contents, modes and paths; the separate inventory makes a
 binary or packaged-data difference readable if the comparison ever fails.
-After the comparison, the script imports the first verified NAR into the active
-Nix store and checks it again there. Qualification resolves that exact store path
-and passes it to `release-candidate prepare`, so the signed candidate cannot be a
-third, merely assumed-equivalent build.
+After the comparison, the script retains the first verified rootless store at
+`NANO_REPRODUCIBLE_STORE` and checks it again there. Qualification passes that
+store and its exact output path to `release-candidate prepare`, so the signed
+candidate cannot be a third, merely assumed-equivalent build. Remove the handoff
+store after finalization and verification.
 
 ## Capacity and shutdown contract
 

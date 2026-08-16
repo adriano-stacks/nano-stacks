@@ -103,7 +103,10 @@ jobs:
             status=$?
             trap - EXIT
             for directory in "${scratch_dirs[@]}"; do
-              rm -rf -- "$directory"
+              if test -d "$directory"; then
+                find "$directory" -type d -exec chmod u+w {} + || status=1
+                rm -rf -- "$directory" || status=1
+              fi
             done
             exit "$status"
           }
@@ -144,9 +147,10 @@ jobs:
           fresh_reflink 098
           fresh_reflink 111
 
+          export NANO_REPRODUCIBLE_STORE="$qualification_tmp/reproducible-store"
           nix develop --command scripts/ci.sh reproducible-release
-          verified_artifact=$(nix build .#stacks-node --no-link --print-out-paths)
-          test -x "$verified_artifact/bin/stacks-node"
+          verified_artifact=$(<"$NANO_REPRODUCIBLE_STORE/output-path")
+          test -x "$NANO_REPRODUCIBLE_STORE$verified_artifact/bin/stacks-node"
 
           candidate="$NANO_RELEASE_OUTPUT/candidate-$GITHUB_SHA-$GITHUB_RUN_ID"
           report="$NANO_RELEASE_OUTPUT/qualification-$GITHUB_SHA-$GITHUB_RUN_ID.txt"
@@ -157,7 +161,8 @@ jobs:
             --advisory-db "$NANO_RELEASE_ADVISORY_DB" \
             --secret-key "$NANO_RELEASE_SECRET_KEY" \
             --public-key "$NANO_RELEASE_PUBLIC_KEY" \
-            --artifact "$verified_artifact"
+            --artifact "$verified_artifact" \
+            --artifact-store "$NANO_REPRODUCIBLE_STORE"
           nix develop --command cargo xtask release-report \
             --candidate "$candidate" --public-key "$NANO_RELEASE_PUBLIC_KEY" \
             --capture "$NANO_MAINNET_CAPTURE" --state "$NANO_MAINNET_STATE" \

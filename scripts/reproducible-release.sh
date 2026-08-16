@@ -11,13 +11,22 @@ fi
 
 revision=$(git rev-parse HEAD)
 source="git+file://$workspace?rev=$revision"
-scratch_root=${TMPDIR_OVERRIDE:-"$HOME/.cache/nano-stacks/tmp"}
+scratch_root=${TMPDIR_OVERRIDE:-${TMPDIR:-"$HOME/.cache/nano-stacks/tmp"}}
 mkdir -p "$scratch_root"
 scratch=$(mktemp -d "$scratch_root/reproducible-release.XXXXXX")
+published_store=${NANO_REPRODUCIBLE_STORE:-}
+published_created=false
 
 cleanup() {
   status=$?
   trap - EXIT
+  if test "$status" -ne 0 && test "$published_created" = true && test -d "$published_store"; then
+    if ! find "$published_store" -type d -exec chmod u+w {} + \
+      || ! find "$published_store" -depth -delete; then
+      echo "failed to remove rejected handoff store: $published_store" >&2
+      status=1
+    fi
+  fi
   case "$scratch" in
     "$scratch_root"/reproducible-release.*)
       if test -d "$scratch"; then
@@ -38,6 +47,28 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+
+if test -z "$published_store"; then
+  echo "NANO_REPRODUCIBLE_STORE must name an absent persistent store root" >&2
+  exit 1
+fi
+case "$published_store" in
+  /*) ;;
+  *)
+    echo "NANO_REPRODUCIBLE_STORE must be absolute" >&2
+    exit 1
+    ;;
+esac
+if test -e "$published_store"; then
+  echo "NANO_REPRODUCIBLE_STORE already exists: $published_store" >&2
+  exit 1
+fi
+published_parent=$(dirname "$published_store")
+mkdir -p "$published_parent"
+if test "$(stat -c %d "$published_parent")" != "$(stat -c %d "$scratch")"; then
+  echo "NANO_REPRODUCIBLE_STORE must be on the scratch filesystem" >&2
+  exit 1
+fi
 
 build_one() {
   name=$1
@@ -74,14 +105,17 @@ binary_hash=$(awk '$2 == "./bin/stacks-node" { print $1 }' "$scratch/first.files
 test -n "$binary_hash"
 
 # Qualification must consume one of the artifacts compared above, not a third
-# build of the same derivation. Import the verified closure into the active Nix
-# store, then recheck both its NAR and its readable file inventory there.
-nix copy --from "local?root=$scratch/first" --no-check-sigs "$output"
-published_hash=$(nix path-info --json --json-format 1 "$output" \
+# build of the same derivation. Move the first verified rootless store to the
+# caller-owned handoff path, then recheck both its NAR and readable file inventory.
+mv "$scratch/first" "$published_store"
+published_created=true
+printf '%s\n' "$output" > "$published_store/output-path"
+published_uri="local?root=$published_store"
+published_hash=$(nix --store "$published_uri" path-info --json --json-format 1 "$output" \
   | jq -er --arg output "$output" '.[$output].narHash')
 test "$published_hash" = "$nar_hash"
 (
-  cd "$output"
+  cd "$published_store$output"
   find . -type f -print0 \
     | sort -z \
     | xargs -0 sha256sum
@@ -93,4 +127,4 @@ printf 'Nix output       %s\n' "$output"
 printf 'NAR hash         %s\n' "$nar_hash"
 printf 'binary SHA-256   %s\n' "$binary_hash"
 printf 'reproducibility  PASS: two independent stores are byte-identical\n'
-printf 'qualification   PASS: verified NAR installed in the active store\n'
+printf 'qualification   PASS: verified NAR retained in %s\n' "$published_store"
