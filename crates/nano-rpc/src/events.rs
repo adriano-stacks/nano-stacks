@@ -8,7 +8,7 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -22,7 +22,7 @@ use nano_primitives::{
 use nano_stackerdb::Chunk;
 use reqwest::Url;
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 /// A block whose transactions were all skipped still says nothing about
 /// microblocks, which epoch 4.0 does not have.
@@ -685,6 +685,8 @@ pub const DEFAULT_DISPATCH_ATTEMPTS: u32 = 5;
 /// hundred blocks of slack, so an observer that restarts or pauses for a GC
 /// catches up with no gap at all.
 pub const DEFAULT_DISPATCH_QUEUE_BYTES: usize = 32 * 1024 * 1024;
+/// A separate bound for tiny events whose byte total remains small.
+pub const DEFAULT_DISPATCH_QUEUE_ITEMS: usize = 1024;
 
 /// How often a node repeats itself about an observer whose events it is
 /// dropping. Per event it would be one line per block for as long as the
@@ -706,6 +708,7 @@ const DROPPED_HEADER: &str = "x-nano-events-dropped";
 #[derive(Clone, Copy, Debug)]
 pub struct DispatchLimits {
     pub attempts: u32,
+    pub queue_items: usize,
     pub queue_bytes: usize,
 }
 
@@ -713,6 +716,7 @@ impl Default for DispatchLimits {
     fn default() -> Self {
         Self {
             attempts: DEFAULT_DISPATCH_ATTEMPTS,
+            queue_items: DEFAULT_DISPATCH_QUEUE_ITEMS,
             queue_bytes: DEFAULT_DISPATCH_QUEUE_BYTES,
         }
     }
@@ -726,6 +730,9 @@ pub struct ObserverStatus {
     pub dropped: u64,
     /// Events queued for it that have not been attempted yet.
     pub undelivered: usize,
+    pub queued_bytes: usize,
+    pub oldest_age_ms: Option<u64>,
+    pub saturations: u64,
     /// Whether its last attempted event was accepted.
     pub reachable: bool,
 }
@@ -784,14 +791,14 @@ impl EventDispatcher {
         let observers = observers
             .into_iter()
             .map(|url| {
-                let (events, queue) = mpsc::unbounded_channel();
+                let (events, queue) = nano_queue::channel(nano_queue::Limits::new(
+                    limits.queue_items,
+                    limits.queue_bytes,
+                ));
                 let observer = Arc::new(Observer {
                     url,
                     events,
                     attempts: limits.attempts.max(1),
-                    queue_bytes: limits.queue_bytes,
-                    queued: AtomicUsize::new(0),
-                    pending: AtomicUsize::new(0),
                     offered: AtomicU64::new(0),
                     delivered: AtomicU64::new(0),
                     dropped: AtomicU64::new(0),
@@ -848,12 +855,20 @@ impl EventDispatcher {
     pub fn status(&self) -> Vec<ObserverStatus> {
         self.observers
             .iter()
-            .map(|observer| ObserverStatus {
-                url: observer.url.clone(),
-                delivered: observer.delivered.load(Ordering::Relaxed),
-                dropped: observer.dropped.load(Ordering::Relaxed),
-                undelivered: observer.pending.load(Ordering::Relaxed),
-                reachable: observer.reachable.load(Ordering::Relaxed),
+            .map(|observer| {
+                let queue = observer.events.status();
+                ObserverStatus {
+                    url: observer.url.clone(),
+                    delivered: observer.delivered.load(Ordering::Relaxed),
+                    dropped: observer.dropped.load(Ordering::Relaxed),
+                    undelivered: queue.items,
+                    queued_bytes: queue.bytes,
+                    oldest_age_ms: queue
+                        .oldest_age
+                        .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX)),
+                    saturations: queue.saturations,
+                    reachable: observer.reachable.load(Ordering::Relaxed),
+                }
             })
             .collect()
     }
@@ -869,7 +884,7 @@ impl EventDispatcher {
             if self
                 .observers
                 .iter()
-                .all(|observer| observer.pending.load(Ordering::Relaxed) == 0)
+                .all(|observer| observer.events.status().items == 0)
             {
                 return true;
             }
@@ -885,15 +900,8 @@ impl EventDispatcher {
 #[derive(Debug)]
 struct Observer {
     url: Url,
-    events: mpsc::UnboundedSender<Event>,
+    events: nano_queue::Sender<Event>,
     attempts: u32,
-    queue_bytes: usize,
-    /// Bytes of queued-but-unattempted payloads, held against `queue_bytes`.
-    /// This is the bound; the channel itself is unbounded because a count of
-    /// events says nothing about the memory they occupy.
-    queued: AtomicUsize,
-    /// Events queued and not yet attempted, which is what `settle` waits on.
-    pending: AtomicUsize,
     offered: AtomicU64,
     delivered: AtomicU64,
     dropped: AtomicU64,
@@ -909,29 +917,19 @@ impl Observer {
         // sequence number and the observer sees where it went.
         let sequence = self.offered.fetch_add(1, Ordering::Relaxed);
         let size = body.len();
-        let admitted = self
-            .queued
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
-                (queued + size <= self.queue_bytes).then_some(queued + size)
-            });
-        if admitted.is_err() {
-            self.drop_event(kind, sequence, "its queue of undelivered events is full");
-            return;
-        }
-        self.pending.fetch_add(1, Ordering::Relaxed);
-        if self
-            .events
-            .send(Event {
+        if let Err(error) = self.events.try_send(
+            Event {
                 kind,
                 sequence,
                 body: Arc::clone(body),
-            })
-            .is_err()
-        {
-            // The drain task is gone, which happens only as the process exits.
-            self.queued.fetch_sub(size, Ordering::Relaxed);
-            self.pending.fetch_sub(1, Ordering::Relaxed);
-            self.drop_event(kind, sequence, "its delivery task has stopped");
+            },
+            size,
+        ) {
+            let reason = match error.reason {
+                nano_queue::ReserveError::Full => "its queue of undelivered events is full",
+                nano_queue::ReserveError::Closed => "its delivery task has stopped",
+            };
+            self.drop_event(kind, sequence, reason);
         }
     }
 
@@ -1031,15 +1029,11 @@ fn retryable(status: reqwest::StatusCode) -> bool {
 /// Deliver one observer's events, in the order they were dispatched.
 async fn drain(
     observer: Arc<Observer>,
-    mut queue: mpsc::UnboundedReceiver<Event>,
+    mut queue: nano_queue::Receiver<Event>,
     client: reqwest::Client,
 ) {
-    while let Some(event) = queue.recv().await {
-        let size = event.body.len();
-        observer.deliver(&client, &event).await;
-        drop(event);
-        observer.queued.fetch_sub(size, Ordering::Relaxed);
-        observer.pending.fetch_sub(1, Ordering::Relaxed);
+    while let Some(event) = queue.recv_lease().await {
+        observer.deliver(&client, event.value()).await;
     }
 }
 
@@ -1069,8 +1063,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        DEFAULT_DISPATCH_ATTEMPTS, DROPPED_HEADER, DispatchLimits, EventDispatcher, EventKind,
-        SEQUENCE_HEADER, Url, Value, receipt_events, transaction_payload,
+        DEFAULT_DISPATCH_ATTEMPTS, DEFAULT_DISPATCH_QUEUE_ITEMS, DROPPED_HEADER, DispatchLimits,
+        EventDispatcher, EventKind, SEQUENCE_HEADER, Url, Value, receipt_events,
+        transaction_payload,
     };
 
     #[tokio::test]
@@ -1315,6 +1310,7 @@ mod tests {
             vec![url],
             DispatchLimits {
                 attempts: 1,
+                queue_items: DEFAULT_DISPATCH_QUEUE_ITEMS,
                 // Room for two of the payloads below and no more.
                 queue_bytes: 64,
             },
@@ -1332,6 +1328,9 @@ mod tests {
 
         let [status] = dispatcher.status().try_into().expect("one observer");
         assert!(status.dropped > 0, "the full queue dropped events");
+        assert!(status.saturations > 0, "the queue reports saturation");
+        assert_eq!(status.queued_bytes, 0);
+        assert_eq!(status.oldest_age_ms, None);
         assert_eq!(status.delivered + status.dropped, 20);
 
         // The observer has caught up, so the next event reaches it -- and it is
@@ -1358,5 +1357,27 @@ mod tests {
             "a gap in {sequences:?} is what tells the observer it missed events"
         );
         assert_eq!(last.dropped, status.dropped);
+    }
+
+    #[tokio::test]
+    async fn tiny_observer_events_are_bounded_by_count_too() {
+        let (url, _) = observer(Duration::from_millis(50)).await;
+        let dispatcher = EventDispatcher::with_limits(
+            vec![url],
+            DispatchLimits {
+                attempts: 1,
+                queue_items: 1,
+                queue_bytes: 1024 * 1024,
+            },
+        );
+        for sequence in 0..20 {
+            dispatcher.dispatch(EventKind::NewBlock, &json!({ "n": sequence }));
+        }
+        assert!(dispatcher.settle(PATIENCE).await, "the queue drained");
+
+        let [status] = dispatcher.status().try_into().expect("one observer");
+        assert!(status.dropped > 0);
+        assert!(status.saturations > 0);
+        assert_eq!(status.delivered + status.dropped, 20);
     }
 }

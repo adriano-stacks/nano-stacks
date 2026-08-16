@@ -174,7 +174,10 @@ impl<T> Permit<T> {
     /// Fill this reservation. This cannot fail after [`Sender::try_reserve`].
     pub fn send(mut self, value: T) {
         let channel = self.channel.take().expect("an unused queue permit");
-        let _ = channel.send(Entry { id: self.id, value });
+        let channel = channel.send(Entry { id: self.id, value });
+        if channel.is_closed() {
+            lock(&self.accounting).release(self.id);
+        }
     }
 }
 
@@ -203,15 +206,30 @@ impl<T> fmt::Debug for Receiver<T> {
 
 impl<T> Receiver<T> {
     pub async fn recv(&mut self) -> Option<T> {
-        let entry = self.channel.recv().await?;
-        lock(&self.accounting).release(entry.id);
-        Some(entry.value)
+        self.recv_lease().await.map(Lease::into_inner)
     }
 
     pub fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> {
+        self.try_recv_lease().map(Lease::into_inner)
+    }
+
+    /// Receive work while retaining its queue budget until the lease is dropped.
+    pub async fn recv_lease(&mut self) -> Option<Lease<T>> {
+        let entry = self.channel.recv().await?;
+        Some(Lease {
+            value: Some(entry.value),
+            accounting: Arc::clone(&self.accounting),
+            id: entry.id,
+        })
+    }
+
+    pub fn try_recv_lease(&mut self) -> Result<Lease<T>, mpsc::error::TryRecvError> {
         let entry = self.channel.try_recv()?;
-        lock(&self.accounting).release(entry.id);
-        Ok(entry.value)
+        Ok(Lease {
+            value: Some(entry.value),
+            accounting: Arc::clone(&self.accounting),
+            id: entry.id,
+        })
     }
 
     #[must_use]
@@ -232,9 +250,38 @@ impl<T> Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        let mut accounting = lock(&self.accounting);
-        accounting.entries.clear();
-        accounting.bytes = 0;
+        while let Ok(entry) = self.channel.try_recv() {
+            lock(&self.accounting).release(entry.id);
+        }
+    }
+}
+
+/// Received work whose memory remains charged until processing finishes.
+#[must_use = "dropping the lease releases its byte and item reservation"]
+pub struct Lease<T> {
+    value: Option<T>,
+    accounting: Arc<Mutex<Accounting>>,
+    id: u64,
+}
+
+impl<T> Lease<T> {
+    #[must_use]
+    pub const fn value(&self) -> &T {
+        self.value.as_ref().expect("a live queue lease")
+    }
+
+    #[must_use]
+    pub fn into_inner(mut self) -> T {
+        lock(&self.accounting).release(self.id);
+        self.value.take().expect("a live queue lease")
+    }
+}
+
+impl<T> Drop for Lease<T> {
+    fn drop(&mut self) {
+        if self.value.is_some() {
+            lock(&self.accounting).release(self.id);
+        }
     }
 }
 
@@ -368,6 +415,20 @@ mod tests {
         assert_eq!(receiver.recv().await, Some(1));
         sender.try_send(3, 8).expect("capacity recovered");
         assert_eq!(receiver.recv().await, Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_receive_lease_holds_capacity_until_work_finishes() {
+        let (sender, mut receiver) = channel(Limits::new(1, 8));
+        sender.try_send(1, 8).expect("fill the queue");
+        let lease = receiver.recv_lease().await.expect("receive work");
+        assert_eq!(*lease.value(), 1);
+        assert_eq!(sender.status().bytes, 8);
+        assert_eq!(sender.try_reserve(1).err(), Some(ReserveError::Full));
+
+        drop(lease);
+        sender.try_send(2, 8).expect("capacity recovered");
+        assert_eq!(receiver.recv().await, Some(2));
     }
 
     #[test]

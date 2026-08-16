@@ -45,11 +45,11 @@ use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 
 pub use chain::{AccountEntry, ChainAccess, ChainAccessError, ReadOnlyCall};
 pub use events::{
-    BlockEventContext, DEFAULT_DISPATCH_ATTEMPTS, EventDispatcher, EventKind, MaturedReward,
-    MaturedRewardSource, ProposalOutcome, ProposalRejectCode, RewardSetEvent, RewardSetSigner,
-    derived_signers, matured_rewards, mined_nakamoto_block_payload, new_block_payload,
-    new_burn_block_payload, proposal_response_payload, stacker_set_payload,
-    stackerdb_chunks_payload,
+    BlockEventContext, DEFAULT_DISPATCH_ATTEMPTS, DEFAULT_DISPATCH_QUEUE_ITEMS, EventDispatcher,
+    EventKind, MaturedReward, MaturedRewardSource, ProposalOutcome, ProposalRejectCode,
+    RewardSetEvent, RewardSetSigner, derived_signers, matured_rewards,
+    mined_nakamoto_block_payload, new_block_payload, new_burn_block_payload,
+    proposal_response_payload, stacker_set_payload, stackerdb_chunks_payload,
 };
 pub use metrics::{ExecutionCacheReport, NodeMetrics, serve as serve_metrics};
 pub use stackerdb::{ChunkRefusal, StackerDbStore};
@@ -930,6 +930,9 @@ async fn sync_status(
                     delivered: observer.delivered,
                     dropped: observer.dropped,
                     undelivered: observer.undelivered,
+                    queued_bytes: observer.queued_bytes,
+                    oldest_age_ms: observer.oldest_age_ms,
+                    saturations: observer.saturations,
                     reachable: observer.reachable,
                 })
                 .collect()
@@ -2366,6 +2369,9 @@ struct ObserverStatusWire {
     delivered: u64,
     dropped: u64,
     undelivered: usize,
+    queued_bytes: usize,
+    oldest_age_ms: Option<u64>,
+    saturations: u64,
     reachable: bool,
 }
 
