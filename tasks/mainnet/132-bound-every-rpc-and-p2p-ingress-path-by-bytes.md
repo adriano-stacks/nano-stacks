@@ -1,7 +1,7 @@
 ---
 id: "132"
 title: "Bound every RPC and P2P ingress path by bytes"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["063"]
