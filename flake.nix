@@ -74,7 +74,7 @@
             pname = "nano-stacks";
             version = "0.1.0-${builtins.substring 0 12 sourceRevision}";
             src = self;
-            cargoHash = "sha256-hSWYWmhfqgkcduxdxfqeAUt6uJkGLrCxvWcmGro1DVg=";
+            cargoHash = "sha256-d1wUTZliCixSmbo0uMQKyiH9RKLxNdnCg1wp3U3ZtXg=";
             cargoBuildFlags = [ "-p" "nano-node" "--bin" "stacks-node" ];
             doCheck = false;
 
