@@ -5787,6 +5787,7 @@ dependencies = [
  "nano-sync",
  "nano-vm",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "time",

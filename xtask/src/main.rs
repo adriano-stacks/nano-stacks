@@ -89,6 +89,13 @@ fn main() -> ExitCode {
     let command = env::args().nth(1);
     match command.as_deref() {
         Some("scoreboard") => print_scoreboard(),
+        Some("compatibility-vectors") => {
+            if report_compatibility_vectors(true) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         Some("release-report") => release_report(&env::args().skip(2).collect::<Vec<_>>()),
         Some("release-candidate") => {
             release_candidate::command(&env::args().skip(2).collect::<Vec<_>>(), &workspace_root())
@@ -146,7 +153,7 @@ fn main() -> ExitCode {
                  \x20 capture-fixtures  compiler-identity  decode-blocks  export-headers\n\
                  \x20 export-checkpoint-history  export-leader-keys  export-sortition\n\
                  \x20 freeze-receipts  public-key  seed-public-key\n\
-                 \x20 infrastructure-tests  release-candidate  release-report\n\
+                 \x20 compatibility-vectors  infrastructure-tests  release-candidate  release-report\n\
                  \x20 release-tree-status  scoreboard\n\
                  \x20 snapshot-state\n\
                  \x20 validate-fixtures\n\
@@ -6576,6 +6583,229 @@ fn report_replay_diagnostics(stderr: &str) {
     }
 }
 
+const NANO_VECTOR_OWNER: &str =
+    "epoch4_profile::every_mandatory_epoch4_vector_executes_against_nano";
+const STOCK_VECTOR_RUNNERS: [(&str, &str); 2] = [
+    (
+        "efc34a07a225c4b950ab9404a1652aa5e14affaf",
+        "compatibility/epoch4-stock-runner/efc34a07/Cargo.toml",
+    ),
+    (
+        "6d58b498d3bd4f5ee19c69dc97559b4cba8153e8",
+        "compatibility/epoch4-stock-runner/6d58b498/Cargo.toml",
+    ),
+];
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StockVectorRun {
+    id: String,
+    method: String,
+    status: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StockVectorReport {
+    profile: String,
+    revision: String,
+    runner: String,
+    vectors: Vec<StockVectorRun>,
+}
+
+fn expected_compatibility_vectors() -> Result<BTreeSet<String>, String> {
+    let corpus = nano_consensus_profile::vectors()?;
+    if corpus.profile != nano_consensus_profile::PROFILE_ID {
+        return Err(format!(
+            "vector corpus names {} instead of {}",
+            corpus.profile,
+            nano_consensus_profile::PROFILE_ID
+        ));
+    }
+    let ids = corpus
+        .vectors
+        .into_iter()
+        .map(|vector| vector.id)
+        .collect::<BTreeSet<_>>();
+    if ids.is_empty() {
+        return Err("the profile has no compatibility vectors".to_owned());
+    }
+    Ok(ids)
+}
+
+fn validate_stock_vector_report(
+    output: &[u8],
+    expected_revision: &str,
+) -> Result<Vec<StockVectorRun>, String> {
+    let report: StockVectorReport =
+        serde_json::from_slice(output).map_err(|error| error.to_string())?;
+    if report.profile != nano_consensus_profile::PROFILE_ID {
+        return Err(format!("stock runner named profile {}", report.profile));
+    }
+    if report.revision != expected_revision {
+        return Err(format!(
+            "stock runner reported revision {} instead of {expected_revision}",
+            report.revision
+        ));
+    }
+    if report.runner != "stock-stacks-core" {
+        return Err(format!(
+            "unexpected stock runner identity {}",
+            report.runner
+        ));
+    }
+
+    let expected = expected_compatibility_vectors()?;
+    let mut observed = BTreeSet::new();
+    for vector in &report.vectors {
+        if vector.status != "pass" {
+            return Err(format!("vector {} reported {}", vector.id, vector.status));
+        }
+        if vector.method.trim().is_empty() {
+            return Err(format!("vector {} names no execution method", vector.id));
+        }
+        if !observed.insert(vector.id.clone()) {
+            return Err(format!("vector {} appears twice", vector.id));
+        }
+    }
+    if observed != expected {
+        let missing = expected.difference(&observed).cloned().collect::<Vec<_>>();
+        let extra = observed.difference(&expected).cloned().collect::<Vec<_>>();
+        return Err(format!(
+            "stock vector set differs: missing [{}], extra [{}]",
+            missing.join(", "),
+            extra.join(", ")
+        ));
+    }
+    Ok(report.vectors)
+}
+
+fn stock_runner_inventory_is_complete() -> Result<(), String> {
+    let profile = nano_consensus_profile::profile()?;
+    let expected = profile
+        .reference_revisions
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let runners = STOCK_VECTOR_RUNNERS
+        .iter()
+        .map(|(revision, _)| (*revision).to_owned())
+        .collect::<BTreeSet<_>>();
+    if runners != expected {
+        return Err("stock runner revisions differ from the compatibility profile".to_owned());
+    }
+    Ok(())
+}
+
+fn run_nano_vector_owner() -> bool {
+    let gate = run_gate(
+        "cargo",
+        &[
+            "test",
+            "-p",
+            "nano-conformance",
+            "--test",
+            "conformance",
+            NANO_VECTOR_OWNER,
+            "--",
+            "--exact",
+        ],
+        &[],
+    );
+    let passed = gate.passed
+        && gate.detail.contains("1 passed")
+        && gate.detail.contains("0 failed")
+        && gate.detail.contains("0 ignored");
+    println!(
+        "  {:<6} nano {}: {}",
+        if passed { "PASS" } else { "FAIL" },
+        NANO_VECTOR_OWNER,
+        gate.detail
+    );
+    passed
+}
+
+fn run_stock_vector_owner(revision: &str, manifest: &str) -> bool {
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--locked",
+            "--quiet",
+            "--manifest-path",
+            manifest,
+            "--target-dir",
+            "target/epoch4-stock-runner",
+        ])
+        .env("CARGO_BUILD_JOBS", "2")
+        .current_dir(workspace_root())
+        .output();
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("stock runner failed without an error")
+                .to_owned();
+            println!("  FAIL   stock {revision}: {detail}");
+            return false;
+        }
+        Err(error) => {
+            println!("  FAIL   stock {revision}: could not start cargo: {error}");
+            return false;
+        }
+    };
+    match validate_stock_vector_report(&output.stdout, revision) {
+        Ok(vectors) => {
+            println!("  PASS   stock {revision}");
+            for vector in vectors {
+                println!("    PASS {:<42} {}", vector.id, vector.method);
+            }
+            true
+        }
+        Err(error) => {
+            println!("  FAIL   stock {revision}: {error}");
+            false
+        }
+    }
+}
+
+fn report_compatibility_vectors(run_gates: bool) -> bool {
+    println!("\ncompatibility vectors");
+    let expected = match expected_compatibility_vectors() {
+        Ok(expected) => expected,
+        Err(error) => {
+            println!("  FAIL: {error}");
+            return false;
+        }
+    };
+    if let Err(error) = stock_runner_inventory_is_complete() {
+        println!("  FAIL: {error}");
+        return false;
+    }
+    println!(
+        "  profile              {} ({} mandatory vectors)",
+        nano_consensus_profile::PROFILE_ID,
+        expected.len()
+    );
+    if !run_gates {
+        println!("  UNEXECUTED nano {NANO_VECTOR_OWNER}");
+        for (revision, _) in STOCK_VECTOR_RUNNERS {
+            println!("  UNEXECUTED stock revision {revision}");
+        }
+        for id in expected {
+            println!("    mandatory vector {id}");
+        }
+        return true;
+    }
+
+    let mut passed = run_nano_vector_owner();
+    for (revision, manifest) in STOCK_VECTOR_RUNNERS {
+        passed &= run_stock_vector_owner(revision, manifest);
+    }
+    passed
+}
+
 /// Every `NANO_*` variable this run was given, without secret material.
 ///
 /// Part of "the exact commands": most of the mainnet gates take their inputs from
@@ -6931,6 +7161,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
     let contract_arities = report_contract_arities(options.state.as_deref(), options.run_gates);
     let checkpoint_profile = report_checkpoint(options.state.as_deref(), options.run_gates);
     let scoreboard = report_scoreboard(options.state.as_deref(), options.run_gates);
+    let compatibility_vectors = report_compatibility_vectors(options.run_gates);
     report_inputs();
     let release_inventory = report_release_inventory(&inventory, options.run_gates);
 
@@ -6956,6 +7187,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
         && contract_arities
         && checkpoint_profile
         && scoreboard
+        && compatibility_vectors
         && receipt_binding
         && historical_epoch_evidence
         && release_inventory
@@ -7102,7 +7334,7 @@ mod tests {
         ContractLocalsPeak, ContractRefusal, MINER_REWARD_MATURITY, arity_dimensions,
         chainstate_directory, contract_metadata_candidates, crosses_wasm_arity_boundary,
         encode_hex, prune_clarity_metadata_after_checkpoint, public_key_for_seed, refusal_reason,
-        refuse_a_short_earnings_window, report_contract_arities,
+        refuse_a_short_earnings_window, report_contract_arities, validate_stock_vector_report,
         write_checkpoint_authentication_history,
     };
     use nano_chainstate::NakamotoBlock;
@@ -7111,6 +7343,48 @@ mod tests {
     struct FixtureBlock {
         raw: Vec<u8>,
         decoded: NakamotoBlock,
+    }
+
+    #[test]
+    fn stock_vector_reports_must_name_every_vector_and_the_pinned_revision() {
+        let revision = super::STOCK_VECTOR_RUNNERS[0].0;
+        let vectors = nano_consensus_profile::vectors()
+            .expect("vector corpus")
+            .vectors
+            .into_iter()
+            .map(|vector| {
+                json!({
+                    "id": vector.id,
+                    "method": "stock API",
+                    "status": "pass",
+                })
+            })
+            .collect::<Vec<_>>();
+        let report = json!({
+            "profile": nano_consensus_profile::PROFILE_ID,
+            "revision": revision,
+            "runner": "stock-stacks-core",
+            "vectors": vectors,
+        });
+        assert!(
+            validate_stock_vector_report(&serde_json::to_vec(&report).unwrap(), revision).is_ok()
+        );
+
+        let mut missing = report.clone();
+        missing["vectors"].as_array_mut().unwrap().pop();
+        assert!(
+            validate_stock_vector_report(&serde_json::to_vec(&missing).unwrap(), revision)
+                .unwrap_err()
+                .contains("missing")
+        );
+
+        let mut stale = report;
+        stale["revision"] = json!("another-revision");
+        assert!(
+            validate_stock_vector_report(&serde_json::to_vec(&stale).unwrap(), revision)
+                .unwrap_err()
+                .contains("instead of")
+        );
     }
 
     #[test]

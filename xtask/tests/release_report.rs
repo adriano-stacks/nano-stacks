@@ -457,6 +457,24 @@ fn no_gates_is_non_qualifying_and_names_every_unexecuted_owner() {
         "the report omitted its required semantic engine comparison:\n{stdout}"
     );
     assert!(
+        stdout.contains(
+            "UNEXECUTED nano epoch4_profile::every_mandatory_epoch4_vector_executes_against_nano"
+        ) && stdout.contains("UNEXECUTED stock revision efc34a07a225c4b950ab9404a1652aa5e14affaf")
+            && stdout
+                .contains("UNEXECUTED stock revision 6d58b498d3bd4f5ee19c69dc97559b4cba8153e8"),
+        "the report omitted an unexecuted compatibility runner:\n{stdout}"
+    );
+    for vector in nano_consensus_profile::vectors()
+        .expect("vector corpus")
+        .vectors
+    {
+        assert!(
+            stdout.contains(&format!("mandatory vector {}", vector.id)),
+            "the report omitted mandatory vector {}:\n{stdout}",
+            vector.id
+        );
+    }
+    assert!(
         stdout.contains("reference snapshot   PASS stacks-core at-block refusal")
             && stdout.contains("observed mainnet     PASS block 8686666 tx f33840c5"),
         "the report did not distinguish reference and observed epoch evidence:\n{stdout}"
