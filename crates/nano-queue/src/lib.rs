@@ -30,6 +30,8 @@ impl Limits {
 pub struct Status {
     pub items: usize,
     pub bytes: usize,
+    pub item_limit: usize,
+    pub byte_limit: usize,
     pub oldest_age: Option<Duration>,
     pub dropped: u64,
     pub saturations: u64,
@@ -115,6 +117,8 @@ impl<T> Buffer<T> {
         Status {
             items: self.entries.len(),
             bytes: self.bytes,
+            item_limit: self.limits.items,
+            byte_limit: self.limits.bytes,
             oldest_age: self.entries.front().map(|entry| entry.at.elapsed()),
             dropped: self.dropped,
             saturations: self.saturations,
@@ -428,6 +432,8 @@ impl Accounting {
         Status {
             items: self.entries.len(),
             bytes: self.bytes,
+            item_limit: self.limits.items,
+            byte_limit: self.limits.bytes,
             oldest_age: self
                 .entries
                 .values()

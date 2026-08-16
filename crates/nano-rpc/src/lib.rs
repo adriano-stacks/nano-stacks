@@ -387,6 +387,13 @@ impl RpcState {
         self.metrics.clone()
     }
 
+    /// Use one metrics registry created before the RPC itself is ready.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: NodeMetrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// The `StackerDB` replicas this node serves, so the node can configure
     /// their writers and read what a signer wrote.
     #[must_use]
@@ -473,6 +480,7 @@ impl RpcState {
     /// Publish the events a route produces to these observers.
     #[must_use]
     pub fn with_observers(mut self, observers: EventDispatcher) -> Self {
+        observers.publish_metrics_to(&self.metrics);
         self.observers = Some(observers);
         self
     }

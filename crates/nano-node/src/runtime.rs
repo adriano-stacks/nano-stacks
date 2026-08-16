@@ -224,13 +224,13 @@ fn hold_state_directory(working_dir: &Path) -> Result<File, Box<dyn Error>> {
 
 /// Run a node until it is asked to stop or a role gives up.
 pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
-    // Held for the lifetime of the process, and released by the kernel whatever
-    // way it ends. Makes the directory as well: nothing runs before this.
+    // The kernel releases this lifetime lock even after a kill.
     let _state = hold_state_directory(&config.node.working_dir)?;
     let mut roles: JoinSet<(Job, Role)> = JoinSet::new();
     // Written by the follow loop once there is a chain to describe, and read by the
     // discovery loop that starts before there is one.
     let advertised = Advertised::open(&config.node.working_dir);
+    let metrics = nano_rpc::NodeMetrics::default();
     // Where a peer's pushed blocks and transactions wait for the loop that can check
     // them. Created here rather than inside the transport because the follow loop is
     // the other end of it, and neither half is the owner.
@@ -241,10 +241,8 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     // second field of the first message — so a configuration that leaves the chain
     // to be discovered gets no transport, and falls back to what it always did.
     let phase = Phase::start("joining the peer network");
-    let discovered = match config.network() {
-        Some(network) => start_transport(&config, network, &advertised, &relay, &mut roles).await,
-        None => None,
-    };
+    let discovered =
+        start_configured_transport(&config, &advertised, &relay, metrics.clone(), &mut roles).await;
     drop(phase);
     let phase = Phase::start("reaching a peer");
     let peer = awaited_peer(&config, discovered.as_ref()).await?;
@@ -282,7 +280,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let archive = keep_executed_blocks(&config, executor.as_ref()).await;
     let (wiring, api_to_loop, hosted) = ApiWiring::new(executor.clone(), mempool.clone(), archive);
     let rpc_enabled = config.node.rpc_bind.is_some();
-    let state = start_rpc(&config, network, wiring, &dispatcher, &mut roles).await?;
+    let state = start_rpc(&config, network, wiring, &dispatcher, metrics, &mut roles).await?;
     if let Some(executor) = executor.as_ref() {
         executor.lock().await.publish_execution_to(state.metrics());
     }
@@ -2492,6 +2490,7 @@ async fn start_rpc(
     network: Network,
     wiring: ApiWiring,
     dispatcher: &EventDispatcher,
+    metrics: nano_rpc::NodeMetrics,
     roles: &mut JoinSet<(Job, Result<(), String>)>,
 ) -> Result<RpcState, Box<dyn Error>> {
     let ApiWiring {
@@ -2504,6 +2503,7 @@ async fn start_rpc(
         submitted,
     } = wiring;
     let mut state = RpcState::new(network)
+        .with_metrics(metrics)
         .with_roles(nano_rpc::NodeRoles {
             follower: config.node.rpc_bind.is_some() || config.miner.is_some(),
             signer: config.signer.is_some(),
@@ -3244,6 +3244,8 @@ async fn finish_round(
                 nano_rpc::IngressQueueStatus {
                     items: relay.offered,
                     bytes: relay.offered_bytes,
+                    item_limit: relay.offered_item_limit,
+                    byte_limit: relay.offered_byte_limit,
                     oldest_age: relay.offered_oldest_age,
                     dropped: relay.offered_dropped,
                     saturations: relay.offered_saturations,
@@ -3254,6 +3256,8 @@ async fn finish_round(
                 nano_rpc::IngressQueueStatus {
                     items: relay.announcing,
                     bytes: relay.announcing_bytes,
+                    item_limit: relay.announcing_item_limit,
+                    byte_limit: relay.announcing_byte_limit,
                     oldest_age: relay.announcing_oldest_age,
                     dropped: relay.announcing_dropped,
                     saturations: relay.announcing_saturations,
@@ -3702,11 +3706,22 @@ fn advertise_peer_services(local: &mut nano_p2p::LocalPeer, rpc: Option<std::net
 /// identifier to be discovered, which cannot work here because on this protocol
 /// the network id *is* the chain id and it is in the first field of the first
 /// message.
+async fn start_configured_transport(
+    config: &Config,
+    advertised: &Advertised,
+    relay: &nano_p2p::Relay,
+    metrics: nano_rpc::NodeMetrics,
+    roles: &mut JoinSet<(Job, Role)>,
+) -> Option<Discovered> {
+    start_transport(config, config.network()?, advertised, relay, metrics, roles).await
+}
+
 async fn start_transport(
     config: &Config,
     network: Network,
     advertised: &Advertised,
     relay: &nano_p2p::Relay,
+    metrics: nano_rpc::NodeMetrics,
     roles: &mut JoinSet<(Job, Role)>,
 ) -> Option<Discovered> {
     let seeds = config.node.bootstrap_seeds();
@@ -3782,6 +3797,10 @@ async fn start_transport(
     let view = advertised_view(&bitcoin, stable_confirmations);
     advertised.publish_view(view);
     let round = swarm.maintain(view, None).await;
+    metrics.publish_ingress_queue(
+        nano_rpc::IngressQueue::PeerPushes,
+        swarm.pushed_status().into(),
+    );
     println!(
         "p2p: {} peers connected, {} known, {} endpoints to fetch from",
         round.connected,
@@ -3804,6 +3823,7 @@ async fn start_transport(
                 bitcoin,
                 advertised,
                 relay,
+                metrics,
                 tick,
                 stable_confirmations,
             )
@@ -3835,6 +3855,7 @@ async fn peer_discovery(
     bitcoin: BurnchainSource,
     advertised: Advertised,
     relay: nano_p2p::Relay,
+    metrics: nano_rpc::NodeMetrics,
     tick: Duration,
     stable_confirmations: u64,
 ) -> Role {
@@ -3886,6 +3907,10 @@ async fn peer_discovery(
         // a `Service` hands them to it, and this node's `Service` puts them on the
         // relay queue. What `take_pushed` still returns is the signer and StackerDB
         // chunks, which nano replicates over HTTP.
+        metrics.publish_ingress_queue(
+            nano_rpc::IngressQueue::PeerPushes,
+            swarm.pushed_status().into(),
+        );
         let carried = swarm.take_pushed().len();
         if round.collected > 0 {
             println!(

@@ -338,6 +338,16 @@ impl Swarm {
         &self.peers
     }
 
+    /// Aggregate the independently bounded push buffers of every live session.
+    #[must_use]
+    pub fn pushed_status(&self) -> nano_queue::Status {
+        aggregate_queue_statuses(
+            self.connected
+                .iter()
+                .map(|peer| peer.session.pushed_status()),
+        )
+    }
+
     /// Record a configured bootstrap peer, resolving its host.
     ///
     /// The key in a seed specification is ignored beyond being parsed: a session
@@ -705,6 +715,23 @@ impl Swarm {
     }
 }
 
+fn aggregate_queue_statuses(
+    statuses: impl IntoIterator<Item = nano_queue::Status>,
+) -> nano_queue::Status {
+    statuses
+        .into_iter()
+        .fold(nano_queue::Status::default(), |mut total, status| {
+            total.items = total.items.saturating_add(status.items);
+            total.bytes = total.bytes.saturating_add(status.bytes);
+            total.item_limit = total.item_limit.saturating_add(status.item_limit);
+            total.byte_limit = total.byte_limit.saturating_add(status.byte_limit);
+            total.oldest_age = total.oldest_age.max(status.oldest_age);
+            total.dropped = total.dropped.saturating_add(status.dropped);
+            total.saturations = total.saturations.saturating_add(status.saturations);
+            total
+        })
+}
+
 /// Spread a cycle's wanted tenures over the peers that claim to have them.
 ///
 /// This is the scheduling half of inventory sync, kept as a pure function because
@@ -765,6 +792,37 @@ pub fn assign_tenures(claims: &[TenureClaim], wanted: &[u16]) -> Vec<(u16, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_push_statuses_add_without_losing_the_oldest_or_limits() {
+        let status = aggregate_queue_statuses([
+            nano_queue::Status {
+                items: 2,
+                bytes: 5,
+                item_limit: 3,
+                byte_limit: 8,
+                oldest_age: Some(Duration::from_secs(2)),
+                dropped: 1,
+                saturations: 2,
+            },
+            nano_queue::Status {
+                items: 4,
+                bytes: 7,
+                item_limit: 6,
+                byte_limit: 10,
+                oldest_age: Some(Duration::from_secs(3)),
+                dropped: 3,
+                saturations: 4,
+            },
+        ]);
+        assert_eq!(status.items, 6);
+        assert_eq!(status.bytes, 12);
+        assert_eq!(status.item_limit, 9);
+        assert_eq!(status.byte_limit, 18);
+        assert_eq!(status.oldest_age, Some(Duration::from_secs(3)));
+        assert_eq!(status.dropped, 4);
+        assert_eq!(status.saturations, 6);
+    }
 
     fn claim(peer: u8, endpoint: Option<&str>, has: &[u16]) -> TenureClaim {
         let mut tenures = BitVec::<2100>::zeros(2100).expect("a cycle-length bit vector");

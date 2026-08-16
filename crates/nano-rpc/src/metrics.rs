@@ -46,18 +46,23 @@ pub enum IngressQueue {
     Transactions,
     RelayOffered,
     RelayAnnouncing,
+    EventObserver(usize),
+    PeerPushes,
 }
 
 impl EncodeLabelValue for IngressQueue {
     fn encode(&self, encoder: &mut LabelValueEncoder<'_>) -> std::fmt::Result {
-        encoder.write_str(match self {
+        let name = match self {
             Self::BlockUploads => "block_uploads",
             Self::Proposals => "proposals",
             Self::StackerDbChunks => "stackerdb_chunks",
             Self::Transactions => "transactions",
             Self::RelayOffered => "relay_offered",
             Self::RelayAnnouncing => "relay_announcing",
-        })
+            Self::PeerPushes => "peer_pushes",
+            Self::EventObserver(index) => return write!(encoder, "event_observer_{index}"),
+        };
+        encoder.write_str(name)
     }
 }
 
@@ -66,6 +71,8 @@ impl EncodeLabelValue for IngressQueue {
 pub struct IngressQueueStatus {
     pub items: usize,
     pub bytes: usize,
+    pub item_limit: usize,
+    pub byte_limit: usize,
     pub oldest_age: Option<Duration>,
     pub dropped: u64,
     pub saturations: u64,
@@ -76,6 +83,8 @@ impl From<nano_queue::Status> for IngressQueueStatus {
         Self {
             items: status.items,
             bytes: status.bytes,
+            item_limit: status.item_limit,
+            byte_limit: status.byte_limit,
             oldest_age: status.oldest_age,
             dropped: status.dropped,
             saturations: status.saturations,
@@ -91,6 +100,8 @@ struct IngressQueueLabels {
 struct IngressQueueGauges {
     items: Family<IngressQueueLabels, IntGauge>,
     bytes: Family<IngressQueueLabels, IntGauge>,
+    item_limit: Family<IngressQueueLabels, IntGauge>,
+    byte_limit: Family<IngressQueueLabels, IntGauge>,
     oldest_age_seconds: Family<IngressQueueLabels, FloatGauge>,
     dropped: Family<IngressQueueLabels, IntGauge>,
     saturations: Family<IngressQueueLabels, IntGauge>,
@@ -100,6 +111,8 @@ impl IngressQueueGauges {
     fn register(registry: &mut Registry) -> Self {
         let items = Family::default();
         let bytes = Family::default();
+        let item_limit = Family::default();
+        let byte_limit = Family::default();
         let oldest_age_seconds = Family::default();
         let dropped = Family::default();
         let saturations = Family::default();
@@ -112,6 +125,16 @@ impl IngressQueueGauges {
             "ingress_queue_bytes",
             "Bytes retained by each externally fed bounded queue.",
             bytes.clone(),
+        );
+        registry.register(
+            "ingress_queue_item_limit",
+            "Maximum items each externally fed bounded queue retains.",
+            item_limit.clone(),
+        );
+        registry.register(
+            "ingress_queue_byte_limit",
+            "Maximum bytes each externally fed bounded queue retains.",
+            byte_limit.clone(),
         );
         registry.register(
             "ingress_queue_oldest_age_seconds",
@@ -131,6 +154,8 @@ impl IngressQueueGauges {
         Self {
             items,
             bytes,
+            item_limit,
+            byte_limit,
             oldest_age_seconds,
             dropped,
             saturations,
@@ -141,6 +166,12 @@ impl IngressQueueGauges {
         let labels = IngressQueueLabels { queue };
         self.items.get_or_create(&labels).set(as_i64(status.items));
         self.bytes.get_or_create(&labels).set(as_i64(status.bytes));
+        self.item_limit
+            .get_or_create(&labels)
+            .set(as_i64(status.item_limit));
+        self.byte_limit
+            .get_or_create(&labels)
+            .set(as_i64(status.byte_limit));
         self.oldest_age_seconds
             .get_or_create(&labels)
             .set(status.oldest_age.map_or(0.0, |age| age.as_secs_f64()));
@@ -898,6 +929,8 @@ mod tests {
         "nano_staged_blocks 7",
         "nano_ingress_queue_items{queue=\"block_uploads\"} 3",
         "nano_ingress_queue_bytes{queue=\"block_uploads\"} 1024",
+        "nano_ingress_queue_item_limit{queue=\"block_uploads\"} 8",
+        "nano_ingress_queue_byte_limit{queue=\"block_uploads\"} 2048",
         "nano_ingress_queue_oldest_age_seconds{queue=\"block_uploads\"} 2.5",
         "nano_ingress_queue_dropped{queue=\"block_uploads\"} 4",
         "nano_ingress_queue_saturations{queue=\"block_uploads\"} 5",
@@ -995,6 +1028,8 @@ mod tests {
             IngressQueueStatus {
                 items: 3,
                 bytes: 1024,
+                item_limit: 8,
+                byte_limit: 2048,
                 oldest_age: Some(std::time::Duration::from_millis(2500)),
                 dropped: 4,
                 saturations: 5,
@@ -1059,6 +1094,46 @@ mod tests {
         for sample in GOLDEN_SAMPLES {
             assert!(body.contains(sample), "missing {sample:?} in {body}");
         }
+    }
+
+    #[tokio::test]
+    async fn observer_queue_limits_and_saturation_are_published() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("observer listener");
+        let address = listener.local_addr().expect("observer address");
+        let (accepted, connected) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("observer connection");
+            let _ = accepted.send(());
+            std::future::pending::<()>().await;
+        });
+        let observer = reqwest::Url::parse(&format!("http://{address}/")).expect("observer URL");
+        let dispatcher = crate::EventDispatcher::with_limits(
+            vec![observer],
+            crate::events::DispatchLimits {
+                attempts: 1,
+                queue_items: 2,
+                queue_bytes: 64,
+            },
+        );
+        let state = RpcState::new(Network::TESTNET).with_observers(dispatcher.clone());
+
+        dispatcher.dispatch(crate::EventKind::NewBlock, &serde_json::json!({"n": 1}));
+        tokio::time::timeout(std::time::Duration::from_secs(1), connected)
+            .await
+            .expect("the observer connects")
+            .expect("the observer task remains alive");
+        dispatcher.dispatch(crate::EventKind::NewBlock, &serde_json::json!({"n": 2}));
+        dispatcher.dispatch(crate::EventKind::NewBlock, &serde_json::json!({"n": 3}));
+
+        let body = state.metrics().encode().expect("metrics encode");
+        assert!(body.contains("nano_ingress_queue_items{queue=\"event_observer_0\"} 2"));
+        assert!(body.contains("nano_ingress_queue_item_limit{queue=\"event_observer_0\"} 2"));
+        assert!(body.contains("nano_ingress_queue_byte_limit{queue=\"event_observer_0\"} 64"));
+        assert!(body.contains("nano_ingress_queue_dropped{queue=\"event_observer_0\"} 1"));
+        assert!(body.contains("nano_ingress_queue_saturations{queue=\"event_observer_0\"} 1"));
+        server.abort();
     }
 
     #[tokio::test]

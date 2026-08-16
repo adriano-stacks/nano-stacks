@@ -153,12 +153,16 @@ pub struct RelayStatus {
     /// Peer pushes waiting for local validation.
     pub offered: usize,
     pub offered_bytes: usize,
+    pub offered_item_limit: usize,
+    pub offered_byte_limit: usize,
     pub offered_oldest_age: Option<Duration>,
     pub offered_dropped: u64,
     pub offered_saturations: u64,
     /// Accepted items waiting to be sent to peers.
     pub announcing: usize,
     pub announcing_bytes: usize,
+    pub announcing_item_limit: usize,
+    pub announcing_byte_limit: usize,
     pub announcing_oldest_age: Option<Duration>,
     pub announcing_dropped: u64,
     pub announcing_saturations: u64,
@@ -280,11 +284,15 @@ impl Relay {
             RelayStatus {
                 offered: offered.items,
                 offered_bytes: offered.bytes,
+                offered_item_limit: offered.item_limit,
+                offered_byte_limit: offered.byte_limit,
                 offered_oldest_age: offered.oldest_age,
                 offered_dropped: offered.dropped,
                 offered_saturations: offered.saturations,
                 announcing: announcing.items,
                 announcing_bytes: announcing.bytes,
+                announcing_item_limit: announcing.item_limit,
+                announcing_byte_limit: announcing.byte_limit,
                 announcing_oldest_age: announcing.oldest_age,
                 announcing_dropped: announcing.dropped,
                 announcing_saturations: announcing.saturations,
@@ -398,11 +406,15 @@ mod tests {
         let status = relay.status().expect("relay status");
         assert_eq!(status.offered, MAX_QUEUED_OFFERS);
         assert!(status.offered_bytes <= MAX_QUEUED_OFFER_BYTES);
+        assert_eq!(status.offered_item_limit, MAX_QUEUED_OFFERS);
+        assert_eq!(status.offered_byte_limit, MAX_QUEUED_OFFER_BYTES);
         assert!(status.offered_oldest_age.is_some());
         assert_eq!(status.offered_dropped, 8);
         assert_eq!(status.offered_saturations, 8);
         assert_eq!(status.announcing, 0);
         assert_eq!(status.announcing_bytes, 0);
+        assert_eq!(status.announcing_item_limit, MAX_QUEUED_OFFERS);
+        assert_eq!(status.announcing_byte_limit, MAX_QUEUED_OFFER_BYTES);
         assert_eq!(status.announcing_oldest_age, None);
         assert_eq!(status.announcing_dropped, 0);
         assert_eq!(status.announcing_saturations, 0);

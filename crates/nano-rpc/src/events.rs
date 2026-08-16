@@ -7,7 +7,7 @@
 
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -790,7 +790,8 @@ impl EventDispatcher {
         let client = reqwest::Client::new();
         let observers = observers
             .into_iter()
-            .map(|url| {
+            .enumerate()
+            .map(|(index, url)| {
                 let (events, queue) = nano_queue::channel(nano_queue::Limits::new(
                     limits.queue_items,
                     limits.queue_bytes,
@@ -804,6 +805,8 @@ impl EventDispatcher {
                     dropped: AtomicU64::new(0),
                     reachable: AtomicBool::new(true),
                     complained: Mutex::new(None),
+                    metrics: OnceLock::new(),
+                    metric_queue: crate::IngressQueue::EventObserver(index),
                 });
                 tokio::spawn(drain(Arc::clone(&observer), queue, client.clone()));
                 observer
@@ -823,6 +826,13 @@ impl EventDispatcher {
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<StreamEvent> {
         self.stream.subscribe()
+    }
+
+    pub(crate) fn publish_metrics_to(&self, metrics: &crate::NodeMetrics) {
+        for observer in &self.observers {
+            let _ = observer.metrics.set(metrics.clone());
+            observer.publish_queue();
+        }
     }
 
     /// Queue one event for every observer and return.
@@ -908,6 +918,8 @@ struct Observer {
     reachable: AtomicBool,
     /// When this observer was last complained about.
     complained: Mutex<Option<Instant>>,
+    metrics: OnceLock<crate::NodeMetrics>,
+    metric_queue: crate::IngressQueue,
 }
 
 impl Observer {
@@ -931,6 +943,7 @@ impl Observer {
             };
             self.drop_event(kind, sequence, reason);
         }
+        self.publish_queue();
     }
 
     /// POST one event, retrying a live observer and giving up on a dead one.
@@ -1019,6 +1032,12 @@ impl Observer {
         *complained = Some(Instant::now());
         true
     }
+
+    fn publish_queue(&self) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.publish_ingress_queue(self.metric_queue, self.events.status().into());
+        }
+    }
 }
 
 /// Whether asking this observer again could get a different answer.
@@ -1034,6 +1053,8 @@ async fn drain(
 ) {
     while let Some(event) = queue.recv_lease().await {
         observer.deliver(&client, event.value()).await;
+        drop(event);
+        observer.publish_queue();
     }
 }
 
