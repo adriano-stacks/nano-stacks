@@ -25,7 +25,11 @@ members = [
     "crates/nano-conformance",
     "xtask",
 ]
-exclude = ["vendor/clarity-wasm"]
+exclude = [
+    "compatibility/epoch4-stock-runner/6d58b498",
+    "compatibility/epoch4-stock-runner/efc34a07",
+    "vendor/clarity-wasm",
+]
 default-members = ["crates/nano-node", "crates/nano-conformance", "xtask"]
 
 [workspace.package]

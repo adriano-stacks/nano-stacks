@@ -30,7 +30,7 @@ nano promises to preserve.
       source silently.
 - [x] Convert the profile into implementation-neutral block, transaction,
       sortition, signer, VM, receipt, cost and refusal vectors.
-- [ ] Run the vectors against nano and more than one compatible stock
+- [x] Run the vectors against nano and more than one compatible stock
       stacks-core revision so one reference implementation bug is not copied into
       the specification unnoticed.
 - [x] Make checkpoint import, state opening and release qualification verify the
