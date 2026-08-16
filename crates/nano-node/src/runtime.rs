@@ -661,16 +661,16 @@ struct Follower {
     executor: Option<SharedExecutor>,
     miner_owns_execution: Arc<AtomicBool>,
     /// Blocks the public API authenticated, waiting to be staged.
-    offered: tokio::sync::mpsc::UnboundedReceiver<NakamotoBlock>,
+    offered: nano_queue::Receiver<NakamotoBlock>,
     /// Transactions the public API admitted, waiting to be passed on.
-    submitted: tokio::sync::mpsc::UnboundedReceiver<nano_codec::Transaction>,
+    submitted: nano_queue::Receiver<nano_codec::Transaction>,
 }
 
 /// What arrived other than by following: what this node's own API admitted, and
 /// what peers pushed at it.
 struct AdmittedInputs<'a> {
-    offered: &'a mut tokio::sync::mpsc::UnboundedReceiver<NakamotoBlock>,
-    submitted: &'a mut tokio::sync::mpsc::UnboundedReceiver<nano_codec::Transaction>,
+    offered: &'a mut nano_queue::Receiver<NakamotoBlock>,
+    submitted: &'a mut nano_queue::Receiver<nano_codec::Transaction>,
     executor: Option<&'a SharedExecutor>,
     mempool: &'a Arc<Mutex<nano_mempool::Mempool>>,
     relay: &'a nano_p2p::Relay,
@@ -989,10 +989,7 @@ async fn prepare_to_follow(
 ///
 /// It is relayed only after execution commits it, through the same announcement
 /// path as a peer-fetched block.
-fn stage_admitted_blocks(
-    offered: &mut tokio::sync::mpsc::UnboundedReceiver<NakamotoBlock>,
-    staging: &Staging,
-) {
+fn stage_admitted_blocks(offered: &mut nano_queue::Receiver<NakamotoBlock>, staging: &Staging) {
     while let Ok(block) = offered.try_recv() {
         match staging.download(&block) {
             Ok(_) => println!(
@@ -1016,7 +1013,7 @@ fn stage_admitted_blocks(
 /// this node's own rules, against its own accounts — so all that is left is to
 /// say so.
 fn relay_admitted_transactions(
-    submitted: &mut tokio::sync::mpsc::UnboundedReceiver<nano_codec::Transaction>,
+    submitted: &mut nano_queue::Receiver<nano_codec::Transaction>,
     relay: &nano_p2p::Relay,
 ) {
     while let Ok(transaction) = submitted.try_recv() {
@@ -2444,22 +2441,22 @@ struct ApiWiring {
     /// drained by the follow loop into the same staging store the peer's blocks
     /// land in — so an upload and a followed block are the same thing from the
     /// moment they are authenticated.
-    blocks: tokio::sync::mpsc::UnboundedSender<NakamotoBlock>,
-    proposals: tokio::sync::mpsc::UnboundedSender<nano_rpc::ProposalRequest>,
-    chunks: tokio::sync::mpsc::UnboundedSender<(String, nano_stackerdb::Chunk)>,
-    submitted: tokio::sync::mpsc::UnboundedSender<nano_codec::Transaction>,
+    blocks: nano_queue::Sender<NakamotoBlock>,
+    proposals: nano_queue::Sender<nano_rpc::ProposalRequest>,
+    chunks: nano_queue::Sender<(String, nano_stackerdb::Chunk)>,
+    submitted: nano_queue::Sender<nano_codec::Transaction>,
 }
 
 /// The far ends of the channels the follow loop drains.
 struct FollowedChannels {
-    offered: tokio::sync::mpsc::UnboundedReceiver<NakamotoBlock>,
-    submitted: tokio::sync::mpsc::UnboundedReceiver<nano_codec::Transaction>,
+    offered: nano_queue::Receiver<NakamotoBlock>,
+    submitted: nano_queue::Receiver<nano_codec::Transaction>,
 }
 
 /// The far ends of the channels the hosting role drains.
 struct HostedChannels {
-    proposed: tokio::sync::mpsc::UnboundedReceiver<nano_rpc::ProposalRequest>,
-    written: tokio::sync::mpsc::UnboundedReceiver<(String, nano_stackerdb::Chunk)>,
+    proposed: nano_queue::Receiver<nano_rpc::ProposalRequest>,
+    written: nano_queue::Receiver<(String, nano_stackerdb::Chunk)>,
 }
 
 impl ApiWiring {
@@ -2469,10 +2466,10 @@ impl ApiWiring {
         mempool: Arc<Mutex<nano_mempool::Mempool>>,
         archive: Option<Arc<crate::archive::Archive>>,
     ) -> (Self, FollowedChannels, HostedChannels) {
-        let (blocks, offered) = tokio::sync::mpsc::unbounded_channel();
-        let (proposals, proposed) = tokio::sync::mpsc::unbounded_channel();
-        let (chunks, written) = tokio::sync::mpsc::unbounded_channel();
-        let (relayed, submitted) = tokio::sync::mpsc::unbounded_channel();
+        let (blocks, offered) = nano_queue::channel(nano_rpc::BLOCK_QUEUE_LIMITS);
+        let (proposals, proposed) = nano_queue::channel(nano_rpc::PROPOSAL_QUEUE_LIMITS);
+        let (chunks, written) = nano_queue::channel(nano_rpc::CHUNK_QUEUE_LIMITS);
+        let (relayed, submitted) = nano_queue::channel(nano_rpc::TRANSACTION_QUEUE_LIMITS);
         (
             Self {
                 executor,
@@ -3226,8 +3223,8 @@ async fn finish_round(
     state: Option<&RpcState>,
     staging: &Staging,
     relay: &nano_p2p::Relay,
-    offered: &tokio::sync::mpsc::UnboundedReceiver<NakamotoBlock>,
-    submitted: &tokio::sync::mpsc::UnboundedReceiver<nano_codec::Transaction>,
+    offered: &nano_queue::Receiver<NakamotoBlock>,
+    submitted: &nano_queue::Receiver<nano_codec::Transaction>,
     interval: Duration,
 ) {
     if let Some(state) = state {

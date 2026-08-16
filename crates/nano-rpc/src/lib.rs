@@ -40,7 +40,7 @@ use nano_sync::{FollowedTenure, NodeView, PoxInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use siphasher::sip::SipHasher;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 
 pub use chain::{AccountEntry, ChainAccess, ChainAccessError, ReadOnlyCall};
@@ -60,6 +60,13 @@ const MAINNET_SBTC_REGISTRY_CONTRACT: &str =
     "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-registry";
 const MEMPOOL_PAGE_TRANSACTIONS: usize = 128;
 const MEMPOOL_PAGE_BYTES: usize = 8 * 1024 * 1024;
+const MIB: usize = 1024 * 1024;
+
+/// Work admitted by RPC but not yet consumed by its owning role.
+pub const BLOCK_QUEUE_LIMITS: nano_queue::Limits = nano_queue::Limits::new(8, 16 * MIB);
+pub const PROPOSAL_QUEUE_LIMITS: nano_queue::Limits = nano_queue::Limits::new(2, 4 * MIB);
+pub const CHUNK_QUEUE_LIMITS: nano_queue::Limits = nano_queue::Limits::new(256, 16 * MIB);
+pub const TRANSACTION_QUEUE_LIMITS: nano_queue::Limits = nano_queue::Limits::new(256, 16 * MIB);
 
 /// The chain constants `/v2/pox` cannot derive from Clarity state.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -269,16 +276,16 @@ pub struct RpcState {
     /// The validator an uploaded block or a proposal has to pass.
     admission: Option<Arc<Mutex<dyn BlockAdmission>>>,
     /// Where a proposal goes to be executed and answered for.
-    proposals: Option<mpsc::UnboundedSender<ProposalRequest>>,
+    proposals: Option<nano_queue::Sender<ProposalRequest>>,
     /// Where a chunk this node took is passed on, so a signer hosted here reaches
     /// the miner it is answering.
-    chunks: Option<mpsc::UnboundedSender<(String, nano_stackerdb::Chunk)>>,
+    chunks: Option<nano_queue::Sender<(String, nano_stackerdb::Chunk)>>,
     /// Where a transaction this node admitted is passed on to the network.
     ///
     /// A node that keeps what it accepted to itself is a black hole with a `200`:
     /// it looks like acceptance and behaves like a drop, since only a miner that
     /// sees the transaction can ever mine it.
-    submitted: Option<mpsc::UnboundedSender<Transaction>>,
+    submitted: Option<nano_queue::Sender<Transaction>>,
     mempool: Option<Arc<Mutex<Mempool>>>,
     /// The chain this node is on, which no peer needs to be asked about.
     network: Network,
@@ -289,7 +296,7 @@ pub struct RpcState {
     /// The `StackerDB` contracts this node replicates.
     stackerdb: Arc<RwLock<StackerDbStore>>,
     /// Where an accepted block upload is handed to the node.
-    blocks: Option<mpsc::UnboundedSender<NakamotoBlock>>,
+    blocks: Option<nano_queue::Sender<NakamotoBlock>>,
     /// The `authorization` header `/v3/block_proposal` demands.
     proposal_token: Option<String>,
     /// Where the events a route produces are published.
@@ -425,7 +432,7 @@ impl RpcState {
     #[must_use]
     pub fn with_proposal_validator(
         mut self,
-        proposals: mpsc::UnboundedSender<ProposalRequest>,
+        proposals: nano_queue::Sender<ProposalRequest>,
     ) -> Self {
         self.proposals = Some(proposals);
         self
@@ -433,7 +440,7 @@ impl RpcState {
 
     /// Pass the transactions this node admits on to the network over this channel.
     #[must_use]
-    pub fn with_transaction_relay(mut self, submitted: mpsc::UnboundedSender<Transaction>) -> Self {
+    pub fn with_transaction_relay(mut self, submitted: nano_queue::Sender<Transaction>) -> Self {
         self.submitted = Some(submitted);
         self
     }
@@ -442,7 +449,7 @@ impl RpcState {
     #[must_use]
     pub fn with_chunk_relay(
         mut self,
-        chunks: mpsc::UnboundedSender<(String, nano_stackerdb::Chunk)>,
+        chunks: nano_queue::Sender<(String, nano_stackerdb::Chunk)>,
     ) -> Self {
         self.chunks = Some(chunks);
         self
@@ -464,7 +471,7 @@ impl RpcState {
 
     /// Hand blocks accepted by upload to the node over this channel.
     #[must_use]
-    pub fn with_block_sink(mut self, blocks: mpsc::UnboundedSender<NakamotoBlock>) -> Self {
+    pub fn with_block_sink(mut self, blocks: nano_queue::Sender<NakamotoBlock>) -> Self {
         self.blocks = Some(blocks);
         self
     }
@@ -724,6 +731,7 @@ enum RpcError {
     /// A refusal that carries stacks-core's own JSON body.
     Rejected(Value),
     Unauthorized,
+    Overloaded(String),
 }
 
 impl IntoResponse for RpcError {
@@ -737,6 +745,12 @@ impl IntoResponse for RpcError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message).into_response(),
             Self::Rejected(body) => (StatusCode::BAD_REQUEST, axum::Json(body)).into_response(),
+            Self::Overloaded(message) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "1")],
+                message,
+            )
+                .into_response(),
         }
     }
 }
@@ -797,17 +811,28 @@ impl RpcState {
         }
     }
 
-    fn offer_block(&self, block: NakamotoBlock) -> Result<(), RpcError> {
+    fn offer_block(&self, block: NakamotoBlock, bytes: usize) -> Result<(), RpcError> {
         self.blocks
             .as_ref()
             .ok_or(RpcError::Unavailable)?
-            .send(block)
-            .map_err(|_| RpcError::Unavailable)
+            .try_send(block, bytes)
+            .map_err(|error| queue_error("block executor", error.reason))
     }
 
     fn dispatch(&self, kind: EventKind, payload: &Value) {
         if let Some(observers) = self.observers.as_ref() {
             observers.dispatch(kind, payload);
+        }
+    }
+}
+
+fn queue_error(name: &str, error: nano_queue::ReserveError) -> RpcError {
+    match error {
+        nano_queue::ReserveError::Full => {
+            RpcError::Overloaded(format!("the {name} queue is full; retry later"))
+        }
+        nano_queue::ReserveError::Closed => {
+            RpcError::UnavailableBecause(format!("the {name} has stopped"))
         }
     }
 }
@@ -1551,6 +1576,10 @@ async fn submit_transaction(
     let (transaction, _) = Transaction::decode(&body)
         .map_err(|error| RpcError::BadRequest(format!("failed to decode transaction: {error}")))?;
     let txid = transaction.txid();
+    let submitted = state.submitted.as_ref().ok_or(RpcError::Unavailable)?;
+    let relay = submitted
+        .try_reserve(body.len())
+        .map_err(|error| queue_error("transaction relay", error))?;
     let mempool = state.mempool.clone().ok_or(RpcError::Unavailable)?;
     let chain = state.chain()?;
     let mut mempool = mempool.lock().await;
@@ -1568,9 +1597,7 @@ async fn submit_transaction(
     // Admitted here is admitted for the whole network: the pool this node keeps
     // is only read by its own miner, and a transaction nobody else hears about
     // cannot be mined by anybody else.
-    if let Some(submitted) = &state.submitted {
-        let _ = submitted.send(transaction);
-    }
+    relay.send(transaction);
     Ok(axum::Json(txid.to_string()))
 }
 
@@ -1767,8 +1794,10 @@ struct ChunkUploadWire {
 async fn stackerdb_chunk_upload(
     State(state): State<RpcState>,
     Path((address, contract)): Path<(String, String)>,
-    axum::Json(upload): axum::Json<ChunkUploadWire>,
+    body: Bytes,
 ) -> Result<axum::Json<Value>, RpcError> {
+    let upload: ChunkUploadWire = serde_json::from_slice(&body)
+        .map_err(|error| RpcError::BadRequest(format!("invalid chunk upload: {error}")))?;
     let signature: [u8; 65] = hex::decode(upload.sig.trim_start_matches("0x"))
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
@@ -1782,6 +1811,10 @@ async fn stackerdb_chunk_upload(
     };
     let metadata = SlotMetadataWire::from(&chunk.metadata());
     let contract_id = format!("{address}.{contract}");
+    let chunks = state.chunks.as_ref().ok_or(RpcError::Unavailable)?;
+    let replication = chunks
+        .try_reserve(chunk.data.len().saturating_add(contract_id.len() + 73))
+        .map_err(|error| queue_error("StackerDB replication", error))?;
     let announce = chunk.clone();
     let slot_id = chunk.slot_id;
     let accepted = state.accept_stackerdb_chunk(&contract_id, chunk).await;
@@ -1804,17 +1837,18 @@ async fn stackerdb_chunk_upload(
             // A chunk written here has to leave here, or a signer this node hosts
             // is talking to nobody: the miner counting its response reads the
             // chunk from its own replica, and nothing else carries it there.
-            if let Some(chunks) = &state.chunks {
-                let _ = chunks.send((contract_id.clone(), announce.clone()));
-            }
+            replication.send((contract_id.clone(), announce.clone()));
             json!({ "accepted": true, "metadata": metadata })
         }
-        Err(refusal) => json!({
-            "accepted": false,
-            "reason": refusal.reason(),
-            "code": refusal.code(),
-            "metadata": held,
-        }),
+        Err(refusal) => {
+            drop(replication);
+            json!({
+                "accepted": false,
+                "reason": refusal.reason(),
+                "code": refusal.code(),
+                "metadata": held,
+            })
+        }
     }))
 }
 
@@ -1840,7 +1874,7 @@ async fn upload_block(
     // offer it again either: the executor would only walk past it.
     let held = state.holds_block(&block).await;
     if !held {
-        state.offer_block(block)?;
+        state.offer_block(block, body.len())?;
     }
     Ok(axum::Json(BlockUploadWire {
         stacks_block_id,
@@ -1895,7 +1929,7 @@ async fn block_proposal(
     .map_err(|error| RpcError::BadRequest(format!("failed to decode block: {error}")))?;
 
     let digest = block.header.signer_signature_hash();
-    match judge_proposal(&state, &proposal, &block).await {
+    match judge_proposal(&state, &proposal, &block).await? {
         Verdict::Now(outcome) => state.dispatch(
             EventKind::ProposalResponse,
             &proposal_response_payload(digest, &outcome),
@@ -1935,7 +1969,7 @@ async fn judge_proposal(
     state: &RpcState,
     proposal: &BlockProposalWire,
     block: &NakamotoBlock,
-) -> Verdict {
+) -> Result<Verdict, RpcError> {
     let rejected = |reason: String, code| {
         state.metrics.record_block_refusal(&reason);
         Verdict::Now(ProposalOutcome::Rejected { reason, code })
@@ -1945,68 +1979,64 @@ async fn judge_proposal(
     if let Some(chain_id) = proposal.chain_id
         && chain_id != state.network.chain_id()
     {
-        return rejected(
+        return Ok(rejected(
             format!(
                 "proposal names chain {chain_id:#010x}, this node is on {:#010x}",
                 state.network.chain_id()
             ),
             ProposalRejectCode::NetworkChainMismatch,
-        );
+        ));
     }
     if proposal
         .replay_txs
         .as_ref()
         .is_some_and(|replay| !replay.is_empty())
     {
-        return rejected(
+        return Ok(rejected(
             "this node does not validate against a transaction replay set".to_owned(),
             ProposalRejectCode::InvalidTransactionReplay,
-        );
+        ));
     }
     if let Err(error) = state.authenticate(block).await {
-        return rejected(error, ProposalRejectCode::InvalidBlock);
+        return Ok(rejected(error, ProposalRejectCode::InvalidBlock));
     }
     if state.holds_block(block).await {
         // Already executed, so the state root was already checked. Zero cost is
         // the value stacks-core itself reports for a block it did not have to
         // execute, and a signer reads it that way.
-        return Verdict::Now(ProposalOutcome::Accepted {
+        return Ok(Verdict::Now(ProposalOutcome::Accepted {
             cost: clarity::vm::costs::ExecutionCost::ZERO,
             size: block.encode().len() as u64,
             validation_time_ms: 0,
-        });
+        }));
     }
     if !state.holds_parent_of(block).await {
-        return rejected(
+        return Ok(rejected(
             format!(
                 "this node has not executed the parent {} this block builds on",
                 block.header.parent_block_id
             ),
             ProposalRejectCode::UnknownParent,
-        );
+        ));
     }
     let Some(proposals) = &state.proposals else {
-        return rejected(
+        return Ok(rejected(
             "this node validates a proposal by executing it, and has no proposal \
              validator configured to execute this one"
                 .to_owned(),
             ProposalRejectCode::ChainstateError,
-        );
+        ));
     };
+    let size = block.encode().len();
+    let queued = proposals
+        .try_reserve(size)
+        .map_err(|error| queue_error("proposal validator", error))?;
     let (verdict, answered) = tokio::sync::oneshot::channel();
-    if proposals
-        .send(ProposalRequest {
-            block: block.clone(),
-            verdict,
-        })
-        .is_err()
-    {
-        return rejected(
-            "this node's proposal validator has stopped".to_owned(),
-            ProposalRejectCode::ChainstateError,
-        );
-    }
-    Verdict::Pending(answered, block.encode().len() as u64)
+    queued.send(ProposalRequest {
+        block: block.clone(),
+        verdict,
+    });
+    Ok(Verdict::Pending(answered, size as u64))
 }
 
 /// What a route can say about a proposal now, and what it has to wait for.
@@ -2533,7 +2563,7 @@ fn encode_blocks(blocks: &[NakamotoBlock]) -> Vec<u8> {
 mod tests {
     use axum::{
         body::Body,
-        http::{Request, StatusCode},
+        http::{Request, StatusCode, header},
     };
     use nano_primitives::{
         BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, SortitionId, StacksBlockId, TrieHash,
@@ -2564,8 +2594,10 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::{
-        AccountEntry, ChainAccess, ChainAccessError, EventDispatcher, NakamotoBlock, PoxRpcConfig,
-        ProposalRequest, QueueReport, ReadOnlyCall, Router, RpcState, SealedTip, mpsc, router,
+        AccountEntry, BLOCK_QUEUE_LIMITS, CHUNK_QUEUE_LIMITS, ChainAccess, ChainAccessError,
+        EventDispatcher, NakamotoBlock, PROPOSAL_QUEUE_LIMITS, PoxRpcConfig, ProposalRejectCode,
+        ProposalRequest, QueueReport, ReadOnlyCall, Router, RpcState, SealedTip,
+        TRANSACTION_QUEUE_LIMITS, router,
     };
 
     /// The tests reach for both `Value`s: Clarity's for a read-only answer, and
@@ -2825,10 +2857,12 @@ mod tests {
             nonce: 1,
         };
         let mempool = Arc::new(Mutex::new(Mempool::new(NETWORK)));
+        let (relayed, mut submitted) = nano_queue::channel(TRANSACTION_QUEUE_LIMITS);
         let app = router(
             RpcState::new(NETWORK)
                 .with_chain(chain(&[(address(&sender), funded)], None))
-                .with_mempool(mempool.clone()),
+                .with_mempool(mempool.clone())
+                .with_transaction_relay(relayed),
         );
         let submit = |transaction: Transaction, app: Router| async move {
             app.oneshot(
@@ -2850,6 +2884,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await, json!(txid.to_string()));
         assert!(mempool.lock().await.contains(txid));
+        assert_eq!(
+            submitted
+                .recv()
+                .await
+                .expect("relay the transaction")
+                .txid(),
+            txid
+        );
 
         let mut query = vec![2];
         query.extend_from_slice(&[0; 32]);
@@ -2907,6 +2949,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_saturated_transaction_relay_changes_no_mempool_state_and_recovers() {
+        let sender = key(b"saturated sender");
+        let funded = AccountEntry {
+            balance: 4_000_000,
+            locked: 0,
+            unlock_height: 0,
+            nonce: 0,
+        };
+        let mempool = Arc::new(Mutex::new(Mempool::new(NETWORK)));
+        let (relayed, mut submitted) = nano_queue::channel(TRANSACTION_QUEUE_LIMITS);
+        let saturation = relayed
+            .try_reserve(TRANSACTION_QUEUE_LIMITS.bytes)
+            .expect("fill the byte budget");
+        let app = router(
+            RpcState::new(NETWORK)
+                .with_chain(chain(&[(address(&sender), funded)], None))
+                .with_mempool(Arc::clone(&mempool))
+                .with_transaction_relay(relayed),
+        );
+        let transaction = transfer(&sender, 0);
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v2/transactions")
+                .body(Body::from(transaction.encode()))
+                .expect("request")
+        };
+
+        let overloaded = app.clone().oneshot(request()).await.expect("response");
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers()[header::RETRY_AFTER], "1");
+        assert!(mempool.lock().await.is_empty());
+
+        drop(saturation);
+        let accepted = app.oneshot(request()).await.expect("response");
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(
+            submitted.recv().await.expect("relay").txid(),
+            transaction.txid()
+        );
+    }
+
+    #[tokio::test]
     async fn a_reward_set_is_served_once_the_node_derived_it() {
         let state = RpcState::new(NETWORK);
         let app = router(state.clone());
@@ -2943,7 +3028,8 @@ mod tests {
     #[tokio::test]
     async fn a_signer_writes_a_chunk_and_reads_it_back() {
         let writer = key(b"signer");
-        let state = RpcState::new(NETWORK);
+        let (relay, mut replicated) = nano_queue::channel(CHUNK_QUEUE_LIMITS);
+        let state = RpcState::new(NETWORK).with_chunk_relay(relay);
         state.stackerdb().write().await.configure(
             "ST000000000000000000002AMW42H.signers-0-1",
             vec![nano_primitives::hash160(
@@ -2975,6 +3061,10 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(body_json(accepted).await["accepted"], json!(true));
+        assert_eq!(
+            replicated.recv().await.expect("replicate the chunk").1,
+            chunk
+        );
 
         let read = app
             .clone()
@@ -3006,6 +3096,58 @@ mod tests {
             metadata[0]["signature"],
             json!(hex::encode(chunk.signature.as_bytes()))
         );
+    }
+
+    #[tokio::test]
+    async fn a_saturated_chunk_relay_exposes_no_chunk_and_recovers() {
+        let writer = key(b"saturated chunk writer");
+        let (relay, mut replicated) = nano_queue::channel(CHUNK_QUEUE_LIMITS);
+        let saturation = relay
+            .try_reserve(CHUNK_QUEUE_LIMITS.bytes)
+            .expect("fill the byte budget");
+        let state = RpcState::new(NETWORK).with_chunk_relay(relay);
+        let contract = "ST000000000000000000002AMW42H.signers-0-1";
+        state.stackerdb().write().await.configure(
+            contract,
+            vec![nano_primitives::hash160(
+                &writer.public_key().to_bytes_compressed(),
+            )],
+        );
+        let app = router(state.clone());
+        let mut chunk = nano_stackerdb::Chunk::new(0, 1, b"accepted".to_vec());
+        chunk.sign(&writer).expect("sign chunk");
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v2/stackerdb/ST000000000000000000002AMW42H/signers-0-1/chunks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "slot_id": chunk.slot_id,
+                        "slot_version": chunk.slot_version,
+                        "sig": hex::encode(chunk.signature.as_bytes()),
+                        "data": hex::encode(&chunk.data),
+                    })
+                    .to_string(),
+                ))
+                .expect("request")
+        };
+
+        let overloaded = app.clone().oneshot(request()).await.expect("response");
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            state
+                .stackerdb()
+                .read()
+                .await
+                .chunk(contract, 0, None)
+                .is_none()
+        );
+
+        drop(saturation);
+        let accepted = app.oneshot(request()).await.expect("response");
+        assert_eq!(body_json(accepted).await["accepted"], json!(true));
+        assert_eq!(replicated.recv().await.expect("replicate").1, chunk);
     }
 
     fn captured_view() -> NodeView {
@@ -3744,10 +3886,10 @@ mod tests {
     /// from whether the tip happened to move between two samples.
     #[tokio::test]
     async fn sync_status_reports_every_queue_the_node_can_hold() {
-        let (blocks, _offered) = mpsc::unbounded_channel();
-        let (proposals, _proposed) = mpsc::unbounded_channel();
-        let (chunks, _written) = mpsc::unbounded_channel();
-        let (transactions, _submitted) = mpsc::unbounded_channel();
+        let (blocks, _offered) = nano_queue::channel(BLOCK_QUEUE_LIMITS);
+        let (proposals, _proposed) = nano_queue::channel(PROPOSAL_QUEUE_LIMITS);
+        let (chunks, _written) = nano_queue::channel(CHUNK_QUEUE_LIMITS);
+        let (transactions, _submitted) = nano_queue::channel(TRANSACTION_QUEUE_LIMITS);
         let state = RpcState::new(NETWORK)
             .with_block_sink(blocks)
             .with_proposal_validator(proposals)
@@ -4252,7 +4394,7 @@ mod tests {
             asked: Arc::default(),
             refusal: Some("signer weight is below approval threshold".to_owned()),
         };
-        let (blocks_out, mut offered) = mpsc::unbounded_channel();
+        let (blocks_out, mut offered) = nano_queue::channel(BLOCK_QUEUE_LIMITS);
         let state = RpcState::new(NETWORK)
             .with_block_admission(Arc::new(Mutex::new(refusing.clone())))
             .with_block_sink(blocks_out);
@@ -4303,7 +4445,7 @@ mod tests {
         // The same block, from a node whose validator accepts it, is taken once
         // — and a block already executed is neither accepted again nor offered.
         let accepting = RecordingAdmission::default();
-        let (blocks_out, mut offered) = mpsc::unbounded_channel();
+        let (blocks_out, mut offered) = nano_queue::channel(BLOCK_QUEUE_LIMITS);
         let state = RpcState::new(NETWORK)
             .with_block_admission(Arc::new(Mutex::new(accepting)))
             .with_block_sink(blocks_out);
@@ -4336,25 +4478,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_saturated_block_queue_acknowledges_nothing_and_recovers() {
+        let (view, blocks) = view_with_blocks(3);
+        let (blocks_out, mut offered) = nano_queue::channel(BLOCK_QUEUE_LIMITS);
+        let saturation = blocks_out
+            .try_reserve(BLOCK_QUEUE_LIMITS.bytes)
+            .expect("fill the byte budget");
+        let state = RpcState::new(NETWORK)
+            .with_block_admission(Arc::new(Mutex::new(RecordingAdmission::default())))
+            .with_block_sink(blocks_out);
+        state.publish(view).await;
+        state
+            .publish_executed(sealed_at(&blocks[1]), Vec::new(), captured_pox())
+            .await;
+        let app = router(state);
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v3/blocks/upload")
+                .body(Body::from(blocks[2].encode()))
+                .expect("request")
+        };
+
+        let overloaded = app.clone().oneshot(request()).await.expect("response");
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(offered.try_recv().is_err());
+
+        drop(saturation);
+        let accepted = app.oneshot(request()).await.expect("response");
+        assert_eq!(body_json(accepted).await["accepted"], json!(true));
+        assert_eq!(offered.recv().await, Some(blocks[2].clone()));
+    }
+
     /// A node whose proposal route is fully wired: a validator that accepts, a
     /// real observer, a token, and an executed chain two of three blocks deep.
     struct ProposalNode {
         app: Router,
         blocks: Vec<NakamotoBlock>,
         received: Received,
-        offered: mpsc::UnboundedReceiver<NakamotoBlock>,
-        proposed: mpsc::UnboundedReceiver<ProposalRequest>,
+        offered: nano_queue::Receiver<NakamotoBlock>,
+        proposal_sink: nano_queue::Sender<ProposalRequest>,
+        proposed: nano_queue::Receiver<ProposalRequest>,
     }
 
     async fn proposal_node() -> ProposalNode {
         let (view, blocks) = view_with_blocks(3);
         let (url, received) = recording_observer().await;
-        let (blocks_out, offered) = mpsc::unbounded_channel();
-        let (proposals, proposed) = mpsc::unbounded_channel();
+        let (blocks_out, offered) = nano_queue::channel(BLOCK_QUEUE_LIMITS);
+        let (proposals, proposed) = nano_queue::channel(PROPOSAL_QUEUE_LIMITS);
         let state = RpcState::new(NETWORK)
             .with_block_admission(Arc::new(Mutex::new(RecordingAdmission::default())))
             .with_block_sink(blocks_out)
-            .with_proposal_validator(proposals)
+            .with_proposal_validator(proposals.clone())
             .with_observers(EventDispatcher::new(vec![url]))
             .with_proposal_token("t0ken".to_owned());
         state.publish(view).await;
@@ -4366,6 +4542,7 @@ mod tests {
             blocks,
             received,
             offered,
+            proposal_sink: proposals,
             proposed,
         }
     }
@@ -4524,6 +4701,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_saturated_proposal_queue_returns_overload_and_recovers() {
+        let mut node = proposal_node().await;
+        let saturation = node
+            .proposal_sink
+            .try_reserve(PROPOSAL_QUEUE_LIMITS.bytes)
+            .expect("fill the byte budget");
+        let body = json!({ "block": hex::encode(node.blocks[2].encode()) });
+
+        let overloaded = node.propose(body.clone(), Some("t0ken")).await;
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers()[header::RETRY_AFTER], "1");
+        assert!(node.proposed.try_recv().is_err());
+
+        drop(saturation);
+        let accepted = node.propose(body, Some("t0ken")).await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let proposal = node.proposed.recv().await.expect("proposal queued");
+        proposal
+            .verdict
+            .send(Err((
+                "test refusal".to_owned(),
+                ProposalRejectCode::InvalidBlock,
+            )))
+            .expect("answer proposal");
+        assert_eq!(node.verdict().await["result"], json!("Reject"));
+    }
+
     /// A proposal nobody could be told the result of is a request nobody can act
     /// on, which is the one thing stacks-core refuses outright.
     #[tokio::test]
@@ -4550,7 +4755,10 @@ mod tests {
     async fn every_accepted_chunk_is_announced_and_a_refused_one_is_not() {
         let writer = key(b"signer");
         let (url, received) = recording_observer().await;
-        let state = RpcState::new(NETWORK).with_observers(EventDispatcher::new(vec![url]));
+        let (relay, mut queued) = nano_queue::channel(CHUNK_QUEUE_LIMITS);
+        let state = RpcState::new(NETWORK)
+            .with_observers(EventDispatcher::new(vec![url]))
+            .with_chunk_relay(relay);
         state.stackerdb().write().await.configure(
             "ST000000000000000000002AMW42H.signers-0-1",
             vec![nano_primitives::hash160(
@@ -4584,6 +4792,10 @@ mod tests {
         assert_eq!(
             body_json(put(accepted.clone(), app.clone()).await).await["accepted"],
             json!(true)
+        );
+        assert_eq!(
+            queued.recv().await.expect("queue accepted chunk").1,
+            accepted
         );
         for _ in 0..100 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

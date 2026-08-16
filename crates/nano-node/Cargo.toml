@@ -22,6 +22,7 @@ nano-marf = { path = "../nano-marf" }
 nano-mempool = { path = "../nano-mempool" }
 nano-miner = { path = "../nano-miner" }
 nano-primitives = { path = "../nano-primitives" }
+nano-queue = { path = "../nano-queue" }
 nano-rpc = { path = "../nano-rpc" }
 nano-signer = { path = "../nano-signer" }
 nano-sortition = { path = "../nano-sortition" }

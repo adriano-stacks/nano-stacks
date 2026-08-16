@@ -37,7 +37,7 @@ use nano_rpc::{ProposalRejectCode, ProposalRequest, RpcState};
 use nano_signer::{AccumulatedCoinbase as _, ProposalValidator as _};
 use nano_stackerdb::{BlockProposal, Chunk, StackerDbClient, StackerDbContract};
 use nano_sync::{PoxInfo, SyncClient, TenureSource};
-use tokio::{sync::mpsc::UnboundedReceiver, time::sleep};
+use tokio::time::sleep;
 
 use crate::{
     config::{Config, cycle_contract, miner_contract},
@@ -57,7 +57,7 @@ pub async fn validate_proposals(
     mut peers: TenureSource,
     mut validator: Validator,
     state: RpcState,
-    mut requests: UnboundedReceiver<ProposalRequest>,
+    mut requests: nano_queue::Receiver<ProposalRequest>,
 ) -> Role {
     let interval = Duration::from_secs(config.node.poll_interval_secs);
     let mut burn = match LocalBurnView::open(&config, validator.validator_mut().bitcoin_context()) {
@@ -769,7 +769,7 @@ pub async fn replicate(
     discovered: Option<Discovered>,
     mut replicas: Replicas,
     state: RpcState,
-    mut written: UnboundedReceiver<(String, Chunk)>,
+    mut written: nano_queue::Receiver<(String, Chunk)>,
 ) -> Role {
     if replicas.is_empty() {
         return Err("no peer to replicate StackerDB chunks with".to_owned());
