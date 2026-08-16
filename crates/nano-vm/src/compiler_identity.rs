@@ -14,15 +14,15 @@
 //                        relative path ‖ 0x00 ‖ sha256(contents) ‖ 0x00 )
 // ```
 //
-// over every file under `vendor/clarity-wasm`, skipping `target` and `.git`
-// directories and `*.wasm` files — the last because `standard.wasm` is generated
-// from `standard.wat` by clar2wasm's own build script, so its content is implied
-// by a file that is already counted and its presence depends on whether anything
-// has been built yet.
+// over every build input under `vendor/clarity-wasm`, skipping `target`, `.git`
+// and generated `proptest-regressions` directories and `*.wasm` files — the last
+// because `standard.wasm` is generated from `standard.wat` by clar2wasm's own
+// build script, so its content is implied by a file that is already counted and
+// its presence depends on whether anything has been built yet.
 //
-// Two properties this has that a git tree hash does not: it describes a dirty tree
-// as truthfully as a clean one, and it needs no git at all, so it survives a
-// tarball, a vendored crate and a docker build.
+// Two properties this has that a git tree hash does not: it describes a dirty
+// build-relevant tree as truthfully as a clean one, and it needs no git at all,
+// so it survives a tarball, a vendored crate and a docker build.
 //
 // This file is both a module of `nano-vm` and `include!`d by its build script,
 // which is why it takes a directory rather than reading a constant. The build
@@ -61,7 +61,7 @@ fn collect(root: &Path, directory: &Path, found: &mut Vec<(String, PathBuf)>) ->
         let path = entry.ok()?.path();
         let name = path.file_name()?.to_str()?.to_owned();
         if path.is_dir() {
-            if name == "target" || name == ".git" {
+            if name == "target" || name == ".git" || name == "proptest-regressions" {
                 continue;
             }
             collect(root, &path, found)?;
@@ -77,4 +77,30 @@ fn collect(root: &Path, directory: &Path, found: &mut Vec<(String, PathBuf)>) ->
         }
     }
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compiler_identity_of;
+
+    #[test]
+    fn generated_proptest_regressions_do_not_change_the_compiler_identity() {
+        let temporary = tempfile::tempdir().expect("temporary compiler tree");
+        std::fs::write(temporary.path().join("compiler.rs"), "first")
+            .expect("write compiler source");
+        let original = compiler_identity_of(temporary.path()).expect("hash compiler tree");
+
+        let regressions = temporary.path().join("proptest-regressions");
+        std::fs::create_dir(&regressions).expect("create generated regressions");
+        std::fs::write(regressions.join("generated.txt"), "generated")
+            .expect("write generated regression");
+        assert_eq!(
+            compiler_identity_of(temporary.path()),
+            Some(original.clone())
+        );
+
+        std::fs::write(temporary.path().join("compiler.rs"), "second")
+            .expect("change compiler source");
+        assert_ne!(compiler_identity_of(temporary.path()), Some(original));
+    }
 }
