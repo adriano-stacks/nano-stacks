@@ -145,6 +145,8 @@ jobs:
           fresh_reflink 111
 
           nix develop --command scripts/ci.sh reproducible-release
+          verified_artifact=$(nix build .#stacks-node --no-link --print-out-paths)
+          test -x "$verified_artifact/bin/stacks-node"
 
           candidate="$NANO_RELEASE_OUTPUT/candidate-$GITHUB_SHA-$GITHUB_RUN_ID"
           report="$NANO_RELEASE_OUTPUT/qualification-$GITHUB_SHA-$GITHUB_RUN_ID.txt"
@@ -154,7 +156,8 @@ jobs:
             --config "$NANO_RELEASE_CONFIG" \
             --advisory-db "$NANO_RELEASE_ADVISORY_DB" \
             --secret-key "$NANO_RELEASE_SECRET_KEY" \
-            --public-key "$NANO_RELEASE_PUBLIC_KEY"
+            --public-key "$NANO_RELEASE_PUBLIC_KEY" \
+            --artifact "$verified_artifact"
           nix develop --command cargo xtask release-report \
             --candidate "$candidate" --public-key "$NANO_RELEASE_PUBLIC_KEY" \
             --capture "$NANO_MAINNET_CAPTURE" --state "$NANO_MAINNET_STATE" \

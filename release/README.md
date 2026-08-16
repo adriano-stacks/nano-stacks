@@ -49,6 +49,10 @@ revision in two separate rootless Nix stores, compares their NAR hashes and a
 sorted SHA-256 inventory of every packaged file, and removes both stores. A NAR
 match includes file contents, modes and paths; the separate inventory makes a
 binary or packaged-data difference readable if the comparison ever fails.
+After the comparison, the script imports the first verified NAR into the active
+Nix store and checks it again there. Qualification resolves that exact store path
+and passes it to `release-candidate prepare`, so the signed candidate cannot be a
+third, merely assumed-equivalent build.
 
 ## Capacity and shutdown contract
 

@@ -72,8 +72,25 @@ output=$(<"$scratch/first.output")
 nar_hash=$(<"$scratch/first.nar-hash")
 binary_hash=$(awk '$2 == "./bin/stacks-node" { print $1 }' "$scratch/first.files")
 test -n "$binary_hash"
+
+# Qualification must consume one of the artifacts compared above, not a third
+# build of the same derivation. Import the verified closure into the active Nix
+# store, then recheck both its NAR and its readable file inventory there.
+nix copy --from "local?root=$scratch/first" --no-check-sigs "$output"
+published_hash=$(nix path-info --json --json-format 1 "$output" \
+  | jq -er --arg output "$output" '.[$output].narHash')
+test "$published_hash" = "$nar_hash"
+(
+  cd "$output"
+  find . -type f -print0 \
+    | sort -z \
+    | xargs -0 sha256sum
+) > "$scratch/published.files"
+diff -u "$scratch/first.files" "$scratch/published.files"
+
 printf 'source revision  %s\n' "$revision"
 printf 'Nix output       %s\n' "$output"
 printf 'NAR hash         %s\n' "$nar_hash"
 printf 'binary SHA-256   %s\n' "$binary_hash"
 printf 'reproducibility  PASS: two independent stores are byte-identical\n'
+printf 'qualification   PASS: verified NAR installed in the active store\n'
