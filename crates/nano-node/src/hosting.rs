@@ -800,9 +800,7 @@ pub async fn replicate(
         // fails: a chunk the hosted signer wrote is the whole reason this loop
         // exists, and dropping it because the peer whose turn it was went away
         // would lose a signature the network is counting.
-        while let Ok(written) = written.try_recv() {
-            outbound.push(written);
-        }
+        retain_written_chunks(&mut written, &mut outbound);
         match round(&mut replicas, network, &state, &outbound).await {
             Ok(()) => outbound.clear(),
             Err(refusal) => {
@@ -843,7 +841,7 @@ pub async fn round(
     replicas: &mut Replicas,
     network: Network,
     state: &RpcState,
-    outbound: &[(String, Chunk)],
+    outbound: &[nano_queue::Lease<(String, Chunk)>],
 ) -> Result<(), String> {
     let Some((peer, client)) = replicas.current_pair() else {
         return Err("no peer left to replicate StackerDB chunks with".to_owned());
@@ -863,7 +861,8 @@ pub async fn round(
     // Outbound first: a chunk a hosted signer wrote is what the network is
     // waiting for, and it must not wait behind a round of pulling.
     let mut answered = true;
-    for (contract_id, chunk) in outbound {
+    for pending in outbound {
+        let (contract_id, chunk) = pending.value();
         answered &= push(&client, &contracts, contract_id, chunk).await;
     }
     for contract in &contracts {
@@ -878,6 +877,16 @@ pub async fn round(
         "{} did not serve a round of StackerDB replication, trying another peer",
         peer.base_url()
     ))
+}
+
+/// Retain the queue reservations while chunks wait for a peer to accept them.
+fn retain_written_chunks(
+    written: &mut nano_queue::Receiver<(String, Chunk)>,
+    outbound: &mut Vec<nano_queue::Lease<(String, Chunk)>>,
+) {
+    while let Ok(pending) = written.try_recv_lease() {
+        outbound.push(pending);
+    }
 }
 
 /// Hand a chunk this node took to the peer that has to see it.
@@ -979,7 +988,8 @@ pub fn identifier(contract: &StackerDbContract) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_directory, recover_validator_seed, requested_burn_height, validator_sortition_state,
+        Chunk, capture_directory, recover_validator_seed, requested_burn_height,
+        retain_written_chunks, validator_sortition_state,
     };
     use crate::config::Config;
 
@@ -1005,6 +1015,55 @@ mod tests {
         anchor_bitcoin_height = 960231
         sortition = "/capture/sortition"
     "#;
+
+    #[test]
+    fn failed_stackerdb_delivery_keeps_its_queue_bytes_reserved() {
+        let limits = nano_queue::Limits::new(2, 8);
+        let (sender, mut receiver) = nano_queue::channel(limits);
+        sender
+            .try_send(
+                (
+                    "ST000000000000000000002AMW42H.signers".to_owned(),
+                    Chunk::new(0, 1, vec![1]),
+                ),
+                6,
+            )
+            .expect("the first chunk fits");
+
+        let mut outbound = Vec::new();
+        retain_written_chunks(&mut receiver, &mut outbound);
+        assert_eq!(receiver.status().items, 1, "a retry remains accounted");
+        assert_eq!(receiver.status().bytes, 6);
+        assert!(
+            sender
+                .try_send(
+                    (
+                        "ST000000000000000000002AMW42H.signers".to_owned(),
+                        Chunk::new(1, 1, vec![2]),
+                    ),
+                    3,
+                )
+                .is_err(),
+            "a failed peer cannot move retained bytes outside the queue budget"
+        );
+
+        outbound.clear();
+        assert_eq!(receiver.status().items, 0);
+        assert_eq!(receiver.status().bytes, 0);
+        assert_eq!(receiver.status().saturations, 1);
+        assert!(
+            sender
+                .try_send(
+                    (
+                        "ST000000000000000000002AMW42H.signers".to_owned(),
+                        Chunk::new(1, 1, vec![2]),
+                    ),
+                    3,
+                )
+                .is_ok(),
+            "the budget recovers when delivery succeeds"
+        );
+    }
 
     /// The validator seeds from the sortition capture, not from beside the trie.
     ///
