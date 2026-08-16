@@ -2715,6 +2715,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-queue"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "nano-rpc"
 version = "0.1.0"
 dependencies = [
