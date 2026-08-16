@@ -8,6 +8,8 @@ license.workspace = true
 axum = "0.8.9"
 clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 hex = "0.4.3"
+hyper = { version = "1.11.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 nano-address = { path = "../nano-address" }
 nano-chainstate = { path = "../nano-chainstate" }
 nano-codec = { path = "../nano-codec" }
@@ -23,13 +25,13 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "n
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 siphasher = "0.3.11"
-tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
-tower-http = { version = "0.6.11", features = ["limit"] }
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.6.11", features = ["limit", "timeout"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
-tower = { version = "0.5.3", features = ["util"] }
 
 [lints]
 workspace = true

@@ -2,6 +2,7 @@ mod chain;
 mod events;
 mod limits;
 mod metrics;
+mod server;
 mod stackerdb;
 
 use std::{
@@ -53,6 +54,7 @@ pub use events::{
     proposal_response_payload, stacker_set_payload, stackerdb_chunks_payload,
 };
 pub use metrics::{ExecutionCacheReport, NodeMetrics, serve as serve_metrics};
+pub use server::serve;
 pub use stackerdb::{ChunkRefusal, StackerDbStore};
 
 const MAINNET_POX_PARTICIPATION_THRESHOLD_PCT: u64 = 5;
@@ -62,6 +64,9 @@ const MAINNET_SBTC_REGISTRY_CONTRACT: &str =
 const MEMPOOL_PAGE_TRANSACTIONS: usize = 128;
 const MEMPOOL_PAGE_BYTES: usize = 8 * 1024 * 1024;
 const MIB: usize = 1024 * 1024;
+const MAX_MEMPOOL_QUERY_TAGS: usize = 8192;
+/// `BOUND_VALUE_SERIALIZATION_BYTES` in the pinned Clarity implementation.
+const MAX_CLARITY_ARGUMENT_BYTES: usize = 2 * MIB;
 
 /// Work admitted by RPC but not yet consumed by its owning role.
 pub const BLOCK_QUEUE_LIMITS: nano_queue::Limits = nano_queue::Limits::new(8, 16 * MIB);
@@ -852,11 +857,6 @@ fn v3_block_routes(ingress: &limits::Registry) -> Router<RpcState> {
                 limits::BLOCK_PROPOSAL,
             ),
         )
-}
-
-/// Serve the public RPC until the listener is stopped.
-pub async fn serve(listener: tokio::net::TcpListener, state: RpcState) -> std::io::Result<()> {
-    axum::serve(listener, router(state)).await
 }
 
 /// Whether every request is to name itself.
@@ -1686,6 +1686,16 @@ struct CallReadOnlyBody {
     arguments: Vec<String>,
 }
 
+fn decode_hex_bounded(value: &str, max_bytes: usize, name: &str) -> Result<Vec<u8>, RpcError> {
+    let value = value.trim_start_matches("0x");
+    if value.len() > max_bytes.saturating_mul(2) {
+        return Err(RpcError::BadRequest(format!(
+            "{name} exceeds its {max_bytes}-byte limit"
+        )));
+    }
+    hex::decode(value).map_err(|error| RpcError::BadRequest(format!("invalid {name}: {error}")))
+}
+
 async fn call_read_only(
     State(state): State<RpcState>,
     Path((address, contract, function)): Path<(String, String, String)>,
@@ -1702,10 +1712,7 @@ async fn call_read_only(
     let arguments = body
         .arguments
         .iter()
-        .map(|argument| {
-            hex::decode(argument.trim_start_matches("0x"))
-                .map_err(|error| RpcError::BadRequest(format!("invalid argument: {error}")))
-        })
+        .map(|argument| decode_hex_bounded(argument, MAX_CLARITY_ARGUMENT_BYTES, "argument"))
         .collect::<Result<Vec<_>, _>>()?;
     let call = ReadOnlyCall {
         bitcoin_context,
@@ -1796,6 +1803,11 @@ fn parse_mempool_query(body: &[u8]) -> Result<Option<KnownMempool>, RpcError> {
             .try_into()
             .expect("the query count slice has a fixed length"),
     ) as usize;
+    if count > MAX_MEMPOOL_QUERY_TAGS {
+        return Err(RpcError::BadRequest(format!(
+            "a mempool query may contain at most {MAX_MEMPOOL_QUERY_TAGS} transaction tags"
+        )));
+    }
     let expected_length = count
         .checked_mul(8)
         .and_then(|length| length.checked_add(36))
@@ -1965,7 +1977,7 @@ async fn stackerdb_chunk_upload(
 ) -> Result<axum::Json<Value>, RpcError> {
     let upload: ChunkUploadWire = serde_json::from_slice(&body)
         .map_err(|error| RpcError::BadRequest(format!("invalid chunk upload: {error}")))?;
-    let signature: [u8; 65] = hex::decode(upload.sig.trim_start_matches("0x"))
+    let signature: [u8; 65] = decode_hex_bounded(&upload.sig, 65, "chunk signature")
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or_else(|| RpcError::BadRequest("invalid chunk signature".to_owned()))?;
@@ -1973,8 +1985,7 @@ async fn stackerdb_chunk_upload(
         slot_id: upload.slot_id,
         slot_version: upload.slot_version,
         signature: MessageSignature::from_bytes(signature),
-        data: hex::decode(upload.data.trim_start_matches("0x"))
-            .map_err(|error| RpcError::BadRequest(format!("invalid chunk data: {error}")))?,
+        data: decode_hex_bounded(&upload.data, nano_stackerdb::MAX_CHUNK_SIZE, "chunk data")?,
     };
     let metadata = SlotMetadataWire::from(&chunk.metadata());
     let contract_id = format!("{address}.{contract}");
@@ -2089,10 +2100,11 @@ async fn block_proposal(
     }
     let proposal: BlockProposalWire = serde_json::from_slice(&body)
         .map_err(|error| RpcError::BadRequest(format!("failed to decode proposal: {error}")))?;
-    let block = NakamotoBlock::decode(
-        &hex::decode(proposal.block.trim_start_matches("0x"))
-            .map_err(|error| RpcError::BadRequest(format!("invalid block hex: {error}")))?,
-    )
+    let block = NakamotoBlock::decode(&decode_hex_bounded(
+        &proposal.block,
+        limits::BLOCK_UPLOAD.body_bytes,
+        "block hex",
+    )?)
     .map_err(|error| RpcError::BadRequest(format!("failed to decode block: {error}")))?;
 
     let digest = block.header.signer_signature_hash();
@@ -2910,6 +2922,31 @@ mod tests {
                 "{method} {uri}"
             );
         }
+    }
+
+    #[test]
+    fn expanded_hex_and_mempool_tags_have_inner_bounds() {
+        assert_eq!(
+            super::decode_hex_bounded("0000", 2, "test").expect("at limit"),
+            [0, 0]
+        );
+        assert!(matches!(
+            super::decode_hex_bounded("0000", 1, "test"),
+            Err(super::RpcError::BadRequest(message)) if message.contains("1-byte limit")
+        ));
+
+        let query = |count: usize| {
+            let mut body = vec![2];
+            body.extend_from_slice(&[0; 32]);
+            body.extend_from_slice(&u32::try_from(count).expect("tag count").to_be_bytes());
+            body.resize(37 + count * 8, 0);
+            body
+        };
+        assert!(super::parse_mempool_query(&query(super::MAX_MEMPOOL_QUERY_TAGS)).is_ok());
+        assert!(matches!(
+            super::parse_mempool_query(&query(super::MAX_MEMPOOL_QUERY_TAGS + 1)),
+            Err(super::RpcError::BadRequest(message)) if message.contains("at most 8192")
+        ));
     }
 
     fn chain(

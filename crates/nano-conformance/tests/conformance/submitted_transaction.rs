@@ -28,7 +28,9 @@ use std::{
     sync::Arc,
 };
 
-use nano_chainstate::{ChainState, NakamotoBlock, TransactionStatus, starts_new_tenure};
+use nano_chainstate::{
+    AppliedBlock, ChainState, NakamotoBlock, TransactionStatus, starts_new_tenure,
+};
 use nano_codec::Transaction;
 use nano_conformance::{FixtureManifest, FixtureMode};
 use nano_mempool::{Account, Mempool};
@@ -171,6 +173,38 @@ fn replay_below(fixtures: &Path, position: usize) -> Option<ChainState> {
     Some(chainstate)
 }
 
+fn assert_receipt_and_observer_payload(
+    block: &NakamotoBlock,
+    applied: &AppliedBlock,
+    txid: Sha256Sum,
+    published: &serde_json::Value,
+) {
+    let receipt = applied
+        .receipts
+        .iter()
+        .find(|receipt| receipt.txid == txid)
+        .expect("the block that carries it has a receipt for it");
+    assert_eq!(
+        receipt.status,
+        TransactionStatus::Success,
+        "the network's receipt said {}",
+        published["status"]
+    );
+    assert_eq!(published["status"], serde_json::json!("success"));
+
+    let payload =
+        nano_rpc::new_block_payload(block, applied, &nano_rpc::BlockEventContext::default());
+    let emitted = payload["transactions"]
+        .as_array()
+        .expect("the payload lists its transactions")
+        .iter()
+        .find(|entry| entry["txid"] == serde_json::json!(format!("0x{txid}")))
+        .expect("the payload names the transaction this node mined");
+    assert_eq!(emitted["status"], published["status"]);
+    assert_eq!(emitted["raw_result"], published["raw_result"]);
+    assert_eq!(emitted["execution_cost"], published["execution_cost"]);
+}
+
 #[tokio::test]
 async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
     let fixtures = fixtures();
@@ -198,11 +232,20 @@ async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
     let mempool = Arc::new(Mutex::new(Mempool::new(
         nano_conformance::captured_network(&fixtures),
     )));
+    let (relay, mut relayed) = nano_queue::channel(nano_rpc::TRANSACTION_QUEUE_LIMITS);
     let state = RpcState::new(nano_conformance::captured_network(&fixtures))
         .with_chain(shared.clone() as Arc<Mutex<dyn ChainAccess>>)
-        .with_mempool(mempool.clone());
+        .with_mempool(mempool.clone())
+        .with_transaction_relay(relay);
 
     post_to_the_rpc(state, &transaction).await;
+    assert_eq!(
+        relayed
+            .try_recv()
+            .expect("the route relayed the transaction"),
+        transaction,
+        "the network relay did not receive what the route admitted"
+    );
     assert!(
         mempool.lock().await.contains(txid),
         "the route answered but the pool the miner reads does not hold it"
@@ -265,35 +308,7 @@ async fn a_transaction_posted_to_the_rpc_is_mined_and_executed_by_this_node() {
         "the assembled block does not carry the transaction the pool offered"
     );
 
-    // Executed: nano's receipt for it, against the one the network published.
-    let receipt = applied
-        .receipts
-        .iter()
-        .find(|receipt| receipt.txid == txid)
-        .expect("the block that carries it has a receipt for it");
-    assert_eq!(
-        receipt.status,
-        TransactionStatus::Success,
-        "the network's receipt said {}",
-        published["status"]
-    );
-    assert_eq!(published["status"], serde_json::json!("success"));
-
-    // Emitted: the payload an observer is sent names it, with the result and the
-    // cost stacks-core published for the same execution.
-    let payload =
-        nano_rpc::new_block_payload(&built, &applied, &nano_rpc::BlockEventContext::default());
-    let emitted = payload["transactions"]
-        .as_array()
-        .expect("the payload lists its transactions")
-        .iter()
-        .find(|entry| entry["txid"] == serde_json::json!(format!("0x{txid}")))
-        .expect("the payload names the transaction this node mined")
-        .clone();
-    assert_eq!(emitted["status"], published["status"]);
-    assert_eq!(emitted["raw_result"], published["raw_result"]);
-    assert_eq!(
-        emitted["execution_cost"], published["execution_cost"],
-        "nano and stacks-core disagree about what the transaction cost"
-    );
+    // Executed and emitted: nano's receipt and observer payload against what the
+    // network published for the same transaction.
+    assert_receipt_and_observer_payload(&built, &applied, txid, &published);
 }

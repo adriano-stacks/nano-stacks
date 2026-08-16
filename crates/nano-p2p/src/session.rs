@@ -1122,11 +1122,20 @@ pub const fn nack_is_transient(code: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use nano_crypto::MessageSignature;
-    use nano_primitives::{BitcoinHeaderHash, Network};
+    use std::{net::Ipv4Addr, time::Duration};
 
-    use super::{MAX_BUFFERED_PUSH_BYTES, PEER_VERSION_MAINNET_MAJOR, Protocol, PushBuffer};
-    use crate::wire::{MAX_PAYLOAD_LEN, Message, PREAMBLE_LEN, Preamble};
+    use nano_crypto::{MessageSignature, StacksPrivateKey};
+    use nano_primitives::{BitcoinHeaderHash, Network};
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
+
+    use super::{
+        Framed, LocalPeer, MAX_BUFFERED_PUSH_BYTES, PEER_VERSION_MAINNET_MAJOR, Protocol,
+        PushBuffer, SessionError,
+    };
+    use crate::{
+        FrameBudget,
+        wire::{ChainView, MAX_PAYLOAD_LEN, Message, PREAMBLE_LEN, Preamble},
+    };
 
     fn unhandled_message(frame_len: usize) -> Message {
         let mut frame = vec![0; frame_len];
@@ -1176,5 +1185,49 @@ mod tests {
         pushes.push(unhandled_message(MAX_PAYLOAD_LEN as usize));
         assert_eq!(pushes.status().bytes, MAX_BUFFERED_PUSH_BYTES);
         assert_eq!(pushes.take().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fragmented_bytes_cannot_restart_a_message_deadline() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("read loopback address");
+        let mut peer = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect loopback");
+        let (stream, remote) = listener.accept().await.expect("accept loopback");
+        let local = LocalPeer::quiet(StacksPrivateKey::from_seed(b"fragment deadline"), 0);
+        let view = ChainView::new(
+            900_000,
+            BitcoinHeaderHash::from_bytes([1; 32]),
+            BitcoinHeaderHash::from_bytes([2; 32]),
+        )
+        .expect("a view above the confirmation window");
+        let mut framed = Framed::new(
+            stream,
+            remote.ip(),
+            &local,
+            Protocol::testnet(),
+            view,
+            Duration::from_millis(100),
+            FrameBudget::default(),
+        );
+
+        let trickle = tokio::spawn(async move {
+            for byte in 0..50_u8 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if peer.write_all(&[byte]).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let until = tokio::time::Instant::now() + Duration::from_millis(100);
+        let error = tokio::time::timeout(Duration::from_millis(300), framed.read_until(until))
+            .await
+            .expect("fragmentation cannot extend the absolute deadline")
+            .expect_err("an incomplete preamble times out");
+        assert!(matches!(error, SessionError::Timeout));
+        trickle.abort();
     }
 }

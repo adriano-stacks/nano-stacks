@@ -9,47 +9,72 @@ use std::{
 
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
+    http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
     routing::MethodRouter,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::{
+    limit::RequestBodyLimitLayer,
+    timeout::{RequestBodyTimeoutLayer, TimeoutLayer},
+};
 
 use crate::{RpcError, RpcState};
 
 const GLOBAL_CONCURRENCY: usize = 128;
 const RATE_WINDOW: Duration = Duration::from_secs(1);
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Policy {
     pub body_bytes: usize,
     concurrent: usize,
     per_second: u64,
+    body_idle_timeout: Duration,
+    request_timeout: Duration,
 }
 
 impl Policy {
-    const fn new(body_bytes: usize, concurrent: usize, per_second: u64) -> Self {
+    const fn new(
+        body_bytes: usize,
+        concurrent: usize,
+        per_second: u64,
+        body_idle_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Self {
         assert!(concurrent > 0, "a route needs a concurrency slot");
         assert!(per_second > 0, "a route needs a request-rate slot");
         Self {
             body_bytes,
             concurrent,
             per_second,
+            body_idle_timeout,
+            request_timeout,
         }
     }
 }
 
-pub const CHEAP_READ: Policy = Policy::new(0, 64, 512);
-pub const STATE_READ: Policy = Policy::new(0, 16, 128);
-pub const ARCHIVE_READ: Policy = Policy::new(0, 16, 64);
-pub const EVENT_STREAM: Policy = Policy::new(0, 64, 64);
-pub const CALL_READ: Policy = Policy::new(4 * 1024 * 1024 + 4096, 4, 16);
-pub const TRANSACTION: Policy = Policy::new(2 * 1024 * 1024, 16, 64);
-pub const MEMPOOL_QUERY: Policy = Policy::new(1024 * 1024, 8, 32);
-pub const STACKERDB_UPLOAD: Policy = Policy::new(4 * 1024 * 1024 + 1024, 8, 32);
-pub const BLOCK_UPLOAD: Policy = Policy::new(4 * 1024 * 1024, 4, 16);
-pub const BLOCK_PROPOSAL: Policy = Policy::new(8 * 1024 * 1024 + 4096, 4, 16);
+const fn policy(body_bytes: usize, concurrent: usize, per_second: u64, seconds: u64) -> Policy {
+    Policy::new(
+        body_bytes,
+        concurrent,
+        per_second,
+        BODY_IDLE_TIMEOUT,
+        Duration::from_secs(seconds),
+    )
+}
+
+pub const CHEAP_READ: Policy = policy(0, 64, 512, 5);
+pub const STATE_READ: Policy = policy(0, 16, 128, 15);
+pub const ARCHIVE_READ: Policy = policy(0, 16, 64, 30);
+pub const EVENT_STREAM: Policy = policy(0, 64, 64, 5);
+pub const CALL_READ: Policy = policy(4 * 1024 * 1024 + 4096, 4, 16, 60);
+pub const TRANSACTION: Policy = policy(2 * 1024 * 1024, 16, 64, 30);
+pub const MEMPOOL_QUERY: Policy = policy(128 * 1024, 8, 32, 30);
+pub const STACKERDB_UPLOAD: Policy = policy(4 * 1024 * 1024 + 1024, 8, 32, 30);
+pub const BLOCK_UPLOAD: Policy = policy(4 * 1024 * 1024, 4, 16, 60);
+pub const BLOCK_PROPOSAL: Policy = policy(8 * 1024 * 1024 + 4096, 4, 16, 60);
 
 #[derive(Clone, Debug)]
 pub struct Registry {
@@ -90,6 +115,11 @@ pub fn guard(
     route
         .layer::<_, Infallible>(DefaultBodyLimit::disable())
         .layer::<_, Infallible>(RequestBodyLimitLayer::new(policy.body_bytes))
+        .layer::<_, Infallible>(RequestBodyTimeoutLayer::new(policy.body_idle_timeout))
+        .layer::<_, Infallible>(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            policy.request_timeout,
+        ))
         .layer::<_, Infallible>(axum::middleware::from_fn_with_state(budget, admit))
 }
 
@@ -197,28 +227,41 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+    use std::time::Duration;
 
     use axum::{
         Router,
-        body::Body,
+        body::{Body, Bytes},
         http::{Request, StatusCode, header},
-        routing::get,
+        routing::{get, post},
     };
     use nano_primitives::Network;
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, mpsc};
+    use tokio_stream::wrappers::ReceiverStream;
     use tower::ServiceExt as _;
 
     use super::{Admission, Policy, Registry};
     use crate::RpcState;
 
+    fn policy(concurrent: usize, per_second: u64) -> Policy {
+        Policy::new(
+            0,
+            concurrent,
+            per_second,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+    }
+
     #[test]
     fn concurrency_and_rate_refusals_recover() {
         let registry = Registry::new(2);
-        let concurrency = registry.budget("concurrency", Policy::new(0, 1, 10));
+        let concurrency = registry.budget("concurrency", policy(1, 10));
         let held = concurrency.try_enter().expect("first request");
         assert!(matches!(
             concurrency.try_enter(),
@@ -227,7 +270,7 @@ mod tests {
         drop(held);
         assert!(concurrency.try_enter().is_ok());
 
-        let rate = registry.budget("rate", Policy::new(0, 2, 1));
+        let rate = registry.budget("rate", policy(2, 1));
         drop(rate.try_enter().expect("first request"));
         assert!(matches!(rate.try_enter(), Err(Admission::Rate)));
     }
@@ -260,7 +303,7 @@ mod tests {
         let app = Router::new()
             .route(
                 "/",
-                super::guard(&registry, "held", get(handler), Policy::new(0, 1, 10)),
+                super::guard(&registry, "held", get(handler), policy(1, 10)),
             )
             .with_state(RpcState::new(Network::TESTNET));
         let first = tokio::spawn(app.clone().oneshot(request()));
@@ -309,7 +352,7 @@ mod tests {
         let app = Router::new()
             .route(
                 "/",
-                super::guard(&registry, "rate", get(handler), Policy::new(0, 1, 1)),
+                super::guard(&registry, "rate", get(handler), policy(1, 1)),
             )
             .with_state(RpcState::new(Network::TESTNET));
         assert_eq!(
@@ -324,5 +367,115 @@ mod tests {
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(limited.headers()[header::RETRY_AFTER], "1");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_handler_releases_its_slot() {
+        let registry = Registry::new(1);
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let handler = {
+            let first = first.clone();
+            move || {
+                let first = first.clone();
+                async move {
+                    if first.swap(false, Ordering::Relaxed) {
+                        std::future::pending::<()>().await;
+                    }
+                    StatusCode::OK
+                }
+            }
+        };
+        let timeout = Policy::new(0, 1, 10, Duration::from_secs(1), Duration::from_millis(20));
+        let app = Router::new()
+            .route(
+                "/",
+                super::guard(&registry, "timeout", get(handler), timeout),
+            )
+            .with_state(RpcState::new(Network::TESTNET));
+
+        let timed_out = app.clone().oneshot(request()).await.expect("response");
+        assert_eq!(timed_out.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            app.oneshot(request()).await.expect("response").status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stalled_body_is_refused_and_the_route_recovers() {
+        let registry = Registry::new(1);
+        let timeout = Policy::new(
+            1024,
+            1,
+            10,
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+        );
+        let app = Router::new()
+            .route(
+                "/",
+                super::guard(
+                    &registry,
+                    "body-timeout",
+                    post(|_: Bytes| async { StatusCode::OK }),
+                    timeout,
+                ),
+            )
+            .with_state(RpcState::new(Network::TESTNET));
+        let (_body_sender, body) = mpsc::channel::<Result<Bytes, Infallible>>(1);
+        let stalled = Request::builder()
+            .method("POST")
+            .uri("/")
+            .body(Body::from_stream(ReceiverStream::new(body)))
+            .expect("request");
+
+        assert_eq!(
+            app.clone()
+                .oneshot(stalled)
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let recovered = Request::builder()
+            .method("POST")
+            .uri("/")
+            .body(Body::from("ok"))
+            .expect("request");
+        assert_eq!(
+            app.oneshot(recovered).await.expect("response").status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn fragmented_bodies_share_one_byte_limit() {
+        let registry = Registry::new(1);
+        let bounded = Policy::new(3, 1, 10, Duration::from_secs(1), Duration::from_secs(1));
+        let app = Router::new()
+            .route(
+                "/",
+                super::guard(
+                    &registry,
+                    "fragmented",
+                    post(|_: Bytes| async { StatusCode::OK }),
+                    bounded,
+                ),
+            )
+            .with_state(RpcState::new(Network::TESTNET));
+        let body = Body::from_stream(tokio_stream::iter([
+            Ok::<_, Infallible>(Bytes::from_static(b"ab")),
+            Ok(Bytes::from_static(b"cd")),
+        ]));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .body(body)
+            .expect("request");
+
+        assert_eq!(
+            app.oneshot(request).await.expect("response").status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 }
