@@ -27,7 +27,7 @@ load shedding instead of an unbounded queue, allocation or task population.
 - [ ] Replace externally fed unbounded channels with bounded, byte-accounted
       queues. Share one small queue abstraction and expose current bytes, age,
       drops and saturation.
-- [ ] Add route-specific body, concurrency and rate limits. Return an explicit
+- [x] Add route-specific body, concurrency and rate limits. Return an explicit
       overload response without reporting admission or changing consensus state.
 - [x] Bound P2P memory per session, per address and globally; enforce the budget
       before allocating or decoding the advertised payload.

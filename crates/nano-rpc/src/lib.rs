@@ -1,5 +1,6 @@
 mod chain;
 mod events;
+mod limits;
 mod metrics;
 mod stackerdb;
 
@@ -301,6 +302,7 @@ pub struct RpcState {
     proposal_token: Option<String>,
     /// Where the events a route produces are published.
     observers: Option<EventDispatcher>,
+    ingress: limits::Registry,
 }
 
 impl std::fmt::Debug for RpcState {
@@ -356,6 +358,7 @@ impl RpcState {
             blocks: None,
             proposal_token: None,
             observers: None,
+            ingress: limits::Registry::default(),
         }
     }
 
@@ -644,57 +647,211 @@ impl NodeEvent {
 
 /// Build the RPC routes backed by the node's latest validated view.
 pub fn router(state: RpcState) -> Router {
+    let ingress = &state.ingress;
     Router::new()
-        .route("/v2/info", get(node_info))
-        .route("/nano/sync_status", get(sync_status))
-        .route("/v2/pox", get(pox_info))
-        .route("/v2/accounts/{principal}", get(account))
+        .merge(v2_routes(ingress))
+        .merge(v3_chain_routes(ingress))
+        .merge(v3_block_routes(ingress))
+        .route(
+            "/events",
+            limits::guard(ingress, "events", get(events), limits::EVENT_STREAM),
+        )
+        .layer(axum::middleware::from_fn(trace))
+        .with_state(state)
+}
+
+fn v2_routes(ingress: &limits::Registry) -> Router<RpcState> {
+    Router::new()
+        .route(
+            "/v2/info",
+            limits::guard(ingress, "v2.info", get(node_info), limits::CHEAP_READ),
+        )
+        .route(
+            "/nano/sync_status",
+            limits::guard(
+                ingress,
+                "nano.sync_status",
+                get(sync_status),
+                limits::CHEAP_READ,
+            ),
+        )
+        .route(
+            "/v2/pox",
+            limits::guard(ingress, "v2.pox", get(pox_info), limits::STATE_READ),
+        )
+        .route(
+            "/v2/accounts/{principal}",
+            limits::guard(ingress, "v2.account", get(account), limits::STATE_READ),
+        )
         .route(
             "/v2/contracts/call-read/{address}/{contract}/{function}",
-            post(call_read_only),
+            limits::guard(
+                ingress,
+                "v2.call_read",
+                post(call_read_only),
+                limits::CALL_READ,
+            ),
         )
-        .route("/v2/transactions", post(submit_transaction))
-        .route("/v2/mempool/query", post(query_mempool))
+        .route(
+            "/v2/transactions",
+            limits::guard(
+                ingress,
+                "v2.transactions",
+                post(submit_transaction),
+                limits::TRANSACTION,
+            ),
+        )
+        .route(
+            "/v2/mempool/query",
+            limits::guard(
+                ingress,
+                "v2.mempool_query",
+                post(query_mempool),
+                limits::MEMPOOL_QUERY,
+            ),
+        )
         .route(
             "/v2/stackerdb/{address}/{contract}",
-            get(stackerdb_metadata),
+            limits::guard(
+                ingress,
+                "v2.stackerdb_metadata",
+                get(stackerdb_metadata),
+                limits::STATE_READ,
+            ),
         )
         .route(
             "/v2/stackerdb/{address}/{contract}/chunks",
-            post(stackerdb_chunk_upload),
+            limits::guard(
+                ingress,
+                "v2.stackerdb_upload",
+                post(stackerdb_chunk_upload),
+                limits::STACKERDB_UPLOAD,
+            ),
         )
         .route(
             "/v2/stackerdb/{address}/{contract}/{slot_id}",
-            get(stackerdb_chunk),
+            limits::guard(
+                ingress,
+                "v2.stackerdb_chunk",
+                get(stackerdb_chunk),
+                limits::ARCHIVE_READ,
+            ),
         )
         .route(
             "/v2/stackerdb/{address}/{contract}/{slot_id}/{slot_version}",
-            get(stackerdb_chunk_at_version),
+            limits::guard(
+                ingress,
+                "v2.stackerdb_chunk_version",
+                get(stackerdb_chunk_at_version),
+                limits::ARCHIVE_READ,
+            ),
         )
-        .route("/v3/sortitions", get(latest_sortition))
+}
+
+fn v3_chain_routes(ingress: &limits::Registry) -> Router<RpcState> {
+    Router::new()
+        .route(
+            "/v3/sortitions",
+            limits::guard(
+                ingress,
+                "v3.sortitions",
+                get(latest_sortition),
+                limits::STATE_READ,
+            ),
+        )
         .route(
             "/v3/sortitions/latest_and_last",
-            get(latest_and_last_sortition),
+            limits::guard(
+                ingress,
+                "v3.sortitions_latest_and_last",
+                get(latest_and_last_sortition),
+                limits::STATE_READ,
+            ),
         )
-        .route("/v3/sortitions/consensus/{consensus_hash}", get(sortition))
-        .route("/v3/stacker_set/{cycle}", get(stacker_set))
-        .route("/v3/tenures/info", get(tenure_info))
+        .route(
+            "/v3/sortitions/consensus/{consensus_hash}",
+            limits::guard(
+                ingress,
+                "v3.sortition_consensus",
+                get(sortition),
+                limits::STATE_READ,
+            ),
+        )
+        .route(
+            "/v3/stacker_set/{cycle}",
+            limits::guard(
+                ingress,
+                "v3.stacker_set",
+                get(stacker_set),
+                limits::STATE_READ,
+            ),
+        )
+        .route(
+            "/v3/tenures/info",
+            limits::guard(
+                ingress,
+                "v3.tenure_info",
+                get(tenure_info),
+                limits::STATE_READ,
+            ),
+        )
         .route(
             "/v3/tenures/fork_info/{start}/{stop}",
-            get(tenure_fork_info),
+            limits::guard(
+                ingress,
+                "v3.tenure_fork_info",
+                get(tenure_fork_info),
+                limits::STATE_READ,
+            ),
         )
         .route(
             "/v3/tenures/tip_metadata/{consensus_hash}",
-            get(tenure_tip_metadata),
+            limits::guard(
+                ingress,
+                "v3.tenure_tip_metadata",
+                get(tenure_tip_metadata),
+                limits::STATE_READ,
+            ),
         )
-        .route("/v3/tenures/{start_block_id}", get(tenure))
-        .route("/v3/blocks/upload", post(upload_block))
-        .route("/v3/blocks/upload/", post(upload_block))
-        .route("/v3/blocks/{block_id}", get(block))
-        .route("/v3/block_proposal", post(block_proposal))
-        .route("/events", get(events))
-        .layer(axum::middleware::from_fn(trace))
-        .with_state(state)
+        .route(
+            "/v3/tenures/{start_block_id}",
+            limits::guard(ingress, "v3.tenure", get(tenure), limits::ARCHIVE_READ),
+        )
+}
+
+fn v3_block_routes(ingress: &limits::Registry) -> Router<RpcState> {
+    Router::new()
+        .route(
+            "/v3/blocks/upload",
+            limits::guard(
+                ingress,
+                "v3.block_upload",
+                post(upload_block),
+                limits::BLOCK_UPLOAD,
+            ),
+        )
+        .route(
+            "/v3/blocks/upload/",
+            limits::guard(
+                ingress,
+                "v3.block_upload",
+                post(upload_block),
+                limits::BLOCK_UPLOAD,
+            ),
+        )
+        .route(
+            "/v3/blocks/{block_id}",
+            limits::guard(ingress, "v3.block", get(block), limits::ARCHIVE_READ),
+        )
+        .route(
+            "/v3/block_proposal",
+            limits::guard(
+                ingress,
+                "v3.block_proposal",
+                post(block_proposal),
+                limits::BLOCK_PROPOSAL,
+            ),
+        )
 }
 
 /// Serve the public RPC until the listener is stopped.
@@ -732,6 +889,7 @@ enum RpcError {
     Rejected(Value),
     Unauthorized,
     Overloaded(String),
+    RateLimited(String),
 }
 
 impl IntoResponse for RpcError {
@@ -747,6 +905,12 @@ impl IntoResponse for RpcError {
             Self::Rejected(body) => (StatusCode::BAD_REQUEST, axum::Json(body)).into_response(),
             Self::Overloaded(message) => (
                 StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "1")],
+                message,
+            )
+                .into_response(),
+            Self::RateLimited(message) => (
+                StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, "1")],
                 message,
             )
@@ -2707,6 +2871,45 @@ mod tests {
             .await
             .expect("read body");
         String::from_utf8(bytes.to_vec()).expect("UTF-8 body")
+    }
+
+    #[tokio::test]
+    async fn every_body_route_rejects_its_declared_over_limit_size() {
+        let routes = [
+            (
+                "POST",
+                "/v2/contracts/call-read/ST000000000000000000002AMW42H/a/f",
+                super::limits::CALL_READ,
+            ),
+            ("POST", "/v2/transactions", super::limits::TRANSACTION),
+            ("POST", "/v2/mempool/query", super::limits::MEMPOOL_QUERY),
+            (
+                "POST",
+                "/v2/stackerdb/ST000000000000000000002AMW42H/a/chunks",
+                super::limits::STACKERDB_UPLOAD,
+            ),
+            ("POST", "/v3/blocks/upload", super::limits::BLOCK_UPLOAD),
+            ("POST", "/v3/block_proposal", super::limits::BLOCK_PROPOSAL),
+            ("GET", "/v2/info", super::limits::CHEAP_READ),
+        ];
+        for (method, uri, policy) in routes {
+            let response = router(RpcState::new(Network::TESTNET))
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(header::CONTENT_LENGTH, (policy.body_bytes + 1).to_string())
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{method} {uri}"
+            );
+        }
     }
 
     fn chain(
