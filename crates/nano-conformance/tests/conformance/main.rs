@@ -33,6 +33,7 @@ mod coinbase_schedule;
 mod derived_reward_set;
 mod engine_failure;
 mod engine_state_roots;
+mod epoch4_profile;
 mod event_delivery;
 mod event_observer;
 mod event_queue;

@@ -17,7 +17,7 @@ use nano_primitives::{Hash160, Network, hash160};
 use crate::{NakamotoBlock, NakamotoBlockHeader, SignerSetError};
 
 /// The header version epoch 4.0 blocks carry, below the shadow flag.
-pub const NAKAMOTO_BLOCK_VERSION_EPOCH_4: u8 = 1;
+pub use nano_consensus_profile::NAKAMOTO_BLOCK_VERSION as NAKAMOTO_BLOCK_VERSION_EPOCH_4;
 
 /// The most `problematic_txs` markers a block may carry.
 ///
@@ -285,7 +285,7 @@ pub fn authenticate_block(
     network: Network,
     signatures: Signatures,
 ) -> Result<(), ConsensusError> {
-    if block.header.version & 0x7f != NAKAMOTO_BLOCK_VERSION_EPOCH_4 {
+    if !nano_consensus_profile::admits_nakamoto_block_version(block.header.version) {
         return Err(ConsensusError::HeaderVersion(block.header.version));
     }
     // A block with nothing in it is not merely pointless: it could not have

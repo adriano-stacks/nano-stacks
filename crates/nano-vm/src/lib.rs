@@ -703,6 +703,12 @@ fn epoch_at_burn_height(mainnet: bool, height: u64) -> StacksEpochId {
         .map_or(StacksEpochId::Epoch20, |(_, epoch)| *epoch)
 }
 
+/// The semantic epoch the mainnet profile assigns to a Bitcoin height.
+#[must_use]
+pub fn semantic_epoch_at_burn_height(network: Network, height: u64) -> StacksEpochId {
+    epoch_at_burn_height(network.is_mainnet(), height)
+}
+
 /// Where epoch 4.0 begins on mainnet, which is where pox-5 activates.
 const MAINNET_EPOCH_40_HEIGHT: u64 = 960_230;
 

@@ -8,6 +8,20 @@ use sha2::{Digest as _, Sha256};
 pub const PROFILE_JSON: &str = include_str!("../profile/mainnet-epoch4-v1.json");
 pub const VECTORS_JSON: &str = include_str!("../profile/mainnet-epoch4-v1-vectors.json");
 pub const PROFILE_ID: &str = "stacks-mainnet-epoch-4.0-v1";
+pub const SEMANTIC_EPOCH: &str = "Epoch40";
+pub const NAKAMOTO_BLOCK_VERSION: u8 = 1;
+
+/// Whether a Nakamoto header belongs to this profile's only supported epoch.
+#[must_use]
+pub const fn admits_nakamoto_block_version(version: u8) -> bool {
+    version & 0x7f == NAKAMOTO_BLOCK_VERSION
+}
+
+/// Whether an explicitly announced activation is inside this profile.
+#[must_use]
+pub fn admits_activation(semantic_epoch: &str, block_version: u8) -> bool {
+    semantic_epoch == SEMANTIC_EPOCH && admits_nakamoto_block_version(block_version)
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Fingerprint([u8; 32]);
@@ -312,8 +326,9 @@ fn validate_profile(profile: &Profile) -> Result<(), String> {
         || profile.network.chain_id != 1
         || profile.network.network_id != 0x1700_0000
         || profile.network.peer_version != 0x1800_0010
-        || profile.activation.semantic_epoch != "Epoch40"
+        || profile.activation.semantic_epoch != SEMANTIC_EPOCH
         || profile.activation.burn_height != 960_230
+        || profile.activation.nakamoto_block_version != NAKAMOTO_BLOCK_VERSION
         || profile.pox.activation_burn_height != profile.activation.burn_height
         || profile.pox.reward_cycle_length
             != profile.pox.prepare_phase_length + profile.pox.reward_phase_length
