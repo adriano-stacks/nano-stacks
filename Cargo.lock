@@ -2597,6 +2597,7 @@ name = "nano-marf"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "nano-consensus-profile",
  "nano-primitives",
  "rusqlite",
  "serde",
@@ -2654,6 +2655,7 @@ dependencies = [
  "nano-bitcoin",
  "nano-chainstate",
  "nano-codec",
+ "nano-consensus-profile",
  "nano-crypto",
  "nano-marf",
  "nano-mempool",
@@ -2826,6 +2828,7 @@ dependencies = [
  "clar2wasm",
  "clarity",
  "hex",
+ "nano-consensus-profile",
  "nano-marf",
  "nano-primitives",
  "nano-wasm-cache",
@@ -5772,6 +5775,7 @@ dependencies = [
  "nano-chainstate",
  "nano-codec",
  "nano-conformance",
+ "nano-consensus-profile",
  "nano-crypto",
  "nano-marf",
  "nano-node",

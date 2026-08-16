@@ -6346,14 +6346,14 @@ fn report_contract_arities(state: Option<&Path>, qualifying: bool) -> bool {
     }
 }
 
-fn report_checkpoint(state: Option<&Path>) {
+fn report_checkpoint(state: Option<&Path>, qualifying: bool) -> bool {
     println!("\ncheckpoint provenance");
     let Some(directory) = state else {
         println!(
             "  no --state directory given, so no provenance is claimed. \
              docs/checkpoint-trust.md is the procedure."
         );
-        return;
+        return !qualifying;
     };
     // A node records its provenance beside the MARF it imported, which is
     // `<state>/chainstate`, and an operator naturally names the state directory.
@@ -6368,7 +6368,7 @@ fn report_checkpoint(state: Option<&Path>) {
             },
         );
     let (directory, loaded) = found.unwrap_or_else(|| (directory.to_path_buf(), Ok(None)));
-    match loaded {
+    let provenance_profile = match loaded {
         Ok(Some(provenance)) => {
             let checkpoint = &provenance.checkpoint;
             println!("  state directory      {}", directory.display());
@@ -6383,6 +6383,10 @@ fn report_checkpoint(state: Option<&Path>) {
                 hex::encode(checkpoint.state_index_root.as_bytes())
             );
             println!("  first_bitcoin_height {}", checkpoint.first_bitcoin_height);
+            match checkpoint.profile_fingerprint {
+                Some(profile) => println!("  checkpoint profile   {profile}"),
+                None => println!("  checkpoint profile   MISSING"),
+            }
             match &provenance.attestation {
                 Some(attestation) => {
                     println!(
@@ -6399,15 +6403,36 @@ fn report_checkpoint(state: Option<&Path>) {
                      than from a signed header"
                 ),
             }
+            checkpoint.profile_fingerprint
         }
-        Ok(None) => println!(
-            "  {} carries no checkpoint-provenance.toml, so what it descends from is \
-             unrecorded",
-            directory.display()
-        ),
-        Err(error) => println!("  {} is unreadable: {error}", directory.display()),
-    }
+        Ok(None) => {
+            println!(
+                "  {} carries no checkpoint-provenance.toml, so what it descends from is \
+                 unrecorded",
+                directory.display()
+            );
+            None
+        }
+        Err(error) => {
+            println!("  {} is unreadable: {error}", directory.display());
+            None
+        }
+    };
+    let active = nano_vm::compatibility_profile_fingerprint();
+    let active_text = active.to_string();
+    let state_profile = nano_vm::recorded_profile_fingerprint(&directory);
+    println!(
+        "  state profile        {}",
+        state_profile.as_deref().unwrap_or("MISSING")
+    );
+    let exact = provenance_profile == Some(active)
+        && state_profile.as_deref() == Some(active_text.as_str());
+    println!(
+        "  profile admission    {}",
+        if exact { "PASS" } else { "FAIL" }
+    );
     report_state_engines(&directory);
+    exact
 }
 
 /// Which clarity-wasm builds wrote the state, and whether this artifact is one.
@@ -6904,7 +6929,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
         .as_deref()
         .is_some_and(|path| report_artifact(path, &source_revision));
     let contract_arities = report_contract_arities(options.state.as_deref(), options.run_gates);
-    report_checkpoint(options.state.as_deref());
+    let checkpoint_profile = report_checkpoint(options.state.as_deref(), options.run_gates);
     let scoreboard = report_scoreboard(options.state.as_deref(), options.run_gates);
     report_inputs();
     let release_inventory = report_release_inventory(&inventory, options.run_gates);
@@ -6929,6 +6954,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
 
     let evidence = artifact
         && contract_arities
+        && checkpoint_profile
         && scoreboard
         && receipt_binding
         && historical_epoch_evidence

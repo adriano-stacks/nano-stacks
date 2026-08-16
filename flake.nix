@@ -126,6 +126,8 @@
                 > "$out/share/nano-stacks/config.schema.json"
               "$out/bin/stacks-node" build-identity \
                 > "$out/share/nano-stacks/build-identity.json"
+              "$out/bin/stacks-node" compatibility-profile \
+                > "$out/share/nano-stacks/compatibility-profile.json"
             '';
           };
 

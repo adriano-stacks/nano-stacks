@@ -154,6 +154,7 @@ fn the_published_mainnet_checkpoint_is_attested_by_the_header_that_sealed_it() {
         source_state_id: thirty_two(CHECKPOINT_STATE_ID),
         state_index_root: nano_primitives::TrieHash::from_bytes(thirty_two(CHECKPOINT_STATE_ROOT)),
         first_bitcoin_height: CHECKPOINT_BITCOIN_HEIGHT,
+        profile_fingerprint: Some(nano_vm::compatibility_profile_fingerprint()),
     };
     let attestation = nano_node::attest_checkpoint(&manifest, &block.header, &reward_set())
         .expect("mainnet's signers attest the checkpoint nano starts from");

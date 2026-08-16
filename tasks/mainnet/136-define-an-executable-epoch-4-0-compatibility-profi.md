@@ -21,21 +21,21 @@ nano promises to preserve.
 
 ## Tasks
 
-- [ ] Define a machine-readable profile covering network and chain IDs,
+- [x] Define a machine-readable profile covering network and chain IDs,
       activation heights, PoX-5 transition, reward-cycle constants, system
       contract sources/hashes, transaction and block limits, Clarity semantic
       epoch and all consensus-critical compiler/host identities.
-- [ ] Bind every field to its SIP, deployed-chain evidence and pinned reference
+- [x] Bind every field to its SIP, deployed-chain evidence and pinned reference
       source revision. Record disagreements explicitly rather than choosing one
       source silently.
-- [ ] Convert the profile into implementation-neutral block, transaction,
+- [x] Convert the profile into implementation-neutral block, transaction,
       sortition, signer, VM, receipt, cost and refusal vectors.
 - [ ] Run the vectors against nano and more than one compatible stock
       stacks-core revision so one reference implementation bug is not copied into
       the specification unnoticed.
-- [ ] Make checkpoint import, state opening and release qualification verify the
+- [x] Make checkpoint import, state opening and release qualification verify the
       profile fingerprint before execution.
-- [ ] Document the compatibility policy for security-only engine/compiler
+- [x] Document the compatibility policy for security-only engine/compiler
       upgrades: full replay is mandatory and there is no fallback or healing
       mechanism.
 - [ ] Fail closed on any unknown post-Epoch-4 activation instead of silently

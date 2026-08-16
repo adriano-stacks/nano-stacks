@@ -184,6 +184,7 @@ fn the_checkpoint_procedure_names_the_fields_the_node_writes() {
             source_state_id: [0x59; 32],
             state_index_root: nano_primitives::TrieHash::from_bytes([0x34; 32]),
             first_bitcoin_height: 277,
+            profile_fingerprint: Some(nano_vm::compatibility_profile_fingerprint()),
         },
         attestation: Some(nano_node::CheckpointAttestation {
             attesting_block_id: [0x59; 32],

@@ -45,6 +45,11 @@ pub enum CheckpointError {
         recorded: Box<CheckpointManifest>,
         configured: Box<CheckpointManifest>,
     },
+    MissingProfileFingerprint,
+    ProfileMismatch {
+        declared: nano_consensus_profile::Fingerprint,
+        active: nano_consensus_profile::Fingerprint,
+    },
     UnfinishedImport {
         directory: PathBuf,
         marker: PathBuf,
@@ -91,6 +96,13 @@ impl std::fmt::Display for CheckpointError {
                 configured.state_index_root,
                 configured.stacks_height
             ),
+            Self::MissingProfileFingerprint => formatter.write_str(
+                "checkpoint names no executable consensus profile; mainnet import is refused",
+            ),
+            Self::ProfileMismatch { declared, active } => write!(
+                formatter,
+                "checkpoint profile {declared} does not match this artifact's {active}"
+            ),
             Self::UnfinishedImport {
                 directory,
                 marker,
@@ -125,6 +137,8 @@ impl std::error::Error for CheckpointError {
             | Self::RootMismatch { .. }
             | Self::DeclaredRootMismatch { .. }
             | Self::ProvenanceMismatch { .. }
+            | Self::MissingProfileFingerprint
+            | Self::ProfileMismatch { .. }
             | Self::UnfinishedImport { .. }
             | Self::UnsupportedPatch => None,
         }

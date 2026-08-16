@@ -20,6 +20,7 @@ checkpoint_stacks_height = 400
 source_state_id = "59fddf16…"          # the block_id of the block that sealed the state
 published_state_index_root = "34644adb…" # the state root at that block
 first_bitcoin_height = 277
+profile_fingerprint = "0123456789abcdef…" # exact `stacks-node compatibility-profile` fingerprint
 ```
 
 Three separate assertions live in a running node, and they are not the same
@@ -34,6 +35,13 @@ The import refuses to proceed unless all three agree, and says which pair
 disagreed: `DeclaredRootMismatch` when the configuration and the checkpoint's
 manifest name different roots for the state the checkpoint publishes,
 `RootMismatch` when the trie graph does not hash to the root that was asked for.
+
+Mainnet import also requires `profile_fingerprint` to equal the profile embedded
+in the release artifact. That fingerprint covers the declared Epoch-4 domain,
+the clarity-wasm compiler and the exact Wasmtime version/configuration. Missing
+or different values are refused before any state is copied. A compiler or
+consensus-profile upgrade therefore uses a new directory and a complete replay;
+opening an existing state is never an implicit migration.
 
 That agreement is worth having, but it is only self-consistency. A checkpoint
 fabricated end to end — a doctored trie whose root is recomputed and written
@@ -124,6 +132,7 @@ checkpoint_stacks_height = 400
 source_state_id = "59fddf16…"
 published_state_index_root = "34644adb…"
 first_bitcoin_height = 277
+profile_fingerprint = "0123456789abcdef…"
 
 [attestation]
 attesting_block_id = "59fddf16…"

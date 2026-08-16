@@ -2,7 +2,9 @@
 
 The release bundle contains one Nix-built `stacks-node`, its CycloneDX SBOM,
 resolved Cargo feature tree, generated configuration schema, and the profiles in
-this directory. Verify the signed manifest before installing any file.
+this directory. `share/nano-stacks/compatibility-profile.json` names the exact
+Epoch-4 consensus, compiler and Wasmtime identity the binary can extend. Verify
+the signed manifest before installing any file.
 
 ## Prepare, qualify, and verify
 

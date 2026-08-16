@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 hex = "0.4.3"
 nano-conformance = { path = "../crates/nano-conformance" }
+nano-consensus-profile = { path = "../crates/nano-consensus-profile" }
 nano-primitives = { path = "../crates/nano-primitives" }
 nano-chainstate = { path = "../crates/nano-chainstate" }
 nano-crypto = { path = "../crates/nano-crypto" }

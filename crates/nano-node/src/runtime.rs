@@ -2893,6 +2893,9 @@ fn adopt(config: &Config, directory: &Path, source: [u8; 32]) -> Result<(), Box<
             .parent()
             .ok_or("the checkpoint has no directory")?,
     )?;
+    if config.network().is_some_and(Network::is_mainnet) {
+        manifest.check_profile(nano_vm::compatibility_profile_fingerprint())?;
+    }
     if manifest.source_state_id != source {
         return Err(format!(
             "the checkpoint names state {} where this node is configured for {}",

@@ -28,6 +28,8 @@ enum Command {
     ConfigSchema,
     /// Print the immutable identities embedded in this artifact.
     BuildIdentity,
+    /// Print the exact executable Epoch-4 profile embedded in this artifact.
+    CompatibilityProfile,
 }
 
 /// The same allocator the replay tool measured: 14% off a mainnet replay, and
@@ -44,6 +46,7 @@ async fn main() -> ExitCode {
         Command::CheckConfig { config } => check(&config),
         Command::ConfigSchema => config_schema(),
         Command::BuildIdentity => build_identity(),
+        Command::CompatibilityProfile => compatibility_profile(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -72,8 +75,17 @@ fn build_identity() -> Result<(), Box<dyn Error>> {
             "target": BUILD_TARGET,
             "wasmtime": nano_vm::WASMTIME_VERSION,
             "wasmtime_engine": nano_vm::WASMTIME_ENGINE_CONFIG,
+            "compatibility_profile": nano_consensus_profile::PROFILE_ID,
+            "compatibility_profile_sha256": nano_consensus_profile::profile_sha256().to_string(),
+            "compatibility_vectors_sha256": nano_consensus_profile::vectors_sha256().to_string(),
+            "compatibility_fingerprint": nano_vm::compatibility_profile_fingerprint().to_string(),
         }))?
     );
+    Ok(())
+}
+
+fn compatibility_profile() -> Result<(), Box<dyn Error>> {
+    println!("{}", nano_vm::compatibility_profile_json()?);
     Ok(())
 }
 

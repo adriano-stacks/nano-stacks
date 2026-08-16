@@ -16,6 +16,7 @@ nano-address = { path = "../nano-address" }
 nano-bitcoin = { path = "../nano-bitcoin" }
 nano-chainstate = { path = "../nano-chainstate" }
 nano-codec = { path = "../nano-codec" }
+nano-consensus-profile = { path = "../nano-consensus-profile" }
 nano-crypto = { path = "../nano-crypto" }
 nano-marf = { path = "../nano-marf" }
 nano-mempool = { path = "../nano-mempool" }

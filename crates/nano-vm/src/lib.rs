@@ -29,9 +29,10 @@ use clarity::vm::events::{STXEventType, STXMintEventData, StacksTransactionEvent
 use clarity::vm::representations::SymbolicExpression;
 use clarity::vm::types::{BuffData, PrincipalData, QualifiedContractIdentifier, SequenceData};
 use clarity::vm::{ClarityVersion, Value};
+use nano_consensus_profile::{Fingerprint, RuntimeIdentities};
 use nano_marf::{
-    CheckpointError, MarfError, MarfSnapshot, MarfValue, StateRoot, TriePointer, UnfinishedImport,
-    VersionedMarf, import_checkpoint, import_checkpoint_into,
+    CheckpointError, CheckpointManifest, MarfError, MarfSnapshot, MarfValue, StateRoot,
+    TriePointer, UnfinishedImport, VersionedMarf, import_checkpoint, import_checkpoint_into,
 };
 use nano_primitives::{Network, TrieHash};
 use rusqlite::{OptionalExtension, params};
@@ -63,6 +64,25 @@ pub const COMPILER_IDENTITY: &str = env!("NANO_COMPILER_IDENTITY");
 /// The native runtime and complete configuration embedded in this build.
 pub const WASMTIME_VERSION: &str = clar2wasm::WASMTIME_VERSION;
 pub const WASMTIME_ENGINE_CONFIG: &str = clar2wasm::ENGINE_CONFIG_ID;
+
+/// The exact consensus, compiler and host profile this build can extend.
+#[must_use]
+pub fn compatibility_profile_fingerprint() -> Fingerprint {
+    nano_consensus_profile::fingerprint(RuntimeIdentities {
+        compiler: COMPILER_IDENTITY,
+        host_version: WASMTIME_VERSION,
+        host_configuration: WASMTIME_ENGINE_CONFIG,
+    })
+}
+
+/// The machine-readable profile embedded in this build.
+pub fn compatibility_profile_json() -> Result<String, String> {
+    nano_consensus_profile::active_profile_json(RuntimeIdentities {
+        compiler: COMPILER_IDENTITY,
+        host_version: WASMTIME_VERSION,
+        host_configuration: WASMTIME_ENGINE_CONFIG,
+    })
+}
 
 /// The consensus execution-cost limit for an Epoch 4 block.
 ///
@@ -2416,6 +2436,14 @@ pub enum MarfStoreError {
         stored: Network,
         opened: Network,
     },
+    /// A pre-profile mainnet state cannot be assigned an identity merely by
+    /// opening it. Import and replay produce a new, attributable state.
+    MissingProfile,
+    /// The state was produced under another consensus/compiler/host profile.
+    WrongProfile {
+        stored: String,
+        active: Fingerprint,
+    },
 }
 
 impl std::fmt::Display for MarfStoreError {
@@ -2447,6 +2475,13 @@ impl std::fmt::Display for MarfStoreError {
                 opened.chain_id(),
                 opened.boot_address(),
             ),
+            Self::MissingProfile => formatter.write_str(
+                "this mainnet state names no executable consensus profile; import its checkpoint and replay under this artifact",
+            ),
+            Self::WrongProfile { stored, active } => write!(
+                formatter,
+                "this mainnet state was produced under profile {stored}, not this artifact's {active}; an explicit checkpoint import and full replay are required"
+            ),
         }
     }
 }
@@ -2474,10 +2509,12 @@ impl From<rusqlite::Error> for MarfStoreError {
 impl MarfStore {
     /// Create an empty versioned store for the supplied network.
     pub fn new(network: Network) -> Result<Self, MarfStoreError> {
+        let side_store = create_side_store()?;
+        reconcile_profile(&side_store, network, true)?;
         Ok(Self::assemble(
             network,
             VersionedMarf::default(),
-            create_side_store()?,
+            side_store,
             None,
         ))
     }
@@ -2493,8 +2530,11 @@ impl MarfStore {
         // opens, reads and answers, and is short of nodes it will never mention.
         UnfinishedImport::refuse(directory)?;
         let marf = VersionedMarf::open(directory.join(MARF_FILE))?;
-        let side_store = open_side_store(&directory.join(CLARITY_FILE))?;
+        let clarity_path = directory.join(CLARITY_FILE);
+        let fresh = !clarity_path.exists();
+        let side_store = open_side_store(&clarity_path)?;
         reconcile_network(&side_store, network)?;
+        reconcile_profile(&side_store, network, fresh)?;
         record_engine_identity(&side_store)?;
         // Asked once, here, and the answer decides whether this directory is one a
         // node may run on. Every read after it treats storage failure as impossible,
@@ -2579,9 +2619,11 @@ impl MarfStore {
         expected_root: TrieHash,
     ) -> Result<Self, MarfStoreError> {
         let path = path.as_ref();
+        let profile = checkpoint_profile(network, path)?;
         let marf = import_checkpoint(path, source, expected_root)?;
         let side_store = create_side_store()?;
         import_side_store(&side_store, path, None)?;
+        record_profile(&side_store, profile)?;
         Ok(Self::assemble(network, marf, side_store, Some(source)))
     }
 
@@ -2602,11 +2644,13 @@ impl MarfStore {
         // leave behind, so "there is state here" is not the question. The
         // question is whether the import that put it there ran to the end.
         UnfinishedImport::refuse(directory)?;
+        let checkpoint = checkpoint.as_ref();
+        let profile = checkpoint_profile(network, checkpoint)?;
         if VersionedMarf::open(directory.join(MARF_FILE))?
             .tip()?
             .is_none()
         {
-            import(directory, checkpoint.as_ref(), source, expected_root)?;
+            import(directory, checkpoint, source, expected_root, profile)?;
         }
         // Reopened rather than continued on the import's own connections. Those
         // have journalling off, and a block executed over one of them could not
@@ -3344,6 +3388,16 @@ CREATE TABLE IF NOT EXISTS chain_identity (
     chain_id INTEGER NOT NULL,
     mainnet INTEGER NOT NULL
 ) WITHOUT ROWID;
+-- The complete executable profile that may extend a mainnet state.
+--
+-- Unlike the historical engine list below, this is a single admission key:
+-- changing a consensus parameter, compiler, Wasmtime version or host
+-- configuration requires importing the checkpoint into a fresh directory and
+-- replaying. Opening is not a migration and never rewrites this row.
+CREATE TABLE IF NOT EXISTS consensus_profile (
+    only_row INTEGER PRIMARY KEY CHECK (only_row = 0),
+    fingerprint TEXT NOT NULL
+) WITHOUT ROWID;
 -- Every clarity-wasm build that has opened this state for writing.
 --
 -- A state is not only data: the contract definitions and the values in it were
@@ -3351,11 +3405,10 @@ CREATE TABLE IF NOT EXISTS chain_identity (
 -- root beyond the checkpoint is that engine's arithmetic. So `[[060]]` asks that
 -- provenance name the compiler, and this is where a state answers.
 --
--- A list rather than one row, and appended rather than checked, on purpose. A
--- compiler fix is an ordinary event and must not make a state unopenable; what
--- a release needs to know is *which* builds contributed to it, and a state with
--- two entries is one whose roots two compilers produced. That is a fact worth
--- reporting and not one worth refusing.
+-- A list rather than one row because it is historical evidence. Admission is
+-- the profile row above; a correct state normally has one compiler here, while
+-- an older or manually migrated state exposes every contributor rather than
+-- hiding it.
 CREATE TABLE IF NOT EXISTS engine_identity (
     identity TEXT PRIMARY KEY,
     first_seen INTEGER NOT NULL
@@ -3424,6 +3477,60 @@ fn reconcile_network(
     Ok(())
 }
 
+fn stored_profile(connection: &rusqlite::Connection) -> Option<String> {
+    connection
+        .query_row(
+            "SELECT fingerprint FROM consensus_profile WHERE only_row = 0",
+            [],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+fn reconcile_profile(
+    connection: &rusqlite::Connection,
+    network: Network,
+    fresh: bool,
+) -> Result<(), MarfStoreError> {
+    if !network.is_mainnet() {
+        return Ok(());
+    }
+    let active = compatibility_profile_fingerprint();
+    match stored_profile(connection) {
+        Some(stored) if stored == active.to_string() => Ok(()),
+        Some(stored) => Err(MarfStoreError::WrongProfile { stored, active }),
+        None if fresh => record_profile(connection, Some(active)),
+        None => Err(MarfStoreError::MissingProfile),
+    }
+}
+
+fn record_profile(
+    connection: &rusqlite::Connection,
+    profile: Option<Fingerprint>,
+) -> Result<(), MarfStoreError> {
+    if let Some(profile) = profile {
+        connection.execute(
+            "INSERT INTO consensus_profile (only_row, fingerprint) VALUES (0, ?1)",
+            [profile.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+fn checkpoint_profile(
+    network: Network,
+    checkpoint: &Path,
+) -> Result<Option<Fingerprint>, MarfStoreError> {
+    if !network.is_mainnet() {
+        return Ok(None);
+    }
+    let manifest = CheckpointManifest::beside(checkpoint)?
+        .ok_or(CheckpointError::MissingProfileFingerprint)?;
+    let active = compatibility_profile_fingerprint();
+    manifest.check_profile(active)?;
+    Ok(Some(active))
+}
+
 /// Record that this build's compiler has opened the state.
 ///
 /// Appended, never refused: see the `engine_identity` table's own comment. A
@@ -3470,6 +3577,17 @@ pub fn recorded_engine_identities(directory: &Path) -> Vec<(String, u64)> {
     rows.filter_map(Result::ok).collect()
 }
 
+/// The executable profile a durable state names, without opening it.
+#[must_use]
+pub fn recorded_profile_fingerprint(directory: &Path) -> Option<String> {
+    let connection = rusqlite::Connection::open_with_flags(
+        directory.join(CLARITY_FILE),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    stored_profile(&connection)
+}
+
 /// The chain a state directory belongs to, without opening it for execution.
 ///
 /// For tooling: naming a network to open a state directory *with* is the bug
@@ -3494,6 +3612,7 @@ fn import(
     checkpoint: &Path,
     source: [u8; 32],
     expected_root: TrieHash,
+    profile: Option<Fingerprint>,
 ) -> Result<(), MarfStoreError> {
     let marf_path = directory.join(MARF_FILE);
     let clarity_path = directory.join(CLARITY_FILE);
@@ -3511,6 +3630,7 @@ fn import(
         // missing values its leaves name, which reads as a finished import.
         let importing = open_side_store_for_import(&clarity_path)?;
         import_side_store(&importing, checkpoint, Some(&marf_path))?;
+        record_profile(&importing, profile)?;
         // Inside the mark as well. A state whose trie covers the ancestry but
         // whose headers stop at the anchor is exactly the state this import
         // exists to stop shipping: it answers Clarity for history it holds no
@@ -5399,8 +5519,9 @@ mod tests {
 
     use super::{
         AnalysisDatabase, CLARITY_FILE, MarfStoreError, SQLITE_IMPORT_CACHE_KIB, SQLITE_PAGE_BYTES,
-        SQLITE_RUNTIME_CACHE_KIB, SemanticEpochInspection, StaticCheckError, compile_under,
-        ensure_wasm_module, loadable, open_side_store_with_journal, recorded_network,
+        SQLITE_RUNTIME_CACHE_KIB, SemanticEpochInspection, StaticCheckError,
+        compatibility_profile_fingerprint, compile_under, ensure_wasm_module, loadable,
+        open_side_store_with_journal, recorded_network, recorded_profile_fingerprint,
         reports_analysis_failure,
     };
 
@@ -6864,6 +6985,47 @@ mod tests {
             // not a state directory that can only be opened once.
             drop(Vm::open(created, directory.path()).expect("reopen as its own chain"));
         }
+    }
+
+    #[test]
+    fn a_mainnet_state_opens_only_under_its_executable_profile() {
+        let directory = tempfile::tempdir().expect("a directory");
+        drop(Vm::open(Network::MAINNET, directory.path()).expect("create the state"));
+        let active = compatibility_profile_fingerprint().to_string();
+        assert_eq!(recorded_profile_fingerprint(directory.path()), Some(active));
+        drop(Vm::open(Network::MAINNET, directory.path()).expect("reopen exact profile"));
+
+        let connection = rusqlite::Connection::open(directory.path().join(CLARITY_FILE))
+            .expect("open the side store");
+        connection
+            .execute(
+                "UPDATE consensus_profile SET fingerprint = ?1 WHERE only_row = 0",
+                ["00".repeat(32)],
+            )
+            .expect("tamper the profile");
+        drop(connection);
+
+        assert!(matches!(
+            Vm::open(Network::MAINNET, directory.path()),
+            Err(MarfStoreError::WrongProfile { .. })
+        ));
+    }
+
+    #[test]
+    fn a_pre_profile_mainnet_state_requires_import_and_replay() {
+        let directory = tempfile::tempdir().expect("a directory");
+        drop(Vm::open(Network::MAINNET, directory.path()).expect("create the state"));
+        let connection = rusqlite::Connection::open(directory.path().join(CLARITY_FILE))
+            .expect("open the side store");
+        connection
+            .execute("DELETE FROM consensus_profile", [])
+            .expect("model a state from before profiles");
+        drop(connection);
+
+        assert!(matches!(
+            Vm::open(Network::MAINNET, directory.path()),
+            Err(MarfStoreError::MissingProfile)
+        ));
     }
 
     /// A state created before the chain was recorded is adopted, not refused.

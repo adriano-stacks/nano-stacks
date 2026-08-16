@@ -4,8 +4,10 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     process::{Command, ExitCode},
+    str::FromStr as _,
 };
 
+use nano_consensus_profile::{Fingerprint, RuntimeIdentities};
 use nano_primitives::sha256;
 use serde_json::{Value, json};
 
@@ -40,6 +42,7 @@ pub struct CandidateVerification {
     pub candidate_manifest_sha256: String,
     pub checkpoint_sha256: String,
     pub configuration_sha256: String,
+    pub compatibility_fingerprint: Fingerprint,
     pub source_revision: String,
 }
 
@@ -65,6 +68,14 @@ pub fn verify_qualification_inputs(
             candidate.checkpoint_sha256
         ));
     }
+    nano_marf::CheckpointManifest::load(
+        checkpoint
+            .parent()
+            .ok_or_else(|| "checkpoint manifest has no directory".to_owned())?,
+    )
+    .map_err(|error| error.to_string())?
+    .check_profile(candidate.compatibility_fingerprint)
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -382,6 +393,11 @@ pub fn verify_prepared_candidate(
     )?;
     verify_publisher_key(candidate, public_key)?;
     let source_revision = verify_identity(candidate, expected_revision)?;
+    let compatibility_fingerprint = candidate_fingerprint(candidate)?;
+    nano_marf::CheckpointManifest::load(candidate)
+        .map_err(|error| error.to_string())?
+        .check_profile(compatibility_fingerprint)
+        .map_err(|error| error.to_string())?;
     let configuration = read_json(&candidate.join(CONFIGURATION))?;
     let configuration_sha256 = json_sha256(&configuration, "sha256", CONFIGURATION)?;
     let checkpoint_sha256 = file_sha256(&candidate.join(CHECKPOINT))?;
@@ -390,6 +406,7 @@ pub fn verify_prepared_candidate(
         candidate_manifest_sha256: file_sha256(&candidate.join(PREPARED_SUMS))?,
         checkpoint_sha256,
         configuration_sha256,
+        compatibility_fingerprint,
         source_revision,
     })
 }
@@ -427,6 +444,7 @@ fn required_candidate_files(candidate: &Path) -> Result<(), String> {
     for file in [
         "artifact/bin/stacks-node",
         "artifact/share/nano-stacks/build-identity.json",
+        "artifact/share/nano-stacks/compatibility-profile.json",
         "artifact/share/nano-stacks/config.schema.json",
         "artifact/share/nano-stacks/dependencies.txt",
         "artifact/share/nano-stacks/sbom.cdx.json",
@@ -527,10 +545,63 @@ fn verify_identity(candidate: &Path, expected_revision: Option<&str>) -> Result<
     Ok(revision.to_owned())
 }
 
+fn candidate_fingerprint(candidate: &Path) -> Result<Fingerprint, String> {
+    let artifact = candidate.join(ARTIFACT);
+    let identity = read_json(&artifact.join("share/nano-stacks/build-identity.json"))?;
+    let document = read_json(&artifact.join("share/nano-stacks/compatibility-profile.json"))?;
+    let compiler = json_string(&identity, "compiler_identity", "build identity")?;
+    let host_version = json_string(&identity, "wasmtime", "build identity")?;
+    let host_configuration = json_string(&identity, "wasmtime_engine", "build identity")?;
+    let expected = nano_consensus_profile::fingerprint(RuntimeIdentities {
+        compiler,
+        host_version,
+        host_configuration,
+    });
+    for (owner, value) in [
+        (
+            "build identity",
+            json_string(&identity, "compatibility_fingerprint", "build identity")?,
+        ),
+        (
+            "compatibility profile",
+            json_string(&document, "fingerprint", "compatibility profile")?,
+        ),
+    ] {
+        let declared = Fingerprint::from_str(value)
+            .map_err(|error| format!("{owner} has an invalid profile fingerprint: {error}"))?;
+        if declared != expected {
+            return Err(format!(
+                "{owner} names profile {declared}, but its embedded identities produce {expected}"
+            ));
+        }
+    }
+    if identity["compatibility_profile"] != nano_consensus_profile::PROFILE_ID
+        || identity["compatibility_profile_sha256"]
+            != nano_consensus_profile::profile_sha256().to_string()
+        || identity["compatibility_vectors_sha256"]
+            != nano_consensus_profile::vectors_sha256().to_string()
+        || document["profile"]
+            != serde_json::to_value(nano_consensus_profile::profile()?)
+                .map_err(|error| error.to_string())?
+        || document["profile_sha256"] != nano_consensus_profile::profile_sha256().to_string()
+        || document["vectors_sha256"] != nano_consensus_profile::vectors_sha256().to_string()
+        || document["compiler_identity"] != compiler
+        || document["host_runtime_version"] != host_version
+        || document["host_runtime_configuration"] != host_configuration
+    {
+        return Err(
+            "artifact compatibility profile disagrees with its build identity or vector corpus"
+                .to_owned(),
+        );
+    }
+    Ok(expected)
+}
+
 fn validate_artifact(artifact: &Path, revision: &str) -> Result<(), String> {
     require_file(&artifact.join("bin/stacks-node"), "Nix-built stacks-node")?;
     for file in [
         "share/nano-stacks/build-identity.json",
+        "share/nano-stacks/compatibility-profile.json",
         "share/nano-stacks/config.schema.json",
         "share/nano-stacks/dependencies.txt",
         "share/nano-stacks/sbom.cdx.json",
@@ -1040,9 +1111,10 @@ mod tests {
 
     use super::{
         ARTIFACT, AUDIT, CHECKPOINT, CLOSURE, CONFIGURATION, PREPARED_SIGNATURE, PREPARED_SUMS,
-        PROVENANCE, PUBLISHER_KEY, REPORT, SOURCE_INPUTS, artifact_input, finalize,
-        prepared_exclusions, read_json, required_candidate_files, sign, verify_checksums,
-        verify_final_candidate, verify_identity, verify_prepared_candidate, write_checksum_file,
+        PROVENANCE, PUBLISHER_KEY, REPORT, RuntimeIdentities, SOURCE_INPUTS, artifact_input,
+        candidate_fingerprint, finalize, prepared_exclusions, read_json, required_candidate_files,
+        sign, verify_checksums, verify_final_candidate, verify_identity, verify_prepared_candidate,
+        write_checksum_file,
     };
 
     const REVISION: &str = "1111111111111111111111111111111111111111";
@@ -1085,6 +1157,17 @@ mod tests {
         secret_key: PathBuf,
     }
 
+    const TEST_COMPILER: &str =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+    const fn test_identities() -> RuntimeIdentities<'static> {
+        RuntimeIdentities {
+            compiler: TEST_COMPILER,
+            host_version: nano_vm::WASMTIME_VERSION,
+            host_configuration: nano_vm::WASMTIME_ENGINE_CONFIG,
+        }
+    }
+
     fn candidate(audit: &serde_json::Value, include_sbom: bool, signed: bool) -> SignedCandidate {
         let root = tempfile::tempdir().expect("temporary signed candidate");
         let public_key = root.path().join("trusted.pub");
@@ -1102,7 +1185,16 @@ mod tests {
 
         write_artifact(&candidate, include_sbom);
         write_json_test(&candidate.join(AUDIT), audit);
-        fs::write(candidate.join(CHECKPOINT), "format = 4\n").expect("write checkpoint");
+        fs::write(
+            candidate.join(CHECKPOINT),
+            format!(
+                "format = \"test\"\ncheckpoint_stacks_height = 1\nsource_state_id = \"{}\"\npublished_state_index_root = \"{}\"\nfirst_bitcoin_height = 1\nprofile_fingerprint = \"{}\"\n",
+                "11".repeat(32),
+                "22".repeat(32),
+                nano_consensus_profile::fingerprint(test_identities())
+            ),
+        )
+        .expect("write checkpoint");
         write_json_test(
             &candidate.join(CLOSURE),
             &json!({ "outputNarHash": "sha256:test" }),
@@ -1160,17 +1252,28 @@ mod tests {
         fs::create_dir_all(artifact.join("share/doc/nano-stacks"))
             .expect("create documentation directory");
         fs::write(artifact.join("bin/stacks-node"), "binary").expect("write binary");
+        let fingerprint = nano_consensus_profile::fingerprint(test_identities());
         write_json_test(
             &artifact.join("share/nano-stacks/build-identity.json"),
             &json!({
                 "source_revision": REVISION,
-                "compiler_identity": format!("sha256:{}", "2".repeat(64)),
+                "compiler_identity": TEST_COMPILER,
                 "rustc": "rustc test",
                 "target": "x86_64-unknown-linux-gnu",
                 "wasmtime": nano_vm::WASMTIME_VERSION,
                 "wasmtime_engine": nano_vm::WASMTIME_ENGINE_CONFIG,
+                "compatibility_profile": nano_consensus_profile::PROFILE_ID,
+                "compatibility_profile_sha256": nano_consensus_profile::profile_sha256().to_string(),
+                "compatibility_vectors_sha256": nano_consensus_profile::vectors_sha256().to_string(),
+                "compatibility_fingerprint": fingerprint.to_string(),
             }),
         );
+        fs::write(
+            artifact.join("share/nano-stacks/compatibility-profile.json"),
+            nano_consensus_profile::active_profile_json(test_identities())
+                .expect("build compatibility profile"),
+        )
+        .expect("write compatibility profile");
         write_json_test(
             &artifact.join("share/nano-stacks/config.schema.json"),
             &json!({"title": "Config"}),
@@ -1268,6 +1371,25 @@ mod tests {
             verify_prepared_candidate(&candidate.path, &candidate.public_key, Some(REVISION))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn the_profile_fingerprint_binds_every_artifact_identity() {
+        let candidate = candidate(&green_audit(), true, true);
+        let expected = nano_consensus_profile::fingerprint(test_identities());
+        assert_eq!(
+            candidate_fingerprint(&candidate.path).expect("verify the embedded profile"),
+            expected
+        );
+
+        let profile = candidate
+            .path
+            .join(ARTIFACT)
+            .join("share/nano-stacks/compatibility-profile.json");
+        let mut document = read_json(&profile).expect("read the embedded profile");
+        document["host_runtime_configuration"] = serde_json::Value::String("changed".to_owned());
+        write_json_test(&profile, &document);
+        assert!(candidate_fingerprint(&candidate.path).is_err());
     }
 
     #[test]

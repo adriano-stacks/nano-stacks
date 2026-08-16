@@ -12,6 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use nano_consensus_profile::Fingerprint;
 use nano_primitives::TrieHash;
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +46,10 @@ pub struct CheckpointManifest {
     pub state_index_root: TrieHash,
     /// The Bitcoin height the state was taken at.
     pub first_bitcoin_height: u64,
+    /// The exact consensus, compiler and host profile this checkpoint was
+    /// produced under. Legacy non-mainnet fixtures may omit it; a mainnet node
+    /// refuses such a checkpoint before import.
+    pub profile_fingerprint: Option<Fingerprint>,
 }
 
 impl CheckpointManifest {
@@ -83,6 +88,17 @@ impl CheckpointManifest {
                 declared: root,
                 published: self.state_index_root,
             });
+        }
+        Ok(())
+    }
+
+    /// Require this checkpoint to name the active executable profile.
+    pub fn check_profile(&self, active: Fingerprint) -> Result<(), CheckpointError> {
+        let Some(declared) = self.profile_fingerprint else {
+            return Err(CheckpointError::MissingProfileFingerprint);
+        };
+        if declared != active {
+            return Err(CheckpointError::ProfileMismatch { declared, active });
         }
         Ok(())
     }
@@ -254,6 +270,8 @@ struct ManifestWire {
     source_state_id: String,
     published_state_index_root: String,
     first_bitcoin_height: u64,
+    #[serde(default)]
+    profile_fingerprint: Option<Fingerprint>,
 }
 
 impl ManifestWire {
@@ -264,6 +282,7 @@ impl ManifestWire {
             source_state_id: parse_hex(&self.source_state_id)?,
             state_index_root: TrieHash::from_bytes(parse_hex(&self.published_state_index_root)?),
             first_bitcoin_height: self.first_bitcoin_height,
+            profile_fingerprint: self.profile_fingerprint,
         })
     }
 
@@ -274,6 +293,7 @@ impl ManifestWire {
             source_state_id: hex::encode(manifest.source_state_id),
             published_state_index_root: manifest.state_index_root.to_string(),
             first_bitcoin_height: manifest.first_bitcoin_height,
+            profile_fingerprint: manifest.profile_fingerprint,
         }
     }
 }
@@ -318,5 +338,46 @@ impl ProvenanceWire {
                 approval_threshold: attestation.approval_threshold,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr as _;
+
+    use nano_consensus_profile::Fingerprint;
+
+    use super::CheckpointManifest;
+    use crate::{CheckpointError, TrieHash};
+
+    fn fingerprint(byte: u8) -> Fingerprint {
+        Fingerprint::from_str(&hex::encode([byte; 32])).expect("fingerprint")
+    }
+
+    fn manifest(profile_fingerprint: Option<Fingerprint>) -> CheckpointManifest {
+        CheckpointManifest {
+            format: "test".to_owned(),
+            stacks_height: 7,
+            source_state_id: [1; 32],
+            state_index_root: TrieHash::from_bytes([2; 32]),
+            first_bitcoin_height: 3,
+            profile_fingerprint,
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_must_name_the_exact_executable_profile() {
+        let active = fingerprint(3);
+        manifest(Some(active))
+            .check_profile(active)
+            .expect("the exact profile is accepted");
+        assert!(matches!(
+            manifest(None).check_profile(active),
+            Err(CheckpointError::MissingProfileFingerprint)
+        ));
+        assert!(matches!(
+            manifest(Some(fingerprint(4))).check_profile(active),
+            Err(CheckpointError::ProfileMismatch { .. })
+        ));
     }
 }
