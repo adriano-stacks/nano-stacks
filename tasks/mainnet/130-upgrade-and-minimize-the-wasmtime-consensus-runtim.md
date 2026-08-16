@@ -1,7 +1,7 @@
 ---
 id: "130"
 title: "Upgrade and minimize the Wasmtime consensus runtime"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["060", "078"]
@@ -9,6 +9,7 @@ tags: ["mainnet", "consensus", "vm", "security", "dependencies"]
 created_at: 2026-08-14
 parent: 053
 type: improvement
+completed_at: 2026-08-16
 ---
 
 # Upgrade and minimize the Wasmtime consensus runtime
@@ -42,7 +43,7 @@ surface that can affect the node.
       can omit the persistent native cache without missing its catch-up bound.
 - [x] Add mandatory `cargo audit` and dependency-policy gates. Every allowed
       advisory must name its reachability, owner and expiry.
-- [ ] Replay the complete root, receipt, cost and ABI corpus on x86-64 and
+- [x] Replay the complete root, receipt, cost and ABI corpus on x86-64 and
       AArch64, including fresh compilation and cached-module reloads.
 
 ## Acceptance Criteria
