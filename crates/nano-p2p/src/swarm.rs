@@ -272,6 +272,7 @@ pub struct Swarm {
     local: LocalPeer,
     protocol: Protocol,
     limits: SwarmLimits,
+    frame_budget: crate::FrameBudget,
     connected: Vec<Connected>,
     discovered: Discovered,
     /// What to answer a peer's own requests with, when this node serves anything.
@@ -297,6 +298,7 @@ impl Swarm {
             local,
             protocol,
             limits,
+            frame_budget: crate::FrameBudget::default(),
             connected: Vec::new(),
             discovered: Discovered::default(),
             service: None,
@@ -315,6 +317,13 @@ impl Swarm {
     #[must_use]
     pub fn serving(mut self, service: Arc<dyn crate::inbound::Service>) -> Self {
         self.service = Some(service);
+        self
+    }
+
+    /// Share frame-memory admission with the node's inbound sessions.
+    #[must_use]
+    pub fn with_frame_budget(mut self, frame_budget: crate::FrameBudget) -> Self {
+        self.frame_budget = frame_budget;
         self
     }
 
@@ -434,12 +443,13 @@ impl Swarm {
                 continue;
             }
             attempts += 1;
-            let dialled = Session::open(
+            let dialled = Session::open_with_budget(
                 candidate.socket_addr(),
                 &self.local,
                 self.protocol,
                 view,
                 self.limits.timeout,
+                self.frame_budget.clone(),
             )
             .await;
             match dialled {

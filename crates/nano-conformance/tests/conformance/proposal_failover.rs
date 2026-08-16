@@ -63,7 +63,7 @@ async fn verdict(
     // A proposal has not collected signer signatures yet. Everything else stays
     // byte-for-byte canonical, including the state root the role must reproduce.
     candidate.header.signer_signatures.clear();
-    let (send, receive) = tokio::sync::mpsc::unbounded_channel();
+    let (send, receive) = nano_queue::channel(nano_rpc::PROPOSAL_QUEUE_LIMITS);
     let state = nano_rpc::RpcState::new(network);
     let role = tokio::spawn(hosting::validate_proposals(
         config,
@@ -75,10 +75,15 @@ async fn verdict(
         receive,
     ));
     let (answer, answered) = tokio::sync::oneshot::channel();
-    send.send(ProposalRequest {
-        block: candidate,
-        verdict: answer,
-    })
+    let bytes = candidate.encode().len();
+    send.try_send(
+        ProposalRequest {
+            block: candidate,
+            verdict: answer,
+        },
+        bytes,
+    )
+    .map_err(|error| error.reason)
     .expect("the proposal role is listening");
     let answer = match tokio::time::timeout(PATIENCE, answered).await {
         Ok(Ok(answer)) => answer,

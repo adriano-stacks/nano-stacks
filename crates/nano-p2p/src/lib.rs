@@ -47,6 +47,7 @@
 //! this node's view. Authentication proves *who* said something, never that it is
 //! true.
 
+mod budget;
 pub mod inbound;
 pub mod peers;
 pub mod relay;
@@ -55,7 +56,8 @@ pub mod session;
 pub mod swarm;
 pub mod wire;
 
-pub use inbound::{InboundLimits, Listener, Served, Service, serve_peer};
+pub use budget::{FrameBudget, FrameBudgetStatus, FrameLimits};
+pub use inbound::{InboundLimits, Listener, Served, Service, serve_peer, serve_peer_with_budget};
 pub use peers::{KnownPeer, MAX_KNOWN_PEERS, PeerDb, PeerDbError};
 pub use relay::{
     MAX_QUEUED_OFFER_BYTES, MAX_QUEUED_OFFERS, Offer, Pushed, Relay, RelayStatus, relayed_by,

@@ -3729,7 +3729,9 @@ async fn start_transport(
             return None;
         }
     };
+    let frame_budget = nano_p2p::FrameBudget::default();
     let mut swarm = nano_p2p::Swarm::new(peers, local, protocol, nano_p2p::SwarmLimits::default())
+        .with_frame_budget(frame_budget.clone())
         .serving(service.clone());
     for seed in &seeds {
         if let Err(error) = swarm.seed(seed).await {
@@ -3780,7 +3782,7 @@ async fn start_transport(
     });
 
     if let Some(bind) = bind {
-        start_listener(config, network, bind, service, roles);
+        start_listener(config, network, bind, service, frame_budget, roles);
     }
     Some(discovered)
 }
@@ -3875,6 +3877,7 @@ fn start_listener(
     network: Network,
     bind: std::net::SocketAddr,
     service: Arc<PeerService>,
+    frame_budget: nano_p2p::FrameBudget,
     roles: &mut JoinSet<(Job, Role)>,
 ) {
     let Ok(identity) = p2p_identity(&config.node.working_dir) else {
@@ -3892,7 +3895,7 @@ fn start_listener(
     roles.spawn(async move {
         (
             Job::Peers,
-            answer_peers(bind, local, protocol, service).await,
+            answer_peers(bind, local, protocol, service, frame_budget).await,
         )
     });
 }
@@ -3903,6 +3906,7 @@ async fn answer_peers(
     local: nano_p2p::LocalPeer,
     protocol: nano_p2p::Protocol,
     service: Arc<PeerService>,
+    frame_budget: nano_p2p::FrameBudget,
 ) -> Role {
     {
         let listener = nano_p2p::Listener::bind(bind)
@@ -3910,6 +3914,7 @@ async fn answer_peers(
             .map_err(|error| format!("cannot listen for peers on {bind}: {error}"))?;
         println!("p2p: listening for peers on {bind}");
         let mut conversations: JoinSet<()> = JoinSet::new();
+        let address_slots = InboundAddressSlots::default();
         loop {
             let (stream, from) = match listener.accept().await {
                 Ok(accepted) => accepted,
@@ -3918,22 +3923,29 @@ async fn answer_peers(
                     continue;
                 }
             };
-            // Bounded, so that a flood of connections cannot become a flood of
-            // tasks. Beyond the cap the oldest finished conversations are reaped
-            // first, and if none has, the connection waits its turn.
-            while conversations.len() >= MAX_INBOUND_PEERS {
-                let _ = conversations.join_next().await;
+            while conversations.try_join_next().is_some() {}
+            let Some(address_slot) = address_slots.try_acquire(from.ip()) else {
+                continue;
+            };
+            // Drop excess sockets before spawning a task. Keeping an accepted
+            // connection around while waiting for another peer to leave would let
+            // the network choose the listener's pending socket memory.
+            if conversations.len() >= MAX_INBOUND_PEERS {
+                continue;
             }
             let service = service.clone();
             let local = local.clone();
+            let frame_budget = frame_budget.clone();
             conversations.spawn(async move {
-                if let Err(error) = nano_p2p::serve_peer(
+                let _address_slot = address_slot;
+                if let Err(error) = nano_p2p::serve_peer_with_budget(
                     stream,
                     from,
                     &local,
                     protocol,
                     service.as_ref(),
                     nano_p2p::InboundLimits::default(),
+                    frame_budget,
                 )
                 .await
                 {
@@ -3948,6 +3960,54 @@ async fn answer_peers(
 
 /// How many inbound peers to hold conversations with at once.
 const MAX_INBOUND_PEERS: usize = 64;
+
+/// How many inbound conversations one IP may hold simultaneously.
+const MAX_INBOUND_PEERS_PER_ADDRESS: usize = 4;
+
+#[derive(Clone, Default)]
+struct InboundAddressSlots {
+    held: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>,
+}
+
+impl InboundAddressSlots {
+    fn try_acquire(&self, address: std::net::IpAddr) -> Option<InboundAddressSlot> {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = held.entry(address).or_default();
+        if *count >= MAX_INBOUND_PEERS_PER_ADDRESS {
+            return None;
+        }
+        *count += 1;
+        drop(held);
+        Some(InboundAddressSlot {
+            held: self.held.clone(),
+            address,
+        })
+    }
+}
+
+struct InboundAddressSlot {
+    held: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>,
+    address: std::net::IpAddr,
+}
+
+impl Drop for InboundAddressSlot {
+    fn drop(&mut self) {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = held
+            .get_mut(&self.address)
+            .expect("an inbound slot has an address count");
+        *count -= 1;
+        if *count == 0 {
+            held.remove(&self.address);
+        }
+    }
+}
 
 /// What this node tells a peer that dialled it.
 struct PeerService {
@@ -4058,6 +4118,24 @@ mod tests {
     use nano_crypto::StacksPrivateKey;
     use nano_primitives::{ConsensusHash, Network, Sha256Sum, TrieHash, hash160};
     use nano_sync::PoxInfo;
+
+    #[test]
+    fn one_address_cannot_own_the_inbound_task_set() {
+        let slots = super::InboundAddressSlots::default();
+        let first = "127.0.0.1".parse().expect("an address");
+        let second = "127.0.0.2".parse().expect("an address");
+        let mut held = (0..super::MAX_INBOUND_PEERS_PER_ADDRESS)
+            .map(|_| slots.try_acquire(first).expect("the peer has capacity"))
+            .collect::<Vec<_>>();
+        assert!(slots.try_acquire(first).is_none());
+        let other = slots
+            .try_acquire(second)
+            .expect("another address has independent capacity");
+
+        drop(held.pop());
+        assert!(slots.try_acquire(first).is_some(), "a closed slot recovers");
+        drop((held, other));
+    }
 
     #[test]
     fn a_serving_peer_advertises_relay_and_its_rpc_endpoint() {

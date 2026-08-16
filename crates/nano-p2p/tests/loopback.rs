@@ -14,11 +14,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nano_chainstate::NakamotoBlock;
-use nano_crypto::StacksPrivateKey;
+use nano_crypto::{MessageSignature, StacksPrivateKey};
 use nano_p2p::wire::{ChainView, Message, PREAMBLE_LEN, Payload, Preamble, services};
 use nano_p2p::{
-    InboundLimits, Listener, LocalPeer, PeerDb, Protocol, Service, Session, Swarm, SwarmLimits,
-    serve_peer,
+    FrameBudget, FrameLimits, InboundLimits, Listener, LocalPeer, PeerDb, Protocol, Service,
+    Session, SessionError, Swarm, SwarmLimits, serve_peer,
 };
 use nano_primitives::{BitVec, BitcoinHeaderHash, ConsensusHash, Hash160};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -218,6 +218,44 @@ async fn hostile(
         }
     });
     (address, task)
+}
+
+#[tokio::test]
+async fn an_advertised_frame_reserves_the_shared_budget_before_its_payload() {
+    let protocol = Protocol::testnet();
+    let (address, _task) = hostile(move |seq| {
+        Preamble {
+            peer_version: protocol.peer_version,
+            network_id: protocol.network_id,
+            seq,
+            bitcoin_height: 900_000,
+            bitcoin_hash: BitcoinHeaderHash::from_bytes([0x5a; 32]),
+            stable_bitcoin_height: 899_993,
+            stable_bitcoin_hash: BitcoinHeaderHash::from_bytes([0xc3; 32]),
+            additional_data: 0,
+            signature: MessageSignature::from_bytes([0; 65]),
+            payload_len: 1024,
+        }
+        .encode()
+    })
+    .await;
+    let budget = FrameBudget::new(FrameLimits::new(512, 512));
+    let dialler = LocalPeer::quiet(StacksPrivateKey::from_seed(b"bounded dialler"), 20444);
+    let result = Session::open_with_budget(
+        address,
+        &dialler,
+        protocol,
+        view(900_000),
+        TIMEOUT,
+        budget.clone(),
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("a frame larger than the shared budget was admitted");
+    };
+    assert!(matches!(error, SessionError::Overloaded));
+    assert_eq!(budget.status().bytes, 0);
+    assert_eq!(budget.status().saturations, 1);
 }
 
 /// A peer that completes a real handshake and then keeps talking.

@@ -42,6 +42,7 @@ criterion = "0.7"
 nano-codec = { path = "../nano-codec" }
 nano-mempool = { path = "../nano-mempool" }
 nano-p2p = { path = "../nano-p2p" }
+nano-queue = { path = "../nano-queue" }
 nano-rpc = { path = "../nano-rpc" }
 nano-sync = { path = "../nano-sync" }
 reqwest = { version = "0.13.4", default-features = false }

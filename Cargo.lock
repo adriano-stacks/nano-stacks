@@ -2555,6 +2555,7 @@ dependencies = [
  "nano-oracle",
  "nano-p2p",
  "nano-primitives",
+ "nano-queue",
  "nano-rpc",
  "nano-signer",
  "nano-sortition",

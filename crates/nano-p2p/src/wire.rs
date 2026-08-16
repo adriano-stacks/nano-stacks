@@ -35,6 +35,8 @@ use nano_codec::{CodecError, Transaction};
 use nano_crypto::{CryptoError, MessageSignature, StacksPrivateKey, StacksPublicKey};
 use nano_primitives::{BitVec, BitVecError, BitcoinHeaderHash, ConsensusHash, Hash160, sha512_256};
 
+use crate::budget::FramePermit;
+
 /// The encoded size of a preamble, which is fixed and therefore how much has to
 /// be read before a frame length is known.
 pub const PREAMBLE_LEN: usize = 4 + 4 + 4 + 8 + 32 + 8 + 32 + 4 + 65 + 4;
@@ -45,6 +47,9 @@ pub const PREAMBLE_LEN: usize = 4 + 4 + 4 + 8 + 32 + 8 + 32 + 4 + 65 + 4;
 /// Bounding it before allocating is the only thing standing between a hostile
 /// preamble and 16 MB of our memory per connection.
 pub const MAX_PAYLOAD_LEN: u32 = (1 + 16 * 1024 * 1024) + 16 * (38 + 4);
+
+/// The largest complete message retained from a peer.
+pub const MAX_WIRE_MESSAGE_LEN: usize = PREAMBLE_LEN + MAX_PAYLOAD_LEN as usize;
 
 /// A payload holds at least a zero-length relayer vector and a type byte.
 const MIN_PAYLOAD_LEN: u32 = 5;
@@ -494,6 +499,7 @@ pub struct Message {
     pub relayers: Vec<RelayData>,
     pub payload: Payload,
     frame: Vec<u8>,
+    frame_permit: Option<FramePermit>,
 }
 
 impl Message {
@@ -557,6 +563,7 @@ impl Message {
             relayers,
             payload,
             frame,
+            frame_permit: None,
         })
     }
 
@@ -576,6 +583,7 @@ impl Message {
             relayers,
             payload,
             frame,
+            frame_permit: None,
         })
     }
 
@@ -618,6 +626,11 @@ impl Message {
     #[must_use]
     pub const fn wire_len(&self) -> usize {
         PREAMBLE_LEN + self.frame.len()
+    }
+
+    pub(crate) fn hold_frame_permit(&mut self, permit: FramePermit) {
+        debug_assert!(self.frame_permit.is_none());
+        self.frame_permit = Some(permit);
     }
 }
 

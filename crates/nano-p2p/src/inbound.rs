@@ -27,6 +27,7 @@ use nano_crypto::StacksPublicKey;
 use nano_primitives::{BitVec, ConsensusHash, Hash160, hash160};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::budget::FrameBudget;
 use crate::session::{Framed, LocalPeer, Protocol, SessionError};
 use crate::wire::{
     ChainView, HandshakeAccept, NatPunch, NeighborAddress, Payload, PeerAddress, nack,
@@ -191,12 +192,36 @@ pub async fn serve_peer<S: Service + ?Sized>(
     service: &S,
     limits: InboundLimits,
 ) -> Result<Served, SessionError> {
+    serve_peer_with_budget(
+        stream,
+        from,
+        local,
+        protocol,
+        service,
+        limits,
+        FrameBudget::default(),
+    )
+    .await
+}
+
+/// Serve one inbound peer against a frame budget shared with every node session.
+pub async fn serve_peer_with_budget<S: Service + ?Sized>(
+    stream: TcpStream,
+    from: SocketAddr,
+    local: &LocalPeer,
+    protocol: Protocol,
+    service: &S,
+    limits: InboundLimits,
+    frame_budget: FrameBudget,
+) -> Result<Served, SessionError> {
     let mut framed = Framed::new(
         stream,
+        from.ip(),
         local,
         protocol,
         service.chain_view(),
         limits.timeout,
+        frame_budget,
     );
     let mut served = Served::default();
     let ours = local.private_key.public_key();

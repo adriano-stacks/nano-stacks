@@ -29,7 +29,7 @@ load shedding instead of an unbounded queue, allocation or task population.
       drops and saturation.
 - [ ] Add route-specific body, concurrency and rate limits. Return an explicit
       overload response without reporting admission or changing consensus state.
-- [ ] Bound P2P memory per session, per address and globally; enforce the budget
+- [x] Bound P2P memory per session, per address and globally; enforce the budget
       before allocating or decoding the advertised payload.
 - [ ] Bound pushed messages by bytes rather than only by message count and test
       the maximum-size-message case across all allowed sessions.

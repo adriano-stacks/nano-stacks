@@ -13,7 +13,7 @@
 //! this peer says its tip is here, has these tenures, holds these blocks — and
 //! it is the caller's fork choice that decides what any of it means.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use nano_crypto::{StacksPrivateKey, StacksPublicKey};
@@ -22,8 +22,10 @@ use nano_queue::{Buffer, Limits, Status};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::budget::{FrameBudget, FramePermit};
 use crate::wire::{
-    ChainView, Handshake, Message, PREAMBLE_LEN, Payload, PeerAddress, Preamble, WireError, nack,
+    ChainView, Handshake, MAX_WIRE_MESSAGE_LEN, Message, PREAMBLE_LEN, Payload, PeerAddress,
+    Preamble, WireError, nack,
 };
 
 /// The major protocol version byte, which two peers must share exactly.
@@ -244,6 +246,8 @@ pub enum SessionError {
     /// The peer sent a self-inconsistent Bitcoin view: the stable height must be
     /// exactly [`crate::wire::STABLE_CONFIRMATIONS`] below the tip.
     InconsistentView,
+    /// This node's shared frame-memory budget is full.
+    Overloaded,
 }
 
 impl std::fmt::Display for SessionError {
@@ -272,6 +276,7 @@ impl std::fmt::Display for SessionError {
             Self::InconsistentView => {
                 formatter.write_str("peer's stable Bitcoin height does not follow its tip")
             }
+            Self::Overloaded => formatter.write_str("the local P2P frame budget is full"),
         }
     }
 }
@@ -316,7 +321,11 @@ impl SessionError {
             | Self::WrongNetwork { .. }
             | Self::UnsupportedEpoch(_)
             | Self::UnexpectedReply(_) => true,
-            Self::Io(_) | Self::Timeout | Self::HandshakeRejected | Self::Nack(_) => false,
+            Self::Io(_)
+            | Self::Timeout
+            | Self::HandshakeRejected
+            | Self::Nack(_)
+            | Self::Overloaded => false,
         }
     }
 }
@@ -347,7 +356,7 @@ pub const MAX_BUFFERED_PUSHES: usize = 256;
 /// One maximum protocol frame must fit. Keeping a second requires the caller to
 /// collect the first, so a peer cannot multiply the protocol's per-frame bound by
 /// [`MAX_BUFFERED_PUSHES`].
-pub const MAX_BUFFERED_PUSH_BYTES: usize = PREAMBLE_LEN + crate::wire::MAX_PAYLOAD_LEN as usize;
+pub const MAX_BUFFERED_PUSH_BYTES: usize = MAX_WIRE_MESSAGE_LEN;
 
 /// How much to ask the socket for in one read.
 ///
@@ -389,6 +398,9 @@ impl PushBuffer {
 /// of one message.
 pub(crate) struct Framed {
     stream: TcpStream,
+    remote: IpAddr,
+    frame_budget: FrameBudget,
+    frame_permit: Option<FramePermit>,
     protocol: Protocol,
     local: LocalPeer,
     /// What to answer a peer's own requests with, when this node serves anything.
@@ -425,13 +437,18 @@ pub(crate) struct Framed {
 impl Framed {
     pub(crate) fn new(
         stream: TcpStream,
+        remote: IpAddr,
         local: &LocalPeer,
         protocol: Protocol,
         view: ChainView,
         timeout: Duration,
+        frame_budget: FrameBudget,
     ) -> Self {
         Self {
             stream,
+            remote,
+            frame_budget,
+            frame_permit: None,
             protocol,
             local: local.clone(),
             service: None,
@@ -550,7 +567,7 @@ impl Framed {
             while let Some(message) = self.take_message()? {
                 self.handle_unsolicited(message).await?;
             }
-            let held = self.reserve();
+            let held = self.reserve()?;
             let outcome = self.stream.try_read(&mut self.buffer[held..]);
             self.buffer
                 .truncate(held + outcome.as_ref().copied().unwrap_or(0));
@@ -660,6 +677,25 @@ impl Framed {
 
     /// Take one whole message out of the buffer, if there is one.
     fn take_message(&mut self) -> Result<Option<Message>, SessionError> {
+        let Some((preamble, total)) = self.expected_message()? else {
+            return Ok(None);
+        };
+        if self.buffer.len() < total {
+            return Ok(None);
+        }
+        let rest = self.buffer.split_off(total);
+        let frame = std::mem::replace(&mut self.buffer, rest).split_off(PREAMBLE_LEN);
+        let permit = self
+            .frame_permit
+            .take()
+            .expect("a payload is read only after reserving its advertised bytes");
+        let mut message = Message::decode(preamble, frame)?;
+        message.hold_frame_permit(permit);
+        self.observe(&message)?;
+        Ok(Some(message))
+    }
+
+    fn expected_message(&self) -> Result<Option<(Preamble, usize)>, SessionError> {
         let Some(header) = self.buffer.get(..PREAMBLE_LEN) else {
             return Ok(None);
         };
@@ -673,17 +709,8 @@ impl Framed {
         if !self.protocol.admits_peer_version(preamble.peer_version) {
             return Err(SessionError::UnsupportedEpoch(preamble.peer_version));
         }
-        // `Preamble::decode` has already bounded `payload_len`, so the length added
-        // here is bounded by the protocol rather than by the peer.
         let total = PREAMBLE_LEN + preamble.payload_len as usize;
-        if self.buffer.len() < total {
-            return Ok(None);
-        }
-        let rest = self.buffer.split_off(total);
-        let frame = std::mem::replace(&mut self.buffer, rest).split_off(PREAMBLE_LEN);
-        let message = Message::decode(preamble, frame)?;
-        self.observe(&message)?;
-        Ok(Some(message))
+        Ok(Some((preamble, total)))
     }
 
     /// Wait for more bytes from the peer.
@@ -692,7 +719,7 @@ impl Framed {
     /// if the deadline expires the future is dropped without having consumed
     /// anything, which is what lets a timeout leave the stream usable.
     async fn fill(&mut self, timeout: Duration) -> Result<(), SessionError> {
-        let held = self.reserve();
+        let held = self.reserve()?;
         let outcome = deadline(timeout, self.stream.read(&mut self.buffer[held..])).await;
         // Whatever happened, the room made above stops being part of the message
         // stream: left in, its zeroes would be read as the next preamble.
@@ -723,10 +750,28 @@ impl Framed {
     /// that awaits it — clippy's `large_futures` measured sixteen kilobytes per
     /// session future, which is real memory once there are eight of them nested
     /// inside a swarm round.
-    fn reserve(&mut self) -> usize {
+    fn reserve(&mut self) -> Result<usize, SessionError> {
         let held = self.buffer.len();
-        self.buffer.resize(held + READ_CHUNK, 0);
-        held
+        let target = match self.expected_message()? {
+            Some((_, total)) => {
+                if self.frame_permit.is_none() {
+                    self.frame_permit = Some(
+                        self.frame_budget
+                            .try_reserve(self.remote, total)
+                            .map_err(|_| SessionError::Overloaded)?,
+                    );
+                }
+                total
+            }
+            None => PREAMBLE_LEN,
+        };
+        let read = target.saturating_sub(held).min(READ_CHUNK);
+        debug_assert!(
+            read > 0,
+            "complete messages are decoded before another read"
+        );
+        self.buffer.resize(held + read, 0);
+        Ok(held)
     }
 
     /// Hold a message the caller did not ask for, up to the buffer's bound.
@@ -791,12 +836,32 @@ impl Session {
         view: ChainView,
         timeout: Duration,
     ) -> Result<Self, SessionError> {
+        Self::open_with_budget(
+            address,
+            local,
+            protocol,
+            view,
+            timeout,
+            FrameBudget::default(),
+        )
+        .await
+    }
+
+    /// Dial with a frame budget shared by every session in this node.
+    pub async fn open_with_budget(
+        address: SocketAddr,
+        local: &LocalPeer,
+        protocol: Protocol,
+        view: ChainView,
+        timeout: Duration,
+        frame_budget: FrameBudget,
+    ) -> Result<Self, SessionError> {
         let stream = deadline(timeout, TcpStream::connect(address)).await??;
         // Nagle's algorithm would hold a request back waiting for a second one
         // that is not coming: every message here is written in full and then
         // waited on.
         stream.set_nodelay(true)?;
-        Self::negotiate(stream, local, protocol, view, timeout).await
+        Self::negotiate_with_budget(stream, local, protocol, view, timeout, frame_budget).await
     }
 
     /// Complete a handshake over an already-connected stream.
@@ -807,7 +872,28 @@ impl Session {
         view: ChainView,
         timeout: Duration,
     ) -> Result<Self, SessionError> {
-        let mut framed = Framed::new(stream, local, protocol, view, timeout);
+        Self::negotiate_with_budget(
+            stream,
+            local,
+            protocol,
+            view,
+            timeout,
+            FrameBudget::default(),
+        )
+        .await
+    }
+
+    /// Complete a handshake against a node-wide shared frame budget.
+    pub async fn negotiate_with_budget(
+        stream: TcpStream,
+        local: &LocalPeer,
+        protocol: Protocol,
+        view: ChainView,
+        timeout: Duration,
+        frame_budget: FrameBudget,
+    ) -> Result<Self, SessionError> {
+        let remote = stream.peer_addr()?.ip();
+        let mut framed = Framed::new(stream, remote, local, protocol, view, timeout, frame_budget);
         let reply = framed.request(Payload::Handshake(local.announce())).await?;
         // Cloned rather than moved out, because the reply itself is still needed
         // below to check that the key it announces is the key that signed it.
