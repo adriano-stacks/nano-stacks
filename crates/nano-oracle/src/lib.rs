@@ -295,7 +295,7 @@ fn deploy_contract_in_context(
     save_contract_analysis(store, &persisted_contract, &contract_analysis)?;
 
     Ok(TransactionResult {
-        value: None,
+        value: Some(Value::okay_true()),
         cost,
         assets,
         events,
