@@ -1,7 +1,7 @@
 ---
 id: "136"
 title: "Define an executable Epoch 4.0 compatibility profile"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 dependencies: ["060", "064"]
@@ -9,6 +9,7 @@ tags: ["mainnet", "consensus", "epoch-4", "specification", "conformance"]
 created_at: 2026-08-14
 parent: 053
 type: improvement
+completed_at: 2026-08-16
 ---
 
 # Define an executable Epoch 4.0 compatibility profile
