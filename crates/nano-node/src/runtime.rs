@@ -3230,16 +3230,46 @@ async fn finish_round(
     if let Some(state) = state {
         let staged_blocks = staging.len().ok();
         let relay = relay.status();
+        let blocks = offered.status();
+        let transactions = submitted.status();
+        state
+            .metrics()
+            .publish_ingress_queue(nano_rpc::IngressQueue::BlockUploads, blocks.into());
+        state
+            .metrics()
+            .publish_ingress_queue(nano_rpc::IngressQueue::Transactions, transactions.into());
+        if let Some(relay) = relay {
+            state.metrics().publish_ingress_queue(
+                nano_rpc::IngressQueue::RelayOffered,
+                nano_rpc::IngressQueueStatus {
+                    items: relay.offered,
+                    bytes: relay.offered_bytes,
+                    oldest_age: relay.offered_oldest_age,
+                    dropped: relay.offered_dropped,
+                    saturations: relay.offered_saturations,
+                },
+            );
+            state.metrics().publish_ingress_queue(
+                nano_rpc::IngressQueue::RelayAnnouncing,
+                nano_rpc::IngressQueueStatus {
+                    items: relay.announcing,
+                    bytes: relay.announcing_bytes,
+                    oldest_age: relay.announcing_oldest_age,
+                    dropped: relay.announcing_dropped,
+                    saturations: relay.announcing_saturations,
+                },
+            );
+        }
         state
             .publish_queues(nano_rpc::QueueReport {
                 staged_blocks,
                 relay_offered: relay.map(|status| status.offered),
                 relay_announcing: relay.map(|status| status.announcing),
                 relay_dropped: relay.map(|status| status.dropped),
-                queued_blocks: Some(offered.len()),
+                queued_blocks: Some(blocks.items),
                 queued_proposals: None,
                 queued_stackerdb_chunks: None,
-                queued_transactions: Some(submitted.len()),
+                queued_transactions: Some(transactions.items),
             })
             .await;
     }

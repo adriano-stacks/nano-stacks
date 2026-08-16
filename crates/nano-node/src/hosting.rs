@@ -70,9 +70,13 @@ pub async fn validate_proposals(
         endpoints.len().max(1)
     );
     loop {
+        let queue = requests.status();
+        state
+            .metrics()
+            .publish_ingress_queue(nano_rpc::IngressQueue::Proposals, queue.into());
         state
             .publish_queues(nano_rpc::QueueReport {
-                queued_proposals: Some(requests.len()),
+                queued_proposals: Some(queue.items),
                 ..nano_rpc::QueueReport::default()
             })
             .await;
@@ -783,9 +787,13 @@ pub async fn replicate(
     let mut outbound = Vec::new();
     let mut reported = (0, 0);
     loop {
+        let queue = written.status();
+        state
+            .metrics()
+            .publish_ingress_queue(nano_rpc::IngressQueue::StackerDbChunks, queue.into());
         state
             .publish_queues(nano_rpc::QueueReport {
-                queued_stackerdb_chunks: Some(written.len() + outbound.len()),
+                queued_stackerdb_chunks: Some(queue.items),
                 ..nano_rpc::QueueReport::default()
             })
             .await;

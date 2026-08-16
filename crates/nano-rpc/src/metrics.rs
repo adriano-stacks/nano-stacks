@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicI64, AtomicU64},
     },
+    time::Duration,
 };
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
@@ -34,6 +35,122 @@ pub struct ExecutionCacheReport {
     pub clarity_value_bytes: usize,
     pub wasm_module_entries: usize,
     pub wasm_module_bytes: usize,
+}
+
+/// A bounded ingress queue whose producer reports its own accounting.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum IngressQueue {
+    BlockUploads,
+    Proposals,
+    StackerDbChunks,
+    Transactions,
+    RelayOffered,
+    RelayAnnouncing,
+}
+
+impl EncodeLabelValue for IngressQueue {
+    fn encode(&self, encoder: &mut LabelValueEncoder<'_>) -> std::fmt::Result {
+        encoder.write_str(match self {
+            Self::BlockUploads => "block_uploads",
+            Self::Proposals => "proposals",
+            Self::StackerDbChunks => "stackerdb_chunks",
+            Self::Transactions => "transactions",
+            Self::RelayOffered => "relay_offered",
+            Self::RelayAnnouncing => "relay_announcing",
+        })
+    }
+}
+
+/// Current retained work and cumulative shedding for one ingress queue.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IngressQueueStatus {
+    pub items: usize,
+    pub bytes: usize,
+    pub oldest_age: Option<Duration>,
+    pub dropped: u64,
+    pub saturations: u64,
+}
+
+impl From<nano_queue::Status> for IngressQueueStatus {
+    fn from(status: nano_queue::Status) -> Self {
+        Self {
+            items: status.items,
+            bytes: status.bytes,
+            oldest_age: status.oldest_age,
+            dropped: status.dropped,
+            saturations: status.saturations,
+        }
+    }
+}
+
+#[derive(Clone, Debug, EncodeLabelSet, Eq, Hash, PartialEq)]
+struct IngressQueueLabels {
+    queue: IngressQueue,
+}
+
+struct IngressQueueGauges {
+    items: Family<IngressQueueLabels, IntGauge>,
+    bytes: Family<IngressQueueLabels, IntGauge>,
+    oldest_age_seconds: Family<IngressQueueLabels, FloatGauge>,
+    dropped: Family<IngressQueueLabels, IntGauge>,
+    saturations: Family<IngressQueueLabels, IntGauge>,
+}
+
+impl IngressQueueGauges {
+    fn register(registry: &mut Registry) -> Self {
+        let items = Family::default();
+        let bytes = Family::default();
+        let oldest_age_seconds = Family::default();
+        let dropped = Family::default();
+        let saturations = Family::default();
+        registry.register(
+            "ingress_queue_items",
+            "Items retained by each externally fed bounded queue.",
+            items.clone(),
+        );
+        registry.register(
+            "ingress_queue_bytes",
+            "Bytes retained by each externally fed bounded queue.",
+            bytes.clone(),
+        );
+        registry.register(
+            "ingress_queue_oldest_age_seconds",
+            "Age of the oldest item retained by each externally fed bounded queue.",
+            oldest_age_seconds.clone(),
+        );
+        registry.register(
+            "ingress_queue_dropped",
+            "Items cumulatively dropped by each externally fed bounded queue.",
+            dropped.clone(),
+        );
+        registry.register(
+            "ingress_queue_saturations",
+            "Times each externally fed bounded queue reached an item or byte limit.",
+            saturations.clone(),
+        );
+        Self {
+            items,
+            bytes,
+            oldest_age_seconds,
+            dropped,
+            saturations,
+        }
+    }
+
+    fn publish(&self, queue: IngressQueue, status: IngressQueueStatus) {
+        let labels = IngressQueueLabels { queue };
+        self.items.get_or_create(&labels).set(as_i64(status.items));
+        self.bytes.get_or_create(&labels).set(as_i64(status.bytes));
+        self.oldest_age_seconds
+            .get_or_create(&labels)
+            .set(status.oldest_age.map_or(0.0, |age| age.as_secs_f64()));
+        self.dropped
+            .get_or_create(&labels)
+            .set(as_i64(status.dropped));
+        self.saturations
+            .get_or_create(&labels)
+            .set(as_i64(status.saturations));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -428,6 +545,7 @@ struct Inner {
     queued_proposals: IntGauge,
     queued_stackerdb_chunks: IntGauge,
     queued_transactions: IntGauge,
+    ingress_queues: IngressQueueGauges,
     resources: ResourceGauges,
 }
 
@@ -452,6 +570,7 @@ impl Default for NodeMetrics {
         let progress = ProgressGauges::register(&mut registry);
         let execution = ExecutionGauges::register(&mut registry);
         let peers = PeerGauges::register(&mut registry);
+        let ingress_queues = IngressQueueGauges::register(&mut registry);
         let staged_blocks = gauge(
             &mut registry,
             "staged_blocks",
@@ -507,12 +626,18 @@ impl Default for NodeMetrics {
             queued_proposals,
             queued_stackerdb_chunks,
             queued_transactions,
+            ingress_queues,
             resources,
         }))
     }
 }
 
 impl NodeMetrics {
+    /// Publish the producer-owned accounting for one externally fed queue.
+    pub fn publish_ingress_queue(&self, queue: IngressQueue, status: IngressQueueStatus) {
+        self.0.ingress_queues.publish(queue, status);
+    }
+
     /// Record a block rejected at an explicit validation boundary.
     pub fn record_block_refusal(&self, message: &str) {
         self.0
@@ -753,7 +878,10 @@ mod tests {
     };
     use tower::ServiceExt as _;
 
-    use super::{ExecutionCacheReport, NodeMetrics, RefusalReason, router, serve};
+    use super::{
+        ExecutionCacheReport, IngressQueue, IngressQueueStatus, NodeMetrics, RefusalReason, router,
+        serve,
+    };
     use crate::{PeerReport, QueueReport, RpcState, SealedTip, SelectedTip};
     use nano_primitives::{BlockHeaderHash, ConsensusHash, Network, StacksBlockId, TrieHash};
     use nano_sync::PoxInfo;
@@ -768,6 +896,11 @@ mod tests {
         "nano_serving_peers{role=\"proposal_validator\"} 2",
         "nano_serving_peers{role=\"stackerdb_replication\"} 4",
         "nano_staged_blocks 7",
+        "nano_ingress_queue_items{queue=\"block_uploads\"} 3",
+        "nano_ingress_queue_bytes{queue=\"block_uploads\"} 1024",
+        "nano_ingress_queue_oldest_age_seconds{queue=\"block_uploads\"} 2.5",
+        "nano_ingress_queue_dropped{queue=\"block_uploads\"} 4",
+        "nano_ingress_queue_saturations{queue=\"block_uploads\"} 5",
         "nano_block_refusals_total{reason=\"compiler_gap\"} 1",
         "nano_block_refusals_total{reason=\"root_mismatch\"} 1",
         "nano_block_refusals_total{reason=\"signature\"} 1",
@@ -857,6 +990,16 @@ mod tests {
         metrics.publish_stackerdb_peers(4);
         metrics.publish_mempool_size(11);
         metrics.publish_execution_caches(execution_cache_fixture());
+        metrics.publish_ingress_queue(
+            IngressQueue::BlockUploads,
+            IngressQueueStatus {
+                items: 3,
+                bytes: 1024,
+                oldest_age: Some(std::time::Duration::from_millis(2500)),
+                dropped: 4,
+                saturations: 5,
+            },
+        );
         metrics.publish_block_execution(
             &half_limit_cost(),
             3,

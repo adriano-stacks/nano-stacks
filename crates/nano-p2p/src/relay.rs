@@ -154,10 +154,14 @@ pub struct RelayStatus {
     pub offered: usize,
     pub offered_bytes: usize,
     pub offered_oldest_age: Option<Duration>,
+    pub offered_dropped: u64,
+    pub offered_saturations: u64,
     /// Accepted items waiting to be sent to peers.
     pub announcing: usize,
     pub announcing_bytes: usize,
     pub announcing_oldest_age: Option<Duration>,
+    pub announcing_dropped: u64,
+    pub announcing_saturations: u64,
     /// Offers shed because either bounded queue was full.
     pub dropped: u64,
     pub saturations: u64,
@@ -277,9 +281,13 @@ impl Relay {
                 offered: offered.items,
                 offered_bytes: offered.bytes,
                 offered_oldest_age: offered.oldest_age,
+                offered_dropped: offered.dropped,
+                offered_saturations: offered.saturations,
                 announcing: announcing.items,
                 announcing_bytes: announcing.bytes,
                 announcing_oldest_age: announcing.oldest_age,
+                announcing_dropped: announcing.dropped,
+                announcing_saturations: announcing.saturations,
                 dropped: offered.dropped.saturating_add(announcing.dropped),
                 saturations: offered.saturations.saturating_add(announcing.saturations),
             }
@@ -391,9 +399,13 @@ mod tests {
         assert_eq!(status.offered, MAX_QUEUED_OFFERS);
         assert!(status.offered_bytes <= MAX_QUEUED_OFFER_BYTES);
         assert!(status.offered_oldest_age.is_some());
+        assert_eq!(status.offered_dropped, 8);
+        assert_eq!(status.offered_saturations, 8);
         assert_eq!(status.announcing, 0);
         assert_eq!(status.announcing_bytes, 0);
         assert_eq!(status.announcing_oldest_age, None);
+        assert_eq!(status.announcing_dropped, 0);
+        assert_eq!(status.announcing_saturations, 0);
         assert_eq!(status.dropped, 8);
         assert_eq!(status.saturations, 8);
         assert_eq!(relay.take_offered().len(), MAX_QUEUED_OFFERS);

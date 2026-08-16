@@ -53,7 +53,9 @@ pub use events::{
     mined_nakamoto_block_payload, new_block_payload, new_burn_block_payload,
     proposal_response_payload, stacker_set_payload, stackerdb_chunks_payload,
 };
-pub use metrics::{ExecutionCacheReport, NodeMetrics, serve as serve_metrics};
+pub use metrics::{
+    ExecutionCacheReport, IngressQueue, IngressQueueStatus, NodeMetrics, serve as serve_metrics,
+};
 pub use server::serve;
 pub use stackerdb::{ChunkRefusal, StackerDbStore};
 
