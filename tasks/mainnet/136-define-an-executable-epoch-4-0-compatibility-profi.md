@@ -1,7 +1,7 @@
 ---
 id: "136"
 title: "Define an executable Epoch 4.0 compatibility profile"
-status: pending
+status: in-progress
 priority: critical
 effort: medium
 dependencies: ["060", "064"]
