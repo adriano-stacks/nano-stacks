@@ -8754,9 +8754,9 @@ pub fn dummy_linker<T: 'static>(engine: &Engine) -> Result<Linker<T>, wasmtime::
     Ok(linker)
 }
 
-/// the standard.wat file and link in all of the host interface functions.
+/// Load the compiled standard library and link in all host interface functions.
 pub fn load_stdlib() -> Result<(Instance, Store<()>), wasmtime::Error> {
-    let standard_lib = include_str!("standard/standard.wat");
+    let standard_lib = include_bytes!(concat!(env!("OUT_DIR"), "/standard.wasm"));
     let engine = crate::consensus_engine()?;
     let mut store = Store::new(&engine, ());
 
