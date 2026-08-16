@@ -6787,6 +6787,30 @@ fn candidate_still_frozen(
     }
 }
 
+fn source_still_frozen(source_revision: &str) -> bool {
+    println!("\nrelease source freeze");
+    match source_status(&workspace_root()) {
+        Ok(status) if status.frozen_at(source_revision) => {
+            println!("  PASS: source remains clean at {source_revision}");
+            true
+        }
+        Ok(status) => {
+            println!(
+                "  FAIL: source moved from {source_revision} to {}",
+                status.revision
+            );
+            for change in status.changes {
+                println!("  FAIL: {change}");
+            }
+            false
+        }
+        Err(error) => {
+            println!("  FAIL: {error}");
+            false
+        }
+    }
+}
+
 fn release_report_header() {
     println!("nano-stacks release report");
     println!(
@@ -6899,6 +6923,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
         );
         false
     };
+    let source_frozen = source_still_frozen(&source_revision);
     let candidate_frozen =
         candidate_still_frozen(&options, verified_candidate.as_ref(), &source_revision);
 
@@ -6908,6 +6933,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
         && receipt_binding
         && historical_epoch_evidence
         && release_inventory
+        && source_frozen
         && candidate_frozen;
     release_verdict(options.run_gates, evidence, passed, blocking)
 }

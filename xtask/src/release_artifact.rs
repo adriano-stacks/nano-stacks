@@ -15,6 +15,10 @@ impl SourceStatus {
     pub const fn clean(&self) -> bool {
         self.changes.is_empty()
     }
+
+    pub fn frozen_at(&self, revision: &str) -> bool {
+        self.clean() && self.revision == revision
+    }
 }
 
 pub fn source_status(root: &Path) -> Result<SourceStatus, String> {
@@ -217,5 +221,26 @@ mod tests {
                 status.changes
             );
         }
+    }
+
+    #[test]
+    fn a_source_freeze_rejects_a_change_or_a_new_commit() {
+        let root = repository();
+        let initial = source_status(root.path()).expect("inspect initial source");
+        assert!(initial.frozen_at(&initial.revision));
+
+        fs::write(root.path().join("crates/lib.rs"), "pub fn changed() {}\n")
+            .expect("change source");
+        assert!(
+            !source_status(root.path())
+                .expect("inspect changed source")
+                .frozen_at(&initial.revision)
+        );
+
+        git(root.path(), &["add", "crates/lib.rs"]);
+        git(root.path(), &["commit", "--quiet", "-m", "change source"]);
+        let committed = source_status(root.path()).expect("inspect committed source");
+        assert!(committed.clean());
+        assert!(!committed.frozen_at(&initial.revision));
     }
 }
