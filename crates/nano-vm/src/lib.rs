@@ -2135,8 +2135,17 @@ impl Vm {
         &mut self,
         total: ExecutionCost,
     ) -> Result<LimitedCostTracker, VmExecutionError> {
+        self.cost_tracker_with_limit(EPOCH_4_BLOCK_LIMIT, total)
+    }
+
+    /// Create a tracker for non-consensus work with an explicit cost ceiling.
+    pub fn cost_tracker_with_limit(
+        &mut self,
+        limit: ExecutionCost,
+        total: ExecutionCost,
+    ) -> Result<LimitedCostTracker, VmExecutionError> {
         let Self { store, context, .. } = self;
-        transaction_cost_tracker_in_context(store, context, total)
+        cost_tracker_in_context(store, context, limit, total)
     }
 
     /// Store a transaction nonce in the active block state.
@@ -5192,9 +5201,10 @@ fn credit_stx_in_context(
     })
 }
 
-fn transaction_cost_tracker_in_context(
+fn cost_tracker_in_context(
     store: &mut MarfStore,
     bitcoin_context: &dyn ChainContext,
+    limit: ExecutionCost,
     total: ExecutionCost,
 ) -> Result<LimitedCostTracker, VmExecutionError> {
     let network = store.network();
@@ -5206,7 +5216,7 @@ fn transaction_cost_tracker_in_context(
     let result = LimitedCostTracker::new_mid_block(
         network.is_mainnet(),
         network.chain_id(),
-        EPOCH_4_BLOCK_LIMIT,
+        limit,
         &mut database,
         StacksEpochId::Epoch40,
     );
@@ -6860,6 +6870,25 @@ mod tests {
     }
 
     #[test]
+    fn a_non_consensus_cost_tracker_keeps_its_explicit_limit() {
+        let (checkpoint, source, root) = captured_checkpoint();
+        let mut vm = Vm::from_checkpoint(Network::TESTNET, checkpoint, source, root)
+            .expect("open the captured cost contracts");
+        let limit = ExecutionCost {
+            write_length: 0,
+            write_count: 0,
+            read_length: 200_000,
+            read_count: 100,
+            runtime: 1_000_000_000,
+        };
+        let tracker = vm
+            .cost_tracker_with_limit(limit.clone(), ExecutionCost::ZERO)
+            .expect("load the bounded tracker");
+
+        assert_eq!(tracker.get_limit(), limit);
+    }
+
+    #[test]
     fn loads_clarity_values_and_metadata_from_a_checkpoint() {
         let (checkpoint, source, root) = captured_checkpoint();
         let contract = QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.pox")
@@ -7034,12 +7063,11 @@ mod tests {
         ));
     }
 
-    /// A state created before the chain was recorded is adopted, not refused.
+    /// A non-mainnet state created before the chain was recorded is adopted.
     ///
-    /// Every state directory already on disk is one of those, and the
-    /// alternative is importing a 380 GB checkpoint again to gain a fact its own
-    /// files already imply. It is checked from the first open onwards, which is
-    /// what the previous test asserts.
+    /// Development states predate the identity row and can be assigned a test
+    /// chain on first open. Mainnet is deliberately different: the previous test
+    /// requires its executable profile to come from an authenticated import.
     #[test]
     fn a_state_that_names_no_chain_is_claimed_by_the_first_open() {
         let directory = tempfile::tempdir().expect("a directory");
@@ -7052,10 +7080,11 @@ mod tests {
         drop(connection);
 
         assert_eq!(recorded_network(directory.path()), None);
-        drop(Vm::open(Network::MAINNET, directory.path()).expect("adopt the unclaimed state"));
+        let adopted = Network::testnet_with_chain_id(0x8000_1234);
+        drop(Vm::open(adopted, directory.path()).expect("adopt the unclaimed state"));
         assert_eq!(
             recorded_network(directory.path()),
-            Some(Network::MAINNET),
+            Some(adopted),
             "and it is claimed from then on"
         );
         assert!(matches!(

@@ -42,7 +42,7 @@ use nano_sync::{FollowedTenure, NodeView, PoxInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use siphasher::sip::SipHasher;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, Semaphore, broadcast};
 use tokio_stream::{Stream, StreamExt, wrappers::BroadcastStream};
 
 pub use chain::{AccountEntry, ChainAccess, ChainAccessError, ReadOnlyCall};
@@ -65,6 +65,7 @@ const MEMPOOL_PAGE_TRANSACTIONS: usize = 128;
 const MEMPOOL_PAGE_BYTES: usize = 8 * 1024 * 1024;
 const MIB: usize = 1024 * 1024;
 const MAX_MEMPOOL_QUERY_TAGS: usize = 8192;
+const READ_ONLY_WORKERS: usize = 4;
 /// `BOUND_VALUE_SERIALIZATION_BYTES` in the pinned Clarity implementation.
 const MAX_CLARITY_ARGUMENT_BYTES: usize = 2 * MIB;
 
@@ -276,6 +277,9 @@ pub struct RpcState {
     events: broadcast::Sender<NodeEvent>,
     /// The executed Clarity state, when the node runs one.
     chain: Option<Arc<Mutex<dyn ChainAccess>>>,
+    /// Synchronous Clarity reads kept off the async executor and bounded even
+    /// after a client-side timeout drops its request future.
+    read_only_workers: Arc<Semaphore>,
     /// The blocks this node kept because it executed them, which is what
     /// `/v3/blocks/:id` and `/v3/tenures/:id` answer from when it has them.
     archive: Option<Arc<dyn ExecutedBlocks>>,
@@ -350,6 +354,7 @@ impl RpcState {
             executed: Arc::new(RwLock::new(None)),
             events,
             chain: None,
+            read_only_workers: Arc::new(Semaphore::new(READ_ONLY_WORKERS)),
             archive: None,
             admission: None,
             proposals: None,
@@ -1723,7 +1728,17 @@ async fn call_read_only(
         arguments,
     };
     let chain = state.chain()?;
-    let outcome = chain.lock().await.call_read_only(&call);
+    let worker = state
+        .read_only_workers
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| RpcError::Overloaded("read-only execution is at capacity".to_owned()))?;
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _worker = worker;
+        chain.blocking_lock().call_read_only(&call)
+    })
+    .await
+    .map_err(|error| RpcError::UnavailableBecause(format!("read-only worker failed: {error}")))?;
     // A call that ran and failed is a successful request reporting its cause,
     // which is what a client distinguishes an outage from.
     Ok(axum::Json(match outcome {
@@ -2757,7 +2772,8 @@ mod tests {
 
     use std::{
         collections::{HashMap, VecDeque},
-        sync::{Arc, Mutex as StdMutex},
+        sync::{Arc, Mutex as StdMutex, mpsc},
+        time::Duration,
     };
 
     use clarity::vm::{
@@ -2822,6 +2838,32 @@ mod tests {
     struct ScriptedChain {
         answers: VecDeque<Result<Value, ChainAccessError>>,
         calls: Arc<StdMutex<Vec<ReadOnlyCall>>>,
+    }
+
+    struct BlockingChain {
+        entered: Option<mpsc::Sender<()>>,
+        release: Option<mpsc::Receiver<()>>,
+    }
+
+    impl ChainAccess for BlockingChain {
+        fn account(
+            &mut self,
+            _principal: &PrincipalData,
+        ) -> Result<AccountEntry, ChainAccessError> {
+            Ok(AccountEntry::default())
+        }
+
+        fn call_read_only(&mut self, _call: &ReadOnlyCall) -> Result<Value, ChainAccessError> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).expect("report the entered worker");
+                self.release
+                    .take()
+                    .expect("the first worker has a release")
+                    .recv()
+                    .expect("release the worker");
+            }
+            Ok(Value::UInt(3))
+        }
     }
 
     impl ChainAccess for ScriptedChain {
@@ -3091,6 +3133,55 @@ mod tests {
             body_json(response).await,
             json!({ "okay": false, "cause": "no such function get-cycle" })
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_read_only_calls_keep_their_worker_budget_until_done() {
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let chain: Arc<Mutex<dyn ChainAccess>> = Arc::new(Mutex::new(BlockingChain {
+            entered: Some(entered),
+            release: Some(release_rx),
+        }));
+        let state = pox_state(chain).await;
+        let workers = state.read_only_workers.clone();
+        let app = router(state);
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v2/contracts/call-read/ST000000000000000000002AMW42H/pox-5/get-cycle")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"sender": address(&key(b"sender")).to_string(), "arguments": []})
+                        .to_string(),
+                ))
+                .expect("request")
+        };
+        let requests = (0..super::READ_ONLY_WORKERS)
+            .map(|_| tokio::spawn(app.clone().oneshot(request())))
+            .collect::<Vec<_>>();
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(1)))
+            .await
+            .expect("join the worker notification")
+            .expect("one worker entered the chain");
+        for request in requests {
+            request.abort();
+        }
+
+        let overloaded = app.clone().oneshot(request()).await.expect("response");
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers()[header::RETRY_AFTER], "1");
+
+        release.send(()).expect("release the first worker");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while workers.available_permits() != super::READ_ONLY_WORKERS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all abandoned workers finish");
+        let recovered = app.oneshot(request()).await.expect("response");
+        assert_eq!(recovered.status(), StatusCode::OK);
     }
 
     #[tokio::test]

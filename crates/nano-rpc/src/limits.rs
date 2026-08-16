@@ -20,7 +20,7 @@ use tower_http::{
     timeout::{RequestBodyTimeoutLayer, TimeoutLayer},
 };
 
-use crate::{RpcError, RpcState};
+use crate::{READ_ONLY_WORKERS, RpcError, RpcState};
 
 const GLOBAL_CONCURRENCY: usize = 128;
 const RATE_WINDOW: Duration = Duration::from_secs(1);
@@ -69,7 +69,7 @@ pub const CHEAP_READ: Policy = policy(0, 64, 512, 5);
 pub const STATE_READ: Policy = policy(0, 16, 128, 15);
 pub const ARCHIVE_READ: Policy = policy(0, 16, 64, 30);
 pub const EVENT_STREAM: Policy = policy(0, 64, 64, 5);
-pub const CALL_READ: Policy = policy(4 * 1024 * 1024 + 4096, 4, 16, 60);
+pub const CALL_READ: Policy = policy(4 * 1024 * 1024 + 4096, READ_ONLY_WORKERS, 16, 60);
 pub const TRANSACTION: Policy = policy(2 * 1024 * 1024, 16, 64, 30);
 pub const MEMPOOL_QUERY: Policy = policy(128 * 1024, 8, 32, 30);
 pub const STACKERDB_UPLOAD: Policy = policy(4 * 1024 * 1024 + 1024, 8, 32, 30);

@@ -33,7 +33,7 @@ load shedding instead of an unbounded queue, allocation or task population.
       before allocating or decoding the advertised payload.
 - [ ] Bound pushed messages by bytes rather than only by message count and test
       the maximum-size-message case across all allowed sessions.
-- [ ] Limit slow reads, fragmented frames, decomposed/hex-expanded bodies and
+- [x] Limit slow reads, fragmented frames, decomposed/hex-expanded bodies and
       expensive read-only calls independently from consensus execution.
 - [ ] Add load and slowloris tests using authenticated valid traffic as well as
       malformed traffic. Exercise recovery after every queue saturates.
