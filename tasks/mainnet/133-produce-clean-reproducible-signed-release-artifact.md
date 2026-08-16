@@ -1,7 +1,7 @@
 ---
 id: "133"
 title: "Produce clean reproducible signed release artifacts"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 dependencies: ["074", "078"]
@@ -9,6 +9,7 @@ tags: ["mainnet", "release", "reproducibility", "supply-chain", "ci"]
 created_at: 2026-08-14
 parent: 053
 type: chore
+completed_at: 2026-08-16
 ---
 
 # Produce clean reproducible signed release artifacts
@@ -21,20 +22,20 @@ checkpoint and qualification evidence are inseparable.
 
 ## Tasks
 
-- [ ] Make `cargo xtask release-report` fail qualification on tracked, staged,
+- [x] Make `cargo xtask release-report` fail qualification on tracked, staged,
       untracked or ignored build-relevant changes instead of only printing that
       the tree is dirty.
-- [ ] Build the release as a Nix derivation from a clean source closure, not from
+- [x] Build the release as a Nix derivation from a clean source closure, not from
       a mutable working tree or pre-existing `target/` directory.
 - [x] Build twice in independent clean stores and compare the binaries and all
       packaged data byte-for-byte. Explain and eliminate any nondeterminism.
-- [ ] Generate an SBOM and record the exact Cargo feature/dependency closure,
+- [x] Generate an SBOM and record the exact Cargo feature/dependency closure,
       Rust toolchain, Wasmtime configuration, clarity-wasm identity and target.
-- [ ] Produce signed checksums and provenance for the binary, configuration
+- [x] Produce signed checksums and provenance for the binary, configuration
       schema, checkpoint manifest and qualification report.
-- [ ] Add a release-candidate freeze rule: any source, lock, toolchain,
+- [x] Add a release-candidate freeze rule: any source, lock, toolchain,
       configuration or packaged-data change invalidates the qualification run.
-- [ ] Package documented systemd/container profiles with explicit memory, file
+- [x] Package documented systemd/container profiles with explicit memory, file
       descriptor, disk, log and shutdown behavior.
 
 ## Acceptance Criteria
