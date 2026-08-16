@@ -107,6 +107,178 @@ struct IngressQueueGauges {
     saturations: Family<IngressQueueLabels, IntGauge>,
 }
 
+#[derive(Clone, Debug, EncodeLabelSet, Eq, Hash, PartialEq)]
+struct RpcRouteLabels {
+    route: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum RpcRefusal {
+    Concurrency,
+    Rate,
+}
+
+impl EncodeLabelValue for RpcRefusal {
+    fn encode(&self, encoder: &mut LabelValueEncoder<'_>) -> std::fmt::Result {
+        encoder.write_str(match self {
+            Self::Concurrency => "concurrency",
+            Self::Rate => "rate",
+        })
+    }
+}
+
+#[derive(Clone, Debug, EncodeLabelSet, Eq, Hash, PartialEq)]
+struct RpcRefusalLabels {
+    route: &'static str,
+    reason: RpcRefusal,
+}
+
+struct RpcAdmissionGauges {
+    active: Family<RpcRouteLabels, IntGauge>,
+    body_byte_limit: Family<RpcRouteLabels, IntGauge>,
+    concurrency_limit: Family<RpcRouteLabels, IntGauge>,
+    rate_limit: Family<RpcRouteLabels, IntGauge>,
+    refusals: Family<RpcRefusalLabels, Counter>,
+    global_active: IntGauge,
+    global_limit: IntGauge,
+    global_refusals: Counter,
+}
+
+impl RpcAdmissionGauges {
+    fn register(registry: &mut Registry) -> Self {
+        let active = Family::default();
+        let body_byte_limit = Family::default();
+        let concurrency_limit = Family::default();
+        let rate_limit = Family::default();
+        let refusals = Family::default();
+        registry.register(
+            "rpc_route_active",
+            "Requests currently admitted into each public RPC route.",
+            active.clone(),
+        );
+        registry.register(
+            "rpc_route_body_byte_limit",
+            "Maximum request-body bytes accepted by each public RPC route.",
+            body_byte_limit.clone(),
+        );
+        registry.register(
+            "rpc_route_concurrency_limit",
+            "Maximum concurrent requests admitted into each public RPC route.",
+            concurrency_limit.clone(),
+        );
+        registry.register(
+            "rpc_route_rate_limit",
+            "Maximum requests admitted per second into each public RPC route.",
+            rate_limit.clone(),
+        );
+        registry.register(
+            "rpc_route_refusals",
+            "Requests refused at a route concurrency or rate boundary.",
+            refusals.clone(),
+        );
+        let global_active = gauge(
+            registry,
+            "rpc_requests_active",
+            "Requests currently admitted across all public RPC routes.",
+        );
+        let global_limit = gauge(
+            registry,
+            "rpc_request_concurrency_limit",
+            "Maximum requests admitted across all public RPC routes.",
+        );
+        let global_refusals = counter(
+            registry,
+            "rpc_request_concurrency_refusals",
+            "Requests refused because the node-wide RPC concurrency budget was full.",
+        );
+        Self {
+            active,
+            body_byte_limit,
+            concurrency_limit,
+            rate_limit,
+            refusals,
+            global_active,
+            global_limit,
+            global_refusals,
+        }
+    }
+
+    fn route(
+        &self,
+        route: &'static str,
+        body_bytes: usize,
+        concurrent: usize,
+        per_second: u64,
+        global: usize,
+    ) -> RpcRouteMetrics {
+        let labels = RpcRouteLabels { route };
+        self.body_byte_limit
+            .get_or_create(&labels)
+            .set(as_i64(body_bytes));
+        self.concurrency_limit
+            .get_or_create(&labels)
+            .set(as_i64(concurrent));
+        self.rate_limit
+            .get_or_create(&labels)
+            .set(as_i64(per_second));
+        self.global_limit.set(as_i64(global));
+        let active = self.active.get_or_create(&labels).clone();
+        let concurrency_refusals = self
+            .refusals
+            .get_or_create(&RpcRefusalLabels {
+                route,
+                reason: RpcRefusal::Concurrency,
+            })
+            .clone();
+        let rate_refusals = self
+            .refusals
+            .get_or_create(&RpcRefusalLabels {
+                route,
+                reason: RpcRefusal::Rate,
+            })
+            .clone();
+        RpcRouteMetrics {
+            active,
+            concurrency_refusals,
+            rate_refusals,
+            global_active: self.global_active.clone(),
+            global_refusals: self.global_refusals.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RpcRouteMetrics {
+    active: IntGauge,
+    concurrency_refusals: Counter,
+    rate_refusals: Counter,
+    global_active: IntGauge,
+    global_refusals: Counter,
+}
+
+impl RpcRouteMetrics {
+    pub(crate) fn enter(&self) {
+        self.active.inc();
+        self.global_active.inc();
+    }
+
+    pub(crate) fn leave(&self) {
+        self.active.dec();
+        self.global_active.dec();
+    }
+
+    pub(crate) fn refuse_concurrency(&self, global: bool) {
+        self.concurrency_refusals.inc();
+        if global {
+            self.global_refusals.inc();
+        }
+    }
+
+    pub(crate) fn refuse_rate(&self) {
+        self.rate_refusals.inc();
+    }
+}
+
 impl IngressQueueGauges {
     fn register(registry: &mut Registry) -> Self {
         let items = Family::default();
@@ -577,6 +749,7 @@ struct Inner {
     queued_stackerdb_chunks: IntGauge,
     queued_transactions: IntGauge,
     ingress_queues: IngressQueueGauges,
+    rpc_admission: RpcAdmissionGauges,
     resources: ResourceGauges,
 }
 
@@ -602,6 +775,7 @@ impl Default for NodeMetrics {
         let execution = ExecutionGauges::register(&mut registry);
         let peers = PeerGauges::register(&mut registry);
         let ingress_queues = IngressQueueGauges::register(&mut registry);
+        let rpc_admission = RpcAdmissionGauges::register(&mut registry);
         let staged_blocks = gauge(
             &mut registry,
             "staged_blocks",
@@ -658,6 +832,7 @@ impl Default for NodeMetrics {
             queued_stackerdb_chunks,
             queued_transactions,
             ingress_queues,
+            rpc_admission,
             resources,
         }))
     }
@@ -667,6 +842,19 @@ impl NodeMetrics {
     /// Publish the producer-owned accounting for one externally fed queue.
     pub fn publish_ingress_queue(&self, queue: IngressQueue, status: IngressQueueStatus) {
         self.0.ingress_queues.publish(queue, status);
+    }
+
+    pub(crate) fn rpc_route(
+        &self,
+        route: &'static str,
+        body_bytes: usize,
+        concurrent: usize,
+        per_second: u64,
+        global: usize,
+    ) -> RpcRouteMetrics {
+        self.0
+            .rpc_admission
+            .route(route, body_bytes, concurrent, per_second, global)
     }
 
     /// Record a block rejected at an explicit validation boundary.

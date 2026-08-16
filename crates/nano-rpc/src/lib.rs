@@ -345,8 +345,10 @@ impl RpcState {
     #[must_use]
     pub fn new(network: Network) -> Self {
         let (events, _) = broadcast::channel(256);
+        let metrics = NodeMetrics::default();
+        let ingress = limits::Registry::new(metrics.clone());
         Self {
-            metrics: NodeMetrics::default(),
+            metrics,
             roles: NodeRoles::default(),
             followed: Arc::new(RwLock::new(None)),
             followed_height: Arc::new(RwLock::new(None)),
@@ -370,7 +372,7 @@ impl RpcState {
             blocks: None,
             proposal_token: None,
             observers: None,
-            ingress: limits::Registry::default(),
+            ingress,
         }
     }
 
@@ -390,6 +392,7 @@ impl RpcState {
     /// Use one metrics registry created before the RPC itself is ready.
     #[must_use]
     pub fn with_metrics(mut self, metrics: NodeMetrics) -> Self {
+        self.ingress = limits::Registry::new(metrics.clone());
         self.metrics = metrics;
         self
     }

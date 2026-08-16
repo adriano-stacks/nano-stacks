@@ -79,14 +79,22 @@ pub const BLOCK_PROPOSAL: Policy = policy(8 * 1024 * 1024 + 4096, 4, 16, 60);
 #[derive(Clone, Debug)]
 pub struct Registry {
     global: Arc<Semaphore>,
+    global_limit: usize,
     routes: Arc<Mutex<HashMap<&'static str, Budget>>>,
+    metrics: crate::NodeMetrics,
 }
 
 impl Registry {
-    fn new(global_concurrency: usize) -> Self {
+    pub(crate) fn new(metrics: crate::NodeMetrics) -> Self {
+        Self::with_global_limit(GLOBAL_CONCURRENCY, metrics)
+    }
+
+    fn with_global_limit(global_concurrency: usize, metrics: crate::NodeMetrics) -> Self {
         Self {
             global: Arc::new(Semaphore::new(global_concurrency)),
+            global_limit: global_concurrency,
             routes: Arc::new(Mutex::new(HashMap::new())),
+            metrics,
         }
     }
 
@@ -94,14 +102,21 @@ impl Registry {
         let mut routes = lock(&self.routes);
         routes
             .entry(name)
-            .or_insert_with(|| Budget::new(name, policy, self.global.clone()))
+            .or_insert_with(|| {
+                Budget::new(
+                    name,
+                    policy,
+                    self.global.clone(),
+                    self.metrics.rpc_route(
+                        name,
+                        policy.body_bytes,
+                        policy.concurrent,
+                        policy.per_second,
+                        self.global_limit,
+                    ),
+                )
+            })
             .clone()
-    }
-}
-
-impl Default for Registry {
-    fn default() -> Self {
-        Self::new(GLOBAL_CONCURRENCY)
     }
 }
 
@@ -147,36 +162,44 @@ struct Budget {
     global: Arc<Semaphore>,
     route: Arc<Semaphore>,
     rate: Arc<Mutex<RateWindow>>,
+    metrics: crate::metrics::RpcRouteMetrics,
 }
 
 impl Budget {
-    fn new(name: &'static str, policy: Policy, global: Arc<Semaphore>) -> Self {
+    fn new(
+        name: &'static str,
+        policy: Policy,
+        global: Arc<Semaphore>,
+        metrics: crate::metrics::RpcRouteMetrics,
+    ) -> Self {
         Self {
             name,
             policy,
             global,
             route: Arc::new(Semaphore::new(policy.concurrent)),
             rate: Arc::new(Mutex::new(RateWindow::new())),
+            metrics,
         }
     }
 
     fn try_enter(&self) -> Result<Permits, Admission> {
         if !lock(&self.rate).admit(self.policy.per_second) {
+            self.metrics.refuse_rate();
             return Err(Admission::Rate);
         }
-        let global = self
-            .global
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Admission::Concurrency)?;
-        let route = self
-            .route
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Admission::Concurrency)?;
+        let global = self.global.clone().try_acquire_owned().map_err(|_| {
+            self.metrics.refuse_concurrency(true);
+            Admission::Concurrency
+        })?;
+        let route = self.route.clone().try_acquire_owned().map_err(|_| {
+            self.metrics.refuse_concurrency(false);
+            Admission::Concurrency
+        })?;
+        self.metrics.enter();
         Ok(Permits {
             _global: global,
             _route: route,
+            metrics: self.metrics.clone(),
         })
     }
 }
@@ -190,6 +213,13 @@ enum Admission {
 struct Permits {
     _global: OwnedSemaphorePermit,
     _route: OwnedSemaphorePermit,
+    metrics: crate::metrics::RpcRouteMetrics,
+}
+
+impl Drop for Permits {
+    fn drop(&mut self) {
+        self.metrics.leave();
+    }
 }
 
 #[derive(Debug)]
@@ -248,6 +278,10 @@ mod tests {
     use super::{Admission, Policy, Registry};
     use crate::RpcState;
 
+    fn registry(global_limit: usize) -> Registry {
+        Registry::with_global_limit(global_limit, crate::NodeMetrics::default())
+    }
+
     fn policy(concurrent: usize, per_second: u64) -> Policy {
         Policy::new(
             0,
@@ -260,7 +294,7 @@ mod tests {
 
     #[test]
     fn concurrency_and_rate_refusals_recover() {
-        let registry = Registry::new(2);
+        let registry = registry(2);
         let concurrency = registry.budget("concurrency", policy(1, 10));
         let held = concurrency.try_enter().expect("first request");
         assert!(matches!(
@@ -282,9 +316,26 @@ mod tests {
             .expect("a request")
     }
 
+    async fn scrape(metrics: crate::NodeMetrics) -> String {
+        let response = crate::metrics::router(metrics)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("metrics request"),
+            )
+            .await
+            .expect("metrics response");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("metrics body");
+        String::from_utf8(body.to_vec()).expect("UTF-8 metrics")
+    }
+
     #[tokio::test]
     async fn middleware_returns_explicit_overload_and_recovers() {
-        let registry = Registry::new(2);
+        let metrics = crate::NodeMetrics::default();
+        let registry = Registry::with_global_limit(2, metrics.clone());
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let handler = {
@@ -312,6 +363,16 @@ mod tests {
         let overloaded = app.clone().oneshot(request()).await.expect("response");
         assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(overloaded.headers()[header::RETRY_AFTER], "1");
+        let body = scrape(metrics.clone()).await;
+        assert!(body.contains("nano_rpc_route_active{route=\"held\"} 1"));
+        assert!(body.contains("nano_rpc_route_body_byte_limit{route=\"held\"} 0"));
+        assert!(body.contains("nano_rpc_route_concurrency_limit{route=\"held\"} 1"));
+        assert!(body.contains("nano_rpc_route_rate_limit{route=\"held\"} 10"));
+        assert!(
+            body.contains("nano_rpc_route_refusals_total{route=\"held\",reason=\"concurrency\"} 1")
+        );
+        assert!(body.contains("nano_rpc_requests_active 1"));
+        assert!(body.contains("nano_rpc_request_concurrency_limit 2"));
         release.notify_one();
         assert_eq!(
             first
@@ -333,11 +394,17 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+        assert!(
+            scrape(metrics)
+                .await
+                .contains("nano_rpc_route_active{route=\"held\"} 0")
+        );
     }
 
     #[tokio::test]
     async fn middleware_returns_explicit_rate_limit() {
-        let registry = Registry::new(2);
+        let metrics = crate::NodeMetrics::default();
+        let registry = Registry::with_global_limit(2, metrics.clone());
         let calls = Arc::new(AtomicUsize::new(0));
         let handler = {
             let calls = calls.clone();
@@ -367,11 +434,16 @@ mod tests {
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(limited.headers()[header::RETRY_AFTER], "1");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(
+            scrape(metrics)
+                .await
+                .contains("nano_rpc_route_refusals_total{route=\"rate\",reason=\"rate\"} 1")
+        );
     }
 
     #[tokio::test]
     async fn a_timed_out_handler_releases_its_slot() {
-        let registry = Registry::new(1);
+        let registry = registry(1);
         let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let handler = {
             let first = first.clone();
@@ -403,7 +475,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stalled_body_is_refused_and_the_route_recovers() {
-        let registry = Registry::new(1);
+        let registry = registry(1);
         let timeout = Policy::new(
             1024,
             1,
@@ -450,7 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn fragmented_bodies_share_one_byte_limit() {
-        let registry = Registry::new(1);
+        let registry = registry(1);
         let bounded = Policy::new(3, 1, 10, Duration::from_secs(1), Duration::from_secs(1));
         let app = Router::new()
             .route(
