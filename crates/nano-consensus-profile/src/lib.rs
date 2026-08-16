@@ -9,6 +9,7 @@ pub const PROFILE_JSON: &str = include_str!("../profile/mainnet-epoch4-v1.json")
 pub const VECTORS_JSON: &str = include_str!("../profile/mainnet-epoch4-v1-vectors.json");
 pub const PROFILE_ID: &str = "stacks-mainnet-epoch-4.0-v1";
 pub const SEMANTIC_EPOCH: &str = "Epoch40";
+pub const PEER_EPOCH: u8 = 0x10;
 pub const NAKAMOTO_BLOCK_VERSION: u8 = 1;
 
 /// Whether a Nakamoto header belongs to this profile's only supported epoch.
@@ -327,6 +328,7 @@ fn validate_profile(profile: &Profile) -> Result<(), String> {
         || profile.network.network_id != 0x1700_0000
         || profile.network.peer_version != 0x1800_0010
         || profile.activation.semantic_epoch != SEMANTIC_EPOCH
+        || profile.activation.peer_epoch != PEER_EPOCH
         || profile.activation.burn_height != 960_230
         || profile.activation.nakamoto_block_version != NAKAMOTO_BLOCK_VERSION
         || profile.pox.activation_burn_height != profile.activation.burn_height

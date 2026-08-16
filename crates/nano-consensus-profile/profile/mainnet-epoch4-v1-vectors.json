@@ -55,7 +55,7 @@
       "id": "refusal.unknown-activation",
       "surface": "refusal",
       "evidence": ["epoch-4-activation", "clarity-epoch-and-engine"],
-      "input": { "announced_semantic_epoch": "Epoch41", "nakamoto_block_version": 2 },
+      "input": { "announced_semantic_epoch": "Epoch41", "peer_epoch": 17, "nakamoto_block_version": 2 },
       "expected": { "decision": "reject", "fallback": false, "healing": false }
     }
   ]

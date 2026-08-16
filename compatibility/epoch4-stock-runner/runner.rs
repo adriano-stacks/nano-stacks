@@ -425,6 +425,13 @@ fn check_refusal(vector: &Vector) -> Result<&'static str> {
         "refusal does not announce an unknown epoch"
     );
     ensure!(
+        vector.input["peer_epoch"]
+            .as_u64()
+            .context("announced peer epoch")?
+            != u64::from(PEER_VERSION_MAINNET & 0xff),
+        "refusal announces the admitted peer epoch"
+    );
+    ensure!(
         vector.input["nakamoto_block_version"]
             .as_u64()
             .context("announced block version")?
@@ -435,7 +442,7 @@ fn check_refusal(vector: &Vector) -> Result<&'static str> {
         vector.expected == json!({"decision": "reject", "fallback": false, "healing": false}),
         "refusal policy mismatch"
     );
-    Ok("stock release epoch and Epoch-4 Nakamoto block version")
+    Ok("stock release/peer epochs and Epoch-4 Nakamoto block version")
 }
 
 fn run_vector(vector: &Vector) -> Result<&'static str> {

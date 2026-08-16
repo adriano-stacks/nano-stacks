@@ -520,17 +520,19 @@ fn a_real_block_authenticates() {
 }
 
 #[test]
-fn a_header_version_from_another_epoch_is_rejected() {
-    let (chainstate, mut block) = checkpoint_and_block();
-    // The shadow flag is the top bit; the epoch's version is what is below it.
-    block.header.version = 0;
-    let rejected = chainstate
-        .authenticate_block(&block)
-        .expect_err("a version that is not epoch 4.0's is rejected");
-    assert!(
-        rejected.to_string().contains("version"),
-        "the rejection names the version: {rejected}"
-    );
+fn header_versions_before_and_after_epoch_four_are_rejected() {
+    for version in [0, 2] {
+        let (chainstate, mut block) = checkpoint_and_block();
+        // The shadow flag is the top bit; the epoch's version is what is below it.
+        block.header.version = version;
+        let rejected = chainstate
+            .authenticate_block(&block)
+            .expect_err("a version that is not epoch 4.0's is rejected");
+        assert!(
+            rejected.to_string().contains("version"),
+            "the rejection names version {version}: {rejected}"
+        );
+    }
 }
 
 #[test]

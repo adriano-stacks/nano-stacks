@@ -38,7 +38,7 @@ nano promises to preserve.
 - [x] Document the compatibility policy for security-only engine/compiler
       upgrades: full replay is mandatory and there is no fallback or healing
       mechanism.
-- [ ] Fail closed on any unknown post-Epoch-4 activation instead of silently
+- [x] Fail closed on any unknown post-Epoch-4 activation instead of silently
       applying current rules beyond the declared profile.
 
 ## Acceptance Criteria

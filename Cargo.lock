@@ -2696,6 +2696,7 @@ version = "0.1.0"
 dependencies = [
  "nano-chainstate",
  "nano-codec",
+ "nano-consensus-profile",
  "nano-crypto",
  "nano-primitives",
  "rusqlite",

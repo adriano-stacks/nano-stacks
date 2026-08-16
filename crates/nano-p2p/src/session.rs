@@ -29,10 +29,8 @@ use crate::wire::{
 pub const PEER_VERSION_MAINNET_MAJOR: u32 = 0x1800_0000;
 pub const PEER_VERSION_TESTNET_MAJOR: u32 = 0xfaca_de00;
 
-/// The epoch a node advertises in the low byte of its peer version. A peer
-/// rejects anyone whose epoch byte is *below* its own, so a 4.0-only node
-/// advertises 4.0 and nothing else.
-pub const PEER_VERSION_EPOCH_4_0: u32 = 0x10;
+/// The epoch a node advertises in the low byte of its peer version.
+pub const PEER_VERSION_EPOCH_4_0: u32 = nano_consensus_profile::PEER_EPOCH as u32;
 
 /// The peer version and network identifier a node presents.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,14 +105,14 @@ impl Protocol {
             && preamble.peer_version & 0xff00_0000 == self.peer_version & 0xff00_0000
     }
 
-    /// Whether a peer supports at least the epoch we do.
+    /// Whether a peer speaks the one epoch this compatibility profile supports.
     ///
-    /// This mirrors stacks-core's `has_acceptable_epoch`, and it is policy rather
-    /// than codec: a 3.x node's messages parse fine, they just cannot tell us
-    /// anything about a 4.0 chain.
+    /// A lower epoch cannot serve the current chain. A higher epoch is equally
+    /// unusable: accepting it would apply Epoch 4.0 rules after the peer has
+    /// explicitly announced another activation.
     #[must_use]
-    pub const fn epoch_is_current(&self, preamble: &Preamble) -> bool {
-        preamble.peer_version & 0xff >= self.peer_version & 0xff
+    pub const fn admits_peer_version(&self, peer_version: u32) -> bool {
+        peer_version & 0xff == self.peer_version & 0xff
     }
 }
 
@@ -232,9 +230,8 @@ pub enum SessionError {
         peer_version: u32,
         network_id: u32,
     },
-    /// The peer supports an older epoch than nano does, so it cannot serve a 4.0
-    /// chain even if it is honest.
-    StaleEpoch(u32),
+    /// The peer speaks an epoch outside nano's compatibility profile.
+    UnsupportedEpoch(u32),
     /// The peer's messages are not signed by the key it handshook with.
     Unauthenticated,
     /// The peer refused the handshake outright.
@@ -261,9 +258,9 @@ impl std::fmt::Display for SessionError {
                 formatter,
                 "peer is on network {network_id:#010x} version {peer_version:#010x}"
             ),
-            Self::StaleEpoch(peer_version) => write!(
+            Self::UnsupportedEpoch(peer_version) => write!(
                 formatter,
-                "peer version {peer_version:#010x} predates epoch 4.0"
+                "peer version {peer_version:#010x} is outside the Epoch 4.0 compatibility profile"
             ),
             Self::Unauthenticated => {
                 formatter.write_str("peer message is not signed by its handshake key")
@@ -316,7 +313,7 @@ impl SessionError {
             | Self::Unauthenticated
             | Self::InconsistentView
             | Self::WrongNetwork { .. }
-            | Self::StaleEpoch(_)
+            | Self::UnsupportedEpoch(_)
             | Self::UnexpectedReply(_) => true,
             Self::Io(_) | Self::Timeout | Self::HandshakeRejected | Self::Nack(_) => false,
         }
@@ -643,8 +640,8 @@ impl Framed {
                 network_id: preamble.network_id,
             });
         }
-        if !self.protocol.epoch_is_current(&preamble) {
-            return Err(SessionError::StaleEpoch(preamble.peer_version));
+        if !self.protocol.admits_peer_version(preamble.peer_version) {
+            return Err(SessionError::UnsupportedEpoch(preamble.peer_version));
         }
         // `Preamble::decode` has already bounded `payload_len`, so the length added
         // here is bounded by the protocol rather than by the peer.
@@ -1003,4 +1000,17 @@ pub const fn nack_is_transient(code: u32) -> bool {
             | nack::STALE_VERSION
             | nack::FUTURE_VERSION
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PEER_VERSION_MAINNET_MAJOR, Protocol};
+
+    #[test]
+    fn epochs_before_and_after_the_profile_are_refused() {
+        let protocol = Protocol::mainnet();
+        assert!(protocol.admits_peer_version(protocol.peer_version));
+        assert!(!protocol.admits_peer_version(PEER_VERSION_MAINNET_MAJOR | 0x0f));
+        assert!(!protocol.admits_peer_version(PEER_VERSION_MAINNET_MAJOR | 0x11));
+    }
 }

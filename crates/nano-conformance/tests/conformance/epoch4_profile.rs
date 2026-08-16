@@ -165,7 +165,17 @@ fn refusal(vector: &Vector) {
             .expect("header version"),
     )
     .expect("header version byte");
+    let peer_epoch = u32::try_from(
+        vector.input["peer_epoch"]
+            .as_u64()
+            .expect("announced peer epoch"),
+    )
+    .expect("peer epoch fits u32");
     assert!(!admits_activation(epoch, version));
+    assert!(
+        !nano_p2p::Protocol::mainnet()
+            .admits_peer_version(nano_p2p::session::PEER_VERSION_MAINNET_MAJOR | peer_epoch)
+    );
     assert_eq!(vector.expected["decision"], "reject");
     assert_eq!(vector.expected["fallback"], false);
     assert_eq!(vector.expected["healing"], false);
