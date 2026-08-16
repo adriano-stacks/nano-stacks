@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "profile": "stacks-mainnet-epoch-4.0-v1",
+  "vectors": [
+    {
+      "id": "block.byte-limit",
+      "surface": "block",
+      "evidence": ["transaction-and-block-limits"],
+      "input": { "serialized_bytes": [2097152, 2097153] },
+      "expected": { "admitted": [true, false] }
+    },
+    {
+      "id": "transaction.chain-and-byte-domain",
+      "surface": "transaction",
+      "evidence": ["network-identifiers", "transaction-and-block-limits"],
+      "input": { "chain_ids": [1, 2147483648], "serialized_bytes": [2097152, 2097153] },
+      "expected": { "chain_admitted": [true, false], "bytes_admitted": [true, false] }
+    },
+    {
+      "id": "sortition.epoch-boundary-window",
+      "surface": "sortition",
+      "evidence": ["epoch-4-activation", "pox-and-reward-cycles"],
+      "input": { "burn_heights": [960229, 960230, 960236, 960237] },
+      "expected": { "mining_windows": [6, 1, 1, 6] }
+    },
+    {
+      "id": "signer.weight-threshold",
+      "surface": "signer",
+      "evidence": ["system-contract-sources"],
+      "input": { "weights": [40, 30, 30], "signed_indexes": [[0], [0, 1]] },
+      "expected": { "approval_threshold": 70, "admitted": [false, true] }
+    },
+    {
+      "id": "vm.semantic-domain",
+      "surface": "vm",
+      "evidence": ["epoch-4-activation", "clarity-epoch-and-engine"],
+      "input": { "burn_heights": [960229, 960230], "clarity_versions": [5, 6] },
+      "expected": { "semantic_epochs": ["Epoch34", "Epoch40"], "epoch40_clarity_version": 6 }
+    },
+    {
+      "id": "receipt.mainnet-8708126-tx4",
+      "surface": "receipt",
+      "evidence": ["clarity-epoch-and-engine"],
+      "input": { "txid": "823f248a092638cbe4e08f30e5d60d872ff35d73a6a9ee98c790720f8ebd0db3", "block_height": 8708126 },
+      "expected": { "status": "success", "result_hex": "0701000000000000000000000000070cc3ce", "cost": { "read_count": 170, "read_length": 232559, "runtime": 893312, "write_count": 17, "write_length": 345 }, "ordered_event_count": 8 }
+    },
+    {
+      "id": "cost.epoch4-block-limit",
+      "surface": "cost",
+      "evidence": ["transaction-and-block-limits", "clarity-epoch-and-engine"],
+      "input": { "semantic_epoch": "Epoch40" },
+      "expected": { "read_count": 30000, "read_length": 200000000, "runtime": 5000000000, "write_count": 15000, "write_length": 15000000 }
+    },
+    {
+      "id": "refusal.unknown-activation",
+      "surface": "refusal",
+      "evidence": ["epoch-4-activation", "clarity-epoch-and-engine"],
+      "input": { "announced_semantic_epoch": "Epoch41", "nakamoto_block_version": 2 },
+      "expected": { "decision": "reject", "fallback": false, "healing": false }
+    }
+  ]
+}

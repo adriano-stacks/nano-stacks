@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "id": "stacks-mainnet-epoch-4.0-v1",
+  "domain": {
+    "network": "mainnet",
+    "first_supported_burn_height": 960230,
+    "last_supported_burn_height": null
+  },
+  "network": {
+    "chain_id": 1,
+    "network_id": 385875968,
+    "peer_version": 402653200,
+    "bitcoin_network": "mainnet",
+    "first_burn_height": 666050
+  },
+  "activation": {
+    "semantic_epoch": "Epoch40",
+    "peer_epoch": 16,
+    "burn_height": 960230,
+    "nakamoto_block_version": 1,
+    "next_activation": null
+  },
+  "pox": {
+    "contract": "SP000000000000000000002Q6VF78.pox-5",
+    "activation_burn_height": 960230,
+    "first_burn_height": 666050,
+    "reward_cycle_length": 2100,
+    "prepare_phase_length": 100,
+    "reward_phase_length": 2000,
+    "outputs_per_commit": 2,
+    "mining_commitment_window": 6,
+    "sbtc_registry": "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-registry"
+  },
+  "limits": {
+    "block_bytes": 2097152,
+    "transaction_bytes": 2097152,
+    "block_cost": {
+      "read_count": 30000,
+      "read_length": 200000000,
+      "runtime": 5000000000,
+      "write_count": 15000,
+      "write_length": 15000000
+    }
+  },
+  "vm": {
+    "clarity_version": 6,
+    "semantic_epoch": "Epoch40",
+    "cost_schedule": "costs-5",
+    "production_engine": "clarity-wasm",
+    "compiler_identity": "required-from-artifact",
+    "host_runtime_identity": "required-from-artifact"
+  },
+  "system_contracts": [
+    {
+      "contract": "SP000000000000000000002Q6VF78.pox-5",
+      "role": "pox",
+      "source_sha256": "e666099c036b1e36b56504e53690e8b11f7e8b5e55bb54d4aa40fcd57aa680d4",
+      "reference_path": "stackslib/src/chainstate/stacks/boot/pox-5.clar"
+    },
+    {
+      "contract": "SP000000000000000000002Q6VF78.signers",
+      "role": "signer-registry",
+      "source_sha256": "1a244d7ff81cc5a1854dd151b4c6878db0102d1869707c3baab29370fd3e1b83",
+      "reference_path": "stackslib/src/chainstate/stacks/boot/signers.clar"
+    },
+    {
+      "contract": "SP000000000000000000002Q6VF78.signers-0-*",
+      "role": "signer-cycle-template",
+      "source_sha256": "7f0c5ac3d7b828e4090b827b0b226221eb2262ab8ce20fab45c235b7bc19e0a8",
+      "reference_path": "stackslib/src/chainstate/stacks/boot/signers-0-xxx.clar"
+    },
+    {
+      "contract": "SP000000000000000000002Q6VF78.signers-1-*",
+      "role": "signer-cycle-template",
+      "source_sha256": "6d05fcba59280008153fb96483763766a7ece3a8c63675895c80a10520895022",
+      "reference_path": "stackslib/src/chainstate/stacks/boot/signers-1-xxx.clar"
+    },
+    {
+      "contract": "SP000000000000000000002Q6VF78.signers-voting",
+      "role": "signer-voting",
+      "source_sha256": "1019847f6c58ed1694628ba69be0dbc2fe024cf04c025fec1a92ae8f5eeb566d",
+      "reference_path": "stackslib/src/chainstate/stacks/boot/signers-voting.clar"
+    },
+    {
+      "contract": "SP000000000000000000002Q6VF78.sip-031",
+      "role": "nakamoto-mint-distribution-template",
+      "source_sha256": "7e92b6a4c0214de286caeb5c6283208324957ab46589d976c5a8db0c8114ece4",
+      "reference_path": "stackslib/src/chainstate/stacks/boot/sip-031.clar"
+    },
+    {
+      "contract": "native:costs-5",
+      "role": "cost-schedule",
+      "source_sha256": "4e401d3f76ae558042ae8d78695e85b7fedecddfff31e849405f0e33b5ef8a69",
+      "reference_path": "clarity/src/vm/costs/costs_5.rs"
+    }
+  ],
+  "policies": {
+    "unknown_activation": "reject",
+    "engine_fallback": false,
+    "state_healing": false,
+    "security_upgrade_requires_full_replay": true
+  },
+  "reference_revisions": [
+    "efc34a07a225c4b950ab9404a1652aa5e14affaf",
+    "6d58b498d3bd4f5ee19c69dc97559b4cba8153e8"
+  ],
+  "evidence": [
+    {
+      "id": "network-identifiers",
+      "fields": ["domain.*", "network.*", "activation.peer_epoch", "activation.nakamoto_block_version"],
+      "sips": ["SIP-005", "SIP-029"],
+      "deployed_chain": ["mainnet P2P preambles and transaction auth fields"],
+      "reference_paths": ["stacks-common/src/libcommon.rs", "stackslib/src/chainstate/nakamoto/mod.rs"]
+    },
+    {
+      "id": "epoch-4-activation",
+      "fields": ["activation.semantic_epoch", "activation.burn_height", "activation.next_activation", "pox.activation_burn_height"],
+      "sips": ["SIP-029", "SIP-033"],
+      "deployed_chain": ["mainnet burn block 960230 and PoX-5 activation response"],
+      "reference_paths": ["stacks-common/src/types/mod.rs", "stackslib/src/core/mod.rs"]
+    },
+    {
+      "id": "pox-and-reward-cycles",
+      "fields": ["pox.contract", "pox.first_burn_height", "pox.reward_cycle_length", "pox.prepare_phase_length", "pox.reward_phase_length", "pox.outputs_per_commit", "pox.mining_commitment_window", "pox.sbtc_registry"],
+      "sips": ["SIP-007", "SIP-029", "SIP-033"],
+      "deployed_chain": ["PoX-5 boot contract and mainnet /v2/pox response"],
+      "reference_paths": ["stackslib/src/burnchains/mod.rs", "stackslib/src/chainstate/nakamoto/signer_set.rs"]
+    },
+    {
+      "id": "transaction-and-block-limits",
+      "fields": ["limits.*"],
+      "sips": ["SIP-005", "SIP-029"],
+      "deployed_chain": ["Epoch-4 mainnet block admission"],
+      "reference_paths": ["stacks-codec/src/transaction.rs", "stackslib/src/core/mod.rs"]
+    },
+    {
+      "id": "clarity-epoch-and-engine",
+      "fields": ["vm.*", "policies.*"],
+      "sips": ["SIP-033"],
+      "deployed_chain": ["Epoch-4 receipts and recorded deployment epochs"],
+      "reference_paths": ["clarity/src/vm/costs/mod.rs", "clarity/src/vm/costs/costs_5.rs"]
+    },
+    {
+      "id": "system-contract-sources",
+      "fields": ["system_contracts.*"],
+      "sips": ["SIP-029", "SIP-031", "SIP-033"],
+      "deployed_chain": ["mainnet boot principals and imported contract sources"],
+      "reference_paths": ["stackslib/src/chainstate/stacks/boot/mod.rs"]
+    },
+    {
+      "id": "reference-revisions",
+      "fields": ["reference_revisions.*"],
+      "sips": ["SIP-029", "SIP-033"],
+      "deployed_chain": ["the same mainnet Epoch-4 vectors"],
+      "reference_paths": ["two independently checked stock stacks-core revisions"]
+    }
+  ],
+  "disagreements": []
+}

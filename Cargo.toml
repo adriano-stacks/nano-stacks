@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/nano-primitives",
+    "crates/nano-consensus-profile",
     "crates/nano-crypto",
     "crates/nano-address",
     "crates/nano-codec",
