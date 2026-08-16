@@ -4808,7 +4808,7 @@ mod tests {
             .execute_transaction(&call, &deployed.result.cost)
             .expect("call decoded contract");
 
-        assert_eq!(deployed.result.value, None);
+        assert_eq!(deployed.result.value, Some(clarity::vm::Value::okay_true()));
         assert_eq!(
             called.result.value,
             Some(clarity::vm::Value::okay(clarity::vm::Value::UInt(42)).expect("response"))
