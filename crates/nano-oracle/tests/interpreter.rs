@@ -351,7 +351,7 @@ fn wasm_calls_match_the_clarity_six_interpreter() {
             .expect("valid optional")
             .serialize_to_vec()
             .expect("serialize optional"),
-        Value::list_from(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+        Value::cons_list_unsanitized(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
             .expect("valid list")
             .serialize_to_vec()
             .expect("serialize list"),
