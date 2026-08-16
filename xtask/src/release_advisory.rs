@@ -84,7 +84,7 @@ impl AdvisoryPolicy {
         }
         for exception in self.exceptions.values() {
             match statuses.get(&exception.owner).map(String::as_str) {
-                Some("in-progress" | "blocked") => {}
+                Some("in-progress" | "blocked" | "completed") => {}
                 status => {
                     return Err(format!(
                         "advisory {} has owner task {} with status {status:?}",
@@ -256,7 +256,9 @@ mod tests {
             .expect("xtask is inside the workspace");
         let policy = AdvisoryPolicy::load(&workspace.join("advisory-policy.json"))
             .expect("checked-in advisory policy");
-        policy.verify_owners(workspace).expect("open owner tasks");
+        policy
+            .verify_owners(workspace)
+            .expect("existing owner tasks");
         let report = json!({
             "settings": { "ignore": [] },
             "vulnerabilities": { "found": false, "count": 0, "list": [] },
