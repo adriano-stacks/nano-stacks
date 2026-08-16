@@ -4,7 +4,7 @@ use clarity::vm::types::{
 };
 use clarity::vm::{ClarityName, SymbolicExpression};
 use walrus::ir::{self, BinaryOp, IfElse, Loop, UnaryOp};
-use walrus::ValType;
+use walrus::{LocalId, ValType};
 
 use crate::check_args;
 use crate::cost::ChargeGenerator;
@@ -21,6 +21,47 @@ use crate::words::{self, ComplexWord, Word};
 
 #[derive(Debug)]
 pub struct ListCons;
+
+const LIST_LITERAL_BLOCK_ENTRIES: usize = 512;
+
+struct ListEntryWriter<'a> {
+    elem_ty: &'a TypeSignature,
+    offset: LocalId,
+    charged: LocalId,
+    measured: bool,
+    total_size: u32,
+}
+
+impl ListEntryWriter<'_> {
+    fn write(
+        &mut self,
+        generator: &mut WasmGenerator,
+        builder: &mut walrus::InstrSeqBuilder,
+        entries: &[SymbolicExpression],
+    ) -> Result<(), GeneratorError> {
+        for expr in entries {
+            // WORKAROUND: if you have a list like `(list (some 1) none)`, even if the list elements have type
+            // `optional int`, the typechecker will give NoType to `none`.
+            // This means that the placeholder will be represented with a different number of `ValType`, and will
+            // cause errors (example: function called with wrong number of arguments).
+            // While we wait for a real fix in the typechecker, here is a workaround to set all the elements types.
+            generator.set_expr_type(expr, self.elem_ty.clone())?;
+
+            generator.traverse_expr(builder, expr)?;
+            if self.measured {
+                generator.clarity_value_size_on_stack(builder, self.elem_ty)?;
+                builder
+                    .local_get(self.charged)
+                    .binop(BinaryOp::I32Add)
+                    .local_set(self.charged);
+            }
+            let elem_size =
+                generator.write_to_memory(builder, self.offset, self.total_size, self.elem_ty)?;
+            self.total_size += elem_size;
+        }
+        Ok(())
+    }
+}
 
 impl Word for ListCons {
     fn name(&self) -> ClarityName {
@@ -66,26 +107,23 @@ impl ComplexWord for ListCons {
         let charged = generator.alloc_local(ValType::I32);
         builder.i32_const(0).local_set(charged);
 
-        let mut total_size = 0;
-        for expr in list.iter() {
-            // WORKAROUND: if you have a list like `(list (some 1) none)`, even if the list elements have type
-            // `optional int`, the typechecker will give NoType to `none`.
-            // This means that the placeholder will be represented with a different number of `ValType`, and will
-            // cause errors (example: function called with wrong number of arguments).
-            // While we wait for a real fix in the typechecker, here is a workaround to set all the elements types.
-            generator.set_expr_type(expr, elem_ty.clone())?;
-
-            generator.traverse_expr(builder, expr)?;
-            if measured {
-                generator.clarity_value_size_on_stack(builder, elem_ty)?;
-                builder
-                    .local_get(charged)
-                    .binop(BinaryOp::I32Add)
-                    .local_set(charged);
+        let mut writer = ListEntryWriter {
+            elem_ty,
+            offset,
+            charged,
+            measured,
+            total_size: 0,
+        };
+        if list.len() <= LIST_LITERAL_BLOCK_ENTRIES {
+            writer.write(generator, builder, list)?;
+        } else {
+            for entries in list.chunks(LIST_LITERAL_BLOCK_ENTRIES) {
+                let mut block = builder.dangling_instr_seq(None);
+                let block_id = block.id();
+                writer.write(generator, &mut block, entries)?;
+                block.br(block_id);
+                builder.instr(ir::Block { seq: block_id });
             }
-            // Write this element to memory
-            let elem_size = generator.write_to_memory(builder, offset, total_size, elem_ty)?;
-            total_size += elem_size;
         }
         if measured {
             self.charge(generator, builder, charged)?;
@@ -104,7 +142,7 @@ impl ComplexWord for ListCons {
         builder
             .i32_const(0)
             .local_get(offset)
-            .i32_const(total_size as i32);
+            .i32_const(writer.total_size as i32);
 
         Ok(())
     }
