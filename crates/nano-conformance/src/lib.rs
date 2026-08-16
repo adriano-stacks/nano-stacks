@@ -3019,8 +3019,8 @@ mod tests {
     /// The contracts a checkpoint's side store says it holds an analysis for.
     fn checkpointed_contracts(checkpoint: &Path) -> Vec<String> {
         let connection = rusqlite::Connection::open_with_flags(
-            checkpoint,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            nano_marf::immutable_uri(checkpoint),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )
         .expect("open the checkpoint");
         let mut statement = connection
