@@ -150,8 +150,26 @@ pub struct Vm {
 pub struct SystemContract {
     pub contract: String,
     pub role: String,
-    pub source_sha256: String,
+    pub source_kind: SourceKind,
+    pub deployed_source_sha256: Option<String>,
+    pub reference_sources: Vec<ReferenceSource>,
     pub reference_path: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SourceKind {
+    DeployedContract,
+    DeploymentTemplate,
+    GeneratedContract,
+    Native,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceSource {
+    pub revision: String,
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -313,13 +331,7 @@ fn validate_profile(profile: &Profile) -> Result<(), String> {
     if profile.reference_revisions.len() < 2 {
         return Err("fewer than two stock reference revisions are named".to_owned());
     }
-    for contract in &profile.system_contracts {
-        let digest = hex::decode(&contract.source_sha256)
-            .map_err(|error| format!("{} source hash: {error}", contract.contract))?;
-        if digest.len() != 32 {
-            return Err(format!("{} source hash is not SHA-256", contract.contract));
-        }
-    }
+    validate_sources(profile)?;
     let evidence = profile
         .evidence
         .iter()
@@ -358,6 +370,52 @@ fn validate_profile(profile: &Profile) -> Result<(), String> {
             || disagreement.resolution.is_empty()
         {
             return Err("a source disagreement is not explicit".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_sources(profile: &Profile) -> Result<(), String> {
+    let revisions = profile
+        .reference_revisions
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for contract in &profile.system_contracts {
+        let references = contract
+            .reference_sources
+            .iter()
+            .map(|source| source.revision.as_str())
+            .collect::<BTreeSet<_>>();
+        if references != revisions {
+            return Err(format!(
+                "{} does not name every reference revision",
+                contract.contract
+            ));
+        }
+        if matches!(
+            contract.source_kind,
+            SourceKind::DeployedContract | SourceKind::GeneratedContract
+        ) != contract.deployed_source_sha256.is_some()
+        {
+            return Err(format!(
+                "{} has an inconsistent deployed-source identity",
+                contract.contract
+            ));
+        }
+        for (owner, digest) in contract
+            .deployed_source_sha256
+            .iter()
+            .map(|digest| ("deployed", digest))
+            .chain(
+                contract
+                    .reference_sources
+                    .iter()
+                    .map(|source| (source.revision.as_str(), &source.sha256)),
+            )
+        {
+            validate_sha256(digest)
+                .map_err(|error| format!("{} {owner} source: {error}", contract.contract))?;
         }
     }
     Ok(())
@@ -410,6 +468,14 @@ fn validate_identities(identities: RuntimeIdentities<'_>) -> Result<(), String> 
         || identities.host_configuration.is_empty()
     {
         return Err("an active profile requires exact compiler and host identities".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_sha256(digest: &str) -> Result<(), String> {
+    let bytes = hex::decode(digest).map_err(|error| error.to_string())?;
+    if bytes.len() != 32 {
+        return Err(format!("expected 32 bytes, got {}", bytes.len()));
     }
     Ok(())
 }
@@ -469,5 +535,29 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&document).expect("JSON");
         assert_eq!(json["fingerprint"], fingerprint(IDENTITIES).to_string());
         assert_eq!(json["profile"]["id"], PROFILE_ID);
+    }
+
+    #[test]
+    fn deployed_sources_are_not_relabelled_as_reference_templates() {
+        let profile = profile().expect("profile");
+        let pox = profile
+            .system_contracts
+            .iter()
+            .find(|contract| contract.role == "pox")
+            .expect("pox-5 identity");
+        assert_eq!(
+            pox.deployed_source_sha256.as_deref(),
+            Some("ffad35ad181d85832ebd7b998f445204c92d5cd19549166e644fb1f3988fa385")
+        );
+        assert_ne!(
+            pox.reference_sources[0].sha256,
+            pox.reference_sources[1].sha256
+        );
+        assert!(
+            profile
+                .disagreements
+                .iter()
+                .any(|item| item.field.contains("pox-5"))
+        );
     }
 }

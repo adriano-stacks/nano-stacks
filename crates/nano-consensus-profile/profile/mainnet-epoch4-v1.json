@@ -54,43 +54,78 @@
     {
       "contract": "SP000000000000000000002Q6VF78.pox-5",
       "role": "pox",
-      "source_sha256": "e666099c036b1e36b56504e53690e8b11f7e8b5e55bb54d4aa40fcd57aa680d4",
+      "source_kind": "deployed-contract",
+      "deployed_source_sha256": "ffad35ad181d85832ebd7b998f445204c92d5cd19549166e644fb1f3988fa385",
+      "reference_sources": [
+        { "revision": "efc34a07a225c4b950ab9404a1652aa5e14affaf", "sha256": "e666099c036b1e36b56504e53690e8b11f7e8b5e55bb54d4aa40fcd57aa680d4" },
+        { "revision": "6d58b498d3bd4f5ee19c69dc97559b4cba8153e8", "sha256": "ffad35ad181d85832ebd7b998f445204c92d5cd19549166e644fb1f3988fa385" }
+      ],
       "reference_path": "stackslib/src/chainstate/stacks/boot/pox-5.clar"
     },
     {
       "contract": "SP000000000000000000002Q6VF78.signers",
       "role": "signer-registry",
-      "source_sha256": "1a244d7ff81cc5a1854dd151b4c6878db0102d1869707c3baab29370fd3e1b83",
+      "source_kind": "deployed-contract",
+      "deployed_source_sha256": "1a244d7ff81cc5a1854dd151b4c6878db0102d1869707c3baab29370fd3e1b83",
+      "reference_sources": [
+        { "revision": "efc34a07a225c4b950ab9404a1652aa5e14affaf", "sha256": "1a244d7ff81cc5a1854dd151b4c6878db0102d1869707c3baab29370fd3e1b83" },
+        { "revision": "6d58b498d3bd4f5ee19c69dc97559b4cba8153e8", "sha256": "1a244d7ff81cc5a1854dd151b4c6878db0102d1869707c3baab29370fd3e1b83" }
+      ],
       "reference_path": "stackslib/src/chainstate/stacks/boot/signers.clar"
     },
     {
       "contract": "SP000000000000000000002Q6VF78.signers-0-*",
       "role": "signer-cycle-template",
-      "source_sha256": "7f0c5ac3d7b828e4090b827b0b226221eb2262ab8ce20fab45c235b7bc19e0a8",
+      "source_kind": "deployment-template",
+      "deployed_source_sha256": null,
+      "reference_sources": [
+        { "revision": "efc34a07a225c4b950ab9404a1652aa5e14affaf", "sha256": "7f0c5ac3d7b828e4090b827b0b226221eb2262ab8ce20fab45c235b7bc19e0a8" },
+        { "revision": "6d58b498d3bd4f5ee19c69dc97559b4cba8153e8", "sha256": "7f0c5ac3d7b828e4090b827b0b226221eb2262ab8ce20fab45c235b7bc19e0a8" }
+      ],
       "reference_path": "stackslib/src/chainstate/stacks/boot/signers-0-xxx.clar"
     },
     {
       "contract": "SP000000000000000000002Q6VF78.signers-1-*",
       "role": "signer-cycle-template",
-      "source_sha256": "6d05fcba59280008153fb96483763766a7ece3a8c63675895c80a10520895022",
+      "source_kind": "deployment-template",
+      "deployed_source_sha256": null,
+      "reference_sources": [
+        { "revision": "efc34a07a225c4b950ab9404a1652aa5e14affaf", "sha256": "6d05fcba59280008153fb96483763766a7ece3a8c63675895c80a10520895022" },
+        { "revision": "6d58b498d3bd4f5ee19c69dc97559b4cba8153e8", "sha256": "6d05fcba59280008153fb96483763766a7ece3a8c63675895c80a10520895022" }
+      ],
       "reference_path": "stackslib/src/chainstate/stacks/boot/signers-1-xxx.clar"
     },
     {
       "contract": "SP000000000000000000002Q6VF78.signers-voting",
       "role": "signer-voting",
-      "source_sha256": "1019847f6c58ed1694628ba69be0dbc2fe024cf04c025fec1a92ae8f5eeb566d",
+      "source_kind": "deployed-contract",
+      "deployed_source_sha256": "1019847f6c58ed1694628ba69be0dbc2fe024cf04c025fec1a92ae8f5eeb566d",
+      "reference_sources": [
+        { "revision": "efc34a07a225c4b950ab9404a1652aa5e14affaf", "sha256": "1019847f6c58ed1694628ba69be0dbc2fe024cf04c025fec1a92ae8f5eeb566d" },
+        { "revision": "6d58b498d3bd4f5ee19c69dc97559b4cba8153e8", "sha256": "1019847f6c58ed1694628ba69be0dbc2fe024cf04c025fec1a92ae8f5eeb566d" }
+      ],
       "reference_path": "stackslib/src/chainstate/stacks/boot/signers-voting.clar"
     },
     {
       "contract": "SP000000000000000000002Q6VF78.sip-031",
       "role": "nakamoto-mint-distribution-template",
-      "source_sha256": "7e92b6a4c0214de286caeb5c6283208324957ab46589d976c5a8db0c8114ece4",
+      "source_kind": "generated-contract",
+      "deployed_source_sha256": "fd393bd3e477e3ffb9c5bce9c7e3003d5bd2d4ab572eb6b7878c99fec99c1b07",
+      "reference_sources": [
+        { "revision": "efc34a07a225c4b950ab9404a1652aa5e14affaf", "sha256": "7e92b6a4c0214de286caeb5c6283208324957ab46589d976c5a8db0c8114ece4" },
+        { "revision": "6d58b498d3bd4f5ee19c69dc97559b4cba8153e8", "sha256": "7e92b6a4c0214de286caeb5c6283208324957ab46589d976c5a8db0c8114ece4" }
+      ],
       "reference_path": "stackslib/src/chainstate/stacks/boot/sip-031.clar"
     },
     {
       "contract": "native:costs-5",
       "role": "cost-schedule",
-      "source_sha256": "4e401d3f76ae558042ae8d78695e85b7fedecddfff31e849405f0e33b5ef8a69",
+      "source_kind": "native",
+      "deployed_source_sha256": null,
+      "reference_sources": [
+        { "revision": "efc34a07a225c4b950ab9404a1652aa5e14affaf", "sha256": "4e401d3f76ae558042ae8d78695e85b7fedecddfff31e849405f0e33b5ef8a69" },
+        { "revision": "6d58b498d3bd4f5ee19c69dc97559b4cba8153e8", "sha256": "4e401d3f76ae558042ae8d78695e85b7fedecddfff31e849405f0e33b5ef8a69" }
+      ],
       "reference_path": "clarity/src/vm/costs/costs_5.rs"
     }
   ],
@@ -155,5 +190,22 @@
       "reference_paths": ["two independently checked stock stacks-core revisions"]
     }
   ],
-  "disagreements": []
+  "disagreements": [
+    {
+      "field": "system_contracts[SP000000000000000000002Q6VF78.pox-5].reference_sources",
+      "sources": [
+        "deployed mainnet and 6d58b498: ffad35ad181d85832ebd7b998f445204c92d5cd19549166e644fb1f3988fa385",
+        "efc34a07: e666099c036b1e36b56504e53690e8b11f7e8b5e55bb54d4aa40fcd57aa680d4"
+      ],
+      "resolution": "The deployed mainnet source is canonical profile evidence. efc34a07 remains a behavioral reference revision, but its older pox-5 source is not relabeled as deployed evidence."
+    },
+    {
+      "field": "system_contracts[SP000000000000000000002Q6VF78.sip-031].deployed_source_sha256",
+      "sources": [
+        "deployed mainnet: fd393bd3e477e3ffb9c5bce9c7e3003d5bd2d4ab572eb6b7878c99fec99c1b07",
+        "both reference templates: 7e92b6a4c0214de286caeb5c6283208324957ab46589d976c5a8db0c8114ece4"
+      ],
+      "resolution": "Deployment replaces the template's tx-sender recipient with the mainnet recipient principal. Both generated source and template identities are retained."
+    }
+  ]
 }
