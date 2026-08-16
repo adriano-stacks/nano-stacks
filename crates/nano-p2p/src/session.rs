@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use nano_crypto::{StacksPrivateKey, StacksPublicKey};
 use nano_primitives::{BitVec, ConsensusHash, Hash160, Network, hash160};
+use nano_queue::{Buffer, Limits, Status};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -339,13 +340,45 @@ impl From<WireError> for SessionError {
 /// it the oldest are dropped and counted: a relayed transaction or signer chunk
 /// that nano missed will be pushed again by another peer, while a queue that grows
 /// with a peer's output is memory the peer gets to choose.
-const MAX_BUFFERED_PUSHES: usize = 256;
+pub const MAX_BUFFERED_PUSHES: usize = 256;
+
+/// Wire bytes one session retains after decoding unsolicited pushes.
+///
+/// One maximum protocol frame must fit. Keeping a second requires the caller to
+/// collect the first, so a peer cannot multiply the protocol's per-frame bound by
+/// [`MAX_BUFFERED_PUSHES`].
+pub const MAX_BUFFERED_PUSH_BYTES: usize = PREAMBLE_LEN + crate::wire::MAX_PAYLOAD_LEN as usize;
 
 /// How much to ask the socket for in one read.
 ///
 /// Only a buffering hint — a message may be up to 16 MB and is assembled across
 /// as many reads as it takes.
 const READ_CHUNK: usize = 16 * 1024;
+
+struct PushBuffer {
+    messages: Buffer<Message>,
+}
+
+impl PushBuffer {
+    const fn new() -> Self {
+        Self {
+            messages: Buffer::new(Limits::new(MAX_BUFFERED_PUSHES, MAX_BUFFERED_PUSH_BYTES)),
+        }
+    }
+
+    fn push(&mut self, message: Message) {
+        let bytes = message.wire_len();
+        self.messages.push(message, bytes);
+    }
+
+    fn take(&mut self) -> Vec<Message> {
+        self.messages.take()
+    }
+
+    fn status(&self) -> Status {
+        self.messages.status()
+    }
+}
 
 /// A framed connection, which knows how to speak the protocol but not yet to
 /// whom.
@@ -374,7 +407,7 @@ pub(crate) struct Framed {
     /// re-verified against the key it carries.
     pub(crate) peer_key: Option<StacksPublicKey>,
     remote_view: Option<ChainView>,
-    pushed: Vec<Message>,
+    pushed: PushBuffer,
     unhandled: u64,
     /// Bytes read from the socket that do not yet make a whole message.
     ///
@@ -385,8 +418,6 @@ pub(crate) struct Framed {
     /// [`Framed::drain`], whose whole job is to read what is there, stop, and carry
     /// on using the connection.
     buffer: Vec<u8>,
-    /// Pushes discarded because [`MAX_BUFFERED_PUSHES`] was reached.
-    dropped_pushes: u64,
     /// Unsolicited messages handled since a caller last asked, answered or kept.
     unsolicited: usize,
 }
@@ -409,10 +440,9 @@ impl Framed {
             seq: initial_seq(),
             peer_key: None,
             remote_view: None,
-            pushed: Vec::new(),
+            pushed: PushBuffer::new(),
             unhandled: 0,
             buffer: Vec::new(),
-            dropped_pushes: 0,
             unsolicited: 0,
         }
     }
@@ -701,10 +731,6 @@ impl Framed {
 
     /// Hold a message the caller did not ask for, up to the buffer's bound.
     fn buffer_push(&mut self, message: Message) {
-        if self.pushed.len() >= MAX_BUFFERED_PUSHES {
-            self.pushed.remove(0);
-            self.dropped_pushes = self.dropped_pushes.saturating_add(1);
-        }
         self.pushed.push(message);
     }
 
@@ -872,7 +898,7 @@ impl Session {
     /// blocks and relayed transactions through its own validation.
     #[must_use]
     pub fn take_pushed(&mut self) -> Vec<Message> {
-        std::mem::take(&mut self.framed.pushed)
+        self.framed.pushed.take()
     }
 
     /// Push a block or transaction this node has accepted to this peer.
@@ -913,8 +939,14 @@ impl Session {
     /// enough. Non-zero means this node is dropping relayed data, not that the peer
     /// did anything wrong.
     #[must_use]
-    pub const fn dropped_pushes(&self) -> u64 {
-        self.framed.dropped_pushes
+    pub fn dropped_pushes(&self) -> u64 {
+        self.framed.pushed.status().dropped
+    }
+
+    /// Current retained pushes and cumulative shedding for this session.
+    #[must_use]
+    pub fn pushed_status(&self) -> Status {
+        self.framed.pushed.status()
     }
 
     /// Prove the peer is still there, and that it is still the same peer.
@@ -1004,7 +1036,32 @@ pub const fn nack_is_transient(code: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PEER_VERSION_MAINNET_MAJOR, Protocol};
+    use nano_crypto::MessageSignature;
+    use nano_primitives::{BitcoinHeaderHash, Network};
+
+    use super::{MAX_BUFFERED_PUSH_BYTES, PEER_VERSION_MAINNET_MAJOR, Protocol, PushBuffer};
+    use crate::wire::{MAX_PAYLOAD_LEN, Message, PREAMBLE_LEN, Preamble};
+
+    fn unhandled_message(frame_len: usize) -> Message {
+        let mut frame = vec![0; frame_len];
+        frame[4] = 5;
+        Message::decode(
+            Preamble {
+                peer_version: Protocol::for_network(Network::TESTNET).peer_version,
+                network_id: Network::TESTNET.chain_id(),
+                seq: 1,
+                bitcoin_height: 8,
+                bitcoin_hash: BitcoinHeaderHash::from_bytes([1; 32]),
+                stable_bitcoin_height: 1,
+                stable_bitcoin_hash: BitcoinHeaderHash::from_bytes([2; 32]),
+                additional_data: 0,
+                signature: MessageSignature::from_bytes([0; 65]),
+                payload_len: u32::try_from(frame_len).expect("the protocol length fits"),
+            },
+            frame,
+        )
+        .expect("decode an unmodelled message")
+    }
 
     #[test]
     fn epochs_before_and_after_the_profile_are_refused() {
@@ -1012,5 +1069,26 @@ mod tests {
         assert!(protocol.admits_peer_version(protocol.peer_version));
         assert!(!protocol.admits_peer_version(PEER_VERSION_MAINNET_MAJOR | 0x0f));
         assert!(!protocol.admits_peer_version(PEER_VERSION_MAINNET_MAJOR | 0x11));
+    }
+
+    #[test]
+    fn one_session_retains_at_most_one_maximum_sized_push() {
+        let mut pushes = PushBuffer::new();
+        pushes.push(unhandled_message(MAX_PAYLOAD_LEN as usize));
+        assert_eq!(pushes.status().items, 1);
+        assert_eq!(pushes.status().bytes, MAX_BUFFERED_PUSH_BYTES);
+
+        pushes.push(unhandled_message(5));
+        let saturated = pushes.status();
+        assert_eq!(saturated.items, 1);
+        assert_eq!(saturated.bytes, PREAMBLE_LEN + 5);
+        assert_eq!(saturated.dropped, 1);
+        assert_eq!(saturated.saturations, 1);
+        assert_eq!(pushes.take().len(), 1);
+        assert_eq!(pushes.status().bytes, 0);
+
+        pushes.push(unhandled_message(MAX_PAYLOAD_LEN as usize));
+        assert_eq!(pushes.status().bytes, MAX_BUFFERED_PUSH_BYTES);
+        assert_eq!(pushes.take().len(), 1);
     }
 }

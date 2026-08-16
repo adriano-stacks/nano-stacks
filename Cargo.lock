@@ -2700,6 +2700,7 @@ dependencies = [
  "nano-consensus-profile",
  "nano-crypto",
  "nano-primitives",
+ "nano-queue",
  "rusqlite",
  "tempfile",
  "tokio",

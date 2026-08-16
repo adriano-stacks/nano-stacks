@@ -10,6 +10,7 @@ nano-codec = { path = "../nano-codec" }
 nano-consensus-profile = { path = "../nano-consensus-profile" }
 nano-crypto = { path = "../nano-crypto" }
 nano-primitives = { path = "../nano-primitives" }
+nano-queue = { path = "../nano-queue" }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 tokio = { version = "1.53.1", default-features = false, features = ["io-util", "net", "time"] }
 

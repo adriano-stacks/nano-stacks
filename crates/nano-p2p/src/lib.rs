@@ -57,7 +57,9 @@ pub mod wire;
 
 pub use inbound::{InboundLimits, Listener, Served, Service, serve_peer};
 pub use peers::{KnownPeer, MAX_KNOWN_PEERS, PeerDb, PeerDbError};
-pub use relay::{MAX_QUEUED_OFFERS, Offer, Pushed, Relay, RelayStatus, relayed_by};
+pub use relay::{
+    MAX_QUEUED_OFFER_BYTES, MAX_QUEUED_OFFERS, Offer, Pushed, Relay, RelayStatus, relayed_by,
+};
 pub use served::ServedTenures;
 pub use session::{LocalPeer, Protocol, Session, SessionError, nack_is_transient};
 pub use swarm::{Discovered, Round, Swarm, SwarmLimits, TenureClaim, assign_tenures};

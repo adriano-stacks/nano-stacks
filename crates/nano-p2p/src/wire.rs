@@ -613,6 +613,12 @@ impl Message {
     pub fn frame(&self) -> &[u8] {
         &self.frame
     }
+
+    /// Bytes retained from the peer for this complete wire message.
+    #[must_use]
+    pub const fn wire_len(&self) -> usize {
+        PREAMBLE_LEN + self.frame.len()
+    }
 }
 
 /// Encode the frame a message carries: its relayer list, then its payload.

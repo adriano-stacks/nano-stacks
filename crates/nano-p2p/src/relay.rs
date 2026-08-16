@@ -37,10 +37,12 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use nano_chainstate::NakamotoBlock;
 use nano_codec::Transaction;
 use nano_primitives::Hash160;
+use nano_queue::{Buffer, Limits};
 
 use crate::wire::Message;
 
@@ -52,6 +54,12 @@ use crate::wire::Message;
 /// peer, while a queue that grows with the network's output is memory the network
 /// gets to choose.
 pub const MAX_QUEUED_OFFERS: usize = 1024;
+
+/// Consensus bytes retained in each relay direction.
+///
+/// This admits two maximum P2P frames while keeping the item bound as a second,
+/// independent limit.
+pub const MAX_QUEUED_OFFER_BYTES: usize = 32 * 1024 * 1024;
 
 /// How many accepted items to remember, so each is relayed once.
 const MAX_REMEMBERED: usize = 4096;
@@ -85,6 +93,16 @@ impl Pushed {
         match self {
             Self::Block(_) => "block",
             Self::Transaction(_) => "transaction",
+        }
+    }
+
+    fn consensus_len(&self) -> usize {
+        match self {
+            Self::Block(block) => block.encode().len(),
+            Self::Transaction(transaction) if transaction.as_bytes().is_empty() => {
+                transaction.encode().len()
+            }
+            Self::Transaction(transaction) => transaction.as_bytes().len(),
         }
     }
 }
@@ -134,27 +152,55 @@ pub struct Relay {
 pub struct RelayStatus {
     /// Peer pushes waiting for local validation.
     pub offered: usize,
+    pub offered_bytes: usize,
+    pub offered_oldest_age: Option<Duration>,
     /// Accepted items waiting to be sent to peers.
     pub announcing: usize,
+    pub announcing_bytes: usize,
+    pub announcing_oldest_age: Option<Duration>,
     /// Offers shed because either bounded queue was full.
     pub dropped: u64,
+    pub saturations: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Queues {
     /// What peers pushed, waiting to be checked.
-    offered: VecDeque<Offer>,
+    offered: Buffer<Offer>,
     /// What passed the checks, waiting to go out.
-    announcing: VecDeque<Offer>,
+    announcing: Buffer<Offer>,
     /// Items already accepted and relayed, so each goes out once and a second peer
     /// pushing the same block does not cost a second authentication.
     accepted: HashSet<[u8; 32]>,
     /// Insertion order for `accepted`, so it can be bounded without a full LRU.
     remembered: VecDeque<[u8; 32]>,
-    dropped: u64,
+}
+
+impl Queues {
+    fn new(limits: Limits) -> Self {
+        Self {
+            offered: Buffer::new(limits),
+            announcing: Buffer::new(limits),
+            accepted: HashSet::new(),
+            remembered: VecDeque::new(),
+        }
+    }
+}
+
+impl Default for Queues {
+    fn default() -> Self {
+        Self::new(Limits::new(MAX_QUEUED_OFFERS, MAX_QUEUED_OFFER_BYTES))
+    }
 }
 
 impl Relay {
+    #[cfg(test)]
+    fn with_limits(limits: Limits) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Queues::new(limits))),
+        }
+    }
+
     /// Offer something a peer pushed.
     ///
     /// An item this node has already accepted and relayed is dropped here rather than
@@ -165,18 +211,15 @@ impl Relay {
             if queues.accepted.contains(&offer.data.id()) {
                 return;
             }
-            if queues.offered.len() >= MAX_QUEUED_OFFERS {
-                queues.offered.pop_front();
-                queues.dropped = queues.dropped.saturating_add(1);
-            }
-            queues.offered.push_back(offer);
+            let bytes = offer.data.consensus_len();
+            queues.offered.push(offer, bytes);
         });
     }
 
     /// Take everything waiting to be checked.
     #[must_use]
     pub fn take_offered(&self) -> Vec<Offer> {
-        self.with(|queues| queues.offered.drain(..).collect())
+        self.with(|queues| queues.offered.take())
             .unwrap_or_default()
     }
 
@@ -196,18 +239,15 @@ impl Relay {
                     queues.accepted.remove(&oldest);
                 }
             }
-            if queues.announcing.len() >= MAX_QUEUED_OFFERS {
-                queues.announcing.pop_front();
-                queues.dropped = queues.dropped.saturating_add(1);
-            }
-            queues.announcing.push_back(offer);
+            let bytes = offer.data.consensus_len();
+            queues.announcing.push(offer, bytes);
         });
     }
 
     /// Take everything waiting to go out.
     #[must_use]
     pub fn take_announcing(&self) -> Vec<Offer> {
-        self.with(|queues| queues.announcing.drain(..).collect())
+        self.with(|queues| queues.announcing.take())
             .unwrap_or_default()
     }
 
@@ -215,7 +255,14 @@ impl Relay {
     /// is dropping relayed data, not that any peer did anything wrong.
     #[must_use]
     pub fn dropped(&self) -> u64 {
-        self.with(|queues| queues.dropped).unwrap_or(0)
+        self.with(|queues| {
+            queues
+                .offered
+                .status()
+                .dropped
+                .saturating_add(queues.announcing.status().dropped)
+        })
+        .unwrap_or(0)
     }
 
     /// Report both queue depths without draining either one.
@@ -223,10 +270,19 @@ impl Relay {
     /// A poisoned lock is no measurement, rather than a plausible row of zeroes.
     #[must_use]
     pub fn status(&self) -> Option<RelayStatus> {
-        self.with(|queues| RelayStatus {
-            offered: queues.offered.len(),
-            announcing: queues.announcing.len(),
-            dropped: queues.dropped,
+        self.with(|queues| {
+            let offered = queues.offered.status();
+            let announcing = queues.announcing.status();
+            RelayStatus {
+                offered: offered.items,
+                offered_bytes: offered.bytes,
+                offered_oldest_age: offered.oldest_age,
+                announcing: announcing.items,
+                announcing_bytes: announcing.bytes,
+                announcing_oldest_age: announcing.oldest_age,
+                dropped: offered.dropped.saturating_add(announcing.dropped),
+                saturations: offered.saturations.saturating_add(announcing.saturations),
+            }
         })
     }
 
@@ -331,16 +387,37 @@ mod tests {
         for nonce in 0..u64::try_from(MAX_QUEUED_OFFERS + 8).expect("small") {
             relay.offer(Offer::transaction(None, transaction(nonce)));
         }
-        assert_eq!(
-            relay.status(),
-            Some(RelayStatus {
-                offered: MAX_QUEUED_OFFERS,
-                announcing: 0,
-                dropped: 8,
-            })
-        );
+        let status = relay.status().expect("relay status");
+        assert_eq!(status.offered, MAX_QUEUED_OFFERS);
+        assert!(status.offered_bytes <= MAX_QUEUED_OFFER_BYTES);
+        assert!(status.offered_oldest_age.is_some());
+        assert_eq!(status.announcing, 0);
+        assert_eq!(status.announcing_bytes, 0);
+        assert_eq!(status.announcing_oldest_age, None);
+        assert_eq!(status.dropped, 8);
+        assert_eq!(status.saturations, 8);
         assert_eq!(relay.take_offered().len(), MAX_QUEUED_OFFERS);
         assert_eq!(relay.dropped(), 8);
+    }
+
+    #[test]
+    fn relay_bytes_shed_oldest_and_recover_after_drain() {
+        let bytes = transaction(0).as_bytes().len();
+        let relay = Relay::with_limits(Limits::new(10, bytes * 2));
+        for nonce in 0..3 {
+            relay.offer(Offer::transaction(None, transaction(nonce)));
+        }
+
+        let saturated = relay.status().expect("relay status");
+        assert_eq!(saturated.offered, 2);
+        assert_eq!(saturated.offered_bytes, bytes * 2);
+        assert_eq!(saturated.dropped, 1);
+        assert_eq!(saturated.saturations, 1);
+        assert_eq!(relay.take_offered().len(), 2);
+        assert_eq!(relay.status().expect("relay status").offered_bytes, 0);
+
+        relay.offer(Offer::transaction(None, transaction(3)));
+        assert_eq!(relay.take_offered().len(), 1, "capacity recovers");
     }
 
     /// The set of accepted items is bounded too, and forgetting is not a fault: the

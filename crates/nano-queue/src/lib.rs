@@ -1,7 +1,7 @@
 //! Bounded hand-offs for externally supplied work.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fmt,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
@@ -40,6 +40,93 @@ pub struct Status {
 pub enum ReserveError {
     Full,
     Closed,
+}
+
+/// A local drop-oldest buffer with independent count and byte bounds.
+///
+/// This is for callers that already own their synchronization and must keep the
+/// newest network announcements. [`channel`] is the producer/consumer hand-off.
+#[derive(Debug)]
+pub struct Buffer<T> {
+    limits: Limits,
+    entries: VecDeque<Buffered<T>>,
+    bytes: usize,
+    dropped: u64,
+    saturations: u64,
+}
+
+impl<T> Buffer<T> {
+    #[must_use]
+    pub const fn new(limits: Limits) -> Self {
+        Self {
+            limits,
+            entries: VecDeque::new(),
+            bytes: 0,
+            dropped: 0,
+            saturations: 0,
+        }
+    }
+
+    /// Keep `value`, shedding the oldest entries until both limits admit it.
+    ///
+    /// A value larger than the whole byte budget is shed itself. The return value
+    /// says whether the new value was retained.
+    pub fn push(&mut self, value: T, bytes: usize) -> bool {
+        if bytes > self.limits.bytes {
+            self.dropped = self.dropped.saturating_add(1);
+            self.saturations = self.saturations.saturating_add(1);
+            return false;
+        }
+
+        let saturated = self.entries.len() >= self.limits.items
+            || bytes > self.limits.bytes.saturating_sub(self.bytes);
+        if saturated {
+            self.saturations = self.saturations.saturating_add(1);
+        }
+        while self.entries.len() >= self.limits.items
+            || bytes > self.limits.bytes.saturating_sub(self.bytes)
+        {
+            let oldest = self
+                .entries
+                .pop_front()
+                .expect("a positive limit can only reject a non-empty buffer");
+            self.bytes -= oldest.bytes;
+            self.dropped = self.dropped.saturating_add(1);
+        }
+
+        self.bytes += bytes;
+        self.entries.push_back(Buffered {
+            value,
+            bytes,
+            at: Instant::now(),
+        });
+        true
+    }
+
+    /// Drain retained values in arrival order and release their byte budget.
+    #[must_use]
+    pub fn take(&mut self) -> Vec<T> {
+        self.bytes = 0;
+        self.entries.drain(..).map(|entry| entry.value).collect()
+    }
+
+    #[must_use]
+    pub fn status(&self) -> Status {
+        Status {
+            items: self.entries.len(),
+            bytes: self.bytes,
+            oldest_age: self.entries.front().map(|entry| entry.at.elapsed()),
+            dropped: self.dropped,
+            saturations: self.saturations,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Buffered<T> {
+    value: T,
+    bytes: usize,
+    at: Instant,
 }
 
 impl fmt::Display for ReserveError {
@@ -363,7 +450,35 @@ fn lock(accounting: &Mutex<Accounting>) -> MutexGuard<'_, Accounting> {
 mod tests {
     use std::time::Duration;
 
-    use super::{Limits, ReserveError, channel};
+    use super::{Buffer, Limits, ReserveError, channel};
+
+    #[test]
+    fn a_local_buffer_sheds_oldest_by_count_and_bytes() {
+        let mut buffer = Buffer::new(Limits::new(2, 10));
+        assert!(buffer.push("first", 6));
+        assert!(buffer.push("second", 4));
+        assert!(buffer.push("third", 5));
+
+        let status = buffer.status();
+        assert_eq!(status.items, 2);
+        assert_eq!(status.bytes, 9);
+        assert_eq!(status.dropped, 1);
+        assert_eq!(status.saturations, 1);
+        assert!(status.oldest_age.is_some());
+        assert_eq!(buffer.take(), vec!["second", "third"]);
+        assert_eq!(buffer.status().items, 0);
+        assert_eq!(buffer.status().bytes, 0);
+    }
+
+    #[test]
+    fn a_local_buffer_refuses_one_oversized_value_and_recovers() {
+        let mut buffer = Buffer::new(Limits::new(2, 10));
+        assert!(!buffer.push("oversized", 11));
+        assert_eq!(buffer.status().dropped, 1);
+        assert_eq!(buffer.status().saturations, 1);
+        assert!(buffer.push("fits", 10));
+        assert_eq!(buffer.take(), vec!["fits"]);
+    }
 
     #[tokio::test]
     async fn bytes_are_reserved_before_work_and_released_on_receive() {
