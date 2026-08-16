@@ -49,14 +49,14 @@ extra file makes verification fail.
 Before preparation, set `NANO_REPRODUCIBLE_STORE` to an absent path on the
 disk-backed temporary filesystem. `scripts/reproducible-release.sh` builds the clean Git
 revision in two separate rootless Nix stores, compares their NAR hashes and a
-sorted SHA-256 inventory of every packaged file, and removes both stores. A NAR
-match includes file contents, modes and paths; the separate inventory makes a
-binary or packaged-data difference readable if the comparison ever fails.
-After the comparison, the script retains the first verified rootless store at
-`NANO_REPRODUCIBLE_STORE` and checks it again there. Qualification passes that
-store and its exact output path to `release-candidate prepare`, so the signed
-candidate cannot be a third, merely assumed-equivalent build. Remove the handoff
-store after finalization and verification.
+sorted SHA-256 inventory of every packaged file, removes the second store and
+moves the first to `NANO_REPRODUCIBLE_STORE`. A NAR match includes file contents,
+modes and paths; the separate inventory makes a binary or packaged-data
+difference readable if the comparison ever fails. The script checks the moved
+store again before qualification passes it and its exact output path to
+`release-candidate prepare`, so the signed candidate cannot be a third, merely
+assumed-equivalent build. Remove the handoff store after finalization and
+verification.
 
 ## Capacity and shutdown contract
 

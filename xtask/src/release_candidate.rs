@@ -432,6 +432,7 @@ fn required_candidate_files(candidate: &Path) -> Result<(), String> {
         "artifact/share/nano-stacks/sbom.cdx.json",
         "artifact/share/nano-stacks/container/Containerfile",
         "artifact/share/nano-stacks/systemd/nano-stacks.service",
+        "artifact/share/doc/nano-stacks/README.md",
         AUDIT,
         CHECKPOINT,
         CLOSURE,
@@ -453,6 +454,20 @@ fn verify_identity(candidate: &Path, expected_revision: Option<&str>) -> Result<
         .join("share/nano-stacks/build-identity.json");
     let identity = read_json(&identity_path)?;
     let revision = json_string(&identity, "source_revision", "build identity")?;
+    let compiler_identity = json_string(&identity, "compiler_identity", "build identity")?;
+    if compiler_identity
+        .strip_prefix("sha256:")
+        .is_none_or(|digest| {
+            digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err("build identity has no clarity-wasm SHA-256 identity".to_owned());
+    }
+    for field in ["rustc", "target"] {
+        if json_string(&identity, field, "build identity")?.is_empty() {
+            return Err(format!("build identity has an empty {field}"));
+        }
+    }
     if expected_revision.is_some_and(|expected| expected != revision) {
         return Err(format!(
             "candidate source {revision} does not match current source {}",
@@ -519,6 +534,7 @@ fn validate_artifact(artifact: &Path, revision: &str) -> Result<(), String> {
         "share/nano-stacks/config.schema.json",
         "share/nano-stacks/dependencies.txt",
         "share/nano-stacks/sbom.cdx.json",
+        "share/doc/nano-stacks/README.md",
     ] {
         require_file(&artifact.join(file), file)?;
     }
@@ -1025,8 +1041,8 @@ mod tests {
     use super::{
         ARTIFACT, AUDIT, CHECKPOINT, CLOSURE, CONFIGURATION, PREPARED_SIGNATURE, PREPARED_SUMS,
         PROVENANCE, PUBLISHER_KEY, REPORT, SOURCE_INPUTS, artifact_input, finalize,
-        prepared_exclusions, sign, verify_checksums, verify_final_candidate,
-        verify_prepared_candidate, write_checksum_file,
+        prepared_exclusions, read_json, required_candidate_files, sign, verify_checksums,
+        verify_final_candidate, verify_identity, verify_prepared_candidate, write_checksum_file,
     };
 
     const REVISION: &str = "1111111111111111111111111111111111111111";
@@ -1141,6 +1157,8 @@ mod tests {
             .expect("create container directory");
         fs::create_dir_all(artifact.join("share/nano-stacks/systemd"))
             .expect("create service directory");
+        fs::create_dir_all(artifact.join("share/doc/nano-stacks"))
+            .expect("create documentation directory");
         fs::write(artifact.join("bin/stacks-node"), "binary").expect("write binary");
         write_json_test(
             &artifact.join("share/nano-stacks/build-identity.json"),
@@ -1182,6 +1200,11 @@ mod tests {
             "[Service]\n",
         )
         .expect("write service profile");
+        fs::write(
+            artifact.join("share/doc/nano-stacks/README.md"),
+            "# Running nano-stacks\n",
+        )
+        .expect("write operator documentation");
     }
 
     fn green_audit() -> serde_json::Value {
@@ -1272,6 +1295,32 @@ mod tests {
             verify_prepared_candidate(&advisory.path, &advisory.public_key, Some(REVISION))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn missing_release_identity_or_documentation_is_rejected() {
+        let missing_identity = candidate(&green_audit(), true, true);
+        let identity_path = missing_identity
+            .path
+            .join(ARTIFACT)
+            .join("share/nano-stacks/build-identity.json");
+        let mut identity = read_json(&identity_path).expect("read build identity");
+        identity
+            .as_object_mut()
+            .expect("build identity object")
+            .remove("compiler_identity");
+        write_json_test(&identity_path, &identity);
+        assert!(verify_identity(&missing_identity.path, Some(REVISION)).is_err());
+
+        let missing_documentation = candidate(&green_audit(), true, true);
+        fs::remove_file(
+            missing_documentation
+                .path
+                .join(ARTIFACT)
+                .join("share/doc/nano-stacks/README.md"),
+        )
+        .expect("remove operator documentation");
+        assert!(required_candidate_files(&missing_documentation.path).is_err());
     }
 
     #[test]
