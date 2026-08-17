@@ -13,6 +13,7 @@ nano-primitives = { path = "../nano-primitives" }
 nano-consensus-profile = { path = "../nano-consensus-profile" }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.10.9"
 toml = "1.1.3"
 
 [lints]
