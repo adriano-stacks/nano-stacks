@@ -31,7 +31,7 @@ every finding as a deterministic regression.
 - [x] Add Miri where applicable plus address, undefined-behavior and thread
       sanitizer jobs for the unsafe cache boundary, FFI/dependencies and
       concurrent adapters.
-- [ ] Inject `ENOSPC`, `EIO`, short reads/writes, read-only filesystems, corrupt
+- [x] Inject `ENOSPC`, `EIO`, short reads/writes, read-only filesystems, corrupt
       pages, torn/truncated files and failure at every fsync/rename/commit point,
       in addition to process-kill timing tests.
 - [x] Add deterministic network-chaos scenarios for partitions, peer churn,

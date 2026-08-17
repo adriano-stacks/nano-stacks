@@ -6,6 +6,7 @@
 //! block is interrupted inside ordinary execution or commit.
 
 use std::{
+    env,
     fmt::Write as _,
     fs,
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
@@ -20,6 +21,7 @@ use nano_conformance::{captured_blocks_sealed, durable_replay_chainstate};
 
 const TARGET_BLOCKS: u64 = 32;
 const PATIENCE: Duration = Duration::from_secs(30);
+const MAX_DURABILITY_CALLS: usize = 64;
 // Linux errno values, used only by the Linux libfiu preload module.
 const EIO: i32 = 5;
 const ENOSPC: i32 = 28;
@@ -215,6 +217,71 @@ fn prepare_state(blocks: u64) -> tempfile::TempDir {
     directory
 }
 
+fn replay_with_nth_fault(
+    directory: &Path,
+    point: &str,
+    at: usize,
+    report: &Path,
+) -> (ExitStatus, String) {
+    let preload = env::var_os("NANO_FIU_NTH_PRELOAD").expect("the nth-failure helper is set");
+    let preload_dir =
+        PathBuf::from(env::var_os("NANO_FIU_PRELOAD_DIR").expect("the libfiu path is set"));
+    // Preload constructors run in reverse order; libfiu must initialize first.
+    let libraries = format!(
+        "{}:{}",
+        Path::new(&preload).display(),
+        preload_dir.join("fiu_posix_preload.so").display()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_replay-blocks"))
+        .arg(fixtures())
+        .arg(directory)
+        .arg("1")
+        .env("LD_PRELOAD", libraries)
+        .env("NANO_FIU_POINT", point)
+        .env("NANO_FIU_AT", at.to_string())
+        .env("NANO_FIU_REPORT", report)
+        .output()
+        .expect("run one block with an indexed fault");
+    (
+        output.status,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+fn sweep_durability_point(expected: &Fingerprint, point: &str) -> usize {
+    for at in 1..=MAX_DURABILITY_CALLS {
+        let directory = prepare_state(2);
+        let report = directory.path().join("fiu-hit");
+        let (status, stderr) = replay_with_nth_fault(directory.path(), point, at, &report);
+        if !report.exists() {
+            assert!(
+                status.success(),
+                "the replay failed before reaching {point} call {at}: {stderr}"
+            );
+            assert_eq!(
+                finish(directory.path()),
+                *expected,
+                "a run past the final {point} call reaches the clean state"
+            );
+            return at - 1;
+        }
+        assert!(
+            !stderr.contains("invalid transaction"),
+            "{point} call {at} was misreported as consensus-invalid: {stderr}"
+        );
+        assert!(
+            !stderr.contains("panicked at"),
+            "{point} call {at} returned an error instead of panicking: {stderr}"
+        );
+        assert_eq!(
+            finish(directory.path()),
+            *expected,
+            "{point} call {at} leaves only a complete replay prefix"
+        );
+    }
+    panic!("{point} has more than {MAX_DURABILITY_CALLS} calls in one replayed block");
+}
+
 fn corrupt_first_page(path: &Path) {
     let mut file = fs::OpenOptions::new()
         .read(true)
@@ -398,4 +465,34 @@ fn mismatched_store_generations_expose_only_a_complete_state() {
         expected,
         "the safe half of a file-generation tear replays to the clean state"
     );
+}
+
+#[test]
+fn every_durable_commit_boundary_exposes_only_a_complete_state() {
+    let unavailable = if !cfg!(target_os = "linux") {
+        Some("indexed libfiu injection requires Linux")
+    } else if !fixtures().join("nakamoto/blocks").is_dir() {
+        Some("the captured blocks are unavailable")
+    } else if env::var_os("NANO_FIU_NTH_PRELOAD").is_none()
+        || env::var_os("NANO_FIU_PRELOAD_DIR").is_none()
+    {
+        Some("the indexed libfiu helper is unavailable")
+    } else {
+        None
+    };
+    if let Some(reason) = unavailable {
+        nano_conformance::skip_gate(reason);
+        return;
+    }
+
+    let reference = prepare_state(TARGET_BLOCKS);
+    let expected = fingerprint(reference.path());
+    let fsyncs = sweep_durability_point(&expected, "posix/io/sync/fsync");
+    let fdatasyncs = sweep_durability_point(&expected, "posix/io/sync/fdatasync");
+    let renames = sweep_durability_point(&expected, "posix/io/dir/rename");
+    assert!(
+        fsyncs + fdatasyncs >= 2,
+        "both SQLite commit boundaries issue durable syncs"
+    );
+    println!("exercised {fsyncs} fsync, {fdatasyncs} fdatasync and {renames} rename boundaries");
 }
