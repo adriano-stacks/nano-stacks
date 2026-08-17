@@ -36,7 +36,7 @@ artifact and its dependency closure.
 - [x] Add dependency-tree, route-inventory and binary-inspection gates proving
       forbidden roles and fallback engines are absent rather than disabled by
       configuration.
-- [ ] Run checkpoint import, P2P catch-up, fork/reorg, restart and tip following
+- [x] Run checkpoint import, P2P catch-up, fork/reorg, restart and tip following
       through the exact packaged follower artifact.
 - [ ] Measure whether omitting persistent native modules or inbound service
       violates the documented catch-up/liveness bound; retain neither without a
