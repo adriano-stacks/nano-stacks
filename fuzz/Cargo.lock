@@ -1913,6 +1913,7 @@ dependencies = [
  "nano-codec",
  "nano-crypto",
  "nano-marf",
+ "nano-oracle",
  "nano-p2p",
  "nano-primitives",
  "nano-stackerdb",
@@ -2006,6 +2007,15 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "toml 1.1.4+spec-1.1.0",
+]
+
+[[package]]
+name = "nano-oracle"
+version = "0.1.0"
+dependencies = [
+ "clarity",
+ "nano-primitives",
+ "nano-vm",
 ]
 
 [[package]]

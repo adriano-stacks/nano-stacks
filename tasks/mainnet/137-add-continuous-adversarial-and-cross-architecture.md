@@ -24,7 +24,7 @@ every finding as a deterministic regression.
 - [x] Add structure-aware fuzz targets for P2P framing/session state,
       transaction and block codecs, signer/StackerDB messages, checkpoint
       manifests/import, MARF operations and clarity-wasm ABI boundaries.
-- [ ] Differentially fuzz consensus-visible outputs against compatible
+- [x] Differentially fuzz consensus-visible outputs against compatible
       stacks-core implementations and persist minimized corpora in CI.
 - [ ] Run a bounded deterministic fuzz corpus on every change and continuous
       long-running fuzzers with crash artifact retention and ownership.

@@ -578,12 +578,18 @@ fn execute_contract_call_outcome_in_context(
     };
     match result {
         Ok((value, assets, events)) => {
-            Ok(ContractCallOutcome::Success(Box::new(TransactionResult {
+            let aborted = matches!(&value, Value::Response(response) if !response.committed);
+            let receipt = Box::new(TransactionResult {
                 value: Some(value),
                 cost: cost_tracker.get_total(),
                 assets,
                 events,
-            })))
+            });
+            Ok(if aborted {
+                ContractCallOutcome::AbortedByResponse(receipt)
+            } else {
+                ContractCallOutcome::Success(receipt)
+            })
         }
         Err(error) => {
             if is_acceptable_runtime_failure(&error) {

@@ -50,6 +50,10 @@ case "$target" in
     seed_directory=crates/nano-adversarial/corpus/clarity-refusal
     max_length=1
     ;;
+  clarity_stateful_receipt_differential)
+    seed_directory=crates/nano-adversarial/corpus/clarity-stateful
+    max_length=50
+    ;;
   *)
     echo "unknown fuzz target: $target" >&2
     exit 2

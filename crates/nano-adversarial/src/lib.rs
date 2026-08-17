@@ -12,7 +12,15 @@ use blockstack_lib::chainstate::{
         },
     },
 };
-use clarity::vm::{ClarityVersion, types::QualifiedContractIdentifier};
+use clarity::{
+    types::StacksEpochId,
+    vm::{
+        ClarityVersion, Value,
+        costs::{ExecutionCost, LimitedCostTracker},
+        errors::VmExecutionError,
+        types::QualifiedContractIdentifier,
+    },
+};
 use nano_chainstate::NakamotoBlock;
 use nano_codec::Transaction;
 use nano_crypto::StacksPrivateKey;
@@ -26,7 +34,10 @@ use nano_p2p::{
 };
 use nano_primitives::{BitVec, BitcoinHeaderHash, ConsensusHash, Hash160, Network, TrieHash};
 use nano_stackerdb::{Chunk, SignerMessage};
-use nano_vm::{SemanticEpochInspection, Vm, semantic_epoch_at_burn_height};
+use nano_vm::{
+    ContractCallOutcome, EPOCH_4_BLOCK_LIMIT, MarfStore, SemanticEpochInspection,
+    TransactionResult, Vm, semantic_epoch_at_burn_height,
+};
 use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::StacksBlockId as ReferenceStacksBlockId;
 
@@ -36,6 +47,7 @@ const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_CHECKPOINT_IMPORT_BYTES: usize = 1 + 4 * (1 + 16 * 2);
 const MAX_CLARITY_BYTES: usize = 128 * 1024;
 const MAX_CLARITY_DIFFERENTIAL_BYTES: usize = 50;
+const MAX_CLARITY_STATEFUL_BYTES: usize = 50;
 const MAX_MARF_OPERATIONS: usize = 256;
 const MAX_SESSION_OPERATIONS: usize = 32;
 const CHECKPOINT_SEPARATOR: &[u8] = b"\n--- checkpoint.toml ---\n";
@@ -651,6 +663,357 @@ pub fn clarity_refusal_differential(input: &[u8]) -> u8 {
     assert_eq!(
         compiled, interpreted,
         "compiled and interpreted refusal diverged"
+    );
+    1 << template
+}
+
+const STATEFUL_VARIABLE: &str = r#"
+(define-data-var stored { amount: uint, flag: bool } { amount: u0, flag: false })
+(define-public (mutate (amount uint) (flag bool))
+  (let ((next { amount: amount, flag: flag }))
+    (begin
+      (var-set stored next)
+      (print { kind: "variable", value: next })
+      (ok next))))
+(define-read-only (snapshot) (var-get stored))
+"#;
+
+const STATEFUL_MAP: &str = r#"
+(define-map entries uint { amount: uint, note: (buff 32) })
+(define-public (mutate (key uint) (amount uint) (note (buff 32)) (replace bool))
+  (let ((next { amount: amount, note: note }))
+    (begin
+      (if replace (map-set entries key next) (map-insert entries key next))
+      (print { kind: "map", key: key, value: next })
+      (ok (map-get? entries key)))))
+(define-read-only (snapshot (key uint)) (map-get? entries key))
+"#;
+
+const STATEFUL_FT: &str = r#"
+(define-fungible-token token)
+(define-public (mutate (amount uint) (recipient principal))
+  (begin
+    (try! (ft-mint? token amount tx-sender))
+    (try! (ft-transfer? token amount tx-sender recipient))
+    (print { kind: "ft", amount: amount, recipient: recipient })
+    (ok (ft-get-balance token recipient))))
+(define-read-only (snapshot (owner principal)) (ft-get-balance token owner))
+"#;
+
+const STATEFUL_NFT: &str = r#"
+(define-non-fungible-token collectible uint)
+(define-public (mutate (identifier uint) (recipient principal))
+  (begin
+    (try! (nft-mint? collectible identifier tx-sender))
+    (try! (nft-transfer? collectible identifier tx-sender recipient))
+    (print { kind: "nft", identifier: identifier, recipient: recipient })
+    (ok (nft-get-owner? collectible identifier))))
+(define-read-only (snapshot (identifier uint))
+  (nft-get-owner? collectible identifier))
+"#;
+
+const STATEFUL_ROLLBACK: &str = r#"
+(define-data-var stored uint u0)
+(define-public (mutate (amount uint))
+  (begin
+    (var-set stored amount)
+    (print { kind: "rollback", amount: amount })
+    (err amount)))
+(define-read-only (snapshot) (var-get stored))
+"#;
+
+const STATEFUL_MULTI_WRITE: &str = r#"
+(define-data-var total uint u0)
+(define-map records uint (buff 32))
+(define-public (mutate (key uint) (amount uint) (note (buff 32)))
+  (begin
+    (var-set total (+ (var-get total) amount))
+    (map-set records key note)
+    (print { kind: "multi", key: key, total: (var-get total), note: note })
+    (ok { total: (var-get total), record: (map-get? records key) })))
+(define-read-only (snapshot (key uint))
+  { total: (var-get total), record: (map-get? records key) })
+"#;
+
+struct StatefulCase {
+    source: &'static str,
+    arguments: Vec<Value>,
+    snapshot_arguments: Vec<Value>,
+    expects_assets: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum ReceiptOutcome {
+    Success(TransactionResult),
+    Aborted(TransactionResult),
+    RuntimeFailure {
+        cost: ExecutionCost,
+        error: VmExecutionError,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+struct StatefulObservation {
+    deployment: TransactionResult,
+    call: ReceiptOutcome,
+    snapshot: ReceiptOutcome,
+    root: [u8; 32],
+}
+
+fn stateful_contract() -> QualifiedContractIdentifier {
+    QualifiedContractIdentifier::parse("ST000000000000000000002AMW42H.stateful")
+        .expect("fixed contract identifier")
+}
+
+fn stateful_case(template: u8, amount: u128, key: u128, flag: bool, note: &[u8]) -> StatefulCase {
+    let amount = Value::UInt(amount);
+    let key = Value::UInt(key);
+    let flag = Value::Bool(flag);
+    let note = Value::buff_from(note.to_vec()).expect("bounded buffer");
+    let recipient = Value::Principal(stateful_contract().into());
+    match template {
+        0 => StatefulCase {
+            source: STATEFUL_VARIABLE,
+            arguments: vec![amount, flag],
+            snapshot_arguments: vec![],
+            expects_assets: false,
+        },
+        1 => StatefulCase {
+            source: STATEFUL_MAP,
+            arguments: vec![key.clone(), amount, note, flag],
+            snapshot_arguments: vec![key],
+            expects_assets: false,
+        },
+        2 => StatefulCase {
+            source: STATEFUL_FT,
+            arguments: vec![amount, recipient.clone()],
+            snapshot_arguments: vec![recipient],
+            expects_assets: true,
+        },
+        3 => StatefulCase {
+            source: STATEFUL_NFT,
+            arguments: vec![key.clone(), recipient],
+            snapshot_arguments: vec![key],
+            expects_assets: true,
+        },
+        4 => StatefulCase {
+            source: STATEFUL_ROLLBACK,
+            arguments: vec![amount],
+            snapshot_arguments: vec![],
+            expects_assets: false,
+        },
+        _ => StatefulCase {
+            source: STATEFUL_MULTI_WRITE,
+            arguments: vec![key.clone(), amount, note],
+            snapshot_arguments: vec![key],
+            expects_assets: false,
+        },
+    }
+}
+
+fn receipt(outcome: ContractCallOutcome) -> ReceiptOutcome {
+    match outcome {
+        ContractCallOutcome::Success(result) => ReceiptOutcome::Success(*result),
+        ContractCallOutcome::AbortedByResponse(result) => ReceiptOutcome::Aborted(*result),
+        ContractCallOutcome::RuntimeFailure { cost, error } => {
+            ReceiptOutcome::RuntimeFailure { cost, error }
+        }
+    }
+}
+
+const fn receipt_result(outcome: &ReceiptOutcome) -> Option<&TransactionResult> {
+    match outcome {
+        ReceiptOutcome::Success(result) | ReceiptOutcome::Aborted(result) => Some(result),
+        ReceiptOutcome::RuntimeFailure { .. } => None,
+    }
+}
+
+fn consensus_arguments(arguments: &[Value]) -> Vec<Vec<u8>> {
+    arguments
+        .iter()
+        .map(|argument| {
+            argument
+                .serialize_to_vec()
+                .expect("generated argument is serializable")
+        })
+        .collect()
+}
+
+fn stateful_tracker(store: &mut MarfStore) -> LimitedCostTracker {
+    let mut database = store.as_clarity_db();
+    database.begin();
+    database
+        .set_clarity_epoch_version(StacksEpochId::Epoch40)
+        .expect("declare execution epoch");
+    let tracker = LimitedCostTracker::new_mid_block(
+        Network::TESTNET.is_mainnet(),
+        Network::TESTNET.chain_id(),
+        EPOCH_4_BLOCK_LIMIT,
+        &mut database,
+        StacksEpochId::Epoch40,
+    )
+    .expect("load epoch 4 costs");
+    database
+        .roll_back()
+        .expect("reading the cost schedule writes nothing");
+    tracker
+}
+
+fn compiled_stateful(case: &StatefulCase) -> StatefulObservation {
+    let directory = tempfile::tempdir().expect("compiled state directory");
+    let mut vm = Vm::open(Network::TESTNET, directory.path()).expect("open compiled VM");
+    vm.begin_block(None, [0x37; 32])
+        .expect("begin compiled block");
+    let contract = stateful_contract();
+    let tracker = vm
+        .transaction_cost_tracker()
+        .expect("compiled cost tracker");
+    let deployment = vm
+        .deploy_contract(
+            contract.clone(),
+            ClarityVersion::Clarity6,
+            case.source,
+            tracker,
+        )
+        .expect("deploy compiled contract");
+    let tracker = vm
+        .transaction_cost_tracker()
+        .expect("compiled cost tracker");
+    let call = receipt(
+        vm.execute_contract_call_outcome(
+            contract.issuer.clone().into(),
+            None,
+            contract.clone(),
+            "mutate",
+            &consensus_arguments(&case.arguments),
+            &tracker,
+        )
+        .expect("execute compiled call"),
+    );
+    let tracker = vm
+        .transaction_cost_tracker()
+        .expect("compiled cost tracker");
+    let snapshot = receipt(
+        vm.execute_contract_call_outcome(
+            contract.issuer.clone().into(),
+            None,
+            contract,
+            "snapshot",
+            &consensus_arguments(&case.snapshot_arguments),
+            &tracker,
+        )
+        .expect("read compiled state"),
+    );
+    let root = vm.seal_block().expect("seal compiled state").0;
+    StatefulObservation {
+        deployment,
+        call,
+        snapshot,
+        root,
+    }
+}
+
+fn interpreted_stateful(case: &StatefulCase) -> StatefulObservation {
+    let directory = tempfile::tempdir().expect("interpreted state directory");
+    let mut store =
+        MarfStore::open(Network::TESTNET, directory.path()).expect("open interpreter state");
+    store
+        .begin(None, [0x37; 32])
+        .expect("begin interpreted block");
+    let contract = stateful_contract();
+    let tracker = stateful_tracker(&mut store);
+    let deployment = nano_oracle::deploy_contract(
+        &mut store,
+        contract.clone(),
+        ClarityVersion::Clarity6,
+        case.source,
+        tracker,
+    )
+    .expect("deploy interpreted contract");
+    let tracker = stateful_tracker(&mut store);
+    let call = receipt(
+        nano_oracle::execute_contract_call_outcome(
+            &mut store,
+            contract.issuer.clone().into(),
+            None,
+            contract.clone(),
+            "mutate",
+            &consensus_arguments(&case.arguments),
+            tracker,
+        )
+        .expect("execute interpreted call"),
+    );
+    let tracker = stateful_tracker(&mut store);
+    let snapshot = receipt(
+        nano_oracle::execute_contract_call_outcome(
+            &mut store,
+            contract.issuer.clone().into(),
+            None,
+            contract,
+            "snapshot",
+            &consensus_arguments(&case.snapshot_arguments),
+            tracker,
+        )
+        .expect("read interpreted state"),
+    );
+    let root = store.seal().expect("seal interpreted state").0;
+    StatefulObservation {
+        deployment,
+        call,
+        snapshot,
+        root,
+    }
+}
+
+/// Compare state, transaction receipts and roots for one generated public call.
+#[must_use]
+pub fn clarity_stateful_receipt_differential(input: &[u8]) -> u8 {
+    let Some(input) = within(input, MAX_CLARITY_STATEFUL_BYTES) else {
+        return 0;
+    };
+    let Some((&template, input)) = input.split_first() else {
+        return 0;
+    };
+    let Some((&flags, input)) = input.split_first() else {
+        return 0;
+    };
+    let Some((amount, input)) = input.split_at_checked(8) else {
+        return 0;
+    };
+    let Some((key, note)) = input.split_at_checked(8) else {
+        return 0;
+    };
+    let amount = u128::from(u64::from_le_bytes(
+        amount.try_into().expect("fixed integer width"),
+    )) + 1;
+    let key = u128::from(u64::from_le_bytes(
+        key.try_into().expect("fixed integer width"),
+    ));
+    let template = template % 6;
+    let case = stateful_case(template, amount, key, flags & 1 != 0, note);
+    let compiled = compiled_stateful(&case);
+    let interpreted = interpreted_stateful(&case);
+
+    let compiled_call = receipt_result(&compiled.call).expect("generated call has a receipt");
+    assert_ne!(
+        compiled_call.cost,
+        ExecutionCost::ZERO,
+        "receipt comparison must use metered execution"
+    );
+    assert!(
+        !compiled_call.events.is_empty() || matches!(compiled.call, ReceiptOutcome::Aborted(_)),
+        "successful generated call must emit an event"
+    );
+    if case.expects_assets {
+        assert_ne!(
+            compiled_call.assets,
+            clarity::vm::contexts::AssetMap::default(),
+            "token case must exercise AssetMap"
+        );
+    }
+    assert_eq!(
+        compiled, interpreted,
+        "compiled and interpreted stateful observations diverged"
     );
     1 << template
 }

@@ -13,6 +13,7 @@ nano-chainstate = { path = "../nano-chainstate", default-features = false }
 nano-codec = { path = "../nano-codec" }
 nano-crypto = { path = "../nano-crypto" }
 nano-marf = { path = "../nano-marf" }
+nano-oracle = { path = "../nano-oracle" }
 nano-p2p = { path = "../nano-p2p" }
 nano-primitives = { path = "../nano-primitives" }
 nano-stackerdb = { path = "../nano-stackerdb" }

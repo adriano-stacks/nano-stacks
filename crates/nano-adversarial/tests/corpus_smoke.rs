@@ -5,8 +5,8 @@ use std::{
 
 use nano_adversarial::{
     checkpoint_import, checkpoint_manifests, clarity_refusal_differential,
-    clarity_result_and_cost_differential, clarity_wasm_abi, marf_operations,
-    p2p_frame_and_protocol, p2p_session_state, signer_and_stackerdb_codecs,
+    clarity_result_and_cost_differential, clarity_stateful_receipt_differential, clarity_wasm_abi,
+    marf_operations, p2p_frame_and_protocol, p2p_session_state, signer_and_stackerdb_codecs,
     transaction_and_block_codecs, transaction_and_block_differential,
 };
 
@@ -75,6 +75,11 @@ fn owned_corpora_stay_bounded_and_replay() {
         Target {
             name: "clarity-refusal",
             run: clarity_refusal_differential,
+            required_coverage: 63,
+        },
+        Target {
+            name: "clarity-stateful",
+            run: clarity_stateful_receipt_differential,
             required_coverage: 63,
         },
     ] {

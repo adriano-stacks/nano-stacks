@@ -34,6 +34,7 @@ jobs:
           - clarity_wasm_abi
           - clarity_result_and_cost_differential
           - clarity_refusal_differential
+          - clarity_stateful_receipt_differential
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:

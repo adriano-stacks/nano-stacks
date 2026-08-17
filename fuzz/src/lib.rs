@@ -277,3 +277,21 @@ pub struct ClarityRefusalCase {
 pub fn clarity_refusal_bytes(case: ClarityRefusalCase) -> [u8; 1] {
     [case.template]
 }
+
+#[derive(Arbitrary, Debug)]
+pub struct ClarityStatefulCase {
+    template: u8,
+    flags: u8,
+    amount: u64,
+    key: u64,
+    note: Vec<u8>,
+}
+
+pub fn clarity_stateful_bytes(mut case: ClarityStatefulCase) -> Vec<u8> {
+    case.note.truncate(32);
+    let mut bytes = vec![case.template, case.flags];
+    bytes.extend_from_slice(&case.amount.to_le_bytes());
+    bytes.extend_from_slice(&case.key.to_le_bytes());
+    bytes.extend_from_slice(&case.note);
+    bytes
+}

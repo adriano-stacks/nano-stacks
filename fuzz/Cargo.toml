@@ -90,5 +90,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "clarity_stateful_receipt_differential"
+path = "fuzz_targets/clarity_stateful_receipt_differential.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
