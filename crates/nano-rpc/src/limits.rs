@@ -350,7 +350,7 @@ mod tests {
             .and_then(|(_, routes)| routes.split_once("static TRACE_REQUESTS"))
             .map(|(routes, _)| routes)
             .expect("public route table");
-        assert_eq!(routes.matches(".route(").count(), 24);
+        assert_eq!(routes.matches(".route(").count(), 25);
         assert_eq!(
             routes.matches(".route(").count(),
             routes.matches("limits::guard(").count(),
@@ -364,7 +364,7 @@ mod tests {
         let inventory = std::fs::read_to_string(workspace.join("docs/ingress-budgets.md"))
             .expect("checked-in ingress inventory");
         for required in [
-            "24 route registrations",
+            "25 route registrations",
             "16,778,054 bytes",
             "134,224,432 bytes",
             "Followed tenure history",

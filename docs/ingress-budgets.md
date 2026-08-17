@@ -16,7 +16,7 @@ after decoding is not counted here.
 | Inbound P2P | 64 conversations | 4 | 30 s I/O, 15 min idle, 4,096 messages | `nano-node/src/runtime.rs`, `nano-p2p/src/inbound.rs` |
 | Outbound P2P | 8 sessions | one session per peer | 4 dials/round, 15 s operation deadline | `nano-p2p/src/swarm.rs` |
 
-The public router has 24 route registrations and 24 `limits::guard` wrappers.
+The public router has 25 route registrations and 25 `limits::guard` wrappers.
 The classes below are `(body bytes, concurrency, requests/second, deadline)`:
 
 | Class | Budget | Routes |
