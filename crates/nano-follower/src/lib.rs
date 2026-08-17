@@ -1,5 +1,6 @@
 //! The consensus and durable acquisition core of the mainnet follower.
 
+pub mod adoption;
 pub mod archive;
 pub mod burnchain;
 pub mod checkpoint;
