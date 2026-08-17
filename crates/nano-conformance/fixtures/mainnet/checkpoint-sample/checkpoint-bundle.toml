@@ -1,0 +1,47 @@
+schema = "nano-stacks/checkpoint-bundle/v1"
+chunk_bytes = 4194304
+content_root = "7f77ddc60264d7e3ed0fcfdeb9fd4bd29d88a9f11bf10b81fa628417c2dec679"
+
+[checkpoint]
+state_format = "stacks-core-marf-sqlite-v2"
+checkpoint_stacks_height = 8665600
+source_state_id = "a87338900f279efc1b1df130004238cac8e09a2a4244fea39436fc66afae932d"
+published_state_index_root = "67596465d4a6642ad6fcec1df57c6ef758fcdb0003c7ed7f952e3ced1d7f44ec"
+bitcoin_height = 960231
+bitcoin_block_hash = "0606060606060606060606060606060606060606060606060606060606060606"
+attesting_block_id = "a87338900f279efc1b1df130004238cac8e09a2a4244fea39436fc66afae932d"
+signer_weight = 2708
+approval_threshold = 2599
+semantic_epoch = "Epoch40"
+compiler_identity = "sha256:d211643fb947945d8a3ef0defb5ec67ceaab0bc4f9bfbee54ccd743ab621bd26"
+profile_fingerprint = "7d1a040b785ed00aadf242c0f4fa89ce225e57d51a97d5244bce7d7f4c2af9f8"
+
+[[files]]
+path = "block.bin"
+size = 1973
+sha256 = "756bcf0028c5bd76bf69bfa049167c761031232fba52bb22a649df81eeddd84f"
+chunks = ["756bcf0028c5bd76bf69bfa049167c761031232fba52bb22a649df81eeddd84f"]
+
+[[files]]
+path = "checkpoint.toml"
+size = 373
+sha256 = "902cc2760a8e0a3eaab79d945eded7a2cbb5019ccec511e5169e4ccd097cb6d3"
+chunks = ["902cc2760a8e0a3eaab79d945eded7a2cbb5019ccec511e5169e4ccd097cb6d3"]
+
+[[files]]
+path = "marf.sqlite"
+size = 39
+sha256 = "8e5d4e399d31fe80f3defdfbe96a118f0c6a33c9cad2ae105e84da457a53743d"
+chunks = ["8e5d4e399d31fe80f3defdfbe96a118f0c6a33c9cad2ae105e84da457a53743d"]
+
+[[files]]
+path = "reward-set.json"
+size = 2965
+sha256 = "900e1e29e28d7e02c992e47cc222c00eb0126ad4e6c43ba6890e13fbe37be177"
+chunks = ["900e1e29e28d7e02c992e47cc222c00eb0126ad4e6c43ba6890e13fbe37be177"]
+
+[[files]]
+path = "sortition/history.bin"
+size = 31
+sha256 = "bfbd8e42aa71029f7a1f50b79f2ee063c25f0094a5765c676da0995edab0538f"
+chunks = ["bfbd8e42aa71029f7a1f50b79f2ee063c25f0094a5765c676da0995edab0538f"]

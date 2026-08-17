@@ -21,6 +21,16 @@ Neither needs a chainstate, which is what makes this possible where a full
 replay of mainnet is not: the reward set is published and the envelope is
 self-contained.
 
+`checkpoint-sample/` is the small published-input reproducibility fixture. It
+combines this real checkpoint block and reward set with a deliberately tiny
+stand-in MARF and sortition file. Its Bitcoin hash is the fixed test value
+`06…06`; it is not presented as mainnet evidence. CI assembles those exact
+inputs in two new directories, runs the production manifest builder and
+verifier, and requires both byte streams to equal the checked-in
+`checkpoint-bundle.toml`. A compiler/profile or serialization change therefore
+needs an explicit sample-manifest update instead of quietly changing release
+content addressing.
+
 `mainnet_envelope.rs` checks that nano derives the same signer signature hash
 mainnet signed, recovers the same keys from it, orders them the same way, and
 counts the same weight against the same threshold. It says nothing about

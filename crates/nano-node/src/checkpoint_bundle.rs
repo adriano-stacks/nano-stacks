@@ -221,7 +221,7 @@ impl From<CheckpointTrustError> for CheckpointBundleError {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
 
     use nano_chainstate::{NakamotoBlock, NakamotoBlockHeader};
     use nano_crypto::StacksPrivateKey;
@@ -254,6 +254,53 @@ pub(crate) mod tests {
         CHECKPOINT_REWARD_SET_FILE, CheckpointBundleError, build_checkpoint_bundle_manifest,
         observed_claims, verify_checkpoint_bundle,
     };
+
+    fn published_sample() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../nano-conformance/fixtures/mainnet/checkpoint-sample")
+    }
+
+    fn assemble_published_sample(destination: &Path) {
+        let sample = published_sample();
+        fs::create_dir_all(destination.join("sortition")).expect("sample sortition directory");
+        for relative in ["checkpoint.toml", "marf.sqlite", "sortition/history.bin"] {
+            fs::copy(sample.join(relative), destination.join(relative))
+                .expect("copy published sample input");
+        }
+        let mainnet = sample.parent().expect("mainnet fixtures");
+        fs::copy(
+            mainnet.join("checkpoint-block.bin"),
+            destination.join(nano_marf::CHECKPOINT_BLOCK_FILE),
+        )
+        .expect("copy published checkpoint block");
+        fs::copy(
+            mainnet.join("stacker_set-140.json"),
+            destination.join(CHECKPOINT_REWARD_SET_FILE),
+        )
+        .expect("copy published reward set");
+    }
+
+    #[test]
+    fn published_sample_rebuilds_byte_for_byte() {
+        let first = tempfile::tempdir().expect("first independent build");
+        let second = tempfile::tempdir().expect("second independent build");
+        for destination in [first.path(), second.path()] {
+            assemble_published_sample(destination);
+            build_checkpoint_bundle_manifest(destination, &TestBitcoin(960_231, [6; 32]))
+                .expect("rebuild published checkpoint sample");
+            verify_checkpoint_bundle(destination, &TestBitcoin(960_231, [6; 32]))
+                .expect("verify rebuilt checkpoint sample");
+        }
+
+        let first = fs::read(first.path().join(nano_marf::BUNDLE_MANIFEST_FILE))
+            .expect("first manifest bytes");
+        let second = fs::read(second.path().join(nano_marf::BUNDLE_MANIFEST_FILE))
+            .expect("second manifest bytes");
+        assert_eq!(first, second, "independent sample builds differ");
+        let published = fs::read(published_sample().join(nano_marf::BUNDLE_MANIFEST_FILE))
+            .expect("published manifest bytes");
+        assert_eq!(first, published, "sample differs from released manifest");
+    }
 
     pub fn fixture(all_signers: bool) -> (tempfile::TempDir, [StacksPrivateKey; 2]) {
         let root = tempfile::tempdir().expect("checkpoint bundle");

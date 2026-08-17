@@ -52,6 +52,9 @@ jobs:
       - name: fixture integrity
         run: nix develop --command scripts/ci.sh fixtures
 
+      - name: published checkpoint sample rebuilds byte for byte
+        run: nix develop --command scripts/ci.sh checkpoint-sample
+
       - name: workspace and conformance tests
         run: nix develop --command scripts/ci.sh tests
 

@@ -38,6 +38,10 @@ run_gate() {
     fixtures)
       cargo run --profile ci -p xtask -- validate-fixtures
       ;;
+    checkpoint-sample)
+      cargo test --profile ci -p nano-node \
+        checkpoint_bundle::tests::published_sample_rebuilds_byte_for_byte -- --exact
+      ;;
     tests)
       cargo test --profile ci --workspace --tests
       cargo test --profile ci --workspace --doc
@@ -76,7 +80,7 @@ run_gate() {
 
 case "$gate" in
   all)
-    for name in toolchain workflow formatting clippy scoreboard fixtures tests release release-integrity locks; do
+    for name in toolchain workflow formatting clippy scoreboard fixtures checkpoint-sample tests release release-integrity locks; do
       run_gate "$name"
     done
     ;;
