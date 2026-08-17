@@ -80,6 +80,20 @@ const RATE_LIMIT_CEILING: std::time::Duration = std::time::Duration::from_secs(2
 /// `Retry-After` cannot park a catch-up for an hour. Well above any real one.
 const RETRY_AFTER_CEILING: std::time::Duration = std::time::Duration::from_mins(2);
 
+const MIB: usize = 1024 * 1024;
+/// JSON control responses, including reward and signer sets.
+pub const MAX_JSON_RESPONSE_BYTES: usize = 4 * MIB;
+/// One consensus-serialized block fetched by its content identifier.
+pub const MAX_BLOCK_RESPONSE_BYTES: usize = 4 * MIB;
+/// A raw tenure returned as concatenated consensus-serialized blocks.
+pub const MAX_TENURE_RESPONSE_BYTES: usize = 64 * MIB;
+/// A tenure returned inside the hex-expanded `fork_info` JSON shape.
+pub const MAX_TENURE_JSON_RESPONSE_BYTES: usize = 2 * MAX_TENURE_RESPONSE_BYTES + MIB;
+/// One bounded mempool page and its optional 32-byte cursor.
+pub const MAX_MEMPOOL_RESPONSE_BYTES: usize = 8 * MIB + 32;
+/// A small acknowledgement to a block upload.
+pub const MAX_UPLOAD_RESPONSE_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct SyncClient {
     client: Client,
@@ -488,7 +502,11 @@ pub enum SyncError {
         want: u64,
     },
     InvalidBaseUrl,
+    ResponseTooLarge {
+        limit: usize,
+    },
     Http(reqwest::Error),
+    Json(serde_json::Error),
     Block(NakamotoCodecError),
     EmptyTenure,
     TenureStart,
@@ -571,6 +589,9 @@ impl fmt::Display for SyncError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidBaseUrl => formatter.write_str("sync base URL cannot be a base"),
+            Self::ResponseTooLarge { limit } => {
+                write!(formatter, "peer response exceeds its {limit}-byte limit")
+            }
             Self::NoPeer => formatter.write_str("no peer left to ask"),
             Self::Throttled => formatter.write_str("every peer is rate limiting this node"),
             Self::UnexpectedBlock { expected, found } => write!(
@@ -586,6 +607,7 @@ impl fmt::Display for SyncError {
                 "a peer answered the request for the tenure of burn view {asked} with a block of {answered}"
             ),
             Self::Http(error) => write!(formatter, "HTTP sync error: {error}"),
+            Self::Json(error) => write!(formatter, "invalid JSON sync response: {error}"),
             Self::Block(error) => write!(formatter, "invalid Nakamoto block response: {error}"),
             Self::EmptyTenure => formatter.write_str("tenure response contains no blocks"),
             Self::TenureStart => formatter.write_str("tenure response starts at the wrong block"),
@@ -613,12 +635,14 @@ impl std::error::Error for SyncError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Http(error) => Some(error),
+            Self::Json(error) => Some(error),
             Self::Block(error) => Some(error),
             Self::TenureLink(error) => Some(error),
             Self::Crypto(error) => Some(error),
             Self::SignerSet(error) => Some(error),
             Self::TenureGap { .. }
             | Self::InvalidBaseUrl
+            | Self::ResponseTooLarge { .. }
             | Self::EmptyTenure
             | Self::TenureStart
             | Self::InvalidHash
@@ -645,6 +669,12 @@ impl From<reqwest::Error> for SyncError {
     }
 }
 
+impl From<serde_json::Error> for SyncError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
 impl From<CryptoError> for SyncError {
     fn from(error: CryptoError) -> Self {
         Self::Crypto(error)
@@ -655,6 +685,37 @@ impl From<SignerSetError> for SyncError {
     fn from(error: SignerSetError) -> Self {
         Self::SignerSet(error)
     }
+}
+
+async fn bounded_response(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, SyncError> {
+    let declared = response
+        .content_length()
+        .map(usize::try_from)
+        .transpose()
+        .map_err(|_| SyncError::ResponseTooLarge { limit })?;
+    if declared.is_some_and(|length| length > limit) {
+        return Err(SyncError::ResponseTooLarge { limit });
+    }
+    let mut body = Vec::with_capacity(declared.unwrap_or(0));
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(SyncError::ResponseTooLarge { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn bounded_json<T: for<'de> Deserialize<'de>>(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<T, SyncError> {
+    Ok(serde_json::from_slice(
+        &bounded_response(response, limit).await?,
+    )?)
 }
 
 impl SyncClient {
@@ -876,16 +937,15 @@ impl SyncClient {
         let mut query = vec![MEMPOOL_QUERY_TX_TAGS];
         query.extend_from_slice(&[0; 32]);
         query.extend_from_slice(&0_u32.to_be_bytes());
-        let body = self
+        let response = self
             .client
             .post(url)
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(query)
             .send()
             .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
+            .error_for_status()?;
+        let body = bounded_response(response, MAX_MEMPOOL_RESPONSE_BYTES).await?;
         decode_mempool_page(&body)
     }
 
@@ -946,7 +1006,9 @@ impl SyncClient {
         if let Some(block) = self.cached(block_id) {
             return Ok(block);
         }
-        let bytes = self.bytes(&format!("v3/blocks/{block_id}")).await?;
+        let bytes = self
+            .bytes(&format!("v3/blocks/{block_id}"), MAX_BLOCK_RESPONSE_BYTES)
+            .await?;
         let block = NakamotoBlock::decode(&bytes).map_err(SyncError::Block)?;
         // A block is content-addressed by the identifier that was asked for, so the
         // one check that makes "which peer answered" irrelevant is that the answer is
@@ -976,16 +1038,15 @@ impl SyncClient {
             .base_url
             .join("v3/blocks/upload")
             .map_err(|_| SyncError::InvalidBaseUrl)?;
-        let response: BlockUploadWire = self
+        let response = self
             .client
             .post(url)
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(block.encode())
             .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?;
+            .error_for_status()?;
+        let response: BlockUploadWire = bounded_json(response, MAX_UPLOAD_RESPONSE_BYTES).await?;
         let upload = BlockUpload {
             accepted: response.accepted,
             block_id: parse_block_id(&response.stacks_block_id)?,
@@ -1092,9 +1153,10 @@ impl SyncClient {
         consensus_hash: ConsensusHash,
     ) -> Result<Vec<NakamotoBlock>, SyncError> {
         let wire: Vec<ForkInfoWire> = self
-            .get(&format!(
-                "v3/tenures/fork_info/{consensus_hash}/{consensus_hash}"
-            ))
+            .get_with_limit(
+                &format!("v3/tenures/fork_info/{consensus_hash}/{consensus_hash}"),
+                MAX_TENURE_JSON_RESPONSE_BYTES,
+            )
             .await?;
         let encoded = wire
             .into_iter()
@@ -1130,7 +1192,7 @@ impl SyncClient {
 
             write!(path, "?stop={stop_block_id}").expect("writing to a string cannot fail");
         }
-        let bytes = self.bytes(&path).await?;
+        let bytes = self.bytes(&path, MAX_TENURE_RESPONSE_BYTES).await?;
         let mut blocks = Vec::new();
         let mut offset = 0;
         while offset < bytes.len() {
@@ -1155,7 +1217,9 @@ impl SyncClient {
         &self,
         block_id: StacksBlockId,
     ) -> Result<Vec<NakamotoBlock>, SyncError> {
-        let bytes = self.bytes(&format!("v3/tenures/{block_id}")).await?;
+        let bytes = self
+            .bytes(&format!("v3/tenures/{block_id}"), MAX_TENURE_RESPONSE_BYTES)
+            .await?;
         let mut blocks = Vec::new();
         let mut offset = 0;
         while offset < bytes.len() {
@@ -1222,19 +1286,27 @@ impl SyncClient {
     }
 
     async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, SyncError> {
-        let url = self
-            .base_url
-            .join(path)
-            .map_err(|_| SyncError::InvalidBaseUrl)?;
-        Ok(self.send(url).await?.json().await?)
+        self.get_with_limit(path, MAX_JSON_RESPONSE_BYTES).await
     }
 
-    async fn bytes(&self, path: &str) -> Result<Vec<u8>, SyncError> {
+    async fn get_with_limit<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        limit: usize,
+    ) -> Result<T, SyncError> {
         let url = self
             .base_url
             .join(path)
             .map_err(|_| SyncError::InvalidBaseUrl)?;
-        Ok(self.send(url).await?.bytes().await?.to_vec())
+        bounded_json(self.send(url).await?, limit).await
+    }
+
+    async fn bytes(&self, path: &str, limit: usize) -> Result<Vec<u8>, SyncError> {
+        let url = self
+            .base_url
+            .join(path)
+            .map_err(|_| SyncError::InvalidBaseUrl)?;
+        bounded_response(self.send(url).await?, limit).await
     }
 
     /// Send a request, waiting out a peer that is rate limiting this node.
@@ -2732,6 +2804,47 @@ mod tests {
         assert!(limited.is_rate_limited(), "{limited}");
         let missing = client.node_info().await.expect_err("the peer said 404");
         assert!(!missing.is_rate_limited(), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn peer_response_bytes_are_bounded_before_and_during_streaming() {
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let address = peer.local_addr().expect("the bound address");
+        let server = tokio::spawn(async move {
+            for response in [
+                "HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n4\r\nabcd\r\n0\r\n\r\n",
+                "HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nabc",
+            ] {
+                let (mut stream, _) = peer.accept().await.expect("a request");
+                tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                    .await
+                    .expect("answer request");
+            }
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}/");
+
+        for edge in ["declared", "chunked"] {
+            let response = client.get(&url).send().await.expect("peer response");
+            assert!(
+                matches!(
+                    super::bounded_response(response, 3).await,
+                    Err(SyncError::ResponseTooLarge { limit: 3 })
+                ),
+                "{edge} overflow was admitted"
+            );
+        }
+        let response = client.get(url).send().await.expect("recovery response");
+        assert_eq!(
+            super::bounded_response(response, 3)
+                .await
+                .expect("a response at the limit"),
+            b"abc"
+        );
+        server.await.expect("peer exits");
     }
 
     /// The bound on what a peer may ask for, checked without waiting for it.
