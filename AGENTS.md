@@ -13,3 +13,6 @@ you don't stop until @plan.md is done.
 you use https://github.com/driangle/taskmd (at ~/go/bin/taskmd) for task management.
 
 you use nix to bring any tool you need into scope
+
+you always use the latest released GitHub Actions revisions and pin every
+`uses:` reference to its full 40-character commit SHA
