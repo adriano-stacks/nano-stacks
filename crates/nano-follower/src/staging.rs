@@ -478,6 +478,45 @@ impl Staging {
         Ok(())
     }
 
+    /// Forget a rejected block and every staged block that descends from it.
+    pub fn remove_branch(&self, root: StacksBlockId) -> Result<usize, StagingError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let block_ids = {
+            let mut statement = transaction.prepare(
+                "WITH RECURSIVE
+                 links(block_id, parent_block_id) AS (
+                     SELECT block_id, parent_block_id FROM staged
+                     UNION
+                     SELECT block_id, parent_block_id FROM downloaded
+                 ),
+                 branch(block_id) AS (
+                     SELECT block_id FROM links WHERE block_id = ?1
+                     UNION
+                     SELECT links.block_id
+                     FROM links JOIN branch ON links.parent_block_id = branch.block_id
+                 )
+                 SELECT block_id FROM branch",
+            )?;
+            statement
+                .query_map(params![root.as_bytes().as_slice()], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for block_id in &block_ids {
+            transaction.execute("DELETE FROM staged WHERE block_id = ?1", params![block_id])?;
+            transaction.execute(
+                "DELETE FROM downloaded WHERE block_id = ?1",
+                params![block_id],
+            )?;
+        }
+        transaction.commit()?;
+        self.invalidate_selection()?;
+        drop(connection);
+        Ok(block_ids.len())
+    }
+
     /// Forget everything at or below a height, which sealing past it makes
     /// dead weight — and which a descent that overshot leaves behind.
     pub fn remove_to(&self, height: u64) -> Result<usize, StagingError> {
@@ -842,6 +881,47 @@ mod tests {
                 .expect("selected branch is linked");
             assert_eq!(child.block_id(), expected.block_id());
             parent = child.block_id();
+        }
+    }
+
+    #[test]
+    fn rejecting_a_block_prunes_only_its_descendant_branch() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let staging = Staging::open(&directory.path().join("staging.sqlite")).expect("open");
+        let blocks = fixtures();
+        let rejected = blocks[1..].to_vec();
+        let mut sibling = blocks[1..].to_vec();
+        for index in 0..sibling.len() {
+            sibling[index].header.consensus_hash = ConsensusHash::from_bytes([0x97; 20]);
+            sibling[index].header.parent_block_id = if index == 0 {
+                blocks[0].block_id()
+            } else {
+                sibling[index - 1].block_id()
+            };
+        }
+        for block in rejected.iter().chain(&sibling) {
+            staging.download(block).expect("stage competing branch");
+        }
+
+        assert_eq!(
+            staging
+                .remove_branch(rejected[0].block_id())
+                .expect("prune rejected branch"),
+            rejected.len()
+        );
+        for block in &rejected {
+            assert!(
+                !staging
+                    .has_representation(block.block_id())
+                    .expect("inspect rejected branch")
+            );
+        }
+        for block in &sibling {
+            assert!(
+                staging
+                    .has_representation(block.block_id())
+                    .expect("inspect sibling branch")
+            );
         }
     }
 

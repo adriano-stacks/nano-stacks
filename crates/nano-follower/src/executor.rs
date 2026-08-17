@@ -2651,7 +2651,7 @@ where
             let Some((block, authenticated)) = accepted else {
                 // Signer signatures are absent from the block ID. Keeping only
                 // rejected bytes would make descent hide a later finalized form.
-                staging.remove(selected_id)?;
+                staging.remove_branch(selected_id)?;
                 return Err(rejected
                     .expect("a non-empty set of representations was rejected")
                     .into());
