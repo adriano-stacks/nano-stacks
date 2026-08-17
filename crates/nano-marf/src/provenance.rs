@@ -8,6 +8,7 @@
 
 use std::{
     fs,
+    io::Write as _,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -121,6 +122,17 @@ pub struct CheckpointProvenance {
     pub checkpoint: CheckpointManifest,
     /// The signed header that endorsed the root, when one was checked.
     pub attestation: Option<CheckpointAttestation>,
+    /// The independently signed payload this state was imported from.
+    pub bundle: Option<CheckpointBundleReceipt>,
+}
+
+/// Signed bundle evidence persisted beside imported state for bounded restarts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointBundleReceipt {
+    pub content_root: [u8; 32],
+    pub bitcoin_height: u64,
+    pub bitcoin_block_hash: [u8; 32],
+    pub builders: Vec<String>,
 }
 
 impl CheckpointProvenance {
@@ -144,18 +156,29 @@ impl CheckpointProvenance {
     /// chain's blocks, and nothing downstream could tell.
     pub fn record(&self, directory: impl AsRef<Path>) -> Result<(), CheckpointError> {
         let directory = directory.as_ref();
-        if let Some(recorded) = Self::load(directory)?
-            && recorded.checkpoint != self.checkpoint
-        {
-            return Err(CheckpointError::ProvenanceMismatch {
-                recorded: Box::new(recorded.checkpoint),
-                configured: Box::new(self.checkpoint.clone()),
-            });
+        if let Some(recorded) = Self::load(directory)? {
+            if recorded.checkpoint != self.checkpoint {
+                return Err(CheckpointError::ProvenanceMismatch {
+                    recorded: Box::new(recorded.checkpoint),
+                    configured: Box::new(self.checkpoint.clone()),
+                });
+            }
+            if recorded != *self {
+                return Err(CheckpointError::ProvenanceEvidenceMismatch);
+            }
+            return Ok(());
         }
         fs::create_dir_all(directory)?;
         let contents = toml::to_string(&ProvenanceWire::encode(self))
             .map_err(|error| CheckpointError::InvalidManifest(error.to_string()))?;
-        fs::write(directory.join(PROVENANCE_FILE), contents)?;
+        let path = directory.join(PROVENANCE_FILE);
+        let mut file = fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        fs::File::open(directory)?.sync_all()?;
         Ok(())
     }
 }
@@ -309,10 +332,21 @@ struct AttestationWire {
 struct ProvenanceWire {
     checkpoint: ManifestWire,
     attestation: Option<AttestationWire>,
+    #[serde(default)]
+    bundle: Option<BundleReceiptWire>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct BundleReceiptWire {
+    content_root: String,
+    bitcoin_height: u64,
+    bitcoin_block_hash: String,
+    builders: Vec<String>,
 }
 
 impl ProvenanceWire {
     fn decode(self) -> Result<CheckpointProvenance, CheckpointError> {
+        let checkpoint = self.checkpoint.decode()?;
         let attestation = self
             .attestation
             .map(|wire| {
@@ -323,9 +357,33 @@ impl ProvenanceWire {
                 })
             })
             .transpose()?;
+        let bundle = self
+            .bundle
+            .map(|wire| {
+                if wire.bitcoin_height != checkpoint.first_bitcoin_height {
+                    return Err(CheckpointError::InvalidManifest(
+                        "bundle receipt Bitcoin height differs from checkpoint".to_owned(),
+                    ));
+                }
+                if wire.builders.is_empty()
+                    || wire.builders.windows(2).any(|pair| pair[0] >= pair[1])
+                {
+                    return Err(CheckpointError::InvalidManifest(
+                        "bundle builders are empty, duplicated or unsorted".to_owned(),
+                    ));
+                }
+                Ok(CheckpointBundleReceipt {
+                    content_root: parse_hex(&wire.content_root)?,
+                    bitcoin_height: wire.bitcoin_height,
+                    bitcoin_block_hash: parse_hex(&wire.bitcoin_block_hash)?,
+                    builders: wire.builders,
+                })
+            })
+            .transpose()?;
         Ok(CheckpointProvenance {
-            checkpoint: self.checkpoint.decode()?,
+            checkpoint,
             attestation,
+            bundle,
         })
     }
 
@@ -337,6 +395,12 @@ impl ProvenanceWire {
                 signer_weight: attestation.signer_weight,
                 approval_threshold: attestation.approval_threshold,
             }),
+            bundle: provenance.bundle.as_ref().map(|bundle| BundleReceiptWire {
+                content_root: hex::encode(bundle.content_root),
+                bitcoin_height: bundle.bitcoin_height,
+                bitcoin_block_hash: hex::encode(bundle.bitcoin_block_hash),
+                builders: bundle.builders.clone(),
+            }),
         }
     }
 }
@@ -347,7 +411,7 @@ mod tests {
 
     use nano_consensus_profile::Fingerprint;
 
-    use super::CheckpointManifest;
+    use super::{CheckpointBundleReceipt, CheckpointManifest, CheckpointProvenance};
     use crate::{CheckpointError, TrieHash};
 
     fn fingerprint(byte: u8) -> Fingerprint {
@@ -379,5 +443,42 @@ mod tests {
             manifest(Some(fingerprint(4))).check_profile(active),
             Err(CheckpointError::ProfileMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn signed_bundle_evidence_survives_a_restart() {
+        let directory = tempfile::tempdir().expect("state directory");
+        let provenance = CheckpointProvenance {
+            checkpoint: manifest(Some(fingerprint(3))),
+            attestation: None,
+            bundle: Some(CheckpointBundleReceipt {
+                content_root: [4; 32],
+                bitcoin_height: 3,
+                bitcoin_block_hash: [6; 32],
+                builders: vec!["archive-east".to_owned(), "archive-west".to_owned()],
+            }),
+        };
+
+        provenance
+            .record(directory.path())
+            .expect("record evidence");
+        assert_eq!(
+            CheckpointProvenance::load(directory.path()).expect("load evidence"),
+            Some(provenance.clone())
+        );
+        provenance
+            .record(directory.path())
+            .expect("recording identical evidence is idempotent");
+
+        let mut changed = provenance.clone();
+        changed.bundle.as_mut().expect("bundle").content_root[0] ^= 1;
+        assert!(matches!(
+            changed.record(directory.path()),
+            Err(CheckpointError::ProvenanceEvidenceMismatch)
+        ));
+        assert_eq!(
+            CheckpointProvenance::load(directory.path()).expect("reload evidence"),
+            Some(provenance)
+        );
     }
 }

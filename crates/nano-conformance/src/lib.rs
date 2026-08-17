@@ -3206,6 +3206,7 @@ mod tests {
                 signer_weight: 7,
                 approval_threshold: 7,
             }),
+            bundle: None,
         };
         provenance.record(&directory).expect("record provenance");
 
@@ -3222,6 +3223,7 @@ mod tests {
                 nano_marf::CheckpointProvenance {
                     checkpoint: other,
                     attestation: None,
+                    bundle: None,
                 }
                 .record(&directory),
                 Err(nano_marf::CheckpointError::ProvenanceMismatch { .. })

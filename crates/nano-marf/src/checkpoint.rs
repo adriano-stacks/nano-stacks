@@ -45,6 +45,7 @@ pub enum CheckpointError {
         recorded: Box<CheckpointManifest>,
         configured: Box<CheckpointManifest>,
     },
+    ProvenanceEvidenceMismatch,
     MissingProfileFingerprint,
     ProfileMismatch {
         declared: nano_consensus_profile::Fingerprint,
@@ -96,6 +97,8 @@ impl std::fmt::Display for CheckpointError {
                 configured.state_index_root,
                 configured.stacks_height
             ),
+            Self::ProvenanceEvidenceMismatch => formatter
+                .write_str("state directory already carries different checkpoint trust evidence"),
             Self::MissingProfileFingerprint => formatter.write_str(
                 "checkpoint names no executable consensus profile; mainnet import is refused",
             ),
@@ -137,6 +140,7 @@ impl std::error::Error for CheckpointError {
             | Self::RootMismatch { .. }
             | Self::DeclaredRootMismatch { .. }
             | Self::ProvenanceMismatch { .. }
+            | Self::ProvenanceEvidenceMismatch
             | Self::MissingProfileFingerprint
             | Self::ProfileMismatch { .. }
             | Self::UnfinishedImport { .. }

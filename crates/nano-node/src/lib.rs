@@ -17,7 +17,9 @@ use nano_chainstate::{
     AppliedBlock, AuthenticatedBlock, BitcoinBlockContext, ChainState, ChainStateError,
     NakamotoBlock, NakamotoBlockHeader, SignerSet, SignerSetError, SignerWeights, TenureAccounting,
 };
-pub use nano_marf::{CheckpointAttestation, CheckpointManifest, CheckpointProvenance};
+pub use nano_marf::{
+    CheckpointAttestation, CheckpointBundleReceipt, CheckpointManifest, CheckpointProvenance,
+};
 use nano_miner::{BitcoinTenureView, ParentTenure, TenureTip};
 use nano_primitives::{Network, StacksBlockId, TrieHash};
 use nano_sync::{PoxInfo, SyncClient, SyncError, TenureSource};
@@ -928,10 +930,32 @@ pub fn adopt_checkpoint(
     header: &NakamotoBlockHeader,
     signers: &SignerSet,
 ) -> Result<CheckpointAttestation, CheckpointTrustError> {
+    record_checkpoint(state_directory, manifest, header, signers, None)
+}
+
+/// Attest a signed bundle and persist the content-root receipt for bounded restarts.
+pub fn adopt_checkpoint_bundle(
+    state_directory: impl AsRef<Path>,
+    manifest: &CheckpointManifest,
+    header: &NakamotoBlockHeader,
+    signers: &SignerSet,
+    bundle: CheckpointBundleReceipt,
+) -> Result<CheckpointAttestation, CheckpointTrustError> {
+    record_checkpoint(state_directory, manifest, header, signers, Some(bundle))
+}
+
+fn record_checkpoint(
+    state_directory: impl AsRef<Path>,
+    manifest: &CheckpointManifest,
+    header: &NakamotoBlockHeader,
+    signers: &SignerSet,
+    bundle: Option<CheckpointBundleReceipt>,
+) -> Result<CheckpointAttestation, CheckpointTrustError> {
     let attestation = attest_checkpoint(manifest, header, signers)?;
     CheckpointProvenance {
         checkpoint: manifest.clone(),
         attestation: Some(attestation),
+        bundle,
     }
     .record(state_directory)?;
     Ok(attestation)

@@ -2660,11 +2660,10 @@ impl MarfStore {
         // question is whether the import that put it there ran to the end.
         UnfinishedImport::refuse(directory)?;
         let checkpoint = checkpoint.as_ref();
-        let profile = checkpoint_profile(network, checkpoint)?;
-        if VersionedMarf::open(directory.join(MARF_FILE))?
-            .tip()?
-            .is_none()
-        {
+        let marf_path = directory.join(MARF_FILE);
+        let has_state = marf_path.exists() && VersionedMarf::open(&marf_path)?.tip()?.is_some();
+        if !has_state {
+            let profile = checkpoint_profile(network, checkpoint)?;
             import(directory, checkpoint, source, expected_root, profile)?;
         }
         // Reopened rather than continued on the import's own connections. Those
@@ -7044,6 +7043,27 @@ mod tests {
             Vm::open(Network::MAINNET, directory.path()),
             Err(MarfStoreError::WrongProfile { .. })
         ));
+    }
+
+    #[test]
+    fn an_existing_mainnet_state_does_not_reopen_discarded_checkpoint_bytes() {
+        let directory = tempfile::tempdir().expect("state directory");
+        let block = [7; 32];
+        let mut vm = Vm::open(Network::MAINNET, directory.path()).expect("create state");
+        vm.begin_block(None, block).expect("begin block");
+        vm.seal_block().expect("seal block");
+        drop(vm);
+
+        drop(
+            Vm::open_from_checkpoint(
+                Network::MAINNET,
+                directory.path(),
+                directory.path().join("discarded-checkpoint.sqlite"),
+                [8; 32],
+                TrieHash::from_bytes([9; 32]),
+            )
+            .expect("restart from durable state without checkpoint bytes"),
+        );
     }
 
     #[test]

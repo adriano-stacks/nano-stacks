@@ -32,7 +32,7 @@ claims.
       manifests.
 - [ ] Have independent builders sign the manifest and publish signatures in an
       append-only location with documented key rotation and revocation.
-- [ ] Package ready-to-import bundles and an offline verifier. Import must remain
+- [x] Package ready-to-import bundles and an offline verifier. Import must remain
       restart-safe and reject truncation, substitution, extra files and partial
       manifests before touching production state.
 - [ ] Rebuild a sample checkpoint from its published inputs in CI or scheduled

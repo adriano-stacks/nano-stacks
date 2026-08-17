@@ -32,9 +32,12 @@ use nano_sync::{Node, PeerPool, PoxInfo, SyncClient, SyncError, TenureSource};
 use tokio::{net::TcpListener, signal::unix::SignalKind, sync::Mutex, task::JoinSet, time::sleep};
 
 use crate::{
-    CatchUpBudget, CatchUpRound, CheckpointExecutor, CheckpointManifest, CheckpointProvenance,
+    CatchUpBudget, CatchUpRound, CheckpointBundleReceipt, CheckpointExecutor, CheckpointManifest,
+    CheckpointProvenance,
     checkpoint_bundle::{CHECKPOINT_REWARD_SET_FILE, attesting_reward_set},
-    checkpoint_signatures::{BuilderPolicy, verify_signed_checkpoint_bundle},
+    checkpoint_signatures::{
+        BuilderPolicy, verify_builder_signatures, verify_signed_checkpoint_bundle,
+    },
     config::Config,
     miner, signer,
     sortition::SortitionTracker,
@@ -2909,7 +2912,7 @@ fn adopt(config: &Config, directory: &Path, source: [u8; 32]) -> Result<(), Box<
             "a mainnet checkpoint needs a signed bundle before production state is opened".into(),
         );
     }
-    adopt_attested(config, directory, source)
+    adopt_attested(config, directory, source, None)
 }
 
 fn adopt_signed<S: nano_bitcoin::BitcoinSource>(
@@ -2924,6 +2927,43 @@ fn adopt_signed<S: nano_bitcoin::BitcoinSource>(
 where
     S::Error: std::fmt::Display,
 {
+    if let Some(recorded) = CheckpointProvenance::load(directory)? {
+        already_adopted(recorded.checkpoint.source_state_id, source)?;
+        if config.network().is_some_and(Network::is_mainnet) {
+            recorded
+                .checkpoint
+                .check_profile(nano_vm::compatibility_profile_fingerprint())?;
+        }
+        let receipt = recorded.bundle.as_ref().ok_or(
+            "the existing state predates signed checkpoint provenance and must be re-imported",
+        )?;
+        let canonical = bitcoin
+            .block_hash_at(receipt.bitcoin_height)
+            .map_err(|error| format!("local Bitcoin header lookup failed: {error}"))?;
+        if canonical != receipt.bitcoin_block_hash {
+            return Err(format!(
+                "checkpoint Bitcoin block {} at height {} is no longer locally canonical ({})",
+                hex::encode(receipt.bitcoin_block_hash),
+                receipt.bitcoin_height,
+                hex::encode(canonical)
+            )
+            .into());
+        }
+        verify_external_signing_evidence(policy, signatures)?;
+        let policy = BuilderPolicy::load(policy)?;
+        let builders = verify_builder_signatures(
+            &hex::encode(receipt.content_root),
+            recorded.checkpoint.stacks_height,
+            &policy,
+            signatures,
+        )?;
+        println!(
+            "checkpoint bundle {} reauthenticated by {} from persisted provenance",
+            builders.content_root,
+            builders.names.join(", ")
+        );
+        return Ok(());
+    }
     verify_external_checkpoint_evidence(bundle, policy, signatures)?;
     let policy = BuilderPolicy::load(policy)?;
     let builders = verify_signed_checkpoint_bundle(bundle, bitcoin, &policy, signatures)?;
@@ -2933,7 +2973,24 @@ where
         builders.content_root,
         builders.names.join(", ")
     );
-    adopt_attested(config, directory, source)
+    let manifest = nano_marf::CheckpointBundleManifest::load(bundle)?;
+    let receipt = CheckpointBundleReceipt {
+        content_root: decode_checkpoint_digest(builders.content_root.as_str(), "content root")?,
+        bitcoin_height: manifest.checkpoint.bitcoin_height,
+        bitcoin_block_hash: decode_checkpoint_digest(
+            &manifest.checkpoint.bitcoin_block_hash,
+            "Bitcoin block hash",
+        )?,
+        builders: builders.names,
+    };
+    adopt_attested(config, directory, source, Some(receipt))
+}
+
+fn decode_checkpoint_digest(value: &str, name: &str) -> Result<[u8; 32], Box<dyn Error>> {
+    let bytes = hex::decode(value)?;
+    bytes
+        .try_into()
+        .map_err(|_| format!("checkpoint {name} is not 32 bytes").into())
 }
 
 fn verify_external_checkpoint_evidence(
@@ -2945,10 +3002,7 @@ fn verify_external_checkpoint_evidence(
     if !bundle_metadata.file_type().is_dir() || bundle_metadata.file_type().is_symlink() {
         return Err(format!("{} is not a checkpoint bundle directory", bundle.display()).into());
     }
-    let policy_metadata = fs::symlink_metadata(policy)?;
-    if !policy_metadata.file_type().is_file() || policy_metadata.file_type().is_symlink() {
-        return Err(format!("{} is not a regular builder policy", policy.display()).into());
-    }
+    verify_external_signing_evidence(policy, signatures)?;
     let bundle = fs::canonicalize(bundle)?;
     for (name, path) in [
         ("builder policy", policy),
@@ -2961,6 +3015,25 @@ fn verify_external_checkpoint_evidence(
             )
             .into());
         }
+    }
+    Ok(())
+}
+
+fn verify_external_signing_evidence(
+    policy: &Path,
+    signatures: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let policy_metadata = fs::symlink_metadata(policy)?;
+    if !policy_metadata.file_type().is_file() || policy_metadata.file_type().is_symlink() {
+        return Err(format!("{} is not a regular builder policy", policy.display()).into());
+    }
+    let signatures_metadata = fs::symlink_metadata(signatures)?;
+    if !signatures_metadata.file_type().is_dir() || signatures_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{} is not a builder signature directory",
+            signatures.display()
+        )
+        .into());
     }
     Ok(())
 }
@@ -3056,6 +3129,7 @@ fn adopt_attested(
     config: &Config,
     directory: &Path,
     source: [u8; 32],
+    bundle: Option<CheckpointBundleReceipt>,
 ) -> Result<(), Box<dyn Error>> {
     let manifest = CheckpointManifest::load(
         config
@@ -3095,7 +3169,11 @@ fn adopt_attested(
     };
     let block = NakamotoBlock::decode(&fs::read(block)?)?;
     let signers = attesting_reward_set(&fs::read(reward_set)?)?;
-    let attestation = crate::adopt_checkpoint(directory, &manifest, &block.header, &signers)?;
+    let attestation = if let Some(bundle) = bundle {
+        crate::adopt_checkpoint_bundle(directory, &manifest, &block.header, &signers, bundle)?
+    } else {
+        crate::adopt_checkpoint(directory, &manifest, &block.header, &signers)?
+    };
     println!(
         "checkpoint {} attested by {} of {} signer weight",
         hex::encode(manifest.source_state_id),
@@ -5268,6 +5346,58 @@ attesting_reward_set = "{}"
         .expect("signed checkpoint config")
     }
 
+    fn assert_bounded_signed_restart(
+        config: &crate::config::Config,
+        state: &Path,
+        source: [u8; 32],
+        bitcoin: &TestBitcoin,
+        bundle: &Path,
+        policy: &Path,
+        signatures: &Path,
+    ) {
+        let provenance = crate::CheckpointProvenance::load(state)
+            .expect("provenance")
+            .expect("recorded provenance");
+        let receipt = provenance.bundle.expect("signed bundle receipt");
+        let bundle_manifest =
+            nano_marf::CheckpointBundleManifest::load(bundle).expect("bundle manifest");
+        assert_eq!(
+            hex::encode(receipt.content_root),
+            bundle_manifest.content_root()
+        );
+        assert_eq!(receipt.bitcoin_height, 11);
+        assert_eq!(receipt.bitcoin_block_hash, [6; 32]);
+        assert_eq!(
+            receipt.builders,
+            ["archive-east".to_owned(), "archive-west".to_owned()]
+        );
+
+        fs::remove_file(bundle.join("marf.sqlite")).expect("discard imported MARF");
+        super::adopt_signed(config, state, source, bitcoin, bundle, policy, signatures)
+            .expect("restart from persisted receipt without the payload");
+
+        let error = super::adopt_signed(
+            config,
+            state,
+            source,
+            &TestBitcoin(11, [7; 32]),
+            bundle,
+            policy,
+            signatures,
+        )
+        .expect_err("a changed local Bitcoin view is refused on restart");
+        assert!(error.to_string().contains("no longer locally canonical"));
+
+        fs::remove_file(signatures.join("archive-west.toml"))
+            .expect("remove one external signature");
+        let error = super::adopt_signed(config, state, source, bitcoin, bundle, policy, signatures)
+            .expect_err("the persisted root still needs the external threshold");
+        assert!(
+            error.to_string().contains("do not reach threshold"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn a_signed_bundle_is_refused_before_production_state_is_touched() {
         let (bundle, builders) = checkpoint_fixture(true);
@@ -5330,10 +5460,14 @@ attesting_reward_set = "{}"
             &signatures,
         )
         .expect("signed checkpoint preflight");
-        assert!(
-            crate::CheckpointProvenance::load(&accepted_state)
-                .expect("provenance")
-                .is_some()
+        assert_bounded_signed_restart(
+            &config,
+            &accepted_state,
+            manifest.source_state_id,
+            &bitcoin,
+            bundle.path(),
+            &policy_path,
+            &signatures,
         );
     }
 

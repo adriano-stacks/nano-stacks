@@ -191,6 +191,7 @@ fn the_checkpoint_procedure_names_the_fields_the_node_writes() {
             signer_weight: 12,
             approval_threshold: 9,
         }),
+        bundle: None,
     };
     // Written through the real `record`, so the keys compared are the ones a node
     // puts on disk rather than the ones a test thought it would. In a fresh

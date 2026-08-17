@@ -267,8 +267,31 @@ where
     S::Error: Display,
 {
     let manifest = verify_checkpoint_bundle(bundle, bitcoin)?;
+    verify_builder_signatures(
+        manifest.content_root(),
+        manifest.checkpoint.checkpoint_stacks_height,
+        policy,
+        signatures,
+    )
+}
+
+/// Verify signatures over an already authenticated content root.
+///
+/// This is the bounded restart path: first import persisted the root after
+/// hashing every payload byte, so a restart only rechecks external policy and
+/// signatures rather than reading the discarded import source again.
+///
+/// # Errors
+///
+/// Returns an error for an invalid policy, inactive or unknown builder,
+/// malformed signature, changed content root, or unmet threshold.
+pub fn verify_builder_signatures(
+    content_root: &str,
+    height: u64,
+    policy: &BuilderPolicy,
+    signatures: impl AsRef<Path>,
+) -> Result<VerifiedBuilders, BuilderSignatureError> {
     policy.validate()?;
-    let height = manifest.checkpoint.checkpoint_stacks_height;
     let active = policy.active_builders(height);
     if active < policy.required_signatures {
         return Err(BuilderSignatureError::Invalid(format!(
@@ -277,12 +300,12 @@ where
         )));
     }
     let entries = signature_files(signatures.as_ref())?;
-    let digest = signature_digest(manifest.content_root())?;
+    let digest = signature_digest(content_root)?;
     let mut names = Vec::new();
     for path in entries {
         let statement: BuilderSignature = toml::from_str(&fs::read_to_string(&path)?)
             .map_err(|error| BuilderSignatureError::Invalid(error.to_string()))?;
-        statement.validate(manifest.content_root(), &path)?;
+        statement.validate(content_root, &path)?;
         let key = policy.active_key(&statement.builder, height)?;
         let signature = parse_signature(&statement.signature)?;
         key.verify_transaction(&digest, &signature)?;
@@ -297,7 +320,7 @@ where
         )));
     }
     Ok(VerifiedBuilders {
-        content_root: manifest.content_root().to_owned(),
+        content_root: content_root.to_owned(),
         names,
     })
 }
