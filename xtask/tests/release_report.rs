@@ -457,6 +457,10 @@ fn no_gates_is_non_qualifying_and_names_every_unexecuted_owner() {
         "the report omitted its required semantic engine comparison:\n{stdout}"
     );
     assert!(
+        stdout.contains("adversarial job continuous-fuzz in fuzz.yml (owner task 137)"),
+        "the report omitted an unexecuted adversarial job or its owner:\n{stdout}"
+    );
+    assert!(
         stdout.contains(
             "UNEXECUTED nano epoch4_profile::every_mandatory_epoch4_vector_executes_against_nano"
         ) && stdout.contains("UNEXECUTED stock revision efc34a07a225c4b950ab9404a1652aa5e14affaf")

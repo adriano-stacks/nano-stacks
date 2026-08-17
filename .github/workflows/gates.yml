@@ -21,6 +21,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  actions: read
+  contents: read
+
 jobs:
   gates:
     runs-on: ubuntu-latest
@@ -110,6 +114,8 @@ jobs:
         run: test -n "${NANO_RELEASE_ENV:-}" && test -r "$NANO_RELEASE_ENV"
 
       - name: capture-backed release report
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -a
           # shellcheck source=/dev/null
@@ -148,6 +154,8 @@ jobs:
           qualification_tmp=$(mktemp -d "$NANO_RELEASE_TMP/.qualification.XXXXXX")
           scratch_dirs+=("$qualification_tmp")
           export TMPDIR="$qualification_tmp"
+          export NANO_ADVERSARIAL_RUNS="$qualification_tmp/adversarial-runs.json"
+          nix develop --command scripts/adversarial-status.sh > "$NANO_ADVERSARIAL_RUNS"
 
           fresh_reflink() {
             id=$1

@@ -21,6 +21,7 @@ use nano_chainstate::{
 use nano_primitives::Network;
 use serde_json::json;
 
+mod adversarial_runs;
 mod release_advisory;
 mod release_artifact;
 mod release_candidate;
@@ -31,6 +32,8 @@ use release_candidate::{
     CandidateVerification, verify_prepared_candidate, verify_qualification_inputs,
 };
 use release_inventory::ReleaseInventory;
+
+use adversarial_runs::AdversarialInventory;
 
 /// The chain a state directory on disk belongs to.
 ///
@@ -6935,6 +6938,57 @@ fn report_release_inventory(inventory: &ReleaseInventory, run_gates: bool) -> bo
     required > 0 && inventory.errors.is_empty()
 }
 
+fn report_adversarial_jobs(source_revision: &str, run_gates: bool) -> bool {
+    println!("\nadversarial job history");
+    let inventory = AdversarialInventory::load(&workspace_root());
+    println!(
+        "  {} mandatory jobs are owned in adversarial-jobs.json.",
+        inventory.jobs.len()
+    );
+    for error in &inventory.errors {
+        println!("  FAIL: {error}");
+    }
+    if !run_gates {
+        println!("  UNEXECUTED: --no-gates collected no hosted run history.");
+        for job in &inventory.jobs {
+            println!(
+                "    adversarial job {} in {} (owner task {})",
+                job.id, job.workflow, job.owner
+            );
+        }
+        return !inventory.jobs.is_empty() && inventory.errors.is_empty();
+    }
+    let Some(path) = env::var_os("NANO_ADVERSARIAL_RUNS").map(PathBuf::from) else {
+        println!("  FAIL: NANO_ADVERSARIAL_RUNS names no collected workflow history");
+        return false;
+    };
+    let evidence = inventory.evaluate(&path, source_revision);
+    for job in &inventory.jobs {
+        let Some(run) = evidence.runs.get(&job.id) else {
+            println!("  {:<24} MISSING", job.id);
+            continue;
+        };
+        match &run.latest {
+            Some(latest) => println!(
+                "  {:<24} latest {} / {} at run {} ({})",
+                job.id, latest.status, latest.conclusion, latest.id, latest.completed_at
+            ),
+            None => println!("  {:<24} latest MISSING", job.id),
+        }
+        match &run.last_success {
+            Some(success) => println!(
+                "    last successful run {} at {} for {}\n    {}",
+                success.id, success.completed_at, success.head_sha, success.url
+            ),
+            None => println!("    last successful run MISSING"),
+        }
+    }
+    for error in &evidence.errors {
+        println!("  FAIL: {error}");
+    }
+    !inventory.jobs.is_empty() && inventory.errors.is_empty() && evidence.errors.is_empty()
+}
+
 /// Run the three gates tasks/053 names and report what each said.
 fn report_gates(capture: Option<&str>, state: Option<&Path>, inventory: &ReleaseInventory) -> bool {
     println!("\ngates");
@@ -7216,6 +7270,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
     let compatibility_vectors = report_compatibility_vectors(options.run_gates);
     report_inputs();
     let release_inventory = report_release_inventory(&inventory, options.run_gates);
+    let adversarial_jobs = report_adversarial_jobs(&source_revision, options.run_gates);
 
     let passed = if options.run_gates {
         report_gates(
@@ -7243,6 +7298,7 @@ fn release_report(arguments: &[String]) -> ExitCode {
         && receipt_binding
         && historical_epoch_evidence
         && release_inventory
+        && adversarial_jobs
         && source_frozen
         && candidate_frozen;
     release_verdict(options.run_gates, evidence, passed, blocking)

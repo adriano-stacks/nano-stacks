@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "jobs": [
+    { "id": "bounded-adversarial", "workflow": "gates.yml", "owner": "137" },
+    { "id": "continuous-fuzz", "workflow": "fuzz.yml", "owner": "137" },
+    { "id": "runtime-sanitizers", "workflow": "sanitizers.yml", "owner": "137" },
+    { "id": "cross-architecture", "workflow": "cross-architecture.yml", "owner": "137" },
+    { "id": "decision-mutations", "workflow": "mutations.yml", "owner": "137" }
+  ]
+}

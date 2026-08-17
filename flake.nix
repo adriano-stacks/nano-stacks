@@ -53,6 +53,7 @@
               pkgs.cargo-mutants
               pkgs.clippy
               pkgs.curl
+              pkgs.gh
               fiu
               pkgs.jq
               pkgs.minisign
