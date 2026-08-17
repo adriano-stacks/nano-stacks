@@ -9,11 +9,22 @@
   # worth nothing if a clean checkout picks a different one. The lock file is tracked
   # now and this is the revision it holds.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/b7c2ada94fe99c15b0dbcf4d11fd7850b957a436";
+  inputs.fenix = {
+    url = "github:nix-community/fenix";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
-  outputs = { self, nixpkgs, ... }:
+  outputs = { self, fenix, nixpkgs, ... }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forEachSystem = nixpkgs.lib.genAttrs systems;
+      shellHook = ''
+        export TMPDIR="''${TMPDIR_OVERRIDE:-$HOME/.cache/nano-stacks/tmp}"
+        mkdir -p "$TMPDIR"
+        if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          git config --local core.hooksPath .githooks
+        fi
+      '';
     in rec {
       devShells = forEachSystem (system:
         let pkgs = nixpkgs.legacyPackages.${system};
@@ -52,13 +63,25 @@
             #
             # Pointing `TMPDIR` at the 2 TB disk breaks the cycle: the leak still
             # happens on a kill, and it costs disk instead of the machine.
-            shellHook = ''
-              export TMPDIR="''${TMPDIR_OVERRIDE:-$HOME/.cache/nano-stacks/tmp}"
-              mkdir -p "$TMPDIR"
-              if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-                git config --local core.hooksPath .githooks
-              fi
-            '';
+            inherit shellHook;
+          };
+
+          sanitizers = pkgs.mkShell {
+            packages = [
+              (fenix.packages.${system}.latest.withComponents [
+                "cargo"
+                "miri"
+                "rust-src"
+                "rustc"
+                "rust-std"
+              ])
+              pkgs.clang
+              pkgs.llvmPackages.compiler-rt
+              pkgs.openssl
+              pkgs.pkg-config
+              pkgs.sqlite
+            ];
+            inherit shellHook;
           };
         });
 

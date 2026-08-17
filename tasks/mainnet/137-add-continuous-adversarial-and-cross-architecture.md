@@ -28,7 +28,7 @@ every finding as a deterministic regression.
       stacks-core implementations and persist minimized corpora in CI.
 - [ ] Run a bounded deterministic fuzz corpus on every change and continuous
       long-running fuzzers with crash artifact retention and ownership.
-- [ ] Add Miri where applicable plus address, undefined-behavior and thread
+- [x] Add Miri where applicable plus address, undefined-behavior and thread
       sanitizer jobs for the unsafe cache boundary, FFI/dependencies and
       concurrent adapters.
 - [ ] Inject `ENOSPC`, `EIO`, short reads/writes, read-only filesystems, corrupt

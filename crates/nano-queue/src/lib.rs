@@ -454,7 +454,7 @@ fn lock(accounting: &Mutex<Accounting>) -> MutexGuard<'_, Accounting> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{thread, time::Duration};
 
     use super::{Buffer, Limits, ReserveError, channel};
 
@@ -560,5 +560,42 @@ mod tests {
         assert_eq!(sender.status().bytes, 0);
         assert_eq!(sender.try_reserve(1).err(), Some(ReserveError::Closed));
         assert_eq!(sender.status().dropped, 1);
+    }
+
+    #[test]
+    fn cloned_producers_share_exact_capacity_across_threads() {
+        const PRODUCERS: usize = 4;
+        const ITEMS_PER_PRODUCER: usize = 64;
+        const TOTAL_ITEMS: usize = PRODUCERS * ITEMS_PER_PRODUCER;
+
+        let (sender, mut receiver) = channel(Limits::new(TOTAL_ITEMS, TOTAL_ITEMS));
+        thread::scope(|scope| {
+            for producer in 0..PRODUCERS {
+                let sender = sender.clone();
+                scope.spawn(move || {
+                    for item in 0..ITEMS_PER_PRODUCER {
+                        sender
+                            .try_send((producer, item), 1)
+                            .expect("the exact shared capacity admits every item");
+                    }
+                });
+            }
+        });
+
+        assert_eq!(sender.status().items, TOTAL_ITEMS);
+        assert_eq!(sender.status().bytes, TOTAL_ITEMS);
+        assert_eq!(sender.status().dropped, 0);
+
+        let mut drained = Vec::with_capacity(TOTAL_ITEMS);
+        while let Ok(value) = receiver.try_recv() {
+            drained.push(value);
+        }
+        drained.sort_unstable();
+        let expected = (0..PRODUCERS)
+            .flat_map(|producer| (0..ITEMS_PER_PRODUCER).map(move |item| (producer, item)))
+            .collect::<Vec<_>>();
+        assert_eq!(drained, expected);
+        assert_eq!(sender.status().items, 0);
+        assert_eq!(sender.status().bytes, 0);
     }
 }

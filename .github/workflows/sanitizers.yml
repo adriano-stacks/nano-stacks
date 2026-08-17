@@ -1,0 +1,38 @@
+name: runtime sanitizer debugging
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sanitizer:
+    name: ${{ matrix.mode }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [miri, address, undefined, thread]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sanitizer-${{ matrix.mode }}
+          workspaces: . -> target/sanitizers/${{ matrix.mode }}
+
+      - name: ${{ matrix.mode }} runtime checks
+        run: nix develop .#sanitizers --command scripts/sanitizers.sh "${{ matrix.mode }}"
