@@ -52,6 +52,15 @@
     "/metrics"
   ],
   "public_surfaces": [],
+  "commands": [
+    "build-identity",
+    "check-config",
+    "compatibility-profile",
+    "config-schema",
+    "help",
+    "start",
+    "surface-inventory"
+  ],
   "forbidden_internal_packages": [
     "nano-conformance",
     "nano-mempool",
@@ -81,6 +90,15 @@
     "/v3/blocks/upload",
     "/v3/stacker_set",
     "/v3/stackerdb"
+  ],
+  "forbidden_engine_symbol_fragments": [
+    "clar2wasm::tools::",
+    "execute_contract_call_outcome_with_interpreter",
+    "interpret_contract_call",
+    "nano_oracle::"
+  ],
+  "required_engine_symbol_fragments": [
+    "nano_vm::wasm_outcome"
   ],
   "measurement_decisions": [
     "inbound_p2p_serving",

@@ -46,6 +46,9 @@ jobs:
       - name: clippy, release profile, every target
         run: nix develop --command scripts/ci.sh clippy
 
+      - name: follower dependency, route and binary inspection
+        run: nix develop --command scripts/ci.sh follower-artifact
+
       - name: the bounded fixture replay, as a gate
         run: nix develop --command scripts/ci.sh scoreboard
 

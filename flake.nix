@@ -79,6 +79,7 @@
             doCheck = false;
 
             nativeBuildInputs = [
+              pkgs.binutils
               pkgs.cargo-cyclonedx
               pkgs.jq
               pkgs.pkg-config
@@ -187,6 +188,13 @@
                 > "$out/share/nano-stacks-follower/build-identity.json"
               "$out/bin/stacks-follower" compatibility-profile \
                 > "$out/share/nano-stacks-follower/compatibility-profile.json"
+              "$out/bin/stacks-follower" surface-inventory \
+                > "$out/share/nano-stacks-follower/surface-inventory.json"
+            '';
+
+            postFixup = ''
+              bash scripts/check-follower-artifact.sh "$out" \
+                > "$out/share/nano-stacks-follower/inspection.json"
             '';
           };
 

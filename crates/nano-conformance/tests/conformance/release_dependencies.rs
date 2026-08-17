@@ -103,11 +103,45 @@ fn the_follower_policy_is_a_closed_minimal_capability_matrix() {
         string_set(&policy, "loopback_surfaces"),
         ["/health", "/metrics"].into_iter().collect()
     );
+    assert_eq!(
+        string_set(&policy, "loopback_surfaces"),
+        nano_node::observation::LOOPBACK_ROUTES
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        string_set(&policy, "public_surfaces"),
+        nano_node::observation::PUBLIC_ROUTES.into_iter().collect()
+    );
     assert!(
         policy["public_surfaces"]
             .as_array()
             .is_some_and(Vec::is_empty),
         "the first follower artifact must expose no public HTTP route"
+    );
+    assert_eq!(
+        string_set(&policy, "commands"),
+        [
+            "build-identity",
+            "check-config",
+            "compatibility-profile",
+            "config-schema",
+            "help",
+            "start",
+            "surface-inventory",
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(
+        policy["forbidden_engine_symbol_fragments"]
+            .as_array()
+            .is_some_and(|symbols| !symbols.is_empty())
+    );
+    assert!(
+        policy["required_engine_symbol_fragments"]
+            .as_array()
+            .is_some_and(|symbols| !symbols.is_empty())
     );
 }
 

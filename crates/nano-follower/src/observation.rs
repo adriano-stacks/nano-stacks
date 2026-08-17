@@ -10,6 +10,12 @@ use tokio::{
 
 const MAX_REQUEST_BYTES: usize = 1_024;
 
+/// Every HTTP route served by the follower artifact.
+pub const LOOPBACK_ROUTES: [&str; 2] = ["/health", "/metrics"];
+
+/// The follower artifact deliberately has no public HTTP surface.
+pub const PUBLIC_ROUTES: [&str; 0] = [];
+
 /// What an operator can observe without gaining a chainstate capability.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Snapshot {
@@ -63,8 +69,8 @@ enum Route {
 impl Route {
     const fn path(self) -> &'static str {
         match self {
-            Self::Health => "/health",
-            Self::Metrics => "/metrics",
+            Self::Health => LOOPBACK_ROUTES[0],
+            Self::Metrics => LOOPBACK_ROUTES[1],
         }
     }
 }

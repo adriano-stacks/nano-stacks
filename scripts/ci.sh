@@ -65,6 +65,18 @@ run_gate() {
         an_artifact_from_another_revision_is_an_audit_failure -- --exact
       cargo test --profile ci -p xtask --bin xtask release_candidate::tests -- --nocapture
       ;;
+    follower-artifact)
+      artifact=$(nix build .#stacks-follower --no-link --print-out-paths)
+      inspection_dir=$(mktemp -d "${TMPDIR:-/tmp}/follower-inspection.XXXXXX")
+      trap 'rm -rf -- "$inspection_dir"' RETURN
+      scripts/check-follower-artifact.sh "$artifact" >"$inspection_dir/actual.json"
+      jq -S . "$inspection_dir/actual.json" >"$inspection_dir/actual.sorted.json"
+      jq -S . "$artifact/share/nano-stacks-follower/inspection.json" \
+        >"$inspection_dir/installed.sorted.json"
+      cmp "$inspection_dir/actual.sorted.json" "$inspection_dir/installed.sorted.json"
+      rm -rf -- "$inspection_dir"
+      trap - RETURN
+      ;;
     reproducible-release)
       scripts/reproducible-release.sh
       ;;
@@ -80,7 +92,7 @@ run_gate() {
 
 case "$gate" in
   all)
-    for name in toolchain workflow formatting clippy scoreboard fixtures checkpoint-sample tests release release-integrity locks; do
+    for name in toolchain workflow formatting clippy follower-artifact scoreboard fixtures checkpoint-sample tests release release-integrity locks; do
       run_gate "$name"
     done
     ;;

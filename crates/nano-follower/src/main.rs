@@ -2,8 +2,13 @@
 
 use std::{error::Error, path::PathBuf, process::ExitCode};
 
-use clap::{Parser, Subcommand};
-use nano_follower::{BUILD_TARGET, RUSTC_VERSION, SOURCE_REVISION, config::Config, runtime};
+use clap::{CommandFactory as _, Parser, Subcommand};
+use nano_follower::{
+    BUILD_TARGET, RUSTC_VERSION, SOURCE_REVISION,
+    config::Config,
+    observation::{LOOPBACK_ROUTES, PUBLIC_ROUTES},
+    runtime,
+};
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +38,8 @@ enum Command {
     BuildIdentity,
     /// Print the executable Epoch-4 compatibility profile.
     CompatibilityProfile,
+    /// Print the complete command, configuration and HTTP surface.
+    SurfaceInventory,
 }
 
 #[global_allocator]
@@ -87,6 +94,33 @@ async fn dispatch(command: Command) -> Result<(), Box<dyn Error>> {
             println!("{}", nano_vm::compatibility_profile_json()?);
             Ok(())
         }
+        Command::SurfaceInventory => {
+            let schema = serde_json::to_value(schemars::schema_for!(Config))?;
+            let config_top_level = schema["properties"]
+                .as_object()
+                .ok_or("the follower schema has no top-level properties")?
+                .keys()
+                .collect::<Vec<_>>();
+            let command = Cli::command();
+            let mut commands = command
+                .get_subcommands()
+                .map(|command| command.get_name().to_owned())
+                .collect::<Vec<_>>();
+            commands.push("help".to_owned());
+            commands.sort_unstable();
+            commands.dedup();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema": "nano-stacks/follower-surface-inventory/v1",
+                    "commands": commands,
+                    "config_top_level": config_top_level,
+                    "loopback_routes": LOOPBACK_ROUTES,
+                    "public_routes": PUBLIC_ROUTES,
+                }))?
+            );
+            Ok(())
+        }
     }
 }
 
@@ -112,5 +146,10 @@ mod tests {
             assert!(!help.to_lowercase().contains(forbidden), "{forbidden}");
         }
         assert!(Cli::try_parse_from(["stacks-follower", "start", "--config", "x"]).is_ok());
+    }
+
+    #[test]
+    fn the_surface_inventory_is_a_real_command() {
+        assert!(Cli::try_parse_from(["stacks-follower", "surface-inventory"]).is_ok());
     }
 }
