@@ -3004,6 +3004,238 @@ mod tests {
         .expect("sign a transfer")
     }
 
+    #[cfg(target_os = "linux")]
+    fn process_rss_kib() -> usize {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("process status")
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmRSS:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .expect("resident memory")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_tasks() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .expect("process tasks")
+            .count()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn metric_value(metrics: &str, name: &str) -> u64 {
+        metrics
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+            .unwrap_or_else(|| panic!("missing metric {name}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_rpc_connections(metrics: &super::NodeMetrics, expected: u64) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let body = metrics.encode().expect("metrics");
+                if metric_value(&body, "nano_rpc_connections_active") == expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("RPC connections did not settle at {expected}"));
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn transaction_wave(
+        client: &reqwest::Client,
+        endpoint: &str,
+        bodies: &[Vec<u8>],
+    ) -> Vec<reqwest::StatusCode> {
+        let mut statuses = Vec::with_capacity(bodies.len());
+        for batch in bodies.chunks(16) {
+            let mut requests = tokio::task::JoinSet::new();
+            for body in batch {
+                let client = client.clone();
+                let endpoint = endpoint.to_owned();
+                let body = body.clone();
+                requests.spawn(async move {
+                    client
+                        .post(endpoint)
+                        .header("content-type", "application/octet-stream")
+                        .body(body)
+                        .send()
+                        .await
+                });
+            }
+            while let Some(response) = requests.join_next().await {
+                let status = response
+                    .expect("request task")
+                    .expect("transaction response")
+                    .status();
+                statuses.push(status);
+            }
+        }
+        statuses
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn exercise_slow_headers_and_recovery(
+        address: std::net::SocketAddr,
+        metrics: &super::NodeMetrics,
+        plateau: (usize, usize),
+    ) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const RSS_SLOP_KIB: usize = 16 * 1024;
+
+        wait_for_rpc_connections(metrics, 0).await;
+        let saturations_before = metric_value(
+            &metrics.encode().expect("metrics"),
+            "nano_rpc_connection_saturations",
+        );
+        let mut slow = Vec::new();
+        for _ in 0..16 {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("slow connection");
+            stream.write_all(b"G").await.expect("partial header");
+            slow.push(stream);
+        }
+        wait_for_rpc_connections(metrics, 16).await;
+        assert!(process_tasks() <= plateau.1 + 18);
+
+        let mut refused = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("refused connection");
+        refused.write_all(b"G").await.expect("partial header");
+        let mut byte = [0];
+        match refused.read(&mut byte).await {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            result => panic!("excess slow connection stayed open: {result:?}"),
+        }
+        assert_eq!(slow[0].read(&mut byte).await.expect("header timeout"), 0);
+        drop(slow);
+        wait_for_rpc_connections(metrics, 0).await;
+        assert!(
+            process_rss_kib() <= plateau.0.saturating_add(RSS_SLOP_KIB),
+            "slow-header memory did not return to its plateau"
+        );
+        assert!(process_tasks() <= plateau.1 + 2);
+
+        let recovered = reqwest::get(format!("http://{address}/v2/info"))
+            .await
+            .expect("recovered RPC");
+        assert_eq!(recovered.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            metric_value(
+                &metrics.encode().expect("metrics"),
+                "nano_rpc_connection_saturations",
+            ) > saturations_before
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn signed_and_malformed_load_and_slow_headers_plateau_and_recover() {
+        const WAVE: usize = 64;
+        const RSS_SLOP_KIB: usize = 16 * 1024;
+
+        let senders = (0..WAVE)
+            .map(|index| key(format!("load sender {index}").as_bytes()))
+            .collect::<Vec<_>>();
+        let funded = AccountEntry {
+            balance: 4_000_000,
+            locked: 0,
+            unlock_height: 0,
+            nonce: 0,
+        };
+        let accounts = senders
+            .iter()
+            .map(|sender| (address(sender), funded))
+            .collect::<Vec<_>>();
+        let bodies = (0..3)
+            .map(|nonce| {
+                senders
+                    .iter()
+                    .map(|sender| transfer(sender, nonce).encode())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let (relay, mut relayed) = nano_queue::channel(TRANSACTION_QUEUE_LIMITS);
+        let state = RpcState::new(NETWORK)
+            .with_chain(chain(&accounts, None))
+            .with_mempool(Arc::new(Mutex::new(Mempool::new(NETWORK))))
+            .with_transaction_relay(relay);
+        let metrics = state.metrics();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("RPC listener");
+        let address = listener.local_addr().expect("RPC address");
+        let server = tokio::spawn(super::serve(listener, state));
+        let drain = tokio::spawn(async move { while relayed.recv().await.is_some() {} });
+        let endpoint = format!("http://{address}/v2/transactions");
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(16)
+            .build()
+            .expect("HTTP client");
+
+        let first_statuses = transaction_wave(&client, &endpoint, &bodies[0]).await;
+        assert_valid_load_statuses(&first_statuses);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let first = (process_rss_kib(), process_tasks());
+        let second_statuses = transaction_wave(&client, &endpoint, &bodies[1]).await;
+        assert_valid_load_statuses(&second_statuses);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let second = (process_rss_kib(), process_tasks());
+        let third_statuses = transaction_wave(&client, &endpoint, &bodies[2]).await;
+        assert_valid_load_statuses(&third_statuses);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let third = (process_rss_kib(), process_tasks());
+        assert!(
+            third.0 <= second.0.saturating_add(RSS_SLOP_KIB),
+            "resident memory did not plateau: {first:?}, {second:?}, {third:?} KiB/tasks"
+        );
+        assert!(
+            third.1 <= second.1 + 2,
+            "request tasks did not plateau: {first:?}, {second:?}, {third:?} KiB/tasks"
+        );
+
+        let malformed = vec![vec![0xff; 512]; WAVE];
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let malformed_statuses = transaction_wave(&client, &endpoint, &malformed).await;
+        assert!(
+            malformed_statuses.contains(&reqwest::StatusCode::BAD_REQUEST),
+            "malformed traffic never reached transaction decoding"
+        );
+        assert!(malformed_statuses.iter().all(|status| {
+            *status == reqwest::StatusCode::BAD_REQUEST
+                || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || *status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        }));
+        drop(client);
+        exercise_slow_headers_and_recovery(address, &metrics, third).await;
+        server.abort();
+        drain.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_valid_load_statuses(statuses: &[reqwest::StatusCode]) {
+        assert!(
+            statuses.iter().any(reqwest::StatusCode::is_success),
+            "valid signed traffic never reached admission"
+        );
+        assert!(statuses.iter().all(|status| {
+            status.is_success()
+                || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || *status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        }));
+    }
+
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
