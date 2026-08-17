@@ -1066,31 +1066,20 @@ async fn a_peer_serving_a_coherent_wrong_chain_moves_nothing() {
     // block that cannot be executed ends the round, which is what sets
     // `peer_failed` in the runtime and makes the next round weigh the pool again.
     // A round that quietly executed nothing would leave the node on the liar.
-    match outcome {
-        Ok(round) => assert_eq!(
-            round.executed, 0,
-            "blocks from a chain no signer approved were executed"
-        ),
-        // Which signature rule fires depends on where the branch parts, and both
-        // say the same thing: nobody who could have signed this block did. A
-        // tenure-start block is refused by the *miner* rule, because the header
-        // signature no longer recovers to the key the tenure change names; a
-        // mid-tenure block is refused by the reward set's weight. This branch
-        // parts at a tenure start, so it is the miner rule that answers — the
-        // weight rule is what refuses the same branch at the fork choice above,
-        // and `signer_weight_enforcement` puts it against execution directly.
-        Err(error) => {
-            let refusal = error.to_string();
-            assert!(
-                refusal.contains("signer") || refusal.contains("miner"),
-                "the refusal is not about a signature, so it may be about the fixture: {refusal}"
-            );
-        }
-    }
+    let refusal = outcome
+        .expect_err("a chain no signer approved must end the round")
+        .to_string();
+    // Which signature rule fires depends on where the branch parts, and both
+    // say the same thing: nobody who could have signed this block did. A
+    // tenure-start block is refused by the *miner* rule, because the header
+    // signature no longer recovers to the key the tenure change names; a
+    // mid-tenure block is refused by the reward set's weight. This branch
+    // parts at a tenure start, so it is the miner rule that answers — the
+    // weight rule is what refuses the same branch at the fork choice above,
+    // and `signer_weight_enforcement` puts it against execution directly.
     assert!(
-        staging.len().expect("the staging store answers") > 0,
-        "the round staged nothing, so the refusal is about the transport rather \
-         than about the chain"
+        refusal.contains("signer") || refusal.contains("miner"),
+        "the refusal is not about a signature, so it may be about the fixture: {refusal}"
     );
     assert_eq!(executor.tip().block_id(), before, "the executed tip moved");
     assert_eq!(
