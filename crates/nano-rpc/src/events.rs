@@ -688,6 +688,16 @@ pub const DEFAULT_DISPATCH_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 /// A separate bound for tiny events whose byte total remains small.
 pub const DEFAULT_DISPATCH_QUEUE_ITEMS: usize = 1024;
 
+/// Serialized bytes retained for a slow local event-stream client.
+///
+/// The HTTP stream is diagnostic and may shed an event instead of retaining a
+/// second full block response. Sequence numbers still advance, so the client
+/// sees the gap and can recover through the ordinary RPC surface.
+pub const LOCAL_EVENT_STREAM_BYTES: usize = DEFAULT_DISPATCH_QUEUE_BYTES;
+
+/// Events retained for every local event-stream subscriber together.
+pub const LOCAL_EVENT_STREAM_ITEMS: usize = 1;
+
 /// How often a node repeats itself about an observer whose events it is
 /// dropping. Per event it would be one line per block for as long as the
 /// observer stays down, which buries every other line in the log.
@@ -786,7 +796,7 @@ impl EventDispatcher {
     /// Publish to the supplied observers under limits of your own.
     #[must_use]
     pub fn with_limits(observers: Vec<Url>, limits: DispatchLimits) -> Self {
-        let (stream, _) = broadcast::channel(256);
+        let (stream, _) = broadcast::channel(LOCAL_EVENT_STREAM_ITEMS);
         let client = reqwest::Client::new();
         let observers = observers
             .into_iter()
@@ -850,11 +860,13 @@ impl EventDispatcher {
             }
         };
         let sequence = self.stream_sequence.fetch_add(1, Ordering::Relaxed);
-        let _ = self.stream.send(StreamEvent {
-            kind,
-            sequence,
-            body: Arc::clone(&body),
-        });
+        if body.len() <= LOCAL_EVENT_STREAM_BYTES {
+            let _ = self.stream.send(StreamEvent {
+                kind,
+                sequence,
+                body: Arc::clone(&body),
+            });
+        }
         for observer in &self.observers {
             observer.offer(kind, &body);
         }
@@ -1085,8 +1097,8 @@ mod tests {
 
     use super::{
         DEFAULT_DISPATCH_ATTEMPTS, DEFAULT_DISPATCH_QUEUE_ITEMS, DROPPED_HEADER, DispatchLimits,
-        EventDispatcher, EventKind, SEQUENCE_HEADER, Url, Value, receipt_events,
-        transaction_payload,
+        EventDispatcher, EventKind, LOCAL_EVENT_STREAM_BYTES, SEQUENCE_HEADER, Url, Value,
+        receipt_events, transaction_payload,
     };
 
     #[tokio::test]
@@ -1095,15 +1107,49 @@ mod tests {
         let mut events = dispatcher.subscribe();
 
         dispatcher.dispatch(EventKind::NewBlock, &json!({ "transactions": [] }));
-        dispatcher.dispatch(EventKind::NewBurnBlock, &json!({ "burn_block_height": 7 }));
-
         let block = events.recv().await.expect("new block event");
         assert_eq!(block.kind, EventKind::NewBlock);
         assert_eq!(block.sequence, 0);
         assert_eq!(block.body.as_slice(), br#"{"transactions":[]}"#);
+
+        dispatcher.dispatch(EventKind::NewBurnBlock, &json!({ "burn_block_height": 7 }));
         let burn = events.recv().await.expect("burn block event");
         assert_eq!(burn.kind, EventKind::NewBurnBlock);
         assert_eq!(burn.sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn a_slow_local_event_stream_has_one_byte_bounded_slot_and_recovers() {
+        let dispatcher = EventDispatcher::new(Vec::new());
+        let mut events = dispatcher.subscribe();
+
+        dispatcher.dispatch(EventKind::NewBlock, &json!("first"));
+        dispatcher.dispatch(EventKind::NewBlock, &json!("second"));
+        assert!(matches!(
+            events.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(1))
+        ));
+        assert_eq!(events.recv().await.expect("retained event").sequence, 1);
+
+        dispatcher.dispatch(
+            EventKind::NewBlock,
+            &json!("x".repeat(LOCAL_EVENT_STREAM_BYTES - 2)),
+        );
+        let maximum = events.recv().await.expect("maximum event");
+        assert_eq!(maximum.sequence, 2);
+        assert_eq!(maximum.body.len(), LOCAL_EVENT_STREAM_BYTES);
+
+        dispatcher.dispatch(
+            EventKind::NewBlock,
+            &json!("x".repeat(LOCAL_EVENT_STREAM_BYTES - 1)),
+        );
+        dispatcher.dispatch(EventKind::NewBlock, &json!("recovered"));
+        let recovered = events.recv().await.expect("event after an oversized one");
+        assert_eq!(
+            recovered.sequence, 4,
+            "the omitted event remains visible as a gap"
+        );
+        assert_eq!(recovered.body.as_slice(), br#""recovered""#);
     }
 
     #[test]
