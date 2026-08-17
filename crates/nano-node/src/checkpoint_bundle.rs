@@ -321,6 +321,7 @@ pub(crate) mod tests {
         )
         .expect("checkpoint manifest");
         fs::write(root.path().join("marf.sqlite"), b"state bytes").expect("state");
+        fs::write(root.path().join("anchor.bin"), b"anchor bytes").expect("anchor");
         (root, [first, second])
     }
 

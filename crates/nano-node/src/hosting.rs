@@ -1011,11 +1011,16 @@ mod tests {
         rpc_bind = "127.0.0.1:20443"
 
         [burnchain]
-        rest_url = "https://example.invalid/api"
+        rpc_url = "http://127.0.0.1:8332"
+        rpc_user = "local"
+        rpc_password = "local"
         magic = "X2"
         pox_5_activation_height = 960230
 
         [checkpoint]
+        bundle = "/capture/checkpoint-bundle"
+        builder_policy = "/capture/checkpoint-builders.toml"
+        builder_signatures = "/capture/checkpoint-signatures"
         marf = "/capture/chainstate/checkpoint-H/marf.sqlite"
         source_state_id = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
         state_root = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"

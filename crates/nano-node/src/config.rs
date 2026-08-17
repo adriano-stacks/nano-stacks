@@ -163,6 +163,12 @@ pub struct BurnchainConfig {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointConfig {
+    /// Directory containing the immutable checkpoint payload and content manifest.
+    pub bundle: Option<PathBuf>,
+    /// Operator-pinned independent builder keys and their rotation/revocation policy.
+    pub builder_policy: Option<PathBuf>,
+    /// Append-only builder signature files published separately from the payload.
+    pub builder_signatures: Option<PathBuf>,
     /// The exported Clarity MARF.
     pub marf: PathBuf,
     /// The block state the export was taken at, hex-encoded.
@@ -325,6 +331,13 @@ impl Config {
         }
         config.checkpoint.source_state_id()?;
         config.checkpoint.state_root()?;
+        let signed_bundle = config.checkpoint.signed_bundle()?;
+        if config.network().is_some_and(Network::is_mainnet) && signed_bundle.is_none() {
+            return Err(ConfigError::Invalid(
+                "a mainnet checkpoint needs bundle, builder_policy and builder_signatures"
+                    .to_owned(),
+            ));
+        }
         config.node.peers()?;
         config.node.event_observers()?;
         if let (Some(network), Some(_)) = (config.network(), config.node.rpc_bind) {
@@ -431,6 +444,21 @@ impl BurnchainConfig {
 }
 
 impl CheckpointConfig {
+    pub(crate) fn signed_bundle(
+        &self,
+    ) -> Result<Option<(&PathBuf, &PathBuf, &PathBuf)>, ConfigError> {
+        match (&self.bundle, &self.builder_policy, &self.builder_signatures) {
+            (Some(bundle), Some(policy), Some(signatures)) => {
+                Ok(Some((bundle, policy, signatures)))
+            }
+            (None, None, None) => Ok(None),
+            _ => Err(ConfigError::Invalid(
+                "checkpoint.bundle, builder_policy and builder_signatures must be set together"
+                    .to_owned(),
+            )),
+        }
+    }
+
     pub fn source_state_id(&self) -> Result<[u8; 32], ConfigError> {
         parse_hex("checkpoint.source_state_id", &self.source_state_id)
     }
@@ -543,6 +571,9 @@ mod tests {
         rpc_password = "hacknet"
 
         [checkpoint]
+        bundle = "/tmp/checkpoint"
+        builder_policy = "/tmp/checkpoint-builders.toml"
+        builder_signatures = "/tmp/checkpoint-signatures"
         marf = "/tmp/checkpoint/marf.sqlite"
         source_state_id = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
         state_root = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
@@ -568,6 +599,28 @@ mod tests {
             config.node.bootstrap_seeds()[0].contains("seed.mainnet.hiro.so"),
             "the default seeds are stacks-core's own"
         );
+    }
+
+    #[test]
+    fn a_mainnet_checkpoint_requires_complete_builder_evidence() {
+        let mainnet = MINIMAL
+            .replace("network = \"testnet\"", "network = \"mainnet\"")
+            .replace("chain_id = 2147483648\n", "")
+            .replace("bundle = \"/tmp/checkpoint\"\n", "")
+            .replace("builder_policy = \"/tmp/checkpoint-builders.toml\"\n", "")
+            .replace("builder_signatures = \"/tmp/checkpoint-signatures\"\n", "");
+        assert!(matches!(
+            Config::parse(&mainnet),
+            Err(super::ConfigError::Invalid(reason))
+                if reason.contains("mainnet checkpoint needs bundle")
+        ));
+
+        let partial = MINIMAL.replace("builder_signatures = \"/tmp/checkpoint-signatures\"\n", "");
+        assert!(matches!(
+            Config::parse(&partial),
+            Err(super::ConfigError::Invalid(reason))
+                if reason.contains("must be set together")
+        ));
     }
 
     /// An explicit empty seed list is how a node says "HTTP only" out loud.

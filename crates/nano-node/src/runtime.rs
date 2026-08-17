@@ -33,8 +33,12 @@ use tokio::{net::TcpListener, signal::unix::SignalKind, sync::Mutex, task::JoinS
 
 use crate::{
     CatchUpBudget, CatchUpRound, CheckpointExecutor, CheckpointManifest, CheckpointProvenance,
-    checkpoint_bundle::attesting_reward_set, config::Config, miner, signer,
-    sortition::SortitionTracker, staging::Staging,
+    checkpoint_bundle::{CHECKPOINT_REWARD_SET_FILE, attesting_reward_set},
+    checkpoint_signatures::{BuilderPolicy, verify_signed_checkpoint_bundle},
+    config::Config,
+    miner, signer,
+    sortition::SortitionTracker,
+    staging::Staging,
 };
 
 /// How many blocks one round of catching up will fetch before executing.
@@ -2883,6 +2887,176 @@ async fn backfill_one_header(
 /// not re-adopted; it is checked to be the same checkpoint, so a directory
 /// cannot quietly become descended from a different one.
 fn adopt(config: &Config, directory: &Path, source: [u8; 32]) -> Result<(), Box<dyn Error>> {
+    if let Some((bundle, policy, signatures)) = config.checkpoint.signed_bundle()? {
+        if config.burnchain.rest_url.is_some() {
+            return Err(
+                "a signed checkpoint must be authenticated against the operator's Bitcoin Core, not a REST source"
+                    .into(),
+            );
+        }
+        let bitcoin = BitcoinRpcSource::new(
+            &config.burnchain.rpc_url,
+            config.burnchain.rpc_user.clone(),
+            config.burnchain.rpc_password.clone(),
+            config.burnchain.magic()?,
+        )?;
+        return adopt_signed(
+            config, directory, source, &bitcoin, bundle, policy, signatures,
+        );
+    }
+    if config.network().is_some_and(Network::is_mainnet) {
+        return Err(
+            "a mainnet checkpoint needs a signed bundle before production state is opened".into(),
+        );
+    }
+    adopt_attested(config, directory, source)
+}
+
+fn adopt_signed<S: nano_bitcoin::BitcoinSource>(
+    config: &Config,
+    directory: &Path,
+    source: [u8; 32],
+    bitcoin: &S,
+    bundle: &Path,
+    policy: &Path,
+    signatures: &Path,
+) -> Result<(), Box<dyn Error>>
+where
+    S::Error: std::fmt::Display,
+{
+    verify_external_checkpoint_evidence(bundle, policy, signatures)?;
+    let policy = BuilderPolicy::load(policy)?;
+    let builders = verify_signed_checkpoint_bundle(bundle, bitcoin, &policy, signatures)?;
+    verify_checkpoint_paths(config, bundle)?;
+    println!(
+        "checkpoint bundle {} authenticated by {}",
+        builders.content_root,
+        builders.names.join(", ")
+    );
+    adopt_attested(config, directory, source)
+}
+
+fn verify_external_checkpoint_evidence(
+    bundle: &Path,
+    policy: &Path,
+    signatures: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let bundle_metadata = fs::symlink_metadata(bundle)?;
+    if !bundle_metadata.file_type().is_dir() || bundle_metadata.file_type().is_symlink() {
+        return Err(format!("{} is not a checkpoint bundle directory", bundle.display()).into());
+    }
+    let policy_metadata = fs::symlink_metadata(policy)?;
+    if !policy_metadata.file_type().is_file() || policy_metadata.file_type().is_symlink() {
+        return Err(format!("{} is not a regular builder policy", policy.display()).into());
+    }
+    let bundle = fs::canonicalize(bundle)?;
+    for (name, path) in [
+        ("builder policy", policy),
+        ("builder signatures", signatures),
+    ] {
+        if fs::canonicalize(path)?.starts_with(&bundle) {
+            return Err(format!(
+                "the {name} at {} is inside the bundle and therefore self-declared",
+                path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn verify_checkpoint_paths(config: &Config, bundle: &Path) -> Result<(), Box<dyn Error>> {
+    require_checkpoint_file(
+        bundle,
+        &config.checkpoint.marf,
+        "marf.sqlite",
+        "checkpoint.marf",
+    )?;
+    require_checkpoint_file(
+        bundle,
+        config
+            .checkpoint
+            .attesting_block
+            .as_deref()
+            .ok_or("a signed checkpoint has no configured attesting block")?,
+        nano_marf::CHECKPOINT_BLOCK_FILE,
+        "checkpoint.attesting_block",
+    )?;
+    require_checkpoint_file(
+        bundle,
+        config
+            .checkpoint
+            .attesting_reward_set
+            .as_deref()
+            .ok_or("a signed checkpoint has no configured attesting reward set")?,
+        CHECKPOINT_REWARD_SET_FILE,
+        "checkpoint.attesting_reward_set",
+    )?;
+    for (name, path) in [
+        (
+            "checkpoint.anchor_block",
+            Some(config.checkpoint.anchor_block.as_path()),
+        ),
+        (
+            "checkpoint.tenure_accounting",
+            config.checkpoint.tenure_accounting.as_deref(),
+        ),
+        (
+            "checkpoint.sortition",
+            config.checkpoint.sortition.as_deref(),
+        ),
+        (
+            "checkpoint.authentication_history",
+            config.checkpoint.authentication_history.as_deref(),
+        ),
+    ] {
+        if let Some(path) = path {
+            require_path_in_bundle(bundle, path, name)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_checkpoint_file(
+    bundle: &Path,
+    configured: &Path,
+    relative: &str,
+    name: &str,
+) -> Result<(), Box<dyn Error>> {
+    let expected = bundle.join(relative);
+    if fs::canonicalize(configured)? != fs::canonicalize(&expected)? {
+        return Err(format!(
+            "{name} names {}, not the verified bundle file {}",
+            configured.display(),
+            expected.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn require_path_in_bundle(
+    bundle: &Path,
+    configured: &Path,
+    name: &str,
+) -> Result<(), Box<dyn Error>> {
+    let bundle = fs::canonicalize(bundle)?;
+    let configured = fs::canonicalize(configured)?;
+    if configured == bundle || !configured.starts_with(&bundle) {
+        return Err(format!(
+            "{name} at {} is outside the verified checkpoint bundle",
+            configured.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn adopt_attested(
+    config: &Config,
+    directory: &Path,
+    source: [u8; 32],
+) -> Result<(), Box<dyn Error>> {
     let manifest = CheckpointManifest::load(
         config
             .checkpoint
@@ -4215,6 +4389,14 @@ mod tests {
     use nano_primitives::{ConsensusHash, Network, Sha256Sum, TrieHash, hash160};
     use nano_sync::PoxInfo;
 
+    use crate::{
+        checkpoint_bundle::{
+            CHECKPOINT_REWARD_SET_FILE, build_checkpoint_bundle_manifest,
+            tests::{TestBitcoin, fixture as checkpoint_fixture},
+        },
+        checkpoint_signatures::{BuilderPolicy, sign_checkpoint_bundle},
+    };
+
     #[test]
     fn one_address_cannot_own_the_inbound_task_set() {
         let slots = super::InboundAddressSlots::new(nano_rpc::NodeMetrics::default());
@@ -4996,6 +5178,165 @@ authentication_history = "{}"
         }
     }
 
+    fn builder_evidence(
+        bundle: &Path,
+        evidence: &Path,
+        bitcoin: &TestBitcoin,
+        builders: &[StacksPrivateKey; 2],
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let policy_path = evidence.join("builders.toml");
+        fs::write(
+            &policy_path,
+            format!(
+                "schema = \"nano-stacks/checkpoint-builder-policy/v1\"\n\
+                 required_signatures = 2\n\
+                 [[builders]]\n\
+                 name = \"archive-east\"\n\
+                 public_key = \"{}\"\n\
+                 valid_from_height = 0\n\
+                 [[builders]]\n\
+                 name = \"archive-west\"\n\
+                 public_key = \"{}\"\n\
+                 valid_from_height = 0\n",
+                hex::encode(builders[0].public_key().to_bytes_compressed()),
+                hex::encode(builders[1].public_key().to_bytes_compressed())
+            ),
+        )
+        .expect("builder policy");
+        let policy = BuilderPolicy::load(&policy_path).expect("load builder policy");
+        let signatures = evidence.join("signatures");
+        sign_checkpoint_bundle(
+            bundle,
+            bitcoin,
+            &policy,
+            &signatures,
+            "archive-east",
+            &builders[0],
+        )
+        .expect("first signature");
+        sign_checkpoint_bundle(
+            bundle,
+            bitcoin,
+            &policy,
+            &signatures,
+            "archive-west",
+            &builders[1],
+        )
+        .expect("second signature");
+        (policy_path, signatures)
+    }
+
+    fn signed_checkpoint_config(
+        bundle: &Path,
+        evidence: &Path,
+        policy: &Path,
+        signatures: &Path,
+        manifest: &crate::CheckpointManifest,
+    ) -> crate::config::Config {
+        toml::from_str(&format!(
+            r#"
+[node]
+working_dir = "{}"
+network = "mainnet"
+peers = []
+
+[burnchain]
+
+[checkpoint]
+bundle = "{}"
+builder_policy = "{}"
+builder_signatures = "{}"
+marf = "{}"
+source_state_id = "{}"
+state_root = "{}"
+anchor_block = "{}"
+anchor_bitcoin_height = 11
+attesting_block = "{}"
+attesting_reward_set = "{}"
+"#,
+            evidence.join("working").display(),
+            bundle.display(),
+            policy.display(),
+            signatures.display(),
+            bundle.join("marf.sqlite").display(),
+            hex::encode(manifest.source_state_id),
+            manifest.state_index_root,
+            bundle.join("anchor.bin").display(),
+            bundle.join(nano_marf::CHECKPOINT_BLOCK_FILE).display(),
+            bundle.join(CHECKPOINT_REWARD_SET_FILE).display(),
+        ))
+        .expect("signed checkpoint config")
+    }
+
+    #[test]
+    fn a_signed_bundle_is_refused_before_production_state_is_touched() {
+        let (bundle, builders) = checkpoint_fixture(true);
+        let bitcoin = TestBitcoin(11, [6; 32]);
+        build_checkpoint_bundle_manifest(bundle.path(), &bitcoin).expect("content manifest");
+        let evidence = tempfile::tempdir().expect("external builder evidence");
+        let (policy_path, signatures) =
+            builder_evidence(bundle.path(), evidence.path(), &bitcoin, &builders);
+        let manifest = crate::CheckpointManifest::load(bundle.path()).expect("checkpoint");
+        let config = signed_checkpoint_config(
+            bundle.path(),
+            evidence.path(),
+            &policy_path,
+            &signatures,
+            &manifest,
+        );
+
+        let wrong_view_state = evidence.path().join("wrong-view-state");
+        let error = super::adopt_signed(
+            &config,
+            &wrong_view_state,
+            manifest.source_state_id,
+            &TestBitcoin(11, [7; 32]),
+            bundle.path(),
+            &policy_path,
+            &signatures,
+        )
+        .expect_err("wrong Bitcoin view");
+        assert!(error.to_string().contains("not locally canonical"));
+        assert!(!wrong_view_state.exists());
+
+        let mut escaped = config.clone();
+        escaped.checkpoint.anchor_block = policy_path.clone();
+        let escaped_state = evidence.path().join("escaped-state");
+        let error = super::adopt_signed(
+            &escaped,
+            &escaped_state,
+            manifest.source_state_id,
+            &bitcoin,
+            bundle.path(),
+            &policy_path,
+            &signatures,
+        )
+        .expect_err("unverified anchor path");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the verified checkpoint bundle")
+        );
+        assert!(!escaped_state.exists());
+
+        let accepted_state = evidence.path().join("accepted-state");
+        super::adopt_signed(
+            &config,
+            &accepted_state,
+            manifest.source_state_id,
+            &bitcoin,
+            bundle.path(),
+            &policy_path,
+            &signatures,
+        )
+        .expect("signed checkpoint preflight");
+        assert!(
+            crate::CheckpointProvenance::load(&accepted_state)
+                .expect("provenance")
+                .is_some()
+        );
+    }
+
     /// The cycle a checkpointed node starts in has no pox-5 positions to walk,
     /// and the checkpoint is the only thing that can answer for it.
     ///
@@ -5014,6 +5355,9 @@ authentication_history = "{}"
         )
         .expect("write the document");
         let checkpoint = crate::config::CheckpointConfig {
+            bundle: None,
+            builder_policy: None,
+            builder_signatures: None,
             marf: directory.path().join("marf.sqlite"),
             source_state_id: String::new(),
             state_root: String::new(),
