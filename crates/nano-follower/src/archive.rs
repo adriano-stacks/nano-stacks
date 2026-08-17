@@ -20,8 +20,15 @@ use std::{path::Path, sync::Mutex};
 
 use nano_chainstate::NakamotoBlock;
 use nano_primitives::{ConsensusHash, StacksBlockId};
-use nano_rpc::ExecutedTenure;
 use rusqlite::{Connection, OptionalExtension, params};
+
+/// A bounded tenure read from the executed-block archive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ArchivedTenure {
+    Found(Vec<u8>),
+    Missing,
+    TooLarge,
+}
 
 /// How many executed blocks are kept.
 ///
@@ -192,7 +199,7 @@ impl Archive {
 
     /// The block this node executed at a Stacks height, when it kept exactly one.
     ///
-    /// Asked by name rather than served over [`nano_rpc::ExecutedBlocks`], because
+    /// Asked by name rather than through the compatibility server, because
     /// no route asks a height: this is how the node reads back a tenure-start block
     /// a hundred tenures below its tip to name the rewards it matured, and the
     /// alternative was carrying that provenance in the ledger it serializes with
@@ -258,7 +265,7 @@ impl Archive {
         height: u64,
         stop: Option<StacksBlockId>,
         max_bytes: usize,
-    ) -> Result<ExecutedTenure, ArchiveError> {
+    ) -> Result<ArchivedTenure, ArchiveError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT block_id, bytes FROM executed
@@ -283,7 +290,7 @@ impl Archive {
                 break;
             }
             if bytes.len() > max_bytes.saturating_sub(bytes_out.len()) {
-                return Ok(ExecutedTenure::TooLarge);
+                return Ok(ArchivedTenure::TooLarge);
             }
             let block =
                 NakamotoBlock::decode(&bytes).map_err(|_| ArchiveError::MalformedBlock(id))?;
@@ -293,9 +300,9 @@ impl Archive {
         drop(statement);
         drop(connection);
         Ok(if bytes_out.is_empty() {
-            ExecutedTenure::Missing
+            ArchivedTenure::Missing
         } else {
-            ExecutedTenure::Found(bytes_out)
+            ArchivedTenure::Found(bytes_out)
         })
     }
 }
@@ -311,8 +318,8 @@ struct StoredBlock {
 /// Reading fails only where the store itself is broken, and a route that cannot
 /// read one block is not a route that should refuse every other request. So a
 /// failure reads as "this node does not have it", said once where it happened.
-impl nano_rpc::ExecutedBlocks for Archive {
-    fn block(&self, block_id: StacksBlockId) -> Option<Vec<u8>> {
+impl Archive {
+    pub fn block(&self, block_id: StacksBlockId) -> Option<Vec<u8>> {
         match self.stored(block_id) {
             Ok(stored) => stored.map(|stored| stored.bytes),
             Err(error) => {
@@ -322,7 +329,7 @@ impl nano_rpc::ExecutedBlocks for Archive {
         }
     }
 
-    fn tenure_start(&self, block_id: StacksBlockId) -> Option<StacksBlockId> {
+    pub fn tenure_start(&self, block_id: StacksBlockId) -> Option<StacksBlockId> {
         let stored = self.stored(block_id).ok().flatten()?;
         let found = self.connection().ok()?.query_row(
             "SELECT block_id FROM executed WHERE consensus_hash = ?1 ORDER BY height ASC LIMIT 1",
@@ -340,7 +347,7 @@ impl nano_rpc::ExecutedBlocks for Archive {
         }
     }
 
-    fn tenure_tip(&self, consensus_hash: &[u8; 20]) -> Option<Vec<u8>> {
+    pub fn tenure_tip(&self, consensus_hash: &[u8; 20]) -> Option<Vec<u8>> {
         let found = self.connection().ok()?.query_row(
             "SELECT bytes FROM executed WHERE consensus_hash = ?1 ORDER BY height DESC LIMIT 1",
             params![consensus_hash.as_slice()],
@@ -359,14 +366,14 @@ impl nano_rpc::ExecutedBlocks for Archive {
         }
     }
 
-    fn tenure(
+    pub fn tenure(
         &self,
         start_block_id: StacksBlockId,
         stop: Option<StacksBlockId>,
         max_bytes: usize,
-    ) -> ExecutedTenure {
+    ) -> ArchivedTenure {
         let Ok(Some(start)) = self.stored(start_block_id) else {
-            return ExecutedTenure::Missing;
+            return ArchivedTenure::Missing;
         };
         match self.tenure_from(
             start_block_id,
@@ -378,8 +385,36 @@ impl nano_rpc::ExecutedBlocks for Archive {
             Ok(blocks) => blocks,
             Err(error) => {
                 eprintln!("cannot read the tenure starting at {start_block_id}: {error}");
-                ExecutedTenure::Missing
+                ArchivedTenure::Missing
             }
+        }
+    }
+}
+
+#[cfg(feature = "node-rpc")]
+impl nano_rpc::ExecutedBlocks for Archive {
+    fn block(&self, block_id: StacksBlockId) -> Option<Vec<u8>> {
+        Self::block(self, block_id)
+    }
+
+    fn tenure_start(&self, block_id: StacksBlockId) -> Option<StacksBlockId> {
+        Self::tenure_start(self, block_id)
+    }
+
+    fn tenure_tip(&self, consensus_hash: &[u8; 20]) -> Option<Vec<u8>> {
+        Self::tenure_tip(self, consensus_hash)
+    }
+
+    fn tenure(
+        &self,
+        start_block_id: StacksBlockId,
+        stop: Option<StacksBlockId>,
+        max_bytes: usize,
+    ) -> nano_rpc::ExecutedTenure {
+        match Self::tenure(self, start_block_id, stop, max_bytes) {
+            ArchivedTenure::Found(bytes) => nano_rpc::ExecutedTenure::Found(bytes),
+            ArchivedTenure::Missing => nano_rpc::ExecutedTenure::Missing,
+            ArchivedTenure::TooLarge => nano_rpc::ExecutedTenure::TooLarge,
         }
     }
 }
@@ -388,11 +423,9 @@ impl nano_rpc::ExecutedBlocks for Archive {
 mod tests {
     use std::{fs, path::Path};
 
+    use super::{Archive, ArchivedTenure};
     use nano_chainstate::NakamotoBlock;
     use nano_primitives::{ConsensusHash, StacksBlockId};
-    use nano_rpc::{ExecutedBlocks, ExecutedTenure};
-
-    use super::Archive;
 
     /// Captured blocks, lowest first, which is the order they were executed in.
     fn fixtures() -> Vec<NakamotoBlock> {
@@ -505,14 +538,14 @@ mod tests {
             .flat_map(|block| block.encode())
             .collect::<Vec<_>>();
         let served = archive.tenure(cursor.block_id(), None, usize::MAX);
-        assert_eq!(served, ExecutedTenure::Found(expected.clone()));
+        assert_eq!(served, ArchivedTenure::Found(expected.clone()));
 
         // Stopping before a block a caller already has is what the peer protocol
         // asks for, and it stops *before* rather than after.
         let stop = tenure[1];
         assert_eq!(
             archive.tenure(cursor.block_id(), Some(stop.block_id()), usize::MAX),
-            ExecutedTenure::Found(
+            ArchivedTenure::Found(
                 tenure[2..]
                     .iter()
                     .rev()
@@ -522,16 +555,16 @@ mod tests {
         );
         assert_eq!(
             archive.tenure(StacksBlockId::from_bytes([9; 32]), None, usize::MAX),
-            ExecutedTenure::Missing
+            ArchivedTenure::Missing
         );
 
         assert_eq!(
             archive.tenure(cursor.block_id(), None, expected.len() - 1),
-            ExecutedTenure::TooLarge
+            ArchivedTenure::TooLarge
         );
         assert_eq!(
             archive.tenure(cursor.block_id(), None, expected.len()),
-            ExecutedTenure::Found(expected)
+            ArchivedTenure::Found(expected)
         );
     }
 

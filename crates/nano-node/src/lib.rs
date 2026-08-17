@@ -1,4 +1,3 @@
-pub mod archive;
 pub mod checkpoint_bundle;
 pub mod checkpoint_signatures;
 pub mod config;
@@ -8,7 +7,7 @@ pub mod runtime;
 pub mod signer;
 pub use nano_follower::{
     Checkpoint, CheckpointAttestation, CheckpointBundleReceipt, CheckpointManifest,
-    CheckpointProvenance, CheckpointTrustError, adopt_checkpoint, adopt_checkpoint_bundle,
+    CheckpointProvenance, CheckpointTrustError, adopt_checkpoint, adopt_checkpoint_bundle, archive,
     attest_checkpoint, sortition, staging,
 };
 

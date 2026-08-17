@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+node-rpc = ["dep:nano-rpc"]
+
 [dependencies]
 hex = "0.4.3"
 nano-address = { path = "../nano-address" }
@@ -11,6 +15,7 @@ nano-bitcoin = { path = "../nano-bitcoin" }
 nano-chainstate = { path = "../nano-chainstate" }
 nano-marf = { path = "../nano-marf" }
 nano-primitives = { path = "../nano-primitives" }
+nano-rpc = { path = "../nano-rpc", optional = true }
 nano-sortition = { path = "../nano-sortition" }
 nano-sync = { path = "../nano-sync", default-features = false }
 rusqlite = { version = "0.31.0", features = ["bundled"] }

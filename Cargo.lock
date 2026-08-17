@@ -2606,6 +2606,7 @@ dependencies = [
  "nano-crypto",
  "nano-marf",
  "nano-primitives",
+ "nano-rpc",
  "nano-sortition",
  "nano-sync",
  "rusqlite",
