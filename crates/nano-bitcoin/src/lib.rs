@@ -30,6 +30,10 @@ pub struct BitcoinBlock {
 
 const PRE_STX_WINDOW_BLOCKS: u64 = 6;
 const REST_TIMEOUT: Duration = Duration::from_secs(30);
+/// A Bitcoin block cannot serialize larger than its four-million-unit weight limit.
+pub const MAX_BITCOIN_BLOCK_BYTES: usize = 4_000_000;
+/// Plain-text block hashes and heights returned by Esplora.
+pub const MAX_BITCOIN_TEXT_BYTES: usize = 128;
 
 /// `PreStx` outputs available to later Bitcoin blocks.
 #[derive(Clone, Debug, Default)]
@@ -118,6 +122,9 @@ pub enum BitcoinRpcSourceError {
     Rpc(bitcoincore_rpc::Error),
     /// A REST source could not be read.
     Rest(String),
+    RestResponseTooLarge {
+        limit: usize,
+    },
     Parse(BitcoinParseError),
     /// Bitcoin no longer holds the block this source read at that height.
     ///
@@ -134,6 +141,12 @@ impl std::fmt::Display for BitcoinRpcSourceError {
         match self {
             Self::Rpc(error) => error.fmt(formatter),
             Self::Rest(error) => write!(formatter, "burnchain REST source: {error}"),
+            Self::RestResponseTooLarge { limit } => {
+                write!(
+                    formatter,
+                    "burnchain REST response exceeds its {limit}-byte limit"
+                )
+            }
             Self::Parse(error) => error.fmt(formatter),
             Self::Reorganized { height } => write!(
                 formatter,
@@ -148,7 +161,7 @@ impl std::error::Error for BitcoinRpcSourceError {
         match self {
             Self::Rpc(error) => Some(error),
             Self::Parse(error) => Some(error),
-            Self::Rest(_) | Self::Reorganized { .. } => None,
+            Self::Rest(_) | Self::RestResponseTooLarge { .. } | Self::Reorganized { .. } => None,
         }
     }
 }
@@ -301,10 +314,10 @@ impl BitcoinRestSource {
     /// Deliberately not `reqwest::blocking`, which carries its own runtime:
     /// building one inside the node's async context and dropping it there
     /// panics tokio, which is how the first live node died.
-    fn get(&self, path: &str) -> Result<Vec<u8>, BitcoinRpcSourceError> {
+    fn get(&self, path: &str, limit: usize) -> Result<Vec<u8>, BitcoinRpcSourceError> {
         use std::io::Read as _;
         let mut body = Vec::new();
-        let mut reader = self
+        let reader = self
             .agent
             .get(format!("{}/{path}", self.base))
             .call()
@@ -312,8 +325,12 @@ impl BitcoinRestSource {
             .into_body()
             .into_reader();
         reader
+            .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
             .read_to_end(&mut body)
             .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?;
+        if body.len() > limit {
+            return Err(BitcoinRpcSourceError::RestResponseTooLarge { limit });
+        }
         Ok(body)
     }
 
@@ -324,8 +341,9 @@ impl BitcoinRestSource {
     /// block against its own mirror image and call every height a
     /// reorganization.
     pub fn block_hash_at(&self, height: u64) -> Result<[u8; 32], BitcoinRpcSourceError> {
-        let text = String::from_utf8(self.get(&format!("block-height/{height}"))?)
-            .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?;
+        let text =
+            String::from_utf8(self.get(&format!("block-height/{height}"), MAX_BITCOIN_TEXT_BYTES)?)
+                .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?;
         decode_block_hash(text.trim())
             .ok_or_else(|| BitcoinRpcSourceError::Rest(format!("unreadable block hash {text:?}")))
     }
@@ -335,7 +353,7 @@ impl BitcoinRestSource {
     /// `/blocks/tip/height` is plain text, and it is the one question about the
     /// burnchain that is not about a particular block.
     pub fn tip_height(&self) -> Result<u64, BitcoinRpcSourceError> {
-        let text = String::from_utf8(self.get("blocks/tip/height")?)
+        let text = String::from_utf8(self.get("blocks/tip/height", MAX_BITCOIN_TEXT_BYTES)?)
             .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?;
         text.trim()
             .parse()
@@ -385,9 +403,15 @@ impl BitcoinRestSource {
         );
         let mut current = None;
         for current_height in first_height..=height {
-            let hash = String::from_utf8(self.get(&format!("block-height/{current_height}"))?)
-                .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?;
-            let raw = self.get(&format!("block/{}/raw", hash.trim()))?;
+            let hash = String::from_utf8(self.get(
+                &format!("block-height/{current_height}"),
+                MAX_BITCOIN_TEXT_BYTES,
+            )?)
+            .map_err(|error| BitcoinRpcSourceError::Rest(error.to_string()))?;
+            let raw = self.get(
+                &format!("block/{}/raw", hash.trim()),
+                MAX_BITCOIN_BLOCK_BYTES,
+            )?;
             let block =
                 decode_block_with_pre_stx(current_height, &raw, self.magic, &mut self.pre_stx)?;
             self.last_height = Some(current_height);
@@ -1440,7 +1464,41 @@ mod rest_tests {
 
     use bitcoin::{Block, consensus::deserialize};
 
-    use super::BitcoinRestSource;
+    use super::{BitcoinRestSource, MAX_BITCOIN_TEXT_BYTES};
+
+    #[test]
+    fn oversized_rest_responses_are_bounded_and_recover() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a test server");
+        let address = listener.local_addr().expect("the server address");
+        let server = thread::spawn(move || {
+            for body in [vec![b'1'; MAX_BITCOIN_TEXT_BYTES + 1], b"123".to_vec()] {
+                let (mut socket, _) = listener.accept().expect("accept a request");
+                let mut request = [0; 1024];
+                assert!(socket.read(&mut request).expect("read the request") > 0);
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .expect("write the response headers");
+                socket.write_all(&body).expect("write the response body");
+            }
+        });
+        let source = BitcoinRestSource::with_timeout(
+            &format!("http://{address}"),
+            *b"X2",
+            Duration::from_secs(1),
+        );
+
+        assert!(matches!(
+            source.tip_height(),
+            Err(super::BitcoinRpcSourceError::RestResponseTooLarge {
+                limit: MAX_BITCOIN_TEXT_BYTES
+            })
+        ));
+        assert_eq!(source.tip_height().expect("the source recovers"), 123);
+        server.join().expect("stop the test server");
+    }
 
     #[test]
     fn a_stalled_rest_server_cannot_hold_the_node_forever() {
