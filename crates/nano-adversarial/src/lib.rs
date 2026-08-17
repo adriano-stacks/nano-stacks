@@ -35,6 +35,7 @@ const MAX_CODEC_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_CHECKPOINT_IMPORT_BYTES: usize = 1 + 4 * (1 + 16 * 2);
 const MAX_CLARITY_BYTES: usize = 128 * 1024;
+const MAX_CLARITY_DIFFERENTIAL_BYTES: usize = 50;
 const MAX_MARF_OPERATIONS: usize = 256;
 const MAX_SESSION_OPERATIONS: usize = 32;
 const CHECKPOINT_SEPARATOR: &[u8] = b"\n--- checkpoint.toml ---\n";
@@ -444,6 +445,7 @@ pub fn checkpoint_import(input: &[u8]) -> u8 {
     )
     .expect("create reference checkpoint");
     let mut parent = ReferenceStacksBlockId::sentinel();
+    let mut roots = Vec::with_capacity(blocks.len());
     for (index, writes) in blocks.iter().enumerate() {
         let block =
             ReferenceStacksBlockId([u8::try_from(index + 1).expect("four bounded blocks"); 32]);
@@ -458,21 +460,25 @@ pub fn checkpoint_import(input: &[u8]) -> u8 {
             .expect("write reference block");
         transaction.seal().expect("seal reference block");
         transaction.commit().expect("commit reference block");
+        let root = reference
+            .get_root_hash_at(&block)
+            .expect("read reference block root");
+        roots.push((block.clone(), root));
         parent = block;
     }
-    let root = reference
-        .get_root_hash_at(&parent)
-        .expect("read reference root");
+    let root = roots.last().expect("nonempty generated checkpoint").1;
     drop(reference);
 
     let source = parent.0;
     let root = TrieHash::from_bytes(root.0);
     let imported =
         import_checkpoint(&checkpoint, source, root).expect("import generated checkpoint");
-    assert_eq!(
-        imported.root(source).expect("read imported root"),
-        Some(root)
-    );
+    for (block, expected_root) in roots {
+        assert_eq!(
+            imported.root(block.0).expect("read imported root"),
+            Some(TrieHash::from_bytes(expected_root.0))
+        );
+    }
     for (key, value) in expected {
         assert_eq!(
             imported
@@ -558,4 +564,93 @@ pub fn clarity_wasm_abi(input: &[u8]) -> u8 {
         return 1;
     }
     0
+}
+
+/// Compare compiled and interpreted results and costs for a structured program.
+#[must_use]
+pub fn clarity_result_and_cost_differential(input: &[u8]) -> u8 {
+    let Some(input) = within(input, MAX_CLARITY_DIFFERENTIAL_BYTES) else {
+        return 0;
+    };
+    let Some((&template, input)) = input.split_first() else {
+        return 0;
+    };
+    let Some((&width, input)) = input.split_first() else {
+        return 0;
+    };
+    let Some((left, input)) = input.split_at_checked(8) else {
+        return 0;
+    };
+    let Some((right, bytes)) = input.split_at_checked(8) else {
+        return 0;
+    };
+    let left = u64::from_le_bytes(left.try_into().expect("fixed integer width"));
+    let right = u64::from_le_bytes(right.try_into().expect("fixed integer width"));
+    let width = usize::from(width % 8) + 1;
+    let template = template % 6;
+    let body = match template {
+        0 => format!("(define-read-only (answer) (ok (+ u{left} u{right})))"),
+        1 => format!(
+            "(define-read-only (answer) (get kept (default-to {{kept: u{left}}} \
+             (some {{extra: u{right}, kept: u{left}}}))))"
+        ),
+        2 => {
+            let values = (0..width)
+                .map(|index| if index % 2 == 0 { left } else { right })
+                .map(|value| format!("u{value}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("(define-read-only (answer) (index-of? (list {values}) u{right}))")
+        }
+        3 => format!(
+            "(define-read-only (answer) (match (some {{left: u{left}, right: u{right}}}) \
+             value (+ (get left value) (get right value)) u0))"
+        ),
+        4 => format!(
+            "(define-read-only (answer) (len 0x{}))",
+            stacks_common::util::hash::to_hex(bytes)
+        ),
+        _ => {
+            let values = (0..width)
+                .map(|index| if index % 2 == 0 { left } else { right })
+                .map(|value| format!("u{value}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                "(define-private (sum (value uint) (total uint)) (+ value total)) \
+                 (define-read-only (answer) (fold sum (list {values}) u0))"
+            )
+        }
+    };
+
+    let source =
+        format!("(print {{template: u{template}, left: u{left}, right: u{right}}}) {body}");
+    clar2wasm::tools::crosscheck_compare_only(&source);
+    clar2wasm::tools::crosscheck_cost(&source, "answer", &[]);
+    1 << template
+}
+
+/// Compare the compiler and interpreter's typed refusal for a structured failure.
+#[must_use]
+pub fn clarity_refusal_differential(input: &[u8]) -> u8 {
+    let Some((&template, _)) = input.split_first() else {
+        return 0;
+    };
+    let template = template % 6;
+    let source = match template {
+        0 => "(/ u1 u0)",
+        1 => "(- u0 u1)",
+        2 => "(+ u340282366920938463463374607431768211455 u1)",
+        3 => "(unwrap-panic (if true none (some u1)))",
+        4 => "(unwrap-err-panic (if true (ok u1) (err u2)))",
+        _ => "(asserts! false (err u1))",
+    };
+    let compiled = clar2wasm::tools::evaluate(source);
+    let interpreted = clar2wasm::tools::interpret(source);
+    assert!(compiled.is_err(), "failure template compiled successfully");
+    assert_eq!(
+        compiled, interpreted,
+        "compiled and interpreted refusal diverged"
+    );
+    1 << template
 }

@@ -42,6 +42,14 @@ case "$target" in
     seed_directory=crates/nano-adversarial/corpus/clarity-wasm
     max_length=4096
     ;;
+  clarity_result_and_cost_differential)
+    seed_directory=crates/nano-adversarial/corpus/clarity-differential
+    max_length=50
+    ;;
+  clarity_refusal_differential)
+    seed_directory=crates/nano-adversarial/corpus/clarity-refusal
+    max_length=1
+    ;;
   *)
     echo "unknown fuzz target: $target" >&2
     exit 2

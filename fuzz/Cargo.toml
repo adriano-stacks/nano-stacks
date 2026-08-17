@@ -76,5 +76,19 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "clarity_result_and_cost_differential"
+path = "fuzz_targets/clarity_result_and_cost_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clarity_refusal_differential"
+path = "fuzz_targets/clarity_refusal_differential.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

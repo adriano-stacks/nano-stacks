@@ -250,3 +250,30 @@ pub fn clarity_source(mut case: ClarityCase) -> String {
         ),
     }
 }
+
+#[derive(Arbitrary, Debug)]
+pub struct ClarityDifferentialCase {
+    template: u8,
+    width: u8,
+    left: u64,
+    right: u64,
+    bytes: Vec<u8>,
+}
+
+pub fn clarity_differential_bytes(mut case: ClarityDifferentialCase) -> Vec<u8> {
+    case.bytes.truncate(32);
+    let mut bytes = vec![case.template, case.width];
+    bytes.extend_from_slice(&case.left.to_le_bytes());
+    bytes.extend_from_slice(&case.right.to_le_bytes());
+    bytes.extend_from_slice(&case.bytes);
+    bytes
+}
+
+#[derive(Arbitrary, Debug)]
+pub struct ClarityRefusalCase {
+    template: u8,
+}
+
+pub fn clarity_refusal_bytes(case: ClarityRefusalCase) -> [u8; 1] {
+    [case.template]
+}

@@ -2493,6 +2493,7 @@ dependencies = [
 name = "nano-adversarial"
 version = "0.1.0"
 dependencies = [
+ "clar2wasm",
  "clarity",
  "hex",
  "nano-chainstate",

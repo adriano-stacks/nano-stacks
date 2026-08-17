@@ -32,6 +32,8 @@ jobs:
           - checkpoint_import
           - marf_operations
           - clarity_wasm_abi
+          - clarity_result_and_cost_differential
+          - clarity_refusal_differential
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:

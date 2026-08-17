@@ -57,7 +57,9 @@ run_gate() {
         checkpoint_manifests \
         checkpoint_import \
         marf_operations \
-        clarity_wasm_abi
+        clarity_wasm_abi \
+        clarity_result_and_cost_differential \
+        clarity_refusal_differential
       do
         NANO_FUZZ_RUNS=20 NANO_FUZZ_SANITIZER=none scripts/fuzz.sh "$target" 1
       done

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+clar2wasm = { path = "../../vendor/clarity-wasm/clar2wasm" }
 clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 stackslib = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
