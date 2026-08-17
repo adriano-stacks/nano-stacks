@@ -503,7 +503,7 @@ mod tests {
     use crate::{
         checkpoint_bundle::{
             build_checkpoint_bundle_manifest,
-            tests::{TestBitcoin, fixture},
+            test_support::{TestBitcoin, fixture},
         },
         checkpoint_signatures::BuilderSignature,
     };

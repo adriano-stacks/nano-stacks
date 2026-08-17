@@ -13,6 +13,7 @@ node-adapters = [
     "dep:nano-mempool",
     "dep:nano-miner",
 ]
+test-support = ["dep:tempfile"]
 
 [dependencies]
 clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf", optional = true }
@@ -30,10 +31,13 @@ nano-primitives = { path = "../nano-primitives" }
 nano-rpc = { path = "../nano-rpc", optional = true }
 nano-sortition = { path = "../nano-sortition" }
 nano-sync = { path = "../nano-sync", default-features = false }
+nano-vm = { path = "../nano-vm" }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", default-features = false, features = ["rt"] }
+toml = "0.9.8"
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

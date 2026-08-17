@@ -47,4 +47,5 @@ name = "stacks-node"
 path = "src/main.rs"
 
 [dev-dependencies]
+nano-follower = { path = "../nano-follower", features = ["node-adapters", "test-support"] }
 tempfile = "3"

@@ -4456,7 +4456,7 @@ mod tests {
     use crate::{
         checkpoint_bundle::{
             CHECKPOINT_REWARD_SET_FILE, build_checkpoint_bundle_manifest,
-            tests::{TestBitcoin, fixture as checkpoint_fixture},
+            test_support::{TestBitcoin, fixture as checkpoint_fixture},
         },
         checkpoint_signatures::{BuilderPolicy, sign_checkpoint_bundle},
     };

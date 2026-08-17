@@ -2,6 +2,8 @@
 
 pub mod archive;
 pub mod checkpoint;
+pub mod checkpoint_bundle;
+pub mod checkpoint_signatures;
 pub mod executor;
 pub mod sortition;
 pub mod staging;

@@ -2614,11 +2614,13 @@ dependencies = [
  "nano-rpc",
  "nano-sortition",
  "nano-sync",
+ "nano-vm",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]
