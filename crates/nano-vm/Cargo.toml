@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["persistent-native-modules"]
+persistent-native-modules = ["dep:nano-wasm-cache"]
+
 [dependencies]
 wasmtime = { version = "=36.0.13", default-features = false, features = ["cranelift", "gc", "gc-null", "runtime", "std"] }
 clar2wasm = { path = "../../vendor/clarity-wasm/clar2wasm" }
@@ -12,7 +16,7 @@ hex = "0.4.3"
 nano-marf = { path = "../nano-marf" }
 nano-consensus-profile = { path = "../nano-consensus-profile" }
 nano-primitives = { path = "../nano-primitives" }
-nano-wasm-cache = { path = "../nano-wasm-cache" }
+nano-wasm-cache = { path = "../nano-wasm-cache", optional = true }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 sha2 = "0.10"
 # `default-features = false` and the list spelled out: `stacks-common`'s own

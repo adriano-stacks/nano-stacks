@@ -10,7 +10,7 @@ mempool = ["dep:nano-codec", "dep:nano-mempool"]
 
 [dependencies]
 nano-address = { path = "../nano-address" }
-nano-chainstate = { path = "../nano-chainstate" }
+nano-chainstate = { path = "../nano-chainstate", default-features = false }
 nano-codec = { path = "../nano-codec", optional = true }
 nano-crypto = { path = "../nano-crypto" }
 nano-mempool = { path = "../nano-mempool", optional = true }

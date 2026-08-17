@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["persistent-native-modules"]
+persistent-native-modules = ["nano-vm/persistent-native-modules"]
+
 [dependencies]
 clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 hex = "0.4.3"
@@ -15,7 +19,7 @@ nano-consensus-profile = { path = "../nano-consensus-profile" }
 nano-crypto = { path = "../nano-crypto" }
 nano-primitives = { path = "../nano-primitives" }
 nano-sortition = { path = "../nano-sortition" }
-nano-vm = { path = "../nano-vm" }
+nano-vm = { path = "../nano-vm", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 

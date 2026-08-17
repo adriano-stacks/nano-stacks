@@ -44,8 +44,7 @@
     "nano-queue",
     "nano-sortition",
     "nano-sync",
-    "nano-vm",
-    "nano-wasm-cache"
+    "nano-vm"
   ],
   "loopback_surfaces": [
     "/health",
@@ -70,7 +69,8 @@
     "nano-rpc",
     "nano-signer",
     "nano-stackerdb",
-    "nano-tui"
+    "nano-tui",
+    "nano-wasm-cache"
   ],
   "forbidden_config_keys": [
     "event_observer",

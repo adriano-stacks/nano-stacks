@@ -416,6 +416,10 @@ async fn the_packaged_follower_imports_catches_up_forks_restarts_and_tracks_tip(
     let tip = served.last().expect("served tip");
     assert_eq!(durable_tip(directory.path()), *tip.block_id().as_bytes());
     assert_roots(&log, &served);
+    assert!(
+        !directory.path().join("chainstate/native-modules").exists(),
+        "the follower persisted native modules despite its closed package policy"
+    );
 
     honest_http.abort();
     honest_p2p.abort();

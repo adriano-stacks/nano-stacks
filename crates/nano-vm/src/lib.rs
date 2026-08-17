@@ -2,8 +2,11 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Mutex,
 };
+
+#[cfg(feature = "persistent-native-modules")]
+use std::sync::Arc;
 
 pub use clar2wasm::phases;
 pub use clar2wasm::wasm_generator::{EmittedLocals, LocalsReport};
@@ -4935,6 +4938,7 @@ const fn contract_argument(value: &Value) -> Option<&QualifiedContractIdentifier
 /// Cranelift's output goes beside the databases, so a restart does not compile
 /// every contract it touches all over again. An in-memory store — a test, a
 /// checkpoint being read — has nowhere to put it and does without.
+#[cfg(feature = "persistent-native-modules")]
 fn native_module_cache(side_store: Option<&Path>) -> ModuleCache {
     side_store
         .and_then(Path::parent)
@@ -4942,6 +4946,11 @@ fn native_module_cache(side_store: Option<&Path>) -> ModuleCache {
         .map_or_else(ModuleCache::default, |cache| {
             ModuleCache::persisting_in(Arc::new(cache))
         })
+}
+
+#[cfg(not(feature = "persistent-native-modules"))]
+fn native_module_cache(_: Option<&Path>) -> ModuleCache {
+    ModuleCache::default()
 }
 
 fn ensure_wasm_module(
@@ -5529,6 +5538,7 @@ mod tests {
     use super::{ContractCallOutcome, ContractPresence, DeploymentOutcome, MarfStore, Vm};
     use clarity::vm::costs::{ExecutionCost, LimitedCostTracker};
 
+    #[cfg(feature = "persistent-native-modules")]
     use clar2wasm::NativeModuleStore;
     use rusqlite::params;
 
@@ -7498,6 +7508,7 @@ mod tests {
     /// in the wasm and are not cached — they are linked from the running binary
     /// at instantiation — so a change to one takes effect immediately rather than
     /// being outlived by an entry.
+    #[cfg(feature = "persistent-native-modules")]
     #[test]
     fn a_cached_native_module_cannot_outlive_the_inputs_that_built_it() {
         let mut store = MarfStore::new(Network::TESTNET).expect("create a store");
