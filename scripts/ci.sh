@@ -46,6 +46,19 @@ run_gate() {
       cargo test --profile ci -p nano-adversarial --test corpus_smoke \
         owned_corpora_stay_bounded_and_replay -- --exact --test-threads=1
       ;;
+    fuzz-smoke)
+      cargo fuzz build --fuzz-dir fuzz --sanitizer none --codegen-units 16
+      for target in \
+        p2p_frame_and_protocol \
+        transaction_and_block_codecs \
+        signer_and_stackerdb_codecs \
+        checkpoint_manifests \
+        marf_operations \
+        clarity_wasm_abi
+      do
+        NANO_FUZZ_RUNS=20 NANO_FUZZ_SANITIZER=none scripts/fuzz.sh "$target" 1
+      done
+      ;;
     tests)
       cargo test --profile ci --workspace --tests
       cargo test --profile ci --workspace --doc
@@ -101,7 +114,7 @@ run_gate() {
 
 case "$gate" in
   all)
-    for name in toolchain workflow formatting clippy follower-artifact scoreboard fixtures checkpoint-sample adversarial-smoke tests release release-integrity locks; do
+    for name in toolchain workflow formatting clippy follower-artifact scoreboard fixtures checkpoint-sample adversarial-smoke fuzz-smoke tests release release-integrity locks; do
       run_gate "$name"
     done
     ;;

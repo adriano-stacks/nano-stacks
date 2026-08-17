@@ -1,0 +1,85 @@
+name: continuous fuzz debugging
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds to run each target
+        required: false
+        default: "900"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - p2p_frame_and_protocol
+          - transaction_and_block_codecs
+          - signer_and_stackerdb_codecs
+          - checkpoint_manifests
+          - marf_operations
+          - clarity_wasm_abi
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: fuzz-${{ matrix.target }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+
+      - name: bounded continuous run
+        env:
+          NANO_FUZZ_SANITIZER: none
+          NANO_FUZZ_TMP: ${{ runner.temp }}
+          RUN_SECONDS: ${{ inputs.seconds || '900' }}
+        run: nix develop --command scripts/fuzz.sh "${{ matrix.target }}" "$RUN_SECONDS"
+
+      - name: retain a reproducible input on a durable branch
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          if git diff --quiet -- "fuzz/corpus/$TARGET"; then
+            exit 0
+          fi
+          branch="fuzz-finding/$TARGET-$GITHUB_RUN_ID"
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git switch -c "$branch"
+          git add -- "fuzz/corpus/$TARGET"
+          git commit -m "test(fuzz): retain $TARGET finding"
+          git push origin "$branch"
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "test(fuzz): retain $TARGET finding" \
+            --body "Automated reproducible input from workflow run $GITHUB_RUN_ID."
+
+      - name: upload a convenience copy
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/corpus/${{ matrix.target }}/finding-*
+          if-no-files-found: ignore
+          retention-days: 30

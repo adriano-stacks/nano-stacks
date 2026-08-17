@@ -25,4 +25,6 @@ nix develop --command cargo fuzz run --fuzz-dir fuzz --sanitizer none \
 ```
 
 When a run finds a reproducible failure, minimize it and add the smallest case
-to the owning checked-in corpus before removing the temporary artifact.
+to `fuzz/corpus/<target>`. The scheduled workflow does this automatically and
+opens a pull request from a durable branch; uploaded job artifacts are only a
+convenience copy.
