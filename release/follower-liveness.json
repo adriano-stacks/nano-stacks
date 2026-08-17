@@ -1,0 +1,35 @@
+{
+  "schema": "nano-stacks/follower-liveness-measurement/v1",
+  "measured_at": "2026-08-17",
+  "gate": {
+    "command": "nix develop --command scripts/ci.sh follower-artifact",
+    "fixture": "packaged_follower::the_packaged_follower_imports_catches_up_forks_restarts_and_tracks_tip",
+    "served_blocks": 12,
+    "condition_timeout_seconds": 60
+  },
+  "baseline": {
+    "source_revision": "ffde0bf9547b",
+    "artifact_binary_sha256": "e1d88a5b455454b3bfda4e70798ebb4bd7a3259e91441e45345b836c0d224ff4",
+    "closure_bytes": 94380976,
+    "binary_bytes": 36138192,
+    "elapsed_seconds": 39.53,
+    "persistent_native_modules": true
+  },
+  "minimal": {
+    "source_revision": "dec00fe78490",
+    "artifact_binary_sha256": "775ce76b672009e347a4119bb6fb869ce106762b65a9aa0a3734f6a3e69dc13a",
+    "closure_bytes": 94278296,
+    "binary_bytes": 36047880,
+    "elapsed_seconds": 39.71,
+    "configured_http_peers": 0,
+    "outbound_p2p_peers_observed": true,
+    "http_source_discovered_over_p2p": true,
+    "inbound_p2p_serving": false,
+    "persistent_native_modules": false,
+    "persistent_native_module_directories_after_process_exit": 0
+  },
+  "decisions": {
+    "inbound_p2p_serving": "omit",
+    "persistent_native_modules": "omit"
+  }
+}

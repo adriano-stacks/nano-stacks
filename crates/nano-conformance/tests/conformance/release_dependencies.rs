@@ -145,6 +145,57 @@ fn the_follower_policy_is_a_closed_minimal_capability_matrix() {
     );
 }
 
+#[test]
+fn the_follower_omissions_are_bound_to_liveness_measurements() {
+    let policy: Value = serde_json::from_slice(
+        &std::fs::read(workspace().join("release/follower-policy.json"))
+            .expect("read follower capability policy"),
+    )
+    .expect("parse follower capability policy");
+    let evidence = policy["measurement_evidence"]
+        .as_str()
+        .expect("measurement evidence is a path");
+    assert_eq!(evidence, "release/follower-liveness.json");
+
+    let measurement: Value = serde_json::from_slice(
+        &std::fs::read(workspace().join(evidence)).expect("read follower measurement evidence"),
+    )
+    .expect("parse follower measurement evidence");
+    assert_eq!(
+        measurement["schema"],
+        "nano-stacks/follower-liveness-measurement/v1"
+    );
+    let bound = measurement["gate"]["condition_timeout_seconds"]
+        .as_f64()
+        .expect("condition timeout is numeric");
+    for artifact in ["baseline", "minimal"] {
+        let elapsed = measurement[artifact]["elapsed_seconds"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{artifact} elapsed time is numeric"));
+        assert!(
+            elapsed <= bound,
+            "{artifact} violated the documented liveness bound"
+        );
+    }
+    assert_eq!(measurement["minimal"]["configured_http_peers"], 0);
+    assert_eq!(measurement["minimal"]["outbound_p2p_peers_observed"], true);
+    assert_eq!(
+        measurement["minimal"]["http_source_discovered_over_p2p"],
+        true
+    );
+    assert_eq!(measurement["minimal"]["inbound_p2p_serving"], false);
+    assert_eq!(measurement["minimal"]["persistent_native_modules"], false);
+    assert_eq!(
+        measurement["minimal"]["persistent_native_module_directories_after_process_exit"],
+        0
+    );
+    assert_eq!(measurement["decisions"]["inbound_p2p_serving"], "omit");
+    assert_eq!(
+        measurement["decisions"]["persistent_native_modules"],
+        "omit"
+    );
+}
+
 fn string_set<'a>(document: &'a Value, field: &str) -> std::collections::BTreeSet<&'a str> {
     document[field]
         .as_array()

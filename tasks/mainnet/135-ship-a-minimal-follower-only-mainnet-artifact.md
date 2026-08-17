@@ -38,7 +38,7 @@ artifact and its dependency closure.
       configuration.
 - [x] Run checkpoint import, P2P catch-up, fork/reorg, restart and tip following
       through the exact packaged follower artifact.
-- [ ] Measure whether omitting persistent native modules or inbound service
+- [x] Measure whether omitting persistent native modules or inbound service
       violates the documented catch-up/liveness bound; retain neither without a
       measured need.
 

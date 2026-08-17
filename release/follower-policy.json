@@ -103,5 +103,6 @@
   "measurement_decisions": [
     "inbound_p2p_serving",
     "persistent_native_modules"
-  ]
+  ],
+  "measurement_evidence": "release/follower-liveness.json"
 }

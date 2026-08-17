@@ -19,8 +19,15 @@ chainstate. It may:
 - expose health and metrics on loopback.
 
 It has no public HTTP surface. Inbound P2P serving and persistent native Wasm
-modules remain out until measurements show that omitting either violates the
-documented catch-up or liveness bound.
+modules are omitted. The mandatory packaged lifecycle gate gives every
+externally observed catch-up, fork-refusal, restart and recovery condition 60
+seconds. With persistent modules enabled it completed in 39.53 seconds; the
+cache-free, outbound-only package completed in 39.71 seconds, discovered its
+HTTP block source over outbound P2P with no configured HTTP peer, and left no
+native-module directory after any follower process exited. The exact artifact
+sizes, hashes and decisions are recorded in
+[`release/follower-liveness.json`](../release/follower-liveness.json). Neither
+omitted capability has a measured liveness justification for inclusion.
 
 ## Out-of-process capabilities
 
