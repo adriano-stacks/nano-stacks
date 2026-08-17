@@ -42,6 +42,10 @@ run_gate() {
       cargo test --profile ci -p nano-node \
         checkpoint_bundle::tests::published_sample_rebuilds_byte_for_byte -- --exact
       ;;
+    adversarial-smoke)
+      cargo test --profile ci -p nano-adversarial --test corpus_smoke \
+        owned_corpora_stay_bounded_and_replay -- --exact --test-threads=1
+      ;;
     tests)
       cargo test --profile ci --workspace --tests
       cargo test --profile ci --workspace --doc
@@ -97,7 +101,7 @@ run_gate() {
 
 case "$gate" in
   all)
-    for name in toolchain workflow formatting clippy follower-artifact scoreboard fixtures checkpoint-sample tests release release-integrity locks; do
+    for name in toolchain workflow formatting clippy follower-artifact scoreboard fixtures checkpoint-sample adversarial-smoke tests release release-integrity locks; do
       run_gate "$name"
     done
     ;;

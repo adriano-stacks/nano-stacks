@@ -2490,6 +2490,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-adversarial"
+version = "0.1.0"
+dependencies = [
+ "clarity",
+ "hex",
+ "nano-chainstate",
+ "nano-codec",
+ "nano-marf",
+ "nano-p2p",
+ "nano-primitives",
+ "nano-stackerdb",
+ "nano-vm",
+ "tempfile",
+ "toml 1.1.4+spec-1.1.0",
+]
+
+[[package]]
 name = "nano-bitcoin"
 version = "0.1.0"
 dependencies = [

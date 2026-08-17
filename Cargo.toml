@@ -24,6 +24,7 @@ members = [
     "crates/nano-node",
     "crates/nano-rpc",
     "crates/nano-tui",
+    "crates/nano-adversarial",
     "crates/nano-conformance",
     "xtask",
 ]

@@ -58,6 +58,9 @@ jobs:
       - name: published checkpoint sample rebuilds byte for byte
         run: nix develop --command scripts/ci.sh checkpoint-sample
 
+      - name: bounded adversarial corpus replay
+        run: nix develop --command scripts/ci.sh adversarial-smoke
+
       - name: workspace and conformance tests
         run: nix develop --command scripts/ci.sh tests
 

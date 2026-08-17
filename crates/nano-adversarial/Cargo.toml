@@ -1,0 +1,23 @@
+[package]
+name = "nano-adversarial"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
+nano-chainstate = { path = "../nano-chainstate", default-features = false }
+nano-codec = { path = "../nano-codec" }
+nano-marf = { path = "../nano-marf" }
+nano-p2p = { path = "../nano-p2p" }
+nano-primitives = { path = "../nano-primitives" }
+nano-stackerdb = { path = "../nano-stackerdb" }
+nano-vm = { path = "../nano-vm", default-features = false }
+tempfile = "3"
+toml = "1.1.3"
+
+[dev-dependencies]
+hex = "0.4.3"
+
+[lints]
+workspace = true
