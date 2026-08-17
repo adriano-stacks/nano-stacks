@@ -1661,9 +1661,9 @@ where
         );
     }
 
-    fn keep_executed_block(&self, block: &NakamotoBlock) {
+    fn keep_executed_block(&self, block: &NakamotoBlock, applied: &AppliedBlock) {
         if let Some(archive) = self.archive.as_ref()
-            && let Err(error) = archive.keep(block)
+            && let Err(error) = archive.keep_applied(block, applied)
         {
             eprintln!(
                 "cannot keep the executed block {} for serving: {error}",
@@ -2709,7 +2709,7 @@ where
             // said and stepped over — nothing here is consensus, and a node that
             // stopped executing over an archive write would be trading the chain
             // for a convenience.
-            self.keep_executed_block(&block);
+            self.keep_executed_block(&block, &applied);
             staging.remove(block.block_id())?;
             timing.staging += phase.elapsed();
             executed += 1;
@@ -2796,7 +2796,7 @@ where
         self.remember_waterfall_payout(&applied, bitcoin_context);
         self.adopt_executed_tip(block.clone(), bitcoin_context);
         self.announce_block(block, &applied, bitcoin_context);
-        self.keep_executed_block(block);
+        self.keep_executed_block(block, &applied);
         Ok(applied)
     }
 

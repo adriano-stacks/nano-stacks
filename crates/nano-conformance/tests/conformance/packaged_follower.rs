@@ -333,6 +333,35 @@ fn assert_roots(log: &Path, blocks: &[NakamotoBlock]) {
     }
 }
 
+fn assert_receipts(directory: &Path, blocks: &[NakamotoBlock]) {
+    let archive = nano_node::archive::Archive::open(&directory.join("chainstate/executed.sqlite"))
+        .expect("open packaged receipt archive");
+    for block in blocks.iter().skip(1) {
+        let name = format!(
+            "{:08}-{}.json",
+            block.header.chain_length,
+            block.header.block_hash()
+        );
+        let payload: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixtures().join("events/new_block").join(name))
+                .expect("read captured receipt oracle"),
+        )
+        .expect("parse captured receipt oracle");
+        let expected = serde_json::to_value(nano_conformance::receipt_digest(&payload))
+            .expect("serialize captured receipt summary");
+        let actual = archive
+            .receipt_summary(block.block_id())
+            .expect("read packaged receipt summary")
+            .expect("packaged follower kept a receipt summary");
+        assert_eq!(
+            serde_json::to_value(actual).expect("serialize packaged receipt summary"),
+            expected,
+            "receipt differs at Stacks height {}",
+            block.header.chain_length
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_packaged_follower_imports_catches_up_forks_restarts_and_tracks_tip() {
     let Some(binary) = packaged_binary() else {
@@ -437,6 +466,7 @@ async fn the_packaged_follower_imports_catches_up_forks_restarts_and_tracks_tip(
     let tip = served.last().expect("served tip");
     assert_eq!(durable_tip(directory.path()), *tip.block_id().as_bytes());
     assert_roots(&log, &served);
+    assert_receipts(directory.path(), &served);
     assert_no_persistent_modules(directory.path());
 
     honest_http.abort();
