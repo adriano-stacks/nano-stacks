@@ -38,7 +38,7 @@ use nano_mempool::{Account, ChainTip, Mempool};
 use nano_primitives::{
     BlockHeaderHash, ConsensusHash, Hash160, Network, Sha256Sum, StacksBlockId, TrieHash,
 };
-use nano_sync::{FollowedTenure, NodeView, PoxInfo};
+use nano_sync::{FollowedTenure, MAX_TENURE_RESPONSE_BYTES, NodeView, PoxInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use siphasher::sip::SipHasher;
@@ -162,7 +162,12 @@ pub trait ExecutedBlocks: Send + Sync {
 
     /// This block and its ancestors in the same tenure, newest first, stopping
     /// before `stop` when it is named.
-    fn tenure(&self, block_id: StacksBlockId, stop: Option<StacksBlockId>) -> Vec<Vec<u8>>;
+    fn tenure(
+        &self,
+        block_id: StacksBlockId,
+        stop: Option<StacksBlockId>,
+        max_bytes: usize,
+    ) -> ExecutedTenure;
 
     /// The first block of the tenure this block belongs to.
     ///
@@ -191,6 +196,14 @@ pub trait ExecutedBlocks: Send + Sync {
         let _ = consensus_hash;
         None
     }
+}
+
+/// A bounded archive read for one executed tenure.
+#[derive(Debug, Eq, PartialEq)]
+pub enum ExecutedTenure {
+    Missing,
+    TooLarge,
+    Found(Vec<u8>),
 }
 
 /// A block waiting to be vouched for, and where the verdict goes.
@@ -838,7 +851,7 @@ fn v3_chain_routes(ingress: &limits::Registry) -> Router<RpcState> {
                 ingress,
                 "v3.tenure_fork_info",
                 get(tenure_fork_info),
-                limits::STATE_READ,
+                limits::LARGE_RESPONSE_READ,
             ),
         )
         .route(
@@ -852,7 +865,12 @@ fn v3_chain_routes(ingress: &limits::Registry) -> Router<RpcState> {
         )
         .route(
             "/v3/tenures/{start_block_id}",
-            limits::guard(ingress, "v3.tenure", get(tenure), limits::ARCHIVE_READ),
+            limits::guard(
+                ingress,
+                "v3.tenure",
+                get(tenure),
+                limits::LARGE_RESPONSE_READ,
+            ),
         )
 }
 
@@ -1658,22 +1676,24 @@ async fn tenure_fork_info(
             "the stop sortition is older than the start sortition".to_owned(),
         ));
     }
-    Ok(axum::Json(
-        executed.sortitions[newest..=oldest]
+    let mut remaining = MAX_TENURE_RESPONSE_BYTES;
+    let mut response = Vec::new();
+    for sortition in executed.sortitions[newest..=oldest]
+        .iter()
+        .take(FORK_INFO_DEPTH)
+    {
+        let blocks = executed
+            .chain
             .iter()
-            .take(FORK_INFO_DEPTH)
-            .map(|sortition| {
-                executed
-                    .chain
-                    .iter()
-                    .find(|tenure| tenure.sortition.consensus_hash == sortition.consensus_hash)
-                    .map_or_else(
-                        || TenureForkInfoWire::from_sortition(sortition, &[]),
-                        TenureForkInfoWire::from,
-                    )
-            })
-            .collect(),
-    ))
+            .find(|tenure| tenure.sortition.consensus_hash == sortition.consensus_hash)
+            .map_or(&[][..], |tenure| tenure.blocks.as_ref());
+        response.push(TenureForkInfoWire::from_sortition_bounded(
+            sortition,
+            blocks,
+            &mut remaining,
+        )?);
+    }
+    Ok(axum::Json(response))
 }
 
 async fn stacker_set(
@@ -2346,9 +2366,10 @@ async fn tenure(
         && let Some(start) = block_id(&start_block_id)
     {
         let stop = query.stop.as_deref().and_then(block_id);
-        let kept = archive.tenure(start, stop);
-        if !kept.is_empty() {
-            return Ok(RawBlockStream(kept.concat()));
+        match archive.tenure(start, stop, MAX_TENURE_RESPONSE_BYTES) {
+            ExecutedTenure::Found(kept) => return Ok(RawBlockStream(kept)),
+            ExecutedTenure::TooLarge => return Err(tenure_too_large()),
+            ExecutedTenure::Missing => {}
         }
     }
     let cursor = block_id(&start_block_id).ok_or(RpcError::NotFound)?;
@@ -2371,9 +2392,19 @@ async fn tenure(
         if !bytes.is_empty() && stop.is_some_and(|stop| stop == block.block_id()) {
             break;
         }
-        bytes.extend(block.encode());
+        let encoded = block.encode();
+        if encoded.len() > MAX_TENURE_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+            return Err(tenure_too_large());
+        }
+        bytes.extend(encoded);
     }
     Ok(RawBlockStream(bytes))
+}
+
+fn tenure_too_large() -> RpcError {
+    RpcError::Overloaded(format!(
+        "the requested tenure exceeds the {MAX_TENURE_RESPONSE_BYTES}-byte response limit"
+    ))
 }
 
 async fn block(
@@ -2764,15 +2795,15 @@ struct TenureForkInfoWire {
     nakamoto_blocks: Option<String>,
 }
 
-impl From<&FollowedTenure> for TenureForkInfoWire {
-    fn from(tenure: &FollowedTenure) -> Self {
-        Self::from_sortition(&tenure.sortition, tenure.blocks.as_ref())
-    }
-}
-
 impl TenureForkInfoWire {
-    fn from_sortition(sortition: &nano_sync::SortitionInfo, blocks: &[NakamotoBlock]) -> Self {
-        Self {
+    fn from_sortition_bounded(
+        sortition: &nano_sync::SortitionInfo,
+        blocks: &[NakamotoBlock],
+        remaining: &mut usize,
+    ) -> Result<Self, RpcError> {
+        let encoded = encode_blocks_bounded(blocks, *remaining).ok_or_else(tenure_too_large)?;
+        *remaining -= encoded.len();
+        Ok(Self {
             burn_block_hash: format!("0x{}", sortition.bitcoin_block_hash),
             burn_block_height: sortition.bitcoin_height,
             sortition_id: format!("0x{}", sortition.sortition_id),
@@ -2782,19 +2813,26 @@ impl TenureForkInfoWire {
             first_block_mined: blocks
                 .first()
                 .map(|block| format!("0x{}", block.block_id())),
-            nakamoto_blocks: Some(format!("0x{}", hex::encode(encode_blocks(blocks)))),
-        }
+            nakamoto_blocks: Some(format!("0x{}", hex::encode(encoded))),
+        })
     }
 }
 
 /// A block vector in the consensus encoding: a big-endian count, then the blocks.
-fn encode_blocks(blocks: &[NakamotoBlock]) -> Vec<u8> {
-    let count = u32::try_from(blocks.len()).unwrap_or(u32::MAX);
+fn encode_blocks_bounded(blocks: &[NakamotoBlock], max_bytes: usize) -> Option<Vec<u8>> {
+    if max_bytes < size_of::<u32>() {
+        return None;
+    }
+    let count = u32::try_from(blocks.len()).ok()?;
     let mut bytes = count.to_be_bytes().to_vec();
     for block in blocks {
-        bytes.extend(block.encode());
+        let encoded = block.encode();
+        if encoded.len() > max_bytes.saturating_sub(bytes.len()) {
+            return None;
+        }
+        bytes.extend(encoded);
     }
-    bytes
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -2834,9 +2872,9 @@ mod tests {
 
     use super::{
         AccountEntry, BLOCK_QUEUE_LIMITS, CHUNK_QUEUE_LIMITS, ChainAccess, ChainAccessError,
-        EventDispatcher, NakamotoBlock, PROPOSAL_QUEUE_LIMITS, PoxRpcConfig, ProposalRejectCode,
-        ProposalRequest, QueueReport, ReadOnlyCall, Router, RpcState, SealedTip, StackerDbLimits,
-        StackerDbStore, TRANSACTION_QUEUE_LIMITS, router,
+        EventDispatcher, ExecutedTenure, NakamotoBlock, PROPOSAL_QUEUE_LIMITS, PoxRpcConfig,
+        ProposalRejectCode, ProposalRequest, QueueReport, ReadOnlyCall, Router, RpcState,
+        SealedTip, StackerDbLimits, StackerDbStore, TRANSACTION_QUEUE_LIMITS, router,
     };
 
     /// The tests reach for both `Value`s: Clarity's for a read-only answer, and
@@ -4611,6 +4649,17 @@ mod tests {
         assert!(Arc::ptr_eq(&held, &chain[0].blocks));
     }
 
+    #[test]
+    fn tenure_vector_encoding_enforces_its_exact_byte_budget() {
+        let (_, blocks) = view_with_blocks(3);
+        let encoded = super::encode_blocks_bounded(&blocks, usize::MAX).expect("encode tenure");
+        assert!(super::encode_blocks_bounded(&blocks, encoded.len() - 1).is_none());
+        assert_eq!(
+            super::encode_blocks_bounded(&blocks, encoded.len()),
+            Some(encoded)
+        );
+    }
+
     /// Every route answers from what this node executed, so a block the peer has
     /// and this node has not is not served, and the tenure it belongs to reports
     /// the height this node actually reached.
@@ -4715,26 +4764,62 @@ mod tests {
             &self,
             start_block_id: StacksBlockId,
             stop: Option<StacksBlockId>,
-        ) -> Vec<Vec<u8>> {
+            max_bytes: usize,
+        ) -> ExecutedTenure {
             let Some(position) = self
                 .0
                 .iter()
                 .position(|block| block.block_id() == start_block_id)
             else {
-                return Vec::new();
+                return ExecutedTenure::Missing;
             };
             let consensus_hash = self.0[position].header.consensus_hash;
-            let mut blocks = Vec::new();
+            let mut bytes = Vec::new();
             for block in self.0[..=position].iter().rev() {
                 if block.header.consensus_hash != consensus_hash
-                    || (!blocks.is_empty() && Some(block.block_id()) == stop)
+                    || (!bytes.is_empty() && Some(block.block_id()) == stop)
                 {
                     break;
                 }
-                blocks.push(block.encode());
+                let encoded = block.encode();
+                if encoded.len() > max_bytes.saturating_sub(bytes.len()) {
+                    return ExecutedTenure::TooLarge;
+                }
+                bytes.extend(encoded);
             }
-            blocks
+            ExecutedTenure::Found(bytes)
         }
+    }
+
+    struct OversizeTenure;
+
+    impl super::ExecutedBlocks for OversizeTenure {
+        fn block(&self, _: StacksBlockId) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn tenure(&self, _: StacksBlockId, _: Option<StacksBlockId>, _: usize) -> ExecutedTenure {
+            ExecutedTenure::TooLarge
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversize_archived_tenure_is_refused_before_a_response_is_built() {
+        let state = RpcState::new(NETWORK).with_executed_blocks(Arc::new(OversizeTenure));
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v3/tenures/{}",
+                        StacksBlockId::from_bytes([1; 32])
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
     }
 
     /// A node serves the blocks it executed, whether or not a peer has just

@@ -68,6 +68,7 @@ const fn policy(body_bytes: usize, concurrent: usize, per_second: u64, seconds: 
 pub const CHEAP_READ: Policy = policy(0, 64, 512, 5);
 pub const STATE_READ: Policy = policy(0, 16, 128, 15);
 pub const ARCHIVE_READ: Policy = policy(0, 16, 64, 30);
+pub const LARGE_RESPONSE_READ: Policy = policy(0, 2, 8, 60);
 pub const EVENT_STREAM: Policy = policy(0, 64, 64, 5);
 pub const CALL_READ: Policy = policy(4 * 1024 * 1024 + 4096, READ_ONLY_WORKERS, 16, 60);
 pub const TRANSACTION: Policy = policy(2 * 1024 * 1024, 16, 64, 30);

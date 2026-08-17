@@ -20,6 +20,7 @@ use std::{path::Path, sync::Mutex};
 
 use nano_chainstate::NakamotoBlock;
 use nano_primitives::{ConsensusHash, StacksBlockId};
+use nano_rpc::ExecutedTenure;
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// How many executed blocks are kept.
@@ -256,7 +257,8 @@ impl Archive {
         consensus_hash: &[u8],
         height: u64,
         stop: Option<StacksBlockId>,
-    ) -> Result<Vec<Vec<u8>>, ArchiveError> {
+        max_bytes: usize,
+    ) -> Result<ExecutedTenure, ArchiveError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT block_id, bytes FROM executed
@@ -265,7 +267,7 @@ impl Archive {
         let rows = statement.query_map(params![consensus_hash, height], |row| {
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?;
-        let mut blocks = Vec::new();
+        let mut bytes_out = Vec::new();
         let mut expected = start_block_id;
         for row in rows {
             let (id, bytes) = row?;
@@ -277,17 +279,24 @@ impl Archive {
             if id != expected {
                 continue;
             }
-            if !blocks.is_empty() && Some(id) == stop {
+            if !bytes_out.is_empty() && Some(id) == stop {
                 break;
+            }
+            if bytes.len() > max_bytes.saturating_sub(bytes_out.len()) {
+                return Ok(ExecutedTenure::TooLarge);
             }
             let block =
                 NakamotoBlock::decode(&bytes).map_err(|_| ArchiveError::MalformedBlock(id))?;
             expected = block.header.parent_block_id;
-            blocks.push(bytes);
+            bytes_out.extend(bytes);
         }
         drop(statement);
         drop(connection);
-        Ok(blocks)
+        Ok(if bytes_out.is_empty() {
+            ExecutedTenure::Missing
+        } else {
+            ExecutedTenure::Found(bytes_out)
+        })
     }
 }
 
@@ -350,15 +359,26 @@ impl nano_rpc::ExecutedBlocks for Archive {
         }
     }
 
-    fn tenure(&self, start_block_id: StacksBlockId, stop: Option<StacksBlockId>) -> Vec<Vec<u8>> {
+    fn tenure(
+        &self,
+        start_block_id: StacksBlockId,
+        stop: Option<StacksBlockId>,
+        max_bytes: usize,
+    ) -> ExecutedTenure {
         let Ok(Some(start)) = self.stored(start_block_id) else {
-            return Vec::new();
+            return ExecutedTenure::Missing;
         };
-        match self.tenure_from(start_block_id, &start.consensus_hash, start.height, stop) {
+        match self.tenure_from(
+            start_block_id,
+            &start.consensus_hash,
+            start.height,
+            stop,
+            max_bytes,
+        ) {
             Ok(blocks) => blocks,
             Err(error) => {
                 eprintln!("cannot read the tenure starting at {start_block_id}: {error}");
-                Vec::new()
+                ExecutedTenure::Missing
             }
         }
     }
@@ -370,7 +390,7 @@ mod tests {
 
     use nano_chainstate::NakamotoBlock;
     use nano_primitives::{ConsensusHash, StacksBlockId};
-    use nano_rpc::ExecutedBlocks;
+    use nano_rpc::{ExecutedBlocks, ExecutedTenure};
 
     use super::Archive;
 
@@ -479,31 +499,39 @@ mod tests {
         );
         let cursor = tenure.last().expect("a non-empty tenure");
 
-        let served = archive.tenure(cursor.block_id(), None);
-        assert_eq!(
-            served,
-            tenure
-                .iter()
-                .rev()
-                .map(|block| block.encode())
-                .collect::<Vec<_>>()
-        );
+        let expected = tenure
+            .iter()
+            .rev()
+            .flat_map(|block| block.encode())
+            .collect::<Vec<_>>();
+        let served = archive.tenure(cursor.block_id(), None, usize::MAX);
+        assert_eq!(served, ExecutedTenure::Found(expected.clone()));
 
         // Stopping before a block a caller already has is what the peer protocol
         // asks for, and it stops *before* rather than after.
         let stop = tenure[1];
         assert_eq!(
-            archive.tenure(cursor.block_id(), Some(stop.block_id())),
-            tenure[2..]
-                .iter()
-                .rev()
-                .map(|block| block.encode())
-                .collect::<Vec<_>>()
+            archive.tenure(cursor.block_id(), Some(stop.block_id()), usize::MAX),
+            ExecutedTenure::Found(
+                tenure[2..]
+                    .iter()
+                    .rev()
+                    .flat_map(|block| block.encode())
+                    .collect()
+            )
         );
-        assert!(
-            archive
-                .tenure(StacksBlockId::from_bytes([9; 32]), None)
-                .is_empty()
+        assert_eq!(
+            archive.tenure(StacksBlockId::from_bytes([9; 32]), None, usize::MAX),
+            ExecutedTenure::Missing
+        );
+
+        assert_eq!(
+            archive.tenure(cursor.block_id(), None, expected.len() - 1),
+            ExecutedTenure::TooLarge
+        );
+        assert_eq!(
+            archive.tenure(cursor.block_id(), None, expected.len()),
+            ExecutedTenure::Found(expected)
         );
     }
 
