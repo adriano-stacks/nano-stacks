@@ -1133,7 +1133,7 @@ mod tests {
         PushBuffer, SessionError,
     };
     use crate::{
-        FrameBudget,
+        FrameBudget, SwarmLimits,
         wire::{ChainView, MAX_PAYLOAD_LEN, Message, PREAMBLE_LEN, Preamble},
     };
 
@@ -1185,6 +1185,61 @@ mod tests {
         pushes.push(unhandled_message(MAX_PAYLOAD_LEN as usize));
         assert_eq!(pushes.status().bytes, MAX_BUFFERED_PUSH_BYTES);
         assert_eq!(pushes.take().len(), 1);
+    }
+
+    #[test]
+    fn every_allowed_outbound_session_shares_a_fixed_maximum_push_budget() {
+        let outbound = SwarmLimits::default().outbound;
+        let mut sessions = std::iter::repeat_with(PushBuffer::new)
+            .take(outbound)
+            .collect::<Vec<_>>();
+        for pushes in &mut sessions {
+            pushes.push(unhandled_message(MAX_PAYLOAD_LEN as usize));
+        }
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|pushes| pushes.status().bytes)
+                .sum::<usize>(),
+            outbound * MAX_BUFFERED_PUSH_BYTES
+        );
+
+        for pushes in &mut sessions {
+            pushes.push(unhandled_message(5));
+        }
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|pushes| pushes.status().bytes)
+                .sum::<usize>(),
+            outbound * (PREAMBLE_LEN + 5)
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|pushes| pushes.status().dropped)
+                .sum::<u64>(),
+            u64::try_from(outbound).expect("the outbound session limit fits u64")
+        );
+        assert_eq!(
+            sessions
+                .iter_mut()
+                .map(PushBuffer::take)
+                .map(|pushes| pushes.len())
+                .sum::<usize>(),
+            outbound
+        );
+
+        for pushes in &mut sessions {
+            pushes.push(unhandled_message(MAX_PAYLOAD_LEN as usize));
+        }
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|pushes| pushes.status().bytes)
+                .sum::<usize>(),
+            outbound * MAX_BUFFERED_PUSH_BYTES
+        );
     }
 
     #[tokio::test]

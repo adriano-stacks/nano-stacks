@@ -31,7 +31,7 @@ load shedding instead of an unbounded queue, allocation or task population.
       overload response without reporting admission or changing consensus state.
 - [x] Bound P2P memory per session, per address and globally; enforce the budget
       before allocating or decoding the advertised payload.
-- [ ] Bound pushed messages by bytes rather than only by message count and test
+- [x] Bound pushed messages by bytes rather than only by message count and test
       the maximum-size-message case across all allowed sessions.
 - [x] Limit slow reads, fragmented frames, decomposed/hex-expanded bodies and
       expensive read-only calls independently from consensus execution.
