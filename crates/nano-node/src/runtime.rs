@@ -22,10 +22,9 @@ use fs2::FileExt as _;
 use nano_bitcoin::{BitcoinRestSource, BitcoinRpcSource, BitcoinSource as _};
 use nano_chainstate::{
     BitcoinBlockContext, CHECKPOINT_HISTORY_LIMIT, ChainState, ChainStateError,
-    CheckpointBoundaryProof, CheckpointHistoryBlock, MINER_REWARD_MATURITY, NakamotoBlock, Signer,
-    SignerSet, TenureAccounting,
+    CheckpointBoundaryProof, CheckpointHistoryBlock, MINER_REWARD_MATURITY, NakamotoBlock,
+    TenureAccounting,
 };
-use nano_crypto::StacksPublicKey;
 use nano_p2p::Discovered;
 use nano_primitives::{Network, StacksBlockId};
 use nano_rpc::{ChainAccess, EventDispatcher, RpcState, SealedTip, serve};
@@ -34,7 +33,8 @@ use tokio::{net::TcpListener, signal::unix::SignalKind, sync::Mutex, task::JoinS
 
 use crate::{
     CatchUpBudget, CatchUpRound, CheckpointExecutor, CheckpointManifest, CheckpointProvenance,
-    config::Config, miner, signer, sortition::SortitionTracker, staging::Staging,
+    checkpoint_bundle::attesting_reward_set, config::Config, miner, signer,
+    sortition::SortitionTracker, staging::Staging,
 };
 
 /// How many blocks one round of catching up will fetch before executing.
@@ -2945,30 +2945,6 @@ fn already_adopted(recorded: [u8; 32], configured: [u8; 32]) -> Result<(), Strin
             hex::encode(configured)
         ))
     }
-}
-
-/// The reward set a `/v3/stacker_set/:cycle` document names.
-fn attesting_reward_set(bytes: &[u8]) -> Result<SignerSet, Box<dyn Error>> {
-    let document: serde_json::Value = serde_json::from_slice(bytes)?;
-    let entries = document["stacker_set"]["signers"]
-        .as_array()
-        .ok_or("the reward set names no signers")?;
-    let signers = entries
-        .iter()
-        .map(|entry| {
-            let key = entry["signing_key"]
-                .as_str()
-                .ok_or("a signer has no signing key")?;
-            Ok(Signer {
-                public_key: StacksPublicKey::from_bytes(&hex::decode(
-                    key.trim_start_matches("0x"),
-                )?)
-                .map_err(|error| format!("a signing key is not a public key: {error:?}"))?,
-                weight: u32::try_from(entry["weight"].as_u64().ok_or("a signer has no weight")?)?,
-            })
-        })
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    Ok(SignerSet::new(signers)?)
 }
 
 /// The rewards a role still owes: what it last wrote, or what the checkpoint

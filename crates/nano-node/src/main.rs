@@ -1,6 +1,10 @@
 //! The nano-stacks node: one binary, one configuration file, one state directory.
 
-use std::{error::Error, path::PathBuf, process::ExitCode};
+use std::{
+    error::Error,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use clap::{Parser, Subcommand};
 use nano_node::{BUILD_TARGET, RUSTC_VERSION, SOURCE_REVISION, config::Config, runtime};
@@ -30,6 +34,18 @@ enum Command {
     BuildIdentity,
     /// Print the exact executable Epoch-4 profile embedded in this artifact.
     CompatibilityProfile,
+    /// Build a new content-addressed manifest after checking its signer proof.
+    BuildCheckpointManifest {
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        bitcoin_block_hash: String,
+    },
+    /// Verify a checkpoint bundle without opening or writing node state.
+    VerifyCheckpoint {
+        #[arg(long)]
+        bundle: PathBuf,
+    },
 }
 
 /// The same allocator the replay tool measured: 14% off a mainnet replay, and
@@ -47,6 +63,11 @@ async fn main() -> ExitCode {
         Command::ConfigSchema => config_schema(),
         Command::BuildIdentity => build_identity(),
         Command::CompatibilityProfile => compatibility_profile(),
+        Command::BuildCheckpointManifest {
+            bundle,
+            bitcoin_block_hash,
+        } => build_checkpoint_manifest(&bundle, &bitcoin_block_hash),
+        Command::VerifyCheckpoint { bundle } => verify_checkpoint(&bundle),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -86,6 +107,25 @@ fn build_identity() -> Result<(), Box<dyn Error>> {
 
 fn compatibility_profile() -> Result<(), Box<dyn Error>> {
     println!("{}", nano_vm::compatibility_profile_json()?);
+    Ok(())
+}
+
+fn build_checkpoint_manifest(
+    bundle: &Path,
+    bitcoin_block_hash: &str,
+) -> Result<(), Box<dyn Error>> {
+    let manifest =
+        nano_node::checkpoint_bundle::build_checkpoint_bundle_manifest(bundle, bitcoin_block_hash)?;
+    println!("checkpoint content root {}", manifest.content_root());
+    Ok(())
+}
+
+fn verify_checkpoint(bundle: &Path) -> Result<(), Box<dyn Error>> {
+    let manifest = nano_node::checkpoint_bundle::verify_checkpoint_bundle(bundle)?;
+    println!(
+        "checkpoint content root {} verified",
+        manifest.content_root()
+    );
     Ok(())
 }
 
