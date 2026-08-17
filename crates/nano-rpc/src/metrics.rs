@@ -562,6 +562,11 @@ struct ResourceGauges {
     mempool_transaction_limit: IntGauge,
     mempool_byte_limit: IntGauge,
     mempool_saturations: IntGauge,
+    stackerdb_chunks: IntGauge,
+    stackerdb_bytes: IntGauge,
+    stackerdb_chunk_limit: IntGauge,
+    stackerdb_byte_limit: IntGauge,
+    stackerdb_saturations: IntGauge,
     marf_node_cache_entries: IntGauge,
     marf_node_cache_bytes: IntGauge,
     marf_auxiliary_cache_bytes: IntGauge,
@@ -712,6 +717,31 @@ impl ResourceGauges {
                 registry,
                 "mempool_saturations",
                 "Transactions refused because a local mempool limit was full.",
+            ),
+            stackerdb_chunks: gauge(
+                registry,
+                "stackerdb_chunks",
+                "Signed chunks currently retained in local StackerDB replicas.",
+            ),
+            stackerdb_bytes: gauge(
+                registry,
+                "stackerdb_bytes",
+                "Chunk payload bytes currently retained in local StackerDB replicas.",
+            ),
+            stackerdb_chunk_limit: gauge(
+                registry,
+                "stackerdb_chunk_limit",
+                "Maximum signed chunks retained in local StackerDB replicas.",
+            ),
+            stackerdb_byte_limit: gauge(
+                registry,
+                "stackerdb_byte_limit",
+                "Maximum chunk payload bytes retained in local StackerDB replicas.",
+            ),
+            stackerdb_saturations: gauge(
+                registry,
+                "stackerdb_saturations",
+                "Signed chunks refused because a local StackerDB limit was full.",
             ),
             marf_node_cache_entries: gauge(
                 registry,
@@ -1112,6 +1142,22 @@ impl NodeMetrics {
             .set(as_i64(status.saturations));
     }
 
+    /// Publish the producer-owned accounting for local `StackerDB` replicas.
+    pub fn publish_stackerdb(&self, status: crate::stackerdb::StackerDbStatus) {
+        let resources = &self.0.resources;
+        resources.stackerdb_chunks.set(as_i64(status.chunks));
+        resources.stackerdb_bytes.set(as_i64(status.bytes));
+        resources
+            .stackerdb_chunk_limit
+            .set(as_i64(status.chunk_limit));
+        resources
+            .stackerdb_byte_limit
+            .set(as_i64(status.byte_limit));
+        resources
+            .stackerdb_saturations
+            .set(as_i64(status.saturations));
+    }
+
     /// Publish execution-cache residency observed while the VM was already owned.
     pub fn publish_execution_caches(&self, usage: ExecutionCacheReport) {
         let resources = &self.0.resources;
@@ -1330,6 +1376,11 @@ mod tests {
         "nano_mempool_transaction_limit 17",
         "nano_mempool_byte_limit 19",
         "nano_mempool_saturations 23",
+        "nano_stackerdb_chunks 29",
+        "nano_stackerdb_bytes 31",
+        "nano_stackerdb_chunk_limit 37",
+        "nano_stackerdb_byte_limit 41",
+        "nano_stackerdb_saturations 43",
         "nano_tenure_history_window 0",
         "nano_marf_node_cache_entries 13",
         "nano_marf_node_cache_bytes 17",
@@ -1448,6 +1499,13 @@ mod tests {
             transaction_limit: 17,
             byte_limit: 19,
             saturations: 23,
+        });
+        metrics.publish_stackerdb(crate::stackerdb::StackerDbStatus {
+            chunks: 29,
+            bytes: 31,
+            chunk_limit: 37,
+            byte_limit: 41,
+            saturations: 43,
         });
         metrics.publish_execution_caches(execution_cache_fixture());
         publish_ingress_metrics(&metrics);

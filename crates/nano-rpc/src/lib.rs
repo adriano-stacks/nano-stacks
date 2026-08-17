@@ -36,7 +36,7 @@ use nano_codec::Transaction;
 use nano_crypto::MessageSignature;
 use nano_mempool::{Account, ChainTip, Mempool};
 use nano_primitives::{
-    BlockHeaderHash, ConsensusHash, Network, Sha256Sum, StacksBlockId, TrieHash,
+    BlockHeaderHash, ConsensusHash, Hash160, Network, Sha256Sum, StacksBlockId, TrieHash,
 };
 use nano_sync::{FollowedTenure, NodeView, PoxInfo};
 use serde::{Deserialize, Serialize};
@@ -58,7 +58,7 @@ pub use metrics::{
     serve as serve_metrics,
 };
 pub use server::serve;
-pub use stackerdb::{ChunkRefusal, StackerDbStore};
+pub use stackerdb::{ChunkRefusal, StackerDbLimits, StackerDbStatus, StackerDbStore};
 
 const MAINNET_POX_PARTICIPATION_THRESHOLD_PCT: u64 = 5;
 const MAINNET_SBTC_CONTRACT: &str = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token";
@@ -348,6 +348,8 @@ impl RpcState {
         let (events, _) = broadcast::channel(256);
         let metrics = NodeMetrics::default();
         let ingress = limits::Registry::new(metrics.clone());
+        let stackerdb = StackerDbStore::new();
+        metrics.publish_stackerdb(stackerdb.status());
         Self {
             metrics,
             roles: NodeRoles::default(),
@@ -369,7 +371,7 @@ impl RpcState {
             network,
             pox_rpc: None,
             stacker_sets: Arc::new(RwLock::new(BTreeMap::new())),
-            stackerdb: Arc::new(RwLock::new(StackerDbStore::new())),
+            stackerdb: Arc::new(RwLock::new(stackerdb)),
             blocks: None,
             proposal_token: None,
             observers: None,
@@ -394,6 +396,9 @@ impl RpcState {
     #[must_use]
     pub fn with_metrics(mut self, metrics: NodeMetrics) -> Self {
         self.ingress = limits::Registry::new(metrics.clone());
+        if let Ok(stackerdb) = self.stackerdb.try_read() {
+            metrics.publish_stackerdb(stackerdb.status());
+        }
         self.metrics = metrics;
         self
     }
@@ -403,6 +408,13 @@ impl RpcState {
     #[must_use]
     pub fn stackerdb(&self) -> Arc<RwLock<StackerDbStore>> {
         self.stackerdb.clone()
+    }
+
+    /// Configure one locally derived replica and publish its resulting capacity.
+    pub async fn configure_stackerdb(&self, contract_id: &str, writers: Vec<Hash160>) {
+        let mut stackerdb = self.stackerdb.write().await;
+        stackerdb.configure(contract_id, writers);
+        self.metrics.publish_stackerdb(stackerdb.status());
     }
 
     /// Accept a `StackerDB` chunk and announce it to event observers.
@@ -415,10 +427,11 @@ impl RpcState {
         contract_id: &str,
         chunk: nano_stackerdb::Chunk,
     ) -> Result<(), ChunkRefusal> {
-        self.stackerdb
-            .write()
-            .await
-            .put(contract_id, chunk.clone())?;
+        let mut stackerdb = self.stackerdb.write().await;
+        let accepted = stackerdb.put(contract_id, chunk.clone());
+        self.metrics.publish_stackerdb(stackerdb.status());
+        drop(stackerdb);
+        accepted?;
         self.dispatch(
             EventKind::StackerDbChunks,
             &stackerdb_chunks_payload(contract_id, std::slice::from_ref(&chunk)),
@@ -2033,6 +2046,12 @@ async fn stackerdb_chunk_upload(
     let announce = chunk.clone();
     let slot_id = chunk.slot_id;
     let accepted = state.accept_stackerdb_chunk(&contract_id, chunk).await;
+    if accepted == Err(ChunkRefusal::Capacity) {
+        drop(replication);
+        return Err(RpcError::Overloaded(
+            "the local StackerDB replica is at capacity".to_owned(),
+        ));
+    }
     // What the slot holds *now*, which a refused writer needs: stacks-core answers
     // a refusal with the current metadata so the writer can pick up the version,
     // and a client told nothing walks its version number up one request at a time
@@ -2816,8 +2835,8 @@ mod tests {
     use super::{
         AccountEntry, BLOCK_QUEUE_LIMITS, CHUNK_QUEUE_LIMITS, ChainAccess, ChainAccessError,
         EventDispatcher, NakamotoBlock, PROPOSAL_QUEUE_LIMITS, PoxRpcConfig, ProposalRejectCode,
-        ProposalRequest, QueueReport, ReadOnlyCall, Router, RpcState, SealedTip,
-        TRANSACTION_QUEUE_LIMITS, router,
+        ProposalRequest, QueueReport, ReadOnlyCall, Router, RpcState, SealedTip, StackerDbLimits,
+        StackerDbStore, TRANSACTION_QUEUE_LIMITS, router,
     };
 
     /// The tests reach for both `Value`s: Clarity's for a read-only answer, and
@@ -3595,6 +3614,72 @@ mod tests {
         let accepted = app.oneshot(request()).await.expect("response");
         assert_eq!(body_json(accepted).await["accepted"], json!(true));
         assert_eq!(replicated.recv().await.expect("replicate").1, chunk);
+    }
+
+    #[tokio::test]
+    async fn a_full_stackerdb_store_refuses_without_relaying_and_recovers() {
+        let writer = key(b"full StackerDB writer");
+        let writer_hash = nano_primitives::hash160(&writer.public_key().to_bytes_compressed());
+        let (relay, mut replicated) = nano_queue::channel(CHUNK_QUEUE_LIMITS);
+        let state = RpcState::new(NETWORK).with_chunk_relay(relay);
+        *state.stackerdb().write().await =
+            StackerDbStore::with_limits(StackerDbLimits::new(1, usize::MAX));
+        let contract = "ST000000000000000000002AMW42H.signers-0-1";
+        state
+            .configure_stackerdb(contract, vec![writer_hash, writer_hash])
+            .await;
+        let mut first = nano_stackerdb::Chunk::new(0, 1, b"first".to_vec());
+        first.sign(&writer).expect("sign first chunk");
+        state
+            .accept_stackerdb_chunk(contract, first.clone())
+            .await
+            .expect("the first chunk fits");
+
+        let mut second = nano_stackerdb::Chunk::new(1, 1, b"second".to_vec());
+        second.sign(&writer).expect("sign second chunk");
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v2/stackerdb/ST000000000000000000002AMW42H/signers-0-1/chunks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "slot_id": second.slot_id,
+                        "slot_version": second.slot_version,
+                        "sig": hex::encode(second.signature.as_bytes()),
+                        "data": hex::encode(&second.data),
+                    })
+                    .to_string(),
+                ))
+                .expect("request")
+        };
+        let app = router(state.clone());
+
+        let overloaded = app.clone().oneshot(request()).await.expect("response");
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers()[header::RETRY_AFTER], "1");
+        assert!(
+            replicated.try_recv().is_err(),
+            "a refused chunk was relayed"
+        );
+        assert!(
+            state
+                .stackerdb()
+                .read()
+                .await
+                .chunk(contract, 1, None)
+                .is_none()
+        );
+        let scrape = state.metrics().encode().expect("metrics");
+        assert!(scrape.contains("nano_stackerdb_chunk_limit 1"));
+        assert!(scrape.contains("nano_stackerdb_saturations 1"));
+
+        state
+            .configure_stackerdb(contract, vec![writer_hash, writer_hash])
+            .await;
+        let accepted = app.oneshot(request()).await.expect("response");
+        assert_eq!(body_json(accepted).await["accepted"], json!(true));
+        assert_eq!(replicated.recv().await.expect("replicate").1, second);
     }
 
     fn captured_view() -> NodeView {

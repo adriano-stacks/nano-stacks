@@ -13,12 +13,49 @@ use std::collections::BTreeMap;
 use nano_primitives::Hash160;
 use nano_stackerdb::Chunk;
 
+/// Signed chunks retained across all locally configured replicas.
+pub const MAX_RETAINED_CHUNKS: usize = 16_384;
+
+/// Chunk payload bytes retained across all locally configured replicas.
+pub const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StackerDbLimits {
+    pub chunks: usize,
+    pub bytes: usize,
+}
+
+impl StackerDbLimits {
+    #[must_use]
+    pub const fn new(chunks: usize, bytes: usize) -> Self {
+        assert!(chunks > 0, "a StackerDB store must retain a chunk");
+        assert!(bytes > 0, "a StackerDB store must retain chunk bytes");
+        Self { chunks, bytes }
+    }
+}
+
+impl Default for StackerDbLimits {
+    fn default() -> Self {
+        Self::new(MAX_RETAINED_CHUNKS, MAX_RETAINED_BYTES)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StackerDbStatus {
+    pub chunks: usize,
+    pub bytes: usize,
+    pub chunk_limit: usize,
+    pub byte_limit: usize,
+    pub saturations: u64,
+}
+
 /// Why a node refused a chunk (`net/api/poststackerdbchunk.rs`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChunkRefusal {
     DataAlreadyExists,
     NoSuchSlot,
     BadSigner,
+    Capacity,
 }
 
 impl ChunkRefusal {
@@ -28,6 +65,7 @@ impl ChunkRefusal {
             Self::DataAlreadyExists => 0,
             Self::NoSuchSlot => 1,
             Self::BadSigner => 2,
+            Self::Capacity => 3,
         }
     }
 
@@ -37,6 +75,7 @@ impl ChunkRefusal {
             Self::DataAlreadyExists => "Data for this slot and version already exist",
             Self::NoSuchSlot => "No such StackerDB slot",
             Self::BadSigner => "Signature does not match slot signer",
+            Self::Capacity => "The local StackerDB replica is at capacity",
         }
     }
 }
@@ -49,15 +88,47 @@ struct Replica {
 }
 
 /// The `StackerDB` contracts a node replicates.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct StackerDbStore {
     contracts: BTreeMap<String, Replica>,
+    limits: StackerDbLimits,
+    chunks: usize,
+    bytes: usize,
+    saturations: u64,
+}
+
+impl Default for StackerDbStore {
+    fn default() -> Self {
+        Self::with_limits(StackerDbLimits::default())
+    }
 }
 
 impl StackerDbStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub const fn with_limits(limits: StackerDbLimits) -> Self {
+        Self {
+            contracts: BTreeMap::new(),
+            limits,
+            chunks: 0,
+            bytes: 0,
+            saturations: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> StackerDbStatus {
+        StackerDbStatus {
+            chunks: self.chunks,
+            bytes: self.bytes,
+            chunk_limit: self.limits.chunks,
+            byte_limit: self.limits.bytes,
+            saturations: self.saturations,
+        }
     }
 
     /// Replicate a contract whose slots belong, in order, to these writers.
@@ -67,8 +138,18 @@ impl StackerDbStore {
     /// under the new one.
     pub fn configure(&mut self, contract_id: &str, writers: Vec<Hash160>) {
         let slots = vec![None; writers.len()];
-        self.contracts
-            .insert(contract_id.to_owned(), Replica { writers, slots });
+        if let Some(prior) = self
+            .contracts
+            .insert(contract_id.to_owned(), Replica { writers, slots })
+        {
+            self.chunks -= prior.slots.iter().flatten().count();
+            self.bytes -= prior
+                .slots
+                .iter()
+                .flatten()
+                .map(|chunk| chunk.data.len())
+                .sum::<usize>();
+        }
     }
 
     /// The signed metadata of every slot, which is what a replica compares
@@ -113,8 +194,14 @@ impl StackerDbStore {
 
     /// Accept a chunk into its slot, or say why this node will not.
     pub fn put(&mut self, contract_id: &str, chunk: Chunk) -> Result<(), ChunkRefusal> {
-        let replica = self
-            .contracts
+        let Self {
+            contracts,
+            limits,
+            chunks,
+            bytes,
+            saturations,
+        } = self;
+        let replica = contracts
             .get_mut(contract_id)
             .ok_or(ChunkRefusal::NoSuchSlot)?;
         let slot = usize::try_from(chunk.slot_id).map_err(|_| ChunkRefusal::NoSuchSlot)?;
@@ -133,6 +220,17 @@ impl StackerDbStore {
         {
             return Err(ChunkRefusal::DataAlreadyExists);
         }
+        let prior_bytes = held.as_ref().map_or(0, |held| held.data.len());
+        let retained_chunks = *chunks + usize::from(held.is_none());
+        let retained_bytes = *bytes - prior_bytes;
+        if retained_chunks > limits.chunks
+            || chunk.data.len() > limits.bytes.saturating_sub(retained_bytes)
+        {
+            *saturations = (*saturations).saturating_add(1);
+            return Err(ChunkRefusal::Capacity);
+        }
+        *chunks = retained_chunks;
+        *bytes = retained_bytes + chunk.data.len();
         *held = Some(chunk);
         Ok(())
     }
@@ -144,7 +242,7 @@ mod tests {
     use nano_primitives::hash160;
     use nano_stackerdb::Chunk;
 
-    use super::{ChunkRefusal, StackerDbStore};
+    use super::{ChunkRefusal, StackerDbLimits, StackerDbStore};
 
     fn writer(seed: &[u8]) -> (StacksPrivateKey, nano_primitives::Hash160) {
         let key = StacksPrivateKey::from_seed(seed);
@@ -206,6 +304,60 @@ mod tests {
         assert_eq!(metadata.len(), 1);
         assert_eq!(metadata[0].slot_version, 2);
         assert!(metadata[0].verify(owner_hash).expect("verify"));
+    }
+
+    #[test]
+    fn retained_chunks_are_bounded_by_bytes_and_reconfiguration_recovers() {
+        let (owner, owner_hash) = writer(b"bounded owner");
+        let mut store = StackerDbStore::with_limits(StackerDbLimits::new(2, 5));
+        store.configure("SP0.signers-0-1", vec![owner_hash, owner_hash]);
+        assert_eq!(
+            store.put("SP0.signers-0-1", signed(&owner, 0, 1, b"abc")),
+            Ok(())
+        );
+        assert_eq!(
+            store.put("SP0.signers-0-1", signed(&owner, 1, 1, b"def")),
+            Err(ChunkRefusal::Capacity)
+        );
+        assert_eq!(store.chunk("SP0.signers-0-1", 0, None), Some(&b"abc"[..]));
+        assert_eq!(store.chunk("SP0.signers-0-1", 1, None), None);
+        assert_eq!(store.status().bytes, 3);
+        assert_eq!(store.status().saturations, 1);
+
+        assert_eq!(
+            store.put("SP0.signers-0-1", signed(&owner, 0, 2, b"12345")),
+            Ok(())
+        );
+        assert_eq!(
+            store.status().bytes,
+            5,
+            "a replacement releases prior bytes"
+        );
+
+        store.configure("SP0.signers-0-1", vec![owner_hash, owner_hash]);
+        assert_eq!(store.status().chunks, 0);
+        assert_eq!(store.status().bytes, 0);
+        assert_eq!(
+            store.put("SP0.signers-0-1", signed(&owner, 1, 1, b"def")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn retained_tiny_chunks_are_bounded_by_count() {
+        let (owner, owner_hash) = writer(b"bounded count owner");
+        let mut store = StackerDbStore::with_limits(StackerDbLimits::new(1, usize::MAX));
+        store.configure("SP0.signers-0-1", vec![owner_hash, owner_hash]);
+        assert_eq!(
+            store.put("SP0.signers-0-1", signed(&owner, 0, 1, b"a")),
+            Ok(())
+        );
+        assert_eq!(
+            store.put("SP0.signers-0-1", signed(&owner, 1, 1, b"b")),
+            Err(ChunkRefusal::Capacity)
+        );
+        assert_eq!(store.status().chunks, 1);
+        assert_eq!(store.status().saturations, 1);
     }
 
     #[test]

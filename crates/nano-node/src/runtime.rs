@@ -1331,16 +1331,15 @@ async fn configure_signer_slots(
         .iter()
         .map(|entry| nano_primitives::hash160(&entry.signing_key))
         .collect::<Vec<_>>();
-    let store = state.stackerdb();
-    let mut store = store.write().await;
     for message in SIGNER_MESSAGE_IDS {
         let contract = crate::config::cycle_contract(network, cycle, message);
-        store.configure(
-            &format!("{}.{}", contract.address, contract.name),
-            writers.clone(),
-        );
+        state
+            .configure_stackerdb(
+                &format!("{}.{}", contract.address, contract.name),
+                writers.clone(),
+            )
+            .await;
     }
-    drop(store);
 }
 
 /// Publish the current and upcoming reward sets the executed state derives, and
@@ -1562,10 +1561,8 @@ async fn configure_miner_slots(
         .collect::<Vec<_>>()
         .join(", ");
     state
-        .stackerdb()
-        .write()
-        .await
-        .configure(&crate::hosting::identifier(&contract), assignment);
+        .configure_stackerdb(&crate::hosting::identifier(&contract), assignment)
+        .await;
     println!("replicating .miners for the miners that hold its slots, in order: {names}");
 }
 
