@@ -5,12 +5,14 @@ pub mod archive;
 pub mod burnchain;
 pub mod checkpoint;
 pub mod checkpoint_bundle;
+mod checkpoint_history;
 pub mod checkpoint_signatures;
 pub mod config;
 pub mod executor;
 pub mod observation;
 pub mod sortition;
 pub mod staging;
+pub mod startup;
 
 pub use checkpoint::{
     Checkpoint, CheckpointAttestation, CheckpointBundleReceipt, CheckpointManifest,
