@@ -461,6 +461,11 @@ fn no_gates_is_non_qualifying_and_names_every_unexecuted_owner() {
         "the report omitted an unexecuted adversarial job or its owner:\n{stdout}"
     );
     assert!(
+        stdout.contains("4 mandatory hosted jobs are owned in adversarial-jobs.json")
+            && !stdout.contains("adversarial job bounded-adversarial"),
+        "the current bounded gate was incorrectly made dependent on its own hosted run:\n{stdout}"
+    );
+    assert!(
         stdout.contains(
             "UNEXECUTED nano epoch4_profile::every_mandatory_epoch4_vector_executes_against_nano"
         ) && stdout.contains("UNEXECUTED stock revision efc34a07a225c4b950ab9404a1652aa5e14affaf")

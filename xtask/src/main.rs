@@ -6942,7 +6942,7 @@ fn report_adversarial_jobs(source_revision: &str, run_gates: bool) -> bool {
     println!("\nadversarial job history");
     let inventory = AdversarialInventory::load(&workspace_root());
     println!(
-        "  {} mandatory jobs are owned in adversarial-jobs.json.",
+        "  {} mandatory hosted jobs are owned in adversarial-jobs.json.",
         inventory.jobs.len()
     );
     for error in &inventory.errors {
