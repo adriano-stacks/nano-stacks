@@ -1,7 +1,8 @@
 //! Build and verify the checkpoint trust root without opening production state.
 
-use std::{fs, path::Path};
+use std::{fmt::Display, fs, path::Path};
 
+use nano_bitcoin::BitcoinSource;
 use nano_chainstate::{NakamotoBlock, NakamotoCodecError, Signer, SignerSet, SignerSetError};
 use nano_crypto::StacksPublicKey;
 use nano_marf::{
@@ -20,12 +21,17 @@ pub const CHECKPOINT_REWARD_SET_FILE: &str = "reward-set.json";
 /// Returns an error for an unreadable or malformed bundle, a signer proof below
 /// threshold, claims inconsistent with `checkpoint.toml`, or an existing
 /// `checkpoint-bundle.toml`.
-pub fn build_checkpoint_bundle_manifest(
+pub fn build_checkpoint_bundle_manifest<S: BitcoinSource>(
     directory: impl AsRef<Path>,
-    bitcoin_block_hash: &str,
-) -> Result<CheckpointBundleManifest, CheckpointBundleError> {
+    bitcoin: &S,
+) -> Result<CheckpointBundleManifest, CheckpointBundleError>
+where
+    S::Error: Display,
+{
     let directory = directory.as_ref();
-    let claims = observed_claims(directory, bitcoin_block_hash)?;
+    let checkpoint = CheckpointManifest::load(directory)?;
+    let hash = canonical_bitcoin_hash(bitcoin, checkpoint.first_bitcoin_height)?;
+    let claims = observed_claims(directory, &hash)?;
     Ok(CheckpointBundleManifest::write_new(directory, claims)?)
 }
 
@@ -35,11 +41,22 @@ pub fn build_checkpoint_bundle_manifest(
 ///
 /// Returns an error for every content mismatch, malformed signer set, insufficient
 /// signature weight, or mismatch with this artifact's compiler/profile identity.
-pub fn verify_checkpoint_bundle(
+pub fn verify_checkpoint_bundle<S: BitcoinSource>(
     directory: impl AsRef<Path>,
-) -> Result<CheckpointBundleManifest, CheckpointBundleError> {
+    bitcoin: &S,
+) -> Result<CheckpointBundleManifest, CheckpointBundleError>
+where
+    S::Error: Display,
+{
     let directory = directory.as_ref();
     let manifest = CheckpointBundleManifest::verify(directory)?;
+    let canonical = canonical_bitcoin_hash(bitcoin, manifest.checkpoint.bitcoin_height)?;
+    if canonical != manifest.checkpoint.bitcoin_block_hash {
+        return Err(CheckpointBundleError::Invalid(format!(
+            "Bitcoin block {} at height {} is not locally canonical ({canonical})",
+            manifest.checkpoint.bitcoin_block_hash, manifest.checkpoint.bitcoin_height
+        )));
+    }
     let observed = observed_claims(directory, &manifest.checkpoint.bitcoin_block_hash)?;
     if observed != manifest.checkpoint {
         return Err(CheckpointBundleError::Invalid(
@@ -47,6 +64,23 @@ pub fn verify_checkpoint_bundle(
         ));
     }
     Ok(manifest)
+}
+
+fn canonical_bitcoin_hash<S: BitcoinSource>(
+    bitcoin: &S,
+    height: u64,
+) -> Result<String, CheckpointBundleError>
+where
+    S::Error: Display,
+{
+    bitcoin
+        .block_hash_at(height)
+        .map(hex::encode)
+        .map_err(|error| {
+            CheckpointBundleError::Invalid(format!(
+                "the local Bitcoin header chain has no block {height}: {error}"
+            ))
+        })
 }
 
 fn observed_claims(
@@ -194,6 +228,28 @@ pub(crate) mod tests {
     use nano_marf::{CHECKPOINT_BLOCK_FILE, CheckpointBundleManifest};
     use nano_primitives::{BitVec, ConsensusHash, Sha256Sum, StacksBlockId, TrieHash};
 
+    #[derive(Clone, Copy)]
+    pub struct TestBitcoin(pub u64, pub [u8; 32]);
+
+    impl nano_bitcoin::BitcoinSource for TestBitcoin {
+        type Error = String;
+
+        fn block_at(&mut self, _height: u64) -> Result<nano_bitcoin::BitcoinBlock, Self::Error> {
+            unreachable!("checkpoint tests read only Bitcoin headers")
+        }
+
+        fn block_hash_at(&self, height: u64) -> Result<[u8; 32], Self::Error> {
+            if height != self.0 {
+                return Err(format!("fixture has no Bitcoin block {height}"));
+            }
+            Ok(self.1)
+        }
+
+        fn tip_height(&self) -> Result<u64, Self::Error> {
+            Ok(self.0)
+        }
+    }
+
     use super::{
         CHECKPOINT_REWARD_SET_FILE, CheckpointBundleError, build_checkpoint_bundle_manifest,
         observed_claims, verify_checkpoint_bundle,
@@ -271,9 +327,10 @@ pub(crate) mod tests {
     #[test]
     fn offline_bundle_build_and_verification_recompute_the_signer_proof() {
         let (root, _) = fixture(true);
-        let manifest = build_checkpoint_bundle_manifest(root.path(), &"06".repeat(32))
-            .expect("build manifest");
-        let verified = verify_checkpoint_bundle(root.path()).expect("verify manifest");
+        let bitcoin = TestBitcoin(11, [6; 32]);
+        let manifest =
+            build_checkpoint_bundle_manifest(root.path(), &bitcoin).expect("build manifest");
+        let verified = verify_checkpoint_bundle(root.path(), &bitcoin).expect("verify manifest");
         assert_eq!(verified.content_root(), manifest.content_root());
         assert_eq!(verified.checkpoint.signer_weight, 2);
         assert_eq!(verified.checkpoint.approval_threshold, 2);
@@ -282,11 +339,12 @@ pub(crate) mod tests {
     #[test]
     fn a_self_consistent_but_false_signer_claim_is_refused() {
         let (root, _) = fixture(true);
+        let bitcoin = TestBitcoin(11, [6; 32]);
         let mut claims = observed_claims(root.path(), &"06".repeat(32)).expect("observed claims");
         claims.signer_weight += 1;
         CheckpointBundleManifest::write_new(root.path(), claims).expect("false manifest");
         assert!(matches!(
-            verify_checkpoint_bundle(root.path()),
+            verify_checkpoint_bundle(root.path(), &bitcoin),
             Err(CheckpointBundleError::Invalid(reason))
                 if reason.contains("locally verified")
         ));
@@ -295,10 +353,23 @@ pub(crate) mod tests {
     #[test]
     fn a_checkpoint_below_its_signer_threshold_gets_no_manifest() {
         let (root, _) = fixture(false);
+        let bitcoin = TestBitcoin(11, [6; 32]);
         assert!(matches!(
-            build_checkpoint_bundle_manifest(root.path(), &"06".repeat(32)),
+            build_checkpoint_bundle_manifest(root.path(), &bitcoin),
             Err(CheckpointBundleError::Trust(_))
         ));
         assert!(!root.path().join(nano_marf::BUNDLE_MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    fn a_manifest_for_a_different_bitcoin_view_is_refused() {
+        let (root, _) = fixture(true);
+        build_checkpoint_bundle_manifest(root.path(), &TestBitcoin(11, [6; 32]))
+            .expect("content manifest");
+        assert!(matches!(
+            verify_checkpoint_bundle(root.path(), &TestBitcoin(11, [7; 32])),
+            Err(CheckpointBundleError::Invalid(reason))
+                if reason.contains("not locally canonical")
+        ));
     }
 }

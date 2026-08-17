@@ -7,7 +7,8 @@ use std::{
     process::ExitCode,
 };
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use nano_bitcoin::BitcoinRpcSource;
 use nano_node::{BUILD_TARGET, RUSTC_VERSION, SOURCE_REVISION, config::Config, runtime};
 
 #[derive(Parser)]
@@ -15,6 +16,29 @@ use nano_node::{BUILD_TARGET, RUSTC_VERSION, SOURCE_REVISION, config::Config, ru
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Args)]
+struct LocalBitcoin {
+    /// This operator's locally verified Bitcoin Core RPC endpoint.
+    #[arg(long = "bitcoin-rpc-url")]
+    url: String,
+    #[arg(long = "bitcoin-rpc-user")]
+    user: String,
+    /// File containing the Bitcoin Core RPC password, kept out of argv.
+    #[arg(long = "bitcoin-rpc-password-file")]
+    password_file: PathBuf,
+}
+
+impl LocalBitcoin {
+    fn open(&self) -> Result<BitcoinRpcSource, Box<dyn Error>> {
+        Ok(BitcoinRpcSource::new(
+            &self.url,
+            self.user.clone(),
+            fs::read_to_string(&self.password_file)?.trim().to_owned(),
+            [0; 2],
+        )?)
+    }
 }
 
 #[derive(Subcommand)]
@@ -39,8 +63,8 @@ enum Command {
     BuildCheckpointManifest {
         #[arg(long)]
         bundle: PathBuf,
-        #[arg(long)]
-        bitcoin_block_hash: String,
+        #[command(flatten)]
+        bitcoin: LocalBitcoin,
     },
     /// Add one immutable builder signature over a verified checkpoint manifest.
     SignCheckpointManifest {
@@ -54,6 +78,8 @@ enum Command {
         builder: String,
         #[arg(long)]
         private_key: PathBuf,
+        #[command(flatten)]
+        bitcoin: LocalBitcoin,
     },
     /// Verify a checkpoint bundle without opening or writing node state.
     VerifyCheckpoint {
@@ -63,6 +89,8 @@ enum Command {
         policy: PathBuf,
         #[arg(long)]
         signatures: PathBuf,
+        #[command(flatten)]
+        bitcoin: LocalBitcoin,
     },
 }
 
@@ -81,22 +109,30 @@ async fn main() -> ExitCode {
         Command::ConfigSchema => config_schema(),
         Command::BuildIdentity => build_identity(),
         Command::CompatibilityProfile => compatibility_profile(),
-        Command::BuildCheckpointManifest {
-            bundle,
-            bitcoin_block_hash,
-        } => build_checkpoint_manifest(&bundle, &bitcoin_block_hash),
+        Command::BuildCheckpointManifest { bundle, bitcoin } => {
+            build_checkpoint_manifest(&bundle, &bitcoin)
+        }
         Command::SignCheckpointManifest {
             bundle,
             policy,
             signatures,
             builder,
             private_key,
-        } => sign_checkpoint_manifest(&bundle, &policy, &signatures, &builder, &private_key),
+            bitcoin,
+        } => sign_checkpoint_manifest(
+            &bundle,
+            &policy,
+            &signatures,
+            &builder,
+            &private_key,
+            &bitcoin,
+        ),
         Command::VerifyCheckpoint {
             bundle,
             policy,
             signatures,
-        } => verify_checkpoint(&bundle, &policy, &signatures),
+            bitcoin,
+        } => verify_checkpoint(&bundle, &policy, &signatures, &bitcoin),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -139,12 +175,10 @@ fn compatibility_profile() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn build_checkpoint_manifest(
-    bundle: &Path,
-    bitcoin_block_hash: &str,
-) -> Result<(), Box<dyn Error>> {
+fn build_checkpoint_manifest(bundle: &Path, bitcoin: &LocalBitcoin) -> Result<(), Box<dyn Error>> {
+    let bitcoin = bitcoin.open()?;
     let manifest =
-        nano_node::checkpoint_bundle::build_checkpoint_bundle_manifest(bundle, bitcoin_block_hash)?;
+        nano_node::checkpoint_bundle::build_checkpoint_bundle_manifest(bundle, &bitcoin)?;
     println!("checkpoint content root {}", manifest.content_root());
     Ok(())
 }
@@ -155,8 +189,10 @@ fn sign_checkpoint_manifest(
     signatures: &Path,
     builder: &str,
     private_key: &Path,
+    bitcoin: &LocalBitcoin,
 ) -> Result<(), Box<dyn Error>> {
     let policy = nano_node::checkpoint_signatures::BuilderPolicy::load(policy)?;
+    let bitcoin = bitcoin.open()?;
     let private_key = fs::read_to_string(private_key)?;
     let bytes: [u8; 32] = hex::decode(private_key.trim())?
         .try_into()
@@ -164,6 +200,7 @@ fn sign_checkpoint_manifest(
     let private_key = nano_crypto::StacksPrivateKey::from_bytes(bytes)?;
     let path = nano_node::checkpoint_signatures::sign_checkpoint_bundle(
         bundle,
+        &bitcoin,
         &policy,
         signatures,
         builder,
@@ -177,10 +214,12 @@ fn verify_checkpoint(
     bundle: &Path,
     policy: &Path,
     signatures: &Path,
+    bitcoin: &LocalBitcoin,
 ) -> Result<(), Box<dyn Error>> {
     let policy = nano_node::checkpoint_signatures::BuilderPolicy::load(policy)?;
+    let bitcoin = bitcoin.open()?;
     let verified = nano_node::checkpoint_signatures::verify_signed_checkpoint_bundle(
-        bundle, &policy, signatures,
+        bundle, &bitcoin, &policy, signatures,
     )?;
     println!(
         "checkpoint content root {} verified by {}",

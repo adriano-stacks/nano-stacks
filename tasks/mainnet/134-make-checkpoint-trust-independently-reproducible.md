@@ -21,10 +21,10 @@ claims.
 
 ## Tasks
 
-- [ ] Define a versioned content-addressed checkpoint manifest covering every
+- [x] Define a versioned content-addressed checkpoint manifest covering every
       file and chunk, size, state format, source height and block ID, state root,
       signer threshold proof, Bitcoin view and Epoch 4.0/compiler identity.
-- [ ] Verify the attesting block, signer set and threshold locally from the
+- [x] Verify the attesting block, signer set and threshold locally from the
       bundle and a locally verified Bitcoin header chain; do not accept a remote
       node's derived conclusion as evidence.
 - [ ] Build the same checkpoint from at least two independently sourced archives

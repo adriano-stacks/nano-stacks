@@ -2,11 +2,13 @@
 
 use std::{
     collections::BTreeSet,
+    fmt::Display,
     fs::{self, File},
     io::Write as _,
     path::{Path, PathBuf},
 };
 
+use nano_bitcoin::BitcoinSource;
 use nano_crypto::{CryptoError, MessageSignature, StacksPrivateKey, StacksPublicKey};
 use nano_primitives::sha256;
 use serde::{Deserialize, Serialize};
@@ -209,14 +211,18 @@ impl BuilderKey {
 ///
 /// Returns an error if the bundle or policy is invalid, the private key is not
 /// the pinned active key, or the signature path already exists.
-pub fn sign_checkpoint_bundle(
+pub fn sign_checkpoint_bundle<S: BitcoinSource>(
     bundle: impl AsRef<Path>,
+    bitcoin: &S,
     policy: &BuilderPolicy,
     signatures: impl AsRef<Path>,
     builder: &str,
     private_key: &StacksPrivateKey,
-) -> Result<PathBuf, BuilderSignatureError> {
-    let manifest = verify_checkpoint_bundle(bundle)?;
+) -> Result<PathBuf, BuilderSignatureError>
+where
+    S::Error: Display,
+{
+    let manifest = verify_checkpoint_bundle(bundle, bitcoin)?;
     let expected = policy.active_key(builder, manifest.checkpoint.checkpoint_stacks_height)?;
     if private_key.public_key() != expected {
         return Err(BuilderSignatureError::Invalid(format!(
@@ -251,12 +257,16 @@ pub fn sign_checkpoint_bundle(
 ///
 /// Returns an error before import for any bundle mismatch, unknown or inactive
 /// builder, malformed signature, changed root, or unmet threshold.
-pub fn verify_signed_checkpoint_bundle(
+pub fn verify_signed_checkpoint_bundle<S: BitcoinSource>(
     bundle: impl AsRef<Path>,
+    bitcoin: &S,
     policy: &BuilderPolicy,
     signatures: impl AsRef<Path>,
-) -> Result<VerifiedBuilders, BuilderSignatureError> {
-    let manifest = verify_checkpoint_bundle(bundle)?;
+) -> Result<VerifiedBuilders, BuilderSignatureError>
+where
+    S::Error: Display,
+{
+    let manifest = verify_checkpoint_bundle(bundle, bitcoin)?;
     policy.validate()?;
     let height = manifest.checkpoint.checkpoint_stacks_height;
     let active = policy.active_builders(height);
@@ -468,9 +478,14 @@ mod tests {
         verify_signed_checkpoint_bundle,
     };
     use crate::{
-        checkpoint_bundle::{build_checkpoint_bundle_manifest, tests::fixture},
+        checkpoint_bundle::{
+            build_checkpoint_bundle_manifest,
+            tests::{TestBitcoin, fixture},
+        },
         checkpoint_signatures::BuilderSignature,
     };
+
+    const BITCOIN: TestBitcoin = TestBitcoin(11, [6; 32]);
 
     fn key(
         name: &str,
@@ -499,8 +514,8 @@ mod tests {
     #[test]
     fn two_pinned_builders_sign_one_content_root_append_only() {
         let (bundle, [first, second]) = fixture(true);
-        let manifest = build_checkpoint_bundle_manifest(bundle.path(), &"06".repeat(32))
-            .expect("content manifest");
+        let manifest =
+            build_checkpoint_bundle_manifest(bundle.path(), &BITCOIN).expect("content manifest");
         let signatures = tempfile::tempdir().expect("signature directory");
         let policy = policy(
             2,
@@ -511,6 +526,7 @@ mod tests {
         );
         sign_checkpoint_bundle(
             bundle.path(),
+            &BITCOIN,
             &policy,
             signatures.path(),
             "archive-east",
@@ -519,19 +535,22 @@ mod tests {
         .expect("first builder");
         sign_checkpoint_bundle(
             bundle.path(),
+            &BITCOIN,
             &policy,
             signatures.path(),
             "archive-west",
             &second,
         )
         .expect("second builder");
-        let verified = verify_signed_checkpoint_bundle(bundle.path(), &policy, signatures.path())
-            .expect("builder threshold");
+        let verified =
+            verify_signed_checkpoint_bundle(bundle.path(), &BITCOIN, &policy, signatures.path())
+                .expect("builder threshold");
         assert_eq!(verified.content_root, manifest.content_root());
         assert_eq!(verified.names, ["archive-east", "archive-west"]);
         assert!(matches!(
             sign_checkpoint_bundle(
                 bundle.path(),
+                &BITCOIN,
                 &policy,
                 signatures.path(),
                 "archive-east",
@@ -545,8 +564,7 @@ mod tests {
     #[test]
     fn a_bundle_cannot_declare_its_own_builder_or_bypass_the_threshold() {
         let (bundle, [first, second]) = fixture(true);
-        build_checkpoint_bundle_manifest(bundle.path(), &"06".repeat(32))
-            .expect("content manifest");
+        build_checkpoint_bundle_manifest(bundle.path(), &BITCOIN).expect("content manifest");
         let signatures = tempfile::tempdir().expect("signature directory");
         let trusted = policy(
             2,
@@ -557,6 +575,7 @@ mod tests {
         );
         sign_checkpoint_bundle(
             bundle.path(),
+            &BITCOIN,
             &trusted,
             signatures.path(),
             "archive-east",
@@ -564,7 +583,12 @@ mod tests {
         )
         .expect("one trusted builder");
         assert!(matches!(
-            verify_signed_checkpoint_bundle(bundle.path(), &trusted, signatures.path()),
+            verify_signed_checkpoint_bundle(
+                bundle.path(),
+                &BITCOIN,
+                &trusted,
+                signatures.path()
+            ),
             Err(BuilderSignatureError::Invalid(reason)) if reason.contains("threshold 2")
         ));
 
@@ -573,6 +597,7 @@ mod tests {
         let attacker_signatures = tempfile::tempdir().expect("attacker signatures");
         sign_checkpoint_bundle(
             bundle.path(),
+            &BITCOIN,
             &attacker_policy,
             attacker_signatures.path(),
             "attacker",
@@ -582,6 +607,7 @@ mod tests {
         assert!(matches!(
             verify_signed_checkpoint_bundle(
                 bundle.path(),
+                &BITCOIN,
                 &trusted,
                 attacker_signatures.path()
             ),
@@ -593,8 +619,7 @@ mod tests {
     #[test]
     fn rotation_and_revocation_are_decided_at_the_checkpoint_height() {
         let (bundle, [old, peer]) = fixture(true);
-        build_checkpoint_bundle_manifest(bundle.path(), &"06".repeat(32))
-            .expect("content manifest");
+        build_checkpoint_bundle_manifest(bundle.path(), &BITCOIN).expect("content manifest");
         let replacement = StacksPrivateKey::from_seed(b"replacement checkpoint builder");
         let policy = policy(
             2,
@@ -609,6 +634,7 @@ mod tests {
         assert!(matches!(
             sign_checkpoint_bundle(
                 bundle.path(),
+                &BITCOIN,
                 &policy,
                 signatures.path(),
                 "archive",
@@ -619,21 +645,34 @@ mod tests {
         ));
         sign_checkpoint_bundle(
             bundle.path(),
+            &BITCOIN,
             &policy,
             signatures.path(),
             "archive",
             &replacement,
         )
         .expect("rotated builder");
-        sign_checkpoint_bundle(bundle.path(), &policy, signatures.path(), "peer", &peer)
-            .expect("peer before revocation");
-        verify_signed_checkpoint_bundle(bundle.path(), &policy, signatures.path())
+        sign_checkpoint_bundle(
+            bundle.path(),
+            &BITCOIN,
+            &policy,
+            signatures.path(),
+            "peer",
+            &peer,
+        )
+        .expect("peer before revocation");
+        verify_signed_checkpoint_bundle(bundle.path(), &BITCOIN, &policy, signatures.path())
             .expect("height seven policy");
 
         let mut revoked = policy;
         revoked.builders[2].revoked_from_height = Some(7);
         assert!(matches!(
-            verify_signed_checkpoint_bundle(bundle.path(), &revoked, signatures.path()),
+            verify_signed_checkpoint_bundle(
+                bundle.path(),
+                &BITCOIN,
+                &revoked,
+                signatures.path()
+            ),
             Err(BuilderSignatureError::Invalid(reason))
                 if reason.contains("only 1 builders are active")
         ));
@@ -642,13 +681,18 @@ mod tests {
     #[test]
     fn changed_signature_bytes_and_noncanonical_entries_are_refused() {
         let (bundle, [first, _]) = fixture(true);
-        build_checkpoint_bundle_manifest(bundle.path(), &"06".repeat(32))
-            .expect("content manifest");
+        build_checkpoint_bundle_manifest(bundle.path(), &BITCOIN).expect("content manifest");
         let policy = policy(1, vec![key("archive", &first, 0, None, None)]);
         let signatures = tempfile::tempdir().expect("signature directory");
-        let path =
-            sign_checkpoint_bundle(bundle.path(), &policy, signatures.path(), "archive", &first)
-                .expect("builder signature");
+        let path = sign_checkpoint_bundle(
+            bundle.path(),
+            &BITCOIN,
+            &policy,
+            signatures.path(),
+            "archive",
+            &first,
+        )
+        .expect("builder signature");
         let mut statement: BuilderSignature =
             toml::from_str(&fs::read_to_string(&path).expect("signature bytes"))
                 .expect("signature statement");
@@ -659,12 +703,17 @@ mod tests {
         )
         .expect("replace test signature");
         assert!(matches!(
-            verify_signed_checkpoint_bundle(bundle.path(), &policy, signatures.path()),
+            verify_signed_checkpoint_bundle(bundle.path(), &BITCOIN, &policy, signatures.path()),
             Err(BuilderSignatureError::Crypto(_))
         ));
         fs::create_dir(signatures.path().join("nested")).expect("noncanonical entry");
         assert!(matches!(
-            verify_signed_checkpoint_bundle(bundle.path(), &policy, signatures.path()),
+            verify_signed_checkpoint_bundle(
+                bundle.path(),
+                &BITCOIN,
+                &policy,
+                signatures.path()
+            ),
             Err(BuilderSignatureError::Invalid(reason))
                 if reason.contains("not a regular file")
         ));
