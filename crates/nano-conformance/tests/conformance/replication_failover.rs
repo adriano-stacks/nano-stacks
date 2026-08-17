@@ -324,10 +324,21 @@ async fn a_chunk_this_node_wrote_survives_the_peer_that_was_carrying_it() {
     .await;
     let state = node(vec![writer(&key)]).await;
     let mut replicas = Replicas::from_endpoints(&[gone, honest]);
-    let outbound = vec![(
+    let outbound_chunk = (
         identifier(&nano_node::hosting::replicated(Network::MAINNET, CYCLE)[0]),
         chunk,
-    )];
+    );
+    let outbound_bytes = outbound_chunk.0.len() + outbound_chunk.1.data.len() + 73;
+    let (sender, mut receiver) = nano_queue::channel(nano_queue::Limits::new(1, outbound_bytes));
+    sender
+        .try_send(outbound_chunk, outbound_bytes)
+        .expect("the signer chunk fits its production-shaped queue");
+    let outbound = vec![
+        receiver
+            .recv_lease()
+            .await
+            .expect("the retry keeps its byte lease"),
+    ];
 
     assert!(
         round(&mut replicas, Network::MAINNET, &state, &outbound)
