@@ -21,10 +21,10 @@ load shedding instead of an unbounded queue, allocation or task population.
 
 ## Tasks
 
-- [ ] Inventory RPC bodies, P2P frames, decoded messages, proposal/block/chunk/
+- [x] Inventory RPC bodies, P2P frames, decoded messages, proposal/block/chunk/
       transaction channels, peer push buffers, event observers and spawned
       per-request work. Record their present count and byte bounds.
-- [ ] Replace externally fed unbounded channels with bounded, byte-accounted
+- [x] Replace externally fed unbounded channels with bounded, byte-accounted
       queues. Share one small queue abstraction and expose current bytes, age,
       drops and saturation.
 - [x] Add route-specific body, concurrency and rate limits. Return an explicit

@@ -259,6 +259,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
+    use std::path::{Path, PathBuf};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -281,6 +282,101 @@ mod tests {
 
     fn registry(global_limit: usize) -> Registry {
         Registry::with_global_limit(global_limit, crate::NodeMetrics::default())
+    }
+
+    fn rust_sources(directory: &Path, files: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).expect("read source directory") {
+            let path = entry.expect("source entry").path();
+            if path.is_dir() {
+                rust_sources(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    fn production_source(path: &Path) -> String {
+        let source = std::fs::read_to_string(path).expect("read Rust source");
+        source
+            .split_once("#[cfg(test)]")
+            .map_or(source.as_str(), |(production, _)| production)
+            .to_owned()
+    }
+
+    #[test]
+    fn every_node_ingress_channel_and_route_is_in_the_bounded_inventory() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace");
+        let crates = [
+            "nano-bitcoin",
+            "nano-mempool",
+            "nano-node",
+            "nano-p2p",
+            "nano-queue",
+            "nano-rpc",
+            "nano-stackerdb",
+            "nano-sync",
+        ];
+        let forbidden = [
+            "unbounded_channel",
+            "UnboundedSender",
+            "UnboundedReceiver",
+            "std::sync::mpsc::channel",
+            "mpsc::channel()",
+            "crossbeam_channel::unbounded",
+            "flume::unbounded",
+            "async_channel::unbounded",
+        ];
+        let mut files = Vec::new();
+        for name in crates {
+            rust_sources(&workspace.join("crates").join(name).join("src"), &mut files);
+        }
+        for path in files {
+            let source = production_source(&path);
+            for pattern in forbidden {
+                assert!(
+                    !source.contains(pattern),
+                    "{} uses the unbounded ingress primitive {pattern:?}",
+                    path.display()
+                );
+            }
+        }
+
+        let rpc = production_source(&workspace.join("crates/nano-rpc/src/lib.rs"));
+        let routes = rpc
+            .split_once("pub fn router(state: RpcState)")
+            .and_then(|(_, routes)| routes.split_once("static TRACE_REQUESTS"))
+            .map(|(routes, _)| routes)
+            .expect("public route table");
+        assert_eq!(routes.matches(".route(").count(), 24);
+        assert_eq!(
+            routes.matches(".route(").count(),
+            routes.matches("limits::guard(").count(),
+            "a public route bypasses admission policy"
+        );
+
+        let metrics = production_source(&workspace.join("crates/nano-rpc/src/metrics.rs"));
+        assert!(metrics.contains("crate::server::serve_metrics"));
+        assert!(!metrics.contains("axum::serve("));
+
+        let inventory = std::fs::read_to_string(workspace.join("docs/ingress-budgets.md"))
+            .expect("checked-in ingress inventory");
+        for required in [
+            "24 route registrations",
+            "16,778,054 bytes",
+            "134,224,432 bytes",
+            "Followed tenure history",
+            "640 MiB",
+            "BitcoinRestSource",
+            "nano-tui",
+        ] {
+            assert!(
+                inventory.contains(required),
+                "ingress inventory no longer records {required:?}"
+            );
+        }
     }
 
     fn policy(concurrent: usize, per_second: u64) -> Policy {
