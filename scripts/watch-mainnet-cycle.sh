@@ -11,6 +11,12 @@ readonly local_url="${2%/}"
 shift 2
 readonly -a oracle_urls=("$@")
 
+exec 9>"${output}.lock"
+if ! flock -n 9; then
+    echo "another mainnet-cycle watcher owns ${output}" >&2
+    exit 1
+fi
+
 derive_unbroken_pox_id() {
     python3 -c '
 import hashlib
@@ -30,19 +36,43 @@ else:
 '
 }
 
-last_height=$(tail -n 1 "$output" 2>/dev/null | jq -r '.local.burn_block_height // 0' || true)
-last_height=${last_height:-0}
+last_height=0
+if [ -f "$output" ]; then
+    if ! last_height=$(jq -se '
+        map(.local.burn_block_height) as $heights |
+        if ($heights | length) == 0 then
+            0
+        elif
+            ($heights | unique | length) == ($heights | length) and
+            (($heights | max) - ($heights | min) + 1) == ($heights | length)
+        then
+            $heights | max
+        else
+            error("heights are duplicated or discontinuous")
+        end
+    ' "$output"); then
+        echo "existing cycle evidence is malformed or discontinuous: ${output}" >&2
+        exit 1
+    fi
+fi
 
 while true; do
     # `/v3/sortitions` includes the current locally derived burn view even when
     # that Bitcoin block elected no miner. `latest_and_last` deliberately skips
     # those views, which would leave holes in a whole-cycle comparison.
     local_response=$(curl -fsS --max-time 10 "$local_url/v3/sortitions" || true)
-    local_snapshot=$(jq -ce '.[0]' <<<"$local_response" 2>/dev/null || true)
-    height=$(jq -r '.burn_block_height // 0' <<<"$local_snapshot" 2>/dev/null || true)
-    height=${height:-0}
+    current_snapshot=$(jq -ce '.[0]' <<<"$local_response" 2>/dev/null || true)
+    current_height=$(jq -r '.burn_block_height // 0' <<<"$current_snapshot" 2>/dev/null || true)
+    current_height=${current_height:-0}
 
-    if [ "$height" -gt "$last_height" ]; then
+    if [ "$current_height" -gt "$last_height" ]; then
+        if [ "$last_height" -ne 0 ] && [ "$current_height" -ne $((last_height + 1)) ]; then
+            echo "cycle evidence skipped burn heights ${last_height}..${current_height}" >&2
+            exit 1
+        fi
+
+        height=$current_height
+        local_snapshot=$current_snapshot
         local_info=$(curl -fsS --max-time 10 "$local_url/v2/info" || echo null)
         local_pox_id=$(derive_unbroken_pox_id <<<"$local_snapshot" || echo null)
         oracles='[]'
