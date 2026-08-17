@@ -276,16 +276,16 @@ pub fn authenticated_anchor_index(chain: &[NakamotoBlock]) -> usize {
     authentication_window(chain).anchor
 }
 
-struct PreparedCheckpoint {
-    marf: PathBuf,
-    source: [u8; 32],
-    root: nano_primitives::TrieHash,
-    accounting: PathBuf,
-    attesting_block: PathBuf,
-    attesting_reward_set: PathBuf,
-    authentication_history: PathBuf,
-    anchor: NakamotoBlock,
-    anchor_bitcoin_height: u64,
+pub struct PreparedCheckpoint {
+    pub marf: PathBuf,
+    pub source: [u8; 32],
+    pub root: nano_primitives::TrieHash,
+    pub accounting: PathBuf,
+    pub attesting_block: PathBuf,
+    pub attesting_reward_set: PathBuf,
+    pub authentication_history: PathBuf,
+    pub anchor: NakamotoBlock,
+    pub anchor_bitcoin_height: u64,
 }
 
 fn block_bitcoin_context(block: &NakamotoBlock) -> nano_chainstate::BitcoinBlockContext {
@@ -298,7 +298,7 @@ fn block_bitcoin_context(block: &NakamotoBlock) -> nano_chainstate::BitcoinBlock
         .unwrap_or_else(|| panic!("the capture has Bitcoin context for block {view}"))
 }
 
-fn prepare_checkpoint(directory: &Path, chain: &[NakamotoBlock]) -> PreparedCheckpoint {
+pub fn prepare_checkpoint(directory: &Path, chain: &[NakamotoBlock]) -> PreparedCheckpoint {
     let window = authentication_window(chain);
     let boundary = &chain[window.boundary];
     let source = &chain[window.source];

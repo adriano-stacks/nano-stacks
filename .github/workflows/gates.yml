@@ -163,6 +163,9 @@ jobs:
           nix develop --command scripts/ci.sh reproducible-release
           verified_artifact=$(<"$NANO_REPRODUCIBLE_STORE/output-path")
           test -x "$NANO_REPRODUCIBLE_STORE$verified_artifact/bin/stacks-node"
+          follower_artifact=$(nix build .#stacks-follower --no-link --print-out-paths)
+          export NANO_FOLLOWER_ARTIFACT="$follower_artifact/bin/stacks-follower"
+          export NANO_FOLLOWER_REVISION="$GITHUB_SHA"
 
           candidate="$NANO_RELEASE_OUTPUT/candidate-$GITHUB_SHA-$GITHUB_RUN_ID"
           report="$NANO_RELEASE_OUTPUT/qualification-$GITHUB_SHA-$GITHUB_RUN_ID.txt"

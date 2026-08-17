@@ -236,6 +236,18 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// Start by advertising only this many blocks.
+    #[must_use]
+    pub fn showing(mut self, blocks: usize) -> Self {
+        self.visible = Arc::new(AtomicUsize::new(blocks));
+        self
+    }
+
+    /// Move this peer's advertised tip to a new prefix of its chain.
+    pub fn show(&self, blocks: usize) {
+        self.visible.store(blocks, Ordering::SeqCst);
+    }
+
     /// Refuse every *n*th request with a 429.
     #[must_use]
     pub const fn refusing_every(mut self, requests: usize) -> Self {

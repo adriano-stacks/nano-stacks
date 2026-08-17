@@ -63,6 +63,7 @@ mod p2p_discovery;
 mod p2p_inbound;
 mod p2p_relay;
 mod p2p_wire;
+mod packaged_follower;
 mod peer_equivocation;
 mod pox_boundary;
 mod pox_five_replay;

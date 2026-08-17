@@ -156,6 +156,14 @@ requires = "checked-in captured blocks and timing isolation"
 policy = "required"
 
 [[conditional]]
+site = "packaged_follower::packaged_binary#1"
+class = "infrastructure"
+owner = "135"
+job = "release-qualification"
+requires = "NANO_FOLLOWER_ARTIFACT from the clean Nix package and NANO_FOLLOWER_REVISION"
+policy = "required"
+
+[[conditional]]
 site = "kill_during_replay::a_kill_between_the_two_durability_boundaries_leaves_the_complete_parent#1"
 class = "infrastructure"
 owner = "053"

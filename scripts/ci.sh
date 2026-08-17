@@ -74,6 +74,11 @@ run_gate() {
       jq -S . "$artifact/share/nano-stacks-follower/inspection.json" \
         >"$inspection_dir/installed.sorted.json"
       cmp "$inspection_dir/actual.sorted.json" "$inspection_dir/installed.sorted.json"
+      NANO_FOLLOWER_ARTIFACT="$artifact/bin/stacks-follower" \
+        NANO_FOLLOWER_REVISION=$(git rev-parse HEAD) \
+        cargo test --profile ci -p nano-conformance --test conformance \
+          packaged_follower::the_packaged_follower_imports_catches_up_forks_restarts_and_tracks_tip \
+          -- --exact --nocapture --test-threads=1
       rm -rf -- "$inspection_dir"
       trap - RETURN
       ;;
