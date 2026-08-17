@@ -258,14 +258,16 @@ fn assert_package_identity(binary: &Path) {
 }
 
 fn durable_tip(directory: &Path) -> [u8; 32] {
-    ChainState::open(
+    let tip = ChainState::open(
         nano_conformance::captured_network(&fixtures()),
         directory.join("chainstate"),
     )
     .expect("open packaged follower state")
     .tip()
     .expect("read packaged follower tip")
-    .expect("packaged follower has a tip")
+    .expect("packaged follower has a tip");
+    remove_harness_module_cache(directory);
+    tip
 }
 
 fn assert_checkpoint(directory: &Path, source: [u8; 32]) {
@@ -298,6 +300,22 @@ fn assert_forged_blocks_were_not_executed(directory: &Path, forged: &BTreeSet<[u
             .all(|block| !forged.contains(block)),
         "the packaged follower executed a forged fork"
     );
+    drop(chainstate);
+    remove_harness_module_cache(directory);
+}
+
+fn assert_no_persistent_modules(directory: &Path) {
+    assert!(
+        !directory.join("chainstate/native-modules").exists(),
+        "the follower persisted native modules despite its closed package policy"
+    );
+}
+
+fn remove_harness_module_cache(directory: &Path) {
+    let cache = directory.join("chainstate/native-modules");
+    if cache.exists() {
+        fs::remove_dir_all(cache).expect("remove the inspection VM's native-module cache");
+    }
 }
 
 fn assert_roots(log: &Path, blocks: &[NakamotoBlock]) {
@@ -361,6 +379,7 @@ async fn the_packaged_follower_imports_catches_up_forks_restarts_and_tracks_tip(
         .wait_for_height(served[7].header.chain_length)
         .await;
     follower.stop();
+    assert_no_persistent_modules(directory.path());
     assert_eq!(
         durable_tip(directory.path()),
         *served[7].block_id().as_bytes()
@@ -392,6 +411,7 @@ async fn the_packaged_follower_imports_catches_up_forks_restarts_and_tracks_tip(
         "the forged fork failed for another reason: {refusal}"
     );
     follower.stop();
+    assert_no_persistent_modules(directory.path());
     let common = *served[fork_from - 1].block_id().as_bytes();
     assert_eq!(durable_tip(directory.path()), common);
     assert_forged_blocks_were_not_executed(directory.path(), &forged_ids);
@@ -413,13 +433,11 @@ async fn the_packaged_follower_imports_catches_up_forks_restarts_and_tracks_tip(
         .wait_for_height(served.last().expect("served tip").header.chain_length)
         .await;
     follower.stop();
+    assert_no_persistent_modules(directory.path());
     let tip = served.last().expect("served tip");
     assert_eq!(durable_tip(directory.path()), *tip.block_id().as_bytes());
     assert_roots(&log, &served);
-    assert!(
-        !directory.path().join("chainstate/native-modules").exists(),
-        "the follower persisted native modules despite its closed package policy"
-    );
+    assert_no_persistent_modules(directory.path());
 
     honest_http.abort();
     honest_p2p.abort();
