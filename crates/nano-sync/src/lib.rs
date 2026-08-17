@@ -1,9 +1,10 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
+    hash::Hash,
     num::NonZeroUsize,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -95,27 +96,122 @@ pub const MAX_MEMPOOL_RESPONSE_BYTES: usize = 8 * MIB + 32;
 pub const MAX_MEMPOOL_PAGES: usize = 64;
 /// A small acknowledgement to a block upload.
 pub const MAX_UPLOAD_RESPONSE_BYTES: usize = 64 * 1024;
+/// Content-addressed blocks retained across every peer and node role.
+pub const PEER_BLOCK_CACHE_ITEMS: usize = 4096;
+/// Canonical block bytes retained across every peer and node role.
+pub const PEER_BLOCK_CACHE_BYTES: usize = 64 * MIB;
+/// Sortitions retained across every peer and node role.
+pub const PEER_SORTITION_CACHE_ITEMS: usize = 4096;
+/// JSON bytes represented by retained peer sortitions.
+pub const PEER_SORTITION_CACHE_BYTES: usize = 4 * MIB;
+
+type BlockCacheKey = (Url, StacksBlockId);
+type SortitionCacheKey = (Url, ConsensusHash);
+
+static BLOCKS: OnceLock<Mutex<ByteCache<BlockCacheKey, NakamotoBlock>>> = OnceLock::new();
+static SORTITIONS: OnceLock<Mutex<ByteCache<SortitionCacheKey, SortitionInfo>>> = OnceLock::new();
+
+fn block_cache() -> &'static Mutex<ByteCache<BlockCacheKey, NakamotoBlock>> {
+    BLOCKS.get_or_init(|| {
+        Mutex::new(ByteCache::new(
+            PEER_BLOCK_CACHE_ITEMS,
+            PEER_BLOCK_CACHE_BYTES,
+        ))
+    })
+}
+
+fn sortition_cache() -> &'static Mutex<ByteCache<SortitionCacheKey, SortitionInfo>> {
+    SORTITIONS.get_or_init(|| {
+        Mutex::new(ByteCache::new(
+            PEER_SORTITION_CACHE_ITEMS,
+            PEER_SORTITION_CACHE_BYTES,
+        ))
+    })
+}
+
+#[derive(Debug)]
+struct ByteCache<K: Hash + Eq, V> {
+    entries: LruCache<K, (V, usize)>,
+    bytes: usize,
+    byte_limit: usize,
+}
+
+impl<K: Hash + Eq, V> ByteCache<K, V> {
+    fn new(item_limit: usize, byte_limit: usize) -> Self {
+        Self {
+            entries: LruCache::new(NonZeroUsize::new(item_limit).expect("a non-zero cache limit")),
+            bytes: 0,
+            byte_limit,
+        }
+    }
+
+    fn get(&mut self, key: &K) -> Option<&V> {
+        self.entries.get(key).map(|(value, _)| value)
+    }
+
+    fn insert(&mut self, key: K, value: V, bytes: usize) -> bool {
+        if bytes > self.byte_limit {
+            return false;
+        }
+        if let Some((_, previous)) = self.entries.pop(&key) {
+            self.bytes -= previous;
+        }
+        while self.entries.len() == self.entries.cap().get() || bytes > self.byte_limit - self.bytes
+        {
+            let Some((_, (_, evicted))) = self.entries.pop_lru() else {
+                break;
+            };
+            self.bytes -= evicted;
+        }
+        self.entries.put(key, (value, bytes));
+        self.bytes += bytes;
+        true
+    }
+
+    fn stats(&self) -> CacheStats {
+        CacheStats {
+            items: self.entries.len(),
+            bytes: self.bytes,
+            item_limit: self.entries.cap().get(),
+            byte_limit: self.byte_limit,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CacheStats {
+    pub items: usize,
+    pub bytes: usize,
+    pub item_limit: usize,
+    pub byte_limit: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerCacheStats {
+    pub blocks: CacheStats,
+    pub sortitions: CacheStats,
+}
+
+/// Retained peer data and the process-wide budgets that enforce it.
+#[must_use]
+pub fn peer_cache_stats() -> PeerCacheStats {
+    PeerCacheStats {
+        blocks: block_cache().lock().map_or_else(
+            |poisoned| poisoned.into_inner().stats(),
+            |cache| cache.stats(),
+        ),
+        sortitions: sortition_cache().lock().map_or_else(
+            |poisoned| poisoned.into_inner().stats(),
+            |cache| cache.stats(),
+        ),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SyncClient {
     client: Client,
     base_url: Url,
-    /// Blocks already fetched from this peer.
-    ///
-    /// A block is immutable under its identifier, so this is always sound, and
-    /// it is what makes a retried round cheap: a peer that rate limits one
-    /// request would otherwise have every block of that round asked for again.
-    blocks: Arc<Mutex<LruCache<StacksBlockId, NakamotoBlock>>>,
-    /// Sortitions already fetched from this peer.
-    ///
-    /// A sortition is fixed once its consensus hash is, and every block of a
-    /// tenure carries the same one, so this turns a request per executed block
-    /// into a request per tenure.
-    sortitions: Arc<Mutex<LruCache<ConsensusHash, SortitionInfo>>>,
 }
-
-/// How many fetched blocks one peer's client keeps.
-const BLOCK_CACHE: usize = 4096;
 
 /// The accounts a peer reports, as the tip a mempool judges against.
 ///
@@ -738,12 +834,6 @@ impl SyncClient {
                     .connect_timeout(Duration::from_secs(4))
                     .build()?,
                 base_url,
-                blocks: Arc::new(Mutex::new(LruCache::new(
-                    NonZeroUsize::new(BLOCK_CACHE).expect("the cache holds blocks"),
-                ))),
-                sortitions: Arc::new(Mutex::new(LruCache::new(
-                    NonZeroUsize::new(BLOCK_CACHE).expect("the cache holds sortitions"),
-                ))),
             })
         }
     }
@@ -881,22 +971,22 @@ impl SyncClient {
         &self,
         consensus_hash: ConsensusHash,
     ) -> Result<SortitionInfo, SyncError> {
-        if let Some(sortition) = self
-            .sortitions
+        let key = (self.base_url.clone(), consensus_hash);
+        if let Some(sortition) = sortition_cache()
             .lock()
             .ok()
-            .and_then(|mut cache| cache.get(&consensus_hash).cloned())
+            .and_then(|mut cache| cache.get(&key).cloned())
         {
             return Ok(sortition);
         }
-        let sortition = self
-            .single_sortition(&format!("v3/sortitions/consensus/{consensus_hash}"))
+        let (sortition, bytes) = self
+            .single_sortition_with_size(&format!("v3/sortitions/consensus/{consensus_hash}"))
             .await?;
         if sortition.consensus_hash != consensus_hash {
             return Err(SyncError::InvalidSortition);
         }
-        if let Ok(mut cache) = self.sortitions.lock() {
-            cache.put(consensus_hash, sortition.clone());
+        if let Ok(mut cache) = sortition_cache().lock() {
+            cache.insert(key, sortition.clone(), bytes);
         }
         Ok(sortition)
     }
@@ -996,12 +1086,20 @@ impl SyncClient {
     }
 
     async fn single_sortition(&self, path: &str) -> Result<SortitionInfo, SyncError> {
-        let mut sortitions: Vec<SortitionInfoWire> = self.get(path).await?;
+        Ok(self.single_sortition_with_size(path).await?.0)
+    }
+
+    async fn single_sortition_with_size(
+        &self,
+        path: &str,
+    ) -> Result<(SortitionInfo, usize), SyncError> {
+        let body = self.bytes(path, MAX_JSON_RESPONSE_BYTES).await?;
+        let mut sortitions: Vec<SortitionInfoWire> = serde_json::from_slice(&body)?;
         let sortition = sortitions.pop().ok_or(SyncError::EmptySortition)?;
         if !sortitions.is_empty() {
             return Err(SyncError::InvalidSortition);
         }
-        parse_sortition_info(&sortition)
+        Ok((parse_sortition_info(&sortition)?, body.len()))
     }
 
     /// Download and validate one Nakamoto block by its block ID.
@@ -1025,14 +1123,22 @@ impl SyncClient {
                 found: block.block_id(),
             });
         }
-        if let Ok(mut blocks) = self.blocks.lock() {
-            blocks.put(block_id, block.clone());
+        if let Ok(mut blocks) = block_cache().lock() {
+            blocks.insert(
+                (self.base_url.clone(), block_id),
+                block.clone(),
+                bytes.len(),
+            );
         }
         Ok(block)
     }
 
     fn cached(&self, block_id: StacksBlockId) -> Option<NakamotoBlock> {
-        self.blocks.lock().ok()?.get(&block_id).cloned()
+        block_cache()
+            .lock()
+            .ok()?
+            .get(&(self.base_url.clone(), block_id))
+            .cloned()
     }
 
     /// Upload a finalized block to a stock node and require its exact acknowledgement.
@@ -2555,11 +2661,12 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        BlockUploadWire, BurnView, CandidateTip, PoxInfo, RATE_LIMIT_RETRIES, RETRY_AFTER_CEILING,
-        Signer, SignerSet, SortitionInfoWire, StackerSetResponseWire, StackerSetWire, SyncClient,
-        SyncError, TenureSource, choose_canonical_tip, parse_block_hash, parse_block_id,
-        parse_consensus_hash, parse_prefixed_hash160, parse_sortition_info, parse_stacker_set,
-        retry_after, validate_tenure, validate_tenure_transition,
+        BlockUploadWire, BurnView, ByteCache, CandidateTip, PoxInfo, RATE_LIMIT_RETRIES,
+        RETRY_AFTER_CEILING, Signer, SignerSet, SortitionInfoWire, StackerSetResponseWire,
+        StackerSetWire, SyncClient, SyncError, TenureSource, block_cache, choose_canonical_tip,
+        parse_block_hash, parse_block_id, parse_consensus_hash, parse_prefixed_hash160,
+        parse_sortition_info, parse_stacker_set, retry_after, validate_tenure,
+        validate_tenure_transition,
     };
     use super::{Node, TenureFollower, TenureInfo};
     use nano_chainstate::{NakamotoBlock, TenureError};
@@ -3060,7 +3167,7 @@ mod tests {
     /// A cached block is served without a request, which is what makes a round
     /// that a peer rate limited cheap to retry.
     #[tokio::test]
-    async fn a_fetched_block_is_not_asked_for_twice() {
+    async fn a_fetched_block_is_shared_and_not_asked_for_twice() {
         let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../nano-conformance/fixtures/nakamoto/blocks");
         let path = fs::read_dir(directory)
@@ -3075,19 +3182,52 @@ mod tests {
         let client = SyncClient::new(Url::parse("http://127.0.0.1:1/").expect("a base url"))
             .expect("a client");
         assert!(client.block(block.block_id()).await.is_err());
-        client
-            .blocks
+        block_cache()
             .lock()
             .expect("the cache is not poisoned")
-            .put(block.block_id(), block.clone());
+            .insert(
+                (client.base_url.clone(), block.block_id()),
+                block.clone(),
+                block.encode().len(),
+            );
+        let another_role = SyncClient::new(client.base_url.clone()).expect("another role");
         assert_eq!(
-            client
+            another_role
                 .block(block.block_id())
                 .await
                 .expect("cached")
                 .block_id(),
             block.block_id()
         );
+    }
+
+    #[test]
+    fn peer_cache_evicts_by_bytes_and_count_and_recovers() {
+        let mut bytes = ByteCache::new(3, 5);
+        assert!(bytes.insert(1, "one", 3));
+        assert!(bytes.insert(2, "two", 2));
+        assert_eq!(bytes.stats().items, 2);
+        assert_eq!(bytes.stats().bytes, 5);
+
+        assert_eq!(bytes.get(&1), Some(&"one"));
+        assert!(bytes.insert(3, "three", 3));
+        assert_eq!(bytes.get(&1), None);
+        assert_eq!(bytes.get(&2), None);
+        assert_eq!(bytes.get(&3), Some(&"three"));
+        assert_eq!(bytes.stats().bytes, 3);
+
+        assert!(!bytes.insert(3, "oversize", 6));
+        assert_eq!(bytes.get(&3), Some(&"three"));
+        assert!(bytes.insert(3, "small", 1));
+        assert_eq!(bytes.stats().bytes, 1);
+
+        let mut count = ByteCache::new(2, 100);
+        assert!(count.insert(1, "one", 1));
+        assert!(count.insert(2, "two", 1));
+        assert!(count.insert(3, "three", 1));
+        assert_eq!(count.get(&1), None);
+        assert_eq!(count.stats().items, 2);
+        assert_eq!(count.stats().bytes, 2);
     }
 
     #[test]
