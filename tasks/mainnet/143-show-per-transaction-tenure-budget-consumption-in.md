@@ -1,7 +1,7 @@
 ---
 title: "Show per-transaction tenure budget consumption in nano-tui"
 id: "143"
-status: in-progress
+status: completed
 priority: high
 effort: medium
 type: feature
@@ -14,6 +14,7 @@ verify:
     run: "nix develop -c cargo test -p nano-chainstate -p nano-rpc -p nano-tui"
   - type: bash
     run: "nix develop -c cargo clippy -p nano-chainstate -p nano-rpc -p nano-tui --all-targets -- -D warnings"
+completed_at: 2026-08-17
 ---
 
 # Show per-transaction tenure budget consumption in nano-tui
@@ -27,21 +28,21 @@ never estimate cost from transaction shape or divide against an unrelated epoch.
 
 ## Tasks
 
-- [ ] Trace the block-execution result and confirm whether authoritative
+- [x] Trace the block-execution result and confirm whether authoritative
       per-transaction `ExecutionCost` receipts exist at the execution boundary.
-- [ ] If they are discarded, retain the minimal cost receipt beside the executed
+- [x] If they are discarded, retain the minimal cost receipt beside the executed
       transaction without re-executing it or expanding consensus state.
-- [ ] Expose raw read count, read length, write count, write length and runtime
+- [x] Expose raw read count, read length, write count, write length and runtime
       through the nano block/receipt surface consumed by `nano-tui`.
-- [ ] Associate each receipt with the epoch/tenure limit that applied when it was
+- [x] Associate each receipt with the epoch/tenure limit that applied when it was
       executed; return unavailable rather than comparing unlike budgets.
-- [ ] Render each raw dimension and its percentage of the applicable tenure
+- [x] Render each raw dimension and its percentage of the applicable tenure
       budget in the single-transaction inspector, including a concise aggregate
       explanation that the dimensions are independent limits.
-- [ ] Distinguish zero cost, unavailable receipts and unavailable limits.
-- [ ] Cover transactions with cost, zero-cost dimensions, historical epoch
+- [x] Distinguish zero cost, unavailable receipts and unavailable limits.
+- [x] Cover transactions with cost, zero-cost dimensions, historical epoch
       limits and nodes that do not retain receipts.
-- [ ] Run rustfmt, focused tests and strict clippy without warnings.
+- [x] Run rustfmt, focused tests and strict clippy without warnings.
 
 ## Acceptance Criteria
 
