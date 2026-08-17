@@ -6,6 +6,7 @@ pub mod checkpoint_bundle;
 pub mod checkpoint_signatures;
 pub mod config;
 pub mod executor;
+pub mod observation;
 pub mod sortition;
 pub mod staging;
 

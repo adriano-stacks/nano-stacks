@@ -37,7 +37,7 @@ rusqlite = { version = "0.31.0", features = ["bundled"] }
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tokio = { version = "1.53.1", default-features = false, features = ["rt"] }
+tokio = { version = "1.53.1", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9.8"
 tempfile = { version = "3", optional = true }
 
