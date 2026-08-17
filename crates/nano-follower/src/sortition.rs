@@ -12,7 +12,12 @@
 //! reaching back thousands of blocks — so the checkpoint carries those hashes.
 //! They are twenty bytes a block: mainnet's whole history is twelve megabytes.
 
-use std::{collections::BTreeMap, fmt::Display, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Display,
+    fs,
+    path::Path,
+};
 
 use nano_address::{PoxAddress, PoxAddressType32};
 use nano_bitcoin::{BitcoinBlock, BitcoinOperationKind};
@@ -208,6 +213,10 @@ pub struct SortitionTracker {
     /// snapshot of. Without them the window is short and the winner is not the
     /// one the network picked.
     primed: bool,
+    /// Accepted block commitments on the canonical Bitcoin branch since the
+    /// beginning of the priming window, by burn position.
+    commitments: BTreeSet<(u64, u32)>,
+    commitment_floor: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,6 +248,8 @@ impl SortitionTracker {
             keys: LeaderKeys::new(),
             waterfall_payouts: BTreeMap::new(),
             primed: false,
+            commitments: BTreeSet::new(),
+            commitment_floor: None,
         })
     }
 
@@ -537,7 +548,10 @@ impl SortitionTracker {
         &mut self,
         bitcoin_height: u64,
     ) -> Result<nano_sortition::SortitionReorg, TrackerError> {
-        Ok(self.engine.retract_above(bitcoin_height)?)
+        let reorg = self.engine.retract_above(bitcoin_height)?;
+        self.commitments
+            .retain(|(height, _)| *height <= bitcoin_height);
+        Ok(reorg)
     }
 
     /// Commitments the burn block at the tip put up for its sortition.
@@ -601,10 +615,10 @@ impl SortitionTracker {
             self.pox_id.extend_with_anchor(true);
         }
         self.register_keys(block);
-        let commitments = commitment_window_block(block, payouts, &self.keys);
-        let txids = accepted_operation_txids(block, payouts);
+        let (block, commitments) = self.accepted_block(block, payouts);
+        let txids = accepted_operation_txids(&block, payouts);
         Ok(self.engine.append(
-            block,
+            &block,
             &txids,
             commitments,
             self.pox_id.clone(),
@@ -775,11 +789,11 @@ impl SortitionTracker {
             walk.reading += read.elapsed();
             walk.primed += 1;
             self.register_keys(&block);
+            let payouts = self.payouts_at(payouts, height)?;
+            let (block, commitments) = self.accepted_block(&block, payouts);
             if height == tip {
                 self.recover_seed_from(&block)?;
             }
-            let payouts = self.payouts_at(payouts, height)?;
-            let commitments = commitment_window_block(&block, payouts, &self.keys);
             self.engine.prime(height, commitments);
         }
         self.primed = true;
@@ -976,6 +990,69 @@ impl SortitionTracker {
                 );
             }
         }
+    }
+
+    /// Apply the stateful checks a decoded block commitment cannot answer alone.
+    ///
+    /// In particular, its parent burn position must name an accepted commitment
+    /// on this Bitcoin fork. A one-block Bitcoin reorganization can leave miners
+    /// pointing at an operation from the abandoned block; stacks-core rejects that
+    /// operation with `BlockCommitNoParent`, so it contributes neither a candidate
+    /// nor a transaction to the operations hash.
+    fn accepted_block(
+        &mut self,
+        block: &BitcoinBlock,
+        payouts: PayoutSchedule,
+    ) -> (BitcoinBlock, nano_sortition::CommitmentWindowBlock) {
+        let floor = *self.commitment_floor.get_or_insert(block.height);
+        let mut accepted = block.clone();
+        accepted.operations.retain(|operation| {
+            let BitcoinOperationKind::LeaderBlockCommit {
+                parent_block_height,
+                parent_transaction_index,
+                key_block_height,
+                key_transaction_index,
+                ..
+            } = operation.kind
+            else {
+                return true;
+            };
+            let parent_height = u64::from(parent_block_height);
+            let parent_index = u32::from(parent_transaction_index);
+            let parent_exists = (parent_height < block.height || parent_height == 0)
+                && parent_index == 0
+                || parent_height < floor
+                || self.commitments.contains(&(parent_height, parent_index));
+            let key_exists = self
+                .keys
+                .registration(
+                    u64::from(key_block_height),
+                    u32::from(key_transaction_index),
+                )
+                .is_some();
+            parent_exists && key_exists
+        });
+
+        let commitments = commitment_window_block(&accepted, payouts, &self.keys);
+        let accepted_txids = commitments
+            .commitments
+            .iter()
+            .map(|commitment| commitment.txid)
+            .chain(
+                commitments
+                    .missed_commitments
+                    .iter()
+                    .map(|commitment| commitment.txid),
+            )
+            .collect::<BTreeSet<_>>();
+        self.commitments.extend(
+            accepted
+                .operations
+                .iter()
+                .filter(|operation| accepted_txids.contains(&operation.txid))
+                .map(|operation| (block.height, operation.transaction_index)),
+        );
+        (accepted, commitments)
     }
 
     /// Take on burn heights known to have elected somebody, from outside this chain.
@@ -2002,7 +2079,9 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use nano_address::{PoxAddress, PoxAddressType32};
-    use nano_bitcoin::{BitcoinBlock, BitcoinOperation, BitcoinOperationKind};
+    use nano_bitcoin::{
+        BitcoinBlock, BitcoinInput, BitcoinOperation, BitcoinOperationKind, BitcoinOutput,
+    };
     use nano_primitives::ConsensusHash;
     use nano_sortition::{
         OpsHash, PayoutSchedule, PoxId, RewardCycleSchedule, SortitionHash, SortitionSnapshot,
@@ -2565,6 +2644,74 @@ mod tests {
             Err(TrackerError::Seed(_))
         ));
         assert_eq!(tracker.tip().bitcoin_height, 100);
+    }
+
+    #[test]
+    fn a_commitment_parent_must_exist_on_the_canonical_burnchain() {
+        let mut tracker = tracker(1_000);
+        tracker.keys.register(
+            90,
+            1,
+            nano_sortition::LeaderKeyRegistration {
+                vrf_public_key: [0x11; 32],
+                signing_key_hash: Some([0x22; 20]),
+            },
+        );
+        let recipient = PoxAddress::Addr32 {
+            mainnet: true,
+            address_type: PoxAddressType32::P2tr,
+            bytes: [0x33; 32],
+        };
+        let payouts = PayoutSchedule::new(
+            RewardCycleSchedule::new(0, 20, Some(0)).expect("a schedule"),
+            5,
+        )
+        .expect("payouts")
+        .paying_waterfall_to(recipient);
+        let operation = |height: u64, txid: u8, index: u32, parent_index: u16| BitcoinOperation {
+            txid: [txid; 32],
+            transaction_index: index,
+            inputs: vec![BitcoinInput {
+                txid: [txid.wrapping_sub(1); 32],
+                output_index: 2,
+            }],
+            outputs: vec![BitcoinOutput {
+                amount_sats: 40_000,
+                recipient,
+            }],
+            kind: BitcoinOperationKind::LeaderBlockCommit {
+                block_header_hash: [txid; 32],
+                new_seed: [txid; 32],
+                parent_block_height: u32::try_from(height - 1).expect("height fits u32"),
+                parent_transaction_index: parent_index,
+                key_block_height: 90,
+                key_transaction_index: 1,
+                memo: 0,
+                parent_modulus: u8::try_from((height + 4) % 5).expect("modulus fits u8"),
+            },
+        };
+
+        let parent = block_with(101, vec![operation(101, 1, 7, 1)]);
+        let (_, parent_window) = tracker.accepted_block(&parent, payouts);
+        assert_eq!(parent_window.commitments.len(), 1);
+
+        let child = block_with(102, vec![operation(102, 2, 8, 7), operation(102, 3, 9, 42)]);
+        let (accepted, window) = tracker.accepted_block(&child, payouts);
+        assert_eq!(
+            accepted
+                .operations
+                .iter()
+                .map(|operation| operation.txid)
+                .collect::<Vec<_>>(),
+            vec![[2; 32]]
+        );
+        assert_eq!(window.commitments.len(), 1);
+
+        tracker
+            .retract_above(100)
+            .expect("the abandoned commitment is forgotten");
+        let (accepted, _) = tracker.accepted_block(&child, payouts);
+        assert!(accepted.operations.is_empty());
     }
 
     #[test]

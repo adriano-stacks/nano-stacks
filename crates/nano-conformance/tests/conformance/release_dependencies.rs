@@ -56,12 +56,24 @@ fn the_follower_policy_is_a_closed_minimal_capability_matrix() {
     .expect("parse follower capability policy");
     assert_eq!(
         policy["schema"],
-        "nano-stacks/follower-capability-policy/v1"
+        "nano-stacks/follower-capability-policy/v2"
     );
     assert_eq!(policy["artifact"]["package"], "nano-follower");
     assert_eq!(policy["artifact"]["binary"], "stacks-follower");
+    assert_eq!(
+        string_set(&policy["artifact"], "executables"),
+        std::iter::once("stacks-follower").collect()
+    );
+    assert_eq!(
+        string_set(&policy["artifact"], "service_units"),
+        std::iter::once("stacks-follower.service").collect()
+    );
     assert_eq!(policy["artifact"]["chainstate_writer"], true);
+    assert_follower_process_authority(&policy);
+    assert_follower_capability_surface(&policy);
+}
 
+fn assert_follower_capability_surface(policy: &Value) {
     let capabilities = policy["capabilities"]
         .as_object()
         .expect("capabilities are an object");
@@ -84,8 +96,8 @@ fn the_follower_policy_is_a_closed_minimal_capability_matrix() {
         "every follower capability needs an owning package"
     );
 
-    let allowed = string_set(&policy, "allowed_internal_packages");
-    let forbidden = string_set(&policy, "forbidden_internal_packages");
+    let allowed = string_set(policy, "allowed_internal_packages");
+    let forbidden = string_set(policy, "forbidden_internal_packages");
     assert!(allowed.is_disjoint(&forbidden));
     for package in [
         "nano-mempool",
@@ -100,17 +112,17 @@ fn the_follower_policy_is_a_closed_minimal_capability_matrix() {
         assert!(forbidden.contains(package), "{package} is not forbidden");
     }
     assert_eq!(
-        string_set(&policy, "loopback_surfaces"),
+        string_set(policy, "loopback_surfaces"),
         ["/health", "/metrics"].into_iter().collect()
     );
     assert_eq!(
-        string_set(&policy, "loopback_surfaces"),
+        string_set(policy, "loopback_surfaces"),
         nano_node::observation::LOOPBACK_ROUTES
             .into_iter()
             .collect()
     );
     assert_eq!(
-        string_set(&policy, "public_surfaces"),
+        string_set(policy, "public_surfaces"),
         nano_node::observation::PUBLIC_ROUTES.into_iter().collect()
     );
     assert!(
@@ -120,7 +132,7 @@ fn the_follower_policy_is_a_closed_minimal_capability_matrix() {
         "the first follower artifact must expose no public HTTP route"
     );
     assert_eq!(
-        string_set(&policy, "commands"),
+        string_set(policy, "commands"),
         [
             "build-identity",
             "check-config",
@@ -143,6 +155,67 @@ fn the_follower_policy_is_a_closed_minimal_capability_matrix() {
             .as_array()
             .is_some_and(|symbols| !symbols.is_empty())
     );
+}
+
+fn assert_follower_process_authority(policy: &Value) {
+    let authority = &policy["process_authority"];
+    assert_eq!(authority["chainstate"]["path"], "/var/lib/nano-stacks");
+    assert_eq!(
+        authority["chainstate"]["service"],
+        "stacks-follower.service"
+    );
+    assert_eq!(authority["chainstate"]["user"], "nano-stacks");
+    assert_eq!(authority["chainstate"]["group"], "nano-stacks");
+    assert_eq!(authority["chainstate"]["mode"], "0700");
+    assert_eq!(
+        authority["external_component_requirements"],
+        serde_json::json!({
+            "separate_process": true,
+            "distinct_service_identity": true,
+            "chainstate_inaccessible_path": "/var/lib/nano-stacks",
+            "protocols_must_be_explicitly_allowlisted": true,
+        })
+    );
+    let roles = authority["optional_roles"]
+        .as_object()
+        .expect("optional roles are an object");
+    assert_eq!(
+        roles.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "compatibility",
+            "event",
+            "mempool",
+            "miner",
+            "proposal",
+            "signer",
+            "stackerdb",
+            "tui",
+        ]
+    );
+    assert!(roles.values().all(|role| {
+        role["shipped"] == false
+            && role["chainstate_access"] == "none"
+            && role["protocols"].as_array().is_some_and(Vec::is_empty)
+    }));
+
+    let unit = std::fs::read_to_string(workspace().join("release/systemd/stacks-follower.service"))
+        .expect("read follower service unit");
+    for setting in [
+        "User=nano-stacks",
+        "Group=nano-stacks",
+        "StateDirectory=nano-stacks",
+        "StateDirectoryMode=0700",
+        "UMask=0077",
+        "ReadWritePaths=/var/lib/nano-stacks",
+        "NoNewPrivileges=true",
+        "ProtectSystem=strict",
+        "ProtectHome=true",
+    ] {
+        assert!(
+            unit.lines().any(|line| line == setting),
+            "missing {setting}"
+        );
+    }
 }
 
 #[test]

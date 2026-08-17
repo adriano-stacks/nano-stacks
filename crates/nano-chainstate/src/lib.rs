@@ -1408,6 +1408,19 @@ impl ChainState {
         Ok(self.vm.tip()?)
     }
 
+    /// The parent the next block must extend.
+    ///
+    /// The MARF retains abandoned fork states, so its deepest sealed block can be
+    /// ahead of the branch a retraction selected. The recovered ledger is the
+    /// canonical execution cursor in that case. Before this node has executed a
+    /// block, it is empty and the checkpoint's MARF tip remains the parent.
+    fn execution_tip(&self) -> Result<Option<[u8; 32]>, ChainStateError> {
+        self.ledger
+            .executed
+            .last()
+            .map_or_else(|| self.tip(), |block| Ok(Some(block.block_id)))
+    }
+
     /// Whether a sealed block has a ledger this chain can stand on.
     ///
     /// A sealed state is not by itself a block this node executed: the ledger is
@@ -1877,7 +1890,7 @@ impl ChainState {
             operations,
             parent,
         } = authenticated;
-        let current = self.tip()?;
+        let current = self.execution_tip()?;
         if parent != current {
             return Err(ChainStateError::InvalidTransaction(format!(
                 "authenticated block {} names parent {:?}, but chainstate now stands on {:?}",
@@ -3226,6 +3239,12 @@ impl ChainState {
     #[must_use]
     pub fn knows_burn_header(&self, height: u64) -> bool {
         self.vm.knows_burn_header(height)
+    }
+
+    /// The Bitcoin header hash Clarity reads at this burn height.
+    #[must_use]
+    pub fn burn_header_hash(&self, height: u64) -> Option<[u8; 32]> {
+        self.vm.burn_header_hash(height)
     }
 
     /// Make a burn block's header hash readable from Clarity.
@@ -4783,6 +4802,34 @@ mod tests {
     #[test]
     fn no_unlocks_produce_no_phantom_transaction() {
         assert!(phantom_unlock_transaction(Network::TESTNET, 2267, Vec::new()).is_none());
+    }
+
+    #[test]
+    fn execution_tip_follows_the_recovered_ledger_after_a_retraction() {
+        let mut chainstate = ChainState::new(Network::TESTNET).expect("create chainstate");
+        let canonical = [1; 32];
+        let abandoned = [2; 32];
+        chainstate
+            .vm
+            .begin_block(None, canonical)
+            .expect("begin canonical block");
+        chainstate.vm.seal_block().expect("seal canonical block");
+        chainstate
+            .vm
+            .begin_block(Some(canonical), abandoned)
+            .expect("begin abandoned block");
+        chainstate.vm.seal_block().expect("seal abandoned block");
+        chainstate.ledger.executed.push(ExecutedHeader {
+            block_id: canonical,
+            consensus_hash: ConsensusHash::from_bytes([3; 20]),
+            tenure_height: 1,
+        });
+
+        assert_eq!(chainstate.tip().expect("deepest MARF tip"), Some(abandoned));
+        assert_eq!(
+            chainstate.execution_tip().expect("canonical execution tip"),
+            Some(canonical)
+        );
     }
 
     #[test]

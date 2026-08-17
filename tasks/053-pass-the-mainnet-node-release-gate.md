@@ -41,7 +41,7 @@ and steady state, with evidence tied to the durable executed chain.
 - [x] Remove and lie through one Stacks peer and prove neither event changes the
       canonical executed result.
 - [x] Exercise a Bitcoin reorganization and a Stacks fork switch.
-- [ ] Repeat the pristine checkpoint-to-tip catch-up with every Hiro and other
+- [x] Repeat the pristine checkpoint-to-tip catch-up with every Hiro and other
       hosted Stacks HTTP endpoint absent from configuration and the selected
       peer set. Retain the discovered endpoints and per-tenure serving peer so
       the run proves distribution rather than merely having several peers open.
@@ -70,7 +70,7 @@ and steady state, with evidence tied to the durable executed chain.
 - [x] Reproduce and close the PoX-5 follower root mismatch under
       [[069-resolve-the-pox-5-follower-state-root-divergence]] before using that
       signer run as interoperability evidence.
-- [ ] Run the signer-set and signer-weight mainnet gates in reward cycle 141 or
+- [x] Run the signer-set and signer-weight mainnet gates in reward cycle 141 or
       later; `NANO_REQUIRE_MAINNET` must report that they ran rather than skipped.
 - [ ] Complete the dedicated mainnet tip hold under [[106]].
 - [x] Publish the exact commands, versions, checkpoint provenance and resulting
@@ -80,7 +80,7 @@ and steady state, with evidence tied to the durable executed chain.
 
 - [x] Restore the bounded replay and make red scoreboard output fail under
       [[075-make-the-consensus-scoreboard-an-authoritative-gat]].
-- [ ] Remove fail-open block authentication under
+- [x] Remove fail-open block authentication under
       [[076-refuse-blocks-when-consensus-authentication-inputs]].
 - [x] Remove peer-derived consensus context under
       [[077-remove-peer-derived-consensus-execution-fallbacks]].
@@ -96,7 +96,7 @@ and steady state, with evidence tied to the durable executed chain.
       [[083-refuse-an-unrecoverable-checkpoint-winner-seed-bef]].
 - [x] Eliminate network-valid WebAssembly function-type arity refusals under
       [[084-eliminate-wasm-function-type-arity-refusals-for-ne]].
-- [ ] Account for and execute every required ignored or conditional gate under
+- [x] Account for and execute every required ignored or conditional gate under
       [[085-eliminate-unaccounted-ignored-and-conditional-rele]].
 - [x] Execute the captured mainnet block at 8,708,126 and close its corrupted
       trait-principal ABI path under

@@ -1,9 +1,72 @@
 {
-  "schema": "nano-stacks/follower-capability-policy/v1",
+  "schema": "nano-stacks/follower-capability-policy/v2",
   "artifact": {
     "package": "nano-follower",
     "binary": "stacks-follower",
+    "executables": [
+      "stacks-follower"
+    ],
+    "service_units": [
+      "stacks-follower.service"
+    ],
     "chainstate_writer": true
+  },
+  "process_authority": {
+    "chainstate": {
+      "path": "/var/lib/nano-stacks",
+      "service": "stacks-follower.service",
+      "user": "nano-stacks",
+      "group": "nano-stacks",
+      "mode": "0700"
+    },
+    "external_component_requirements": {
+      "separate_process": true,
+      "distinct_service_identity": true,
+      "chainstate_inaccessible_path": "/var/lib/nano-stacks",
+      "protocols_must_be_explicitly_allowlisted": true
+    },
+    "optional_roles": {
+      "compatibility": {
+        "shipped": false,
+        "chainstate_access": "none",
+        "protocols": []
+      },
+      "event": {
+        "shipped": false,
+        "chainstate_access": "none",
+        "protocols": []
+      },
+      "mempool": {
+        "shipped": false,
+        "chainstate_access": "none",
+        "protocols": []
+      },
+      "miner": {
+        "shipped": false,
+        "chainstate_access": "none",
+        "protocols": []
+      },
+      "proposal": {
+        "shipped": false,
+        "chainstate_access": "none",
+        "protocols": []
+      },
+      "signer": {
+        "shipped": false,
+        "chainstate_access": "none",
+        "protocols": []
+      },
+      "stackerdb": {
+        "shipped": false,
+        "chainstate_access": "none",
+        "protocols": []
+      },
+      "tui": {
+        "shipped": false,
+        "chainstate_access": "none",
+        "protocols": []
+      }
+    }
   },
   "capabilities": {
     "local_bitcoin_view": [

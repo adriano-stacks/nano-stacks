@@ -38,11 +38,20 @@ service or public route.
 ## Out-of-process capabilities
 
 Mining, signing, proposal validation/hosting, StackerDB replication, mempool,
-TUI, event streaming and compatibility RPC are separate products. They do not
-link into `stacks-follower`, receive its state path, or open its databases. A
-separately supervised adapter may consume a bounded read-only protocol and may
-be stopped, compromised or restarted without acquiring chainstate write
-authority.
+TUI, event streaming and compatibility RPC are separate products. The first
+follower release ships none of them and exposes no adapter protocol: its
+executable inventory contains only `stacks-follower`, and its service inventory
+contains only `stacks-follower.service`.
+
+The service runs as `nano-stacks`, creates `/var/lib/nano-stacks` with mode
+`0700`, applies a `0077` umask and grants its strict filesystem sandbox write
+access only to that state directory. An external component must run as a
+different service identity, make the follower state path inaccessible, and use
+only an explicitly allowlisted protocol. It must not receive the state path or
+open a chainstate database. The current protocol allowlist for every optional
+role is empty. Adding a component therefore requires a separate package and a
+policy revision; installing a binary or service beside the follower makes the
+artifact inspection fail.
 
 The development `stacks-node` remains useful for conformance and Hacknet roles,
 but it is not the mainnet follower release artifact.

@@ -358,7 +358,9 @@ impl PayoutSchedule {
             return false;
         };
         if self.cycles.is_waterfall_at(bitcoin_height) {
-            return self.waterfall_recipient == Some(first.recipient);
+            return self.waterfall_recipient.is_some_and(|recipient| {
+                recipient.script_pubkey() == first.recipient.script_pubkey()
+            });
         }
         if self.is_in_prepare_phase(bitcoin_height) {
             return matches!(
@@ -2044,9 +2046,9 @@ mod tests {
         BitcoinBlock, BitcoinInput, BitcoinOperation, BitcoinOperationKind, BitcoinOutput,
     };
 
-    fn waterfall_recipient(byte: u8) -> PoxAddress {
+    fn waterfall_recipient(mainnet: bool, byte: u8) -> PoxAddress {
         PoxAddress::Addr32 {
-            mainnet: false,
+            mainnet,
             address_type: nano_address::PoxAddressType32::P2tr,
             bytes: [byte; 32],
         }
@@ -2615,10 +2617,10 @@ mod tests {
     #[test]
     fn a_commitment_with_stock_invalid_payouts_changes_neither_hash_nor_window() {
         let cycles = RewardCycleSchedule::new(0, 20, Some(280)).expect("valid cycle schedule");
-        let waterfall_recipient = waterfall_recipient(0xbc);
+        let expected_waterfall = waterfall_recipient(false, 0xbc);
         let payouts = PayoutSchedule::new(cycles, 5)
             .expect("valid payout schedule")
-            .paying_waterfall_to(waterfall_recipient);
+            .paying_waterfall_to(expected_waterfall);
         let output = |amount_sats, byte| BitcoinOutput {
             amount_sats,
             recipient: PoxAddress::Addr20 {
@@ -2705,7 +2707,8 @@ mod tests {
             vec![
                 BitcoinOutput {
                     amount_sats: 20_000,
-                    recipient: waterfall_recipient,
+                    // A Bitcoin script carries no network bit.
+                    recipient: waterfall_recipient(true, 0xbc),
                 },
                 output(9_999_947_402, 6),
             ],

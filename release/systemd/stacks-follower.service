@@ -10,6 +10,7 @@ User=nano-stacks
 Group=nano-stacks
 StateDirectory=nano-stacks
 StateDirectoryMode=0700
+UMask=0077
 ExecStart=/usr/bin/stacks-follower start --config /etc/nano-stacks/config.toml
 Restart=on-failure
 RestartSec=10s

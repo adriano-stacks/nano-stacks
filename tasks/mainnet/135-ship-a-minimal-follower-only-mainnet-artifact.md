@@ -30,7 +30,7 @@ artifact and its dependency closure.
       compatibility RPC code.
 - [x] Default the follower to outbound P2P and loopback health/metrics. Make any
       public serving edge an explicit separately supervised component.
-- [ ] Keep optional miner, signer, TUI, event and compatibility adapters as
+- [x] Keep optional miner, signer, TUI, event and compatibility adapters as
       separate processes with bounded protocols and no direct chainstate write
       authority.
 - [x] Add dependency-tree, route-inventory and binary-inspection gates proving

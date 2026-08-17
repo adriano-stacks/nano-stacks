@@ -2006,10 +2006,18 @@ impl Vm {
         Ok(())
     }
 
+    /// The Bitcoin header hash Clarity reads at this burn height.
+    #[must_use]
+    pub fn burn_header_hash(&self, height: u64) -> Option<[u8; 32]> {
+        u32::try_from(height)
+            .ok()
+            .and_then(|height| self.context.burn_header(height))
+    }
+
     /// Whether Clarity can already answer for this burn block.
     #[must_use]
     pub fn knows_burn_header(&self, height: u64) -> bool {
-        u32::try_from(height).is_ok_and(|height| self.context.burn_header(height).is_some())
+        self.burn_header_hash(height).is_some()
     }
 
     pub fn execute_contract_call_outcome(
@@ -6713,6 +6721,19 @@ mod tests {
             value,
             Value::some(Value::buff_from(hash.to_vec()).expect("a buffer")).expect("an optional")
         );
+    }
+
+    #[test]
+    fn a_reorganized_burn_height_replaces_the_hash_clarity_reads() {
+        let mut vm = Vm::new(Network::TESTNET).expect("create VM");
+        vm.record_burn_header(962_722, [0xa7; 32])
+            .expect("record the abandoned header");
+        assert_eq!(vm.burn_header_hash(962_722), Some([0xa7; 32]));
+
+        vm.record_burn_header(962_722, [0xda; 32])
+            .expect("record the canonical replacement");
+
+        assert_eq!(vm.burn_header_hash(962_722), Some([0xda; 32]));
     }
 
     #[test]

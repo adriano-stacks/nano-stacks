@@ -90,10 +90,14 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           sourceRevision = self.rev or (self.dirtyRev or "dirty");
-          stacksCoreVersions = pkgs.fetchurl {
-            url = "https://raw.githubusercontent.com/stacks-network/stacks-core/efc34a07a225c4b950ab9404a1652aa5e14affaf/versions.toml";
-            hash = "sha256-7mmEKZcNtkl13XfqevGUN8oPW+xHuTkkDiFdegbVRrY=";
-          };
+          # Exact copy from stacks-core efc34a07a225c4b950ab9404a1652aa5e14affaf.
+          # Keep release builds independent of GitHub availability and rate limits.
+          stacksCoreVersions = pkgs.writeText "stacks-core-versions.toml" ''
+            # Update this value when a new release is created.
+            # `stacks-common/build.rs` will automatically update `versions.rs` with it.
+            # The node and signer are released together and share this single version.
+            stacks_node_version = "4.0.1"
+          '';
         in rec {
           stacks-node = pkgs.rustPlatform.buildRustPackage {
             pname = "nano-stacks";
@@ -161,7 +165,7 @@
             pname = "nano-stacks-follower";
             version = "0.1.0-${builtins.substring 0 12 sourceRevision}";
             src = self;
-            cargoHash = "sha256-3qn7V/YFRzy10WXHq0VxlObUVEoEWVHkgV81Fxh8jt0=";
+            cargoHash = "sha256-pkxjTPNn33TKGDJV9w47xrbIAM6EaldyGbD0iYNCU50=";
             cargoBuildFlags = [ "-p" "nano-follower" "--bin" "stacks-follower" ];
             doCheck = false;
 

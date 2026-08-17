@@ -362,6 +362,17 @@ fn assert_receipts(directory: &Path, blocks: &[NakamotoBlock]) {
     }
 }
 
+fn assert_final_state(directory: &Path, log: &Path, blocks: &[NakamotoBlock]) {
+    assert_no_persistent_modules(directory);
+    assert_eq!(
+        durable_tip(directory),
+        *blocks.last().expect("served tip").block_id().as_bytes()
+    );
+    assert_roots(log, blocks);
+    assert_receipts(directory, blocks);
+    assert_no_persistent_modules(directory);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_packaged_follower_imports_catches_up_forks_restarts_and_tracks_tip() {
     let Some(binary) = packaged_binary() else {
@@ -462,12 +473,7 @@ async fn the_packaged_follower_imports_catches_up_forks_restarts_and_tracks_tip(
         .wait_for_height(served.last().expect("served tip").header.chain_length)
         .await;
     follower.stop();
-    assert_no_persistent_modules(directory.path());
-    let tip = served.last().expect("served tip");
-    assert_eq!(durable_tip(directory.path()), *tip.block_id().as_bytes());
-    assert_roots(&log, &served);
-    assert_receipts(directory.path(), &served);
-    assert_no_persistent_modules(directory.path());
+    assert_final_state(directory.path(), &log, &served);
 
     honest_http.abort();
     honest_p2p.abort();

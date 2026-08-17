@@ -1585,7 +1585,7 @@ async fn a_bitcoin_reorganization_retracts_the_blocks_it_invalidated() {
         "the derived consensus hash at burn {retracted_at} is not the one the \
          executed tenure carries"
     );
-    let tip_before = executor.tip().block_id();
+    let tip_before = *executor.tip().block_id().as_bytes();
     let executed_before = executor.chainstate_mut().executed_blocks();
     executor.track_sortitions(tracker, directory.path().join("sortitions"));
 
@@ -1598,9 +1598,41 @@ async fn a_bitcoin_reorganization_retracts_the_blocks_it_invalidated() {
     let resumed = round
         .reorganized
         .expect("the reorganization was not noticed");
-    assert_ne!(
+    assert_retracted_state(
+        &mut executor,
+        &staging,
         resumed,
-        *tip_before.as_bytes(),
+        tip_before,
+        &executed_before,
+    );
+
+    // A peer offering the abandoned branch again must not strand the selected child.
+    assert_eq!(
+        executor
+            .catch_up(&client, &mut history, &pox(), &staging, budget, &[])
+            .await
+            .expect("an abandoned Bitcoin branch is discarded")
+            .executed,
+        0,
+        "an abandoned Bitcoin branch executed again"
+    );
+    assert!(
+        staging.is_empty().expect("the staging store answers"),
+        "the peer restaged blocks from an abandoned Bitcoin view and stranded execution"
+    );
+
+    task.abort();
+}
+
+fn assert_retracted_state(
+    executor: &mut CheckpointExecutor<MovableBurnchain>,
+    staging: &Staging,
+    resumed: [u8; 32],
+    tip_before: [u8; 32],
+    executed_before: &[[u8; 32]],
+) {
+    assert_ne!(
+        resumed, tip_before,
         "the node stood on the same tip after a reorganization took it back"
     );
     assert_eq!(
@@ -1620,14 +1652,10 @@ async fn a_bitcoin_reorganization_retracts_the_blocks_it_invalidated() {
         executed_before.starts_with(&executed_after),
         "the surviving chain is not a prefix of the one that was executed"
     );
-    // Nothing of the abandoned branch is left staged to be executed again on the
-    // burnchain that replaced it.
     assert!(
         staging.is_empty().expect("the staging store answers"),
         "blocks from the abandoned burn view are still staged"
     );
-
-    task.abort();
 }
 
 /// Close a gap round by round until the tip reaches `target`, and say how much was
