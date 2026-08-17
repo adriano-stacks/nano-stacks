@@ -49,6 +49,7 @@ pub struct StreamEvent {
 pub struct BlockOutcomes {
     pub index_block_hash: String,
     pub block_height: u64,
+    pub burn_block_height: u64,
     pub transactions: Vec<TransactionOutcome>,
     #[serde(default)]
     events: Vec<Value>,
@@ -342,7 +343,7 @@ mod tests {
     use super::{BlockOutcomes, Update, read_stream};
 
     const BLOCK: &str = r#"{
-      "index_block_hash":"0xblock", "block_height":42,
+      "index_block_hash":"0xblock", "block_height":42, "burn_block_height":30,
       "transactions":[
         {"txid":"0xsuccess","status":"success","raw_result":"0x0703","vm_error":null,
          "execution_cost":{"write_length":1,"write_count":2,"read_length":3,"read_count":4,"runtime":5}},

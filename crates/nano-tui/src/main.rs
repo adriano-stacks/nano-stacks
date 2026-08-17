@@ -2894,7 +2894,11 @@ fn execution_lines(state: &State, block: &node::Block, txid: &str) -> Vec<Line<'
         ];
     };
     let outcome = view.outcome;
-    let budget = state.pox.as_ref().and_then(node::Pox::current_budget);
+    let epoch = state
+        .pox
+        .as_ref()
+        .and_then(|pox| pox.epoch_at(receipt_block.burn_block_height));
+    let budget = epoch.and_then(|epoch| epoch.block_limit);
     let mut lines = vec![
         execution_heading(),
         detail("outcome", outcome.status().to_owned()),
@@ -2903,12 +2907,60 @@ fn execution_lines(state: &State, block: &node::Block, txid: &str) -> Vec<Line<'
     if let Some(error) = outcome.vm_error.as_ref() {
         lines.extend(detail_lines("VM error", error));
     }
+    lines.extend(execution_cost_lines(
+        receipt_block,
+        epoch,
+        budget,
+        outcome.execution_cost,
+    ));
     lines.push(Line::from(Span::styled(
-        "charged cost / current block limit",
+        "ordered events",
         Style::default().fg(Color::Yellow),
     )));
-    let cost = outcome.execution_cost;
-    lines.extend([
+    if view.events.is_empty() {
+        lines.push(detail("events", "none (known empty list)".to_owned()));
+    } else {
+        lines.extend(
+            view.events
+                .into_iter()
+                .enumerate()
+                .map(|(position, event)| {
+                    detail(
+                        &format!("event {}", event.index().unwrap_or(position as u64)),
+                        event.description(),
+                    )
+                }),
+        );
+    }
+    lines
+}
+
+fn execution_cost_lines(
+    receipt: &receipts::BlockOutcomes,
+    epoch: Option<&node::Epoch>,
+    budget: Option<node::ExecutionBudget>,
+    cost: receipts::ExecutionCost,
+) -> Vec<Line<'static>> {
+    let budget_name = epoch.and_then(|epoch| epoch.id.as_deref()).map_or_else(
+        || {
+            format!(
+                "unavailable for Bitcoin block {}",
+                thousands(receipt.burn_block_height)
+            )
+        },
+        |epoch| {
+            format!(
+                "{epoch} at Bitcoin block {}",
+                thousands(receipt.burn_block_height)
+            )
+        },
+    );
+    vec![
+        Line::from(Span::styled(
+            "charged cost / execution-time block limit",
+            Style::default().fg(Color::Yellow),
+        )),
+        detail("budget", budget_name),
         cost_line(
             "runtime",
             cost.runtime,
@@ -2934,27 +2986,11 @@ fn execution_lines(state: &State, block: &node::Block, txid: &str) -> Vec<Line<'
             cost.write_length,
             budget.and_then(|limit| limit.write_length),
         ),
-    ]);
-    lines.push(Line::from(Span::styled(
-        "ordered events",
-        Style::default().fg(Color::Yellow),
-    )));
-    if view.events.is_empty() {
-        lines.push(detail("events", "none (known empty list)".to_owned()));
-    } else {
-        lines.extend(
-            view.events
-                .into_iter()
-                .enumerate()
-                .map(|(position, event)| {
-                    detail(
-                        &format!("event {}", event.index().unwrap_or(position as u64)),
-                        event.description(),
-                    )
-                }),
-        );
-    }
-    lines
+        detail(
+            "limit meaning",
+            "five independent limits; no single aggregate percentage is valid".to_owned(),
+        ),
+    ]
 }
 
 fn execution_heading() -> Line<'static> {
@@ -3003,7 +3039,7 @@ fn receipt_unavailable(state: &State, height: u64) -> String {
 
 fn cost_line(name: &str, used: u64, limit: Option<u64>) -> Line<'static> {
     let value = limit.map_or_else(
-        || format!("{} exact · current limit unavailable", thousands(used)),
+        || format!("{} exact · applicable limit unavailable", thousands(used)),
         |limit| {
             let share = if limit == 0 {
                 "undefined".to_owned()
@@ -3842,6 +3878,66 @@ mod tests {
     }
 
     #[test]
+    fn a_historical_receipt_uses_its_epoch_limit_instead_of_the_current_one() {
+        let mut state = explorer_state();
+        state.pox = Some(node::Pox {
+            current_epoch: Some("Epoch41".to_owned()),
+            epochs: vec![
+                node::Epoch {
+                    id: Some("Epoch40".to_owned()),
+                    start_height: Some(20),
+                    end_height: Some(40),
+                    block_limit: Some(node::ExecutionBudget {
+                        runtime: Some(100),
+                        ..node::ExecutionBudget::default()
+                    }),
+                },
+                node::Epoch {
+                    id: Some("Epoch41".to_owned()),
+                    start_height: Some(40),
+                    end_height: Some(u64::MAX),
+                    block_limit: Some(node::ExecutionBudget {
+                        runtime: Some(1_000),
+                        ..node::ExecutionBudget::default()
+                    }),
+                },
+            ],
+            ..node::Pox::default()
+        });
+        state.screen = Screen::Transaction;
+        state.selected_block.select(Some(0));
+        state.selected_transaction.select(Some(0));
+        state.apply_receipt(receipts::Update::Event(receipts::StreamEvent {
+            sequence: Some(1),
+            kind: "new_block".to_owned(),
+            data: receipt_payload_at("block", 42, 30, "transaction", false),
+        }));
+
+        let rendered = render(&mut state);
+        assert!(rendered.contains("Epoch40 at Bitcoin block 30"));
+        assert!(rendered.contains("5 / 100 exact · 5.000000%"));
+        assert!(!rendered.contains("5 / 1,000 exact"));
+        assert!(rendered.contains("five independent limits"));
+    }
+
+    #[test]
+    fn a_zero_cost_is_exact_while_an_absent_limit_stays_unavailable() {
+        let mut state = explorer_state();
+        state.screen = Screen::Transaction;
+        state.selected_block.select(Some(0));
+        state.selected_transaction.select(Some(0));
+        state.apply_receipt(receipts::Update::Event(receipts::StreamEvent {
+            sequence: Some(1),
+            kind: "new_block".to_owned(),
+            data: zero_cost_receipt_payload("block", 42, "transaction"),
+        }));
+
+        let rendered = render(&mut state);
+        assert!(rendered.contains("0 exact · applicable limit unavailable"));
+        assert!(!rendered.contains("0 / 0"));
+    }
+
+    #[test]
     fn an_empty_event_list_is_not_an_unavailable_outcome() {
         let mut state = explorer_state();
         state.screen = Screen::Transaction;
@@ -4231,7 +4327,9 @@ mod tests {
             }),
             current_epoch: Some("Epoch40".to_owned()),
             epochs: vec![node::Epoch {
-                epoch_id: Some("Epoch40".to_owned()),
+                id: Some("Epoch40".to_owned()),
+                start_height: Some(0),
+                end_height: Some(u64::MAX),
                 block_limit: Some(node::ExecutionBudget {
                     write_length: Some(15_000_000),
                     write_count: Some(15_000),
@@ -4375,6 +4473,16 @@ mod tests {
     }
 
     fn receipt_payload(block_id: &str, height: u64, txid: &str, eventful: bool) -> String {
+        receipt_payload_at(block_id, height, height, txid, eventful)
+    }
+
+    fn receipt_payload_at(
+        block_id: &str,
+        height: u64,
+        burn_height: u64,
+        txid: &str,
+        eventful: bool,
+    ) -> String {
         let events = eventful.then(|| {
             serde_json::json!({
                 "txid": format!("0x{txid}"),
@@ -4390,6 +4498,7 @@ mod tests {
         serde_json::json!({
             "index_block_hash": format!("0x{block_id}"),
             "block_height": height,
+            "burn_block_height": burn_height,
             "transactions": [{
                 "txid": format!("0x{txid}"),
                 "status": "success",
@@ -4406,6 +4515,20 @@ mod tests {
             "events": events.into_iter().collect::<Vec<_>>()
         })
         .to_string()
+    }
+
+    fn zero_cost_receipt_payload(block_id: &str, height: u64, txid: &str) -> String {
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&receipt_payload(block_id, height, txid, false))
+                .expect("receipt fixture");
+        payload["transactions"][0]["execution_cost"] = serde_json::json!({
+            "write_length": 0,
+            "write_count": 0,
+            "read_length": 0,
+            "read_count": 0,
+            "runtime": 0
+        });
+        payload.to_string()
     }
 
     fn block(id: &str, parent_id: &str, height: u64) -> node::Block {

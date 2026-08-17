@@ -290,7 +290,10 @@ pub struct NextCycle {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Epoch {
-    pub epoch_id: Option<String>,
+    #[serde(rename = "epoch_id")]
+    pub id: Option<String>,
+    pub start_height: Option<u64>,
+    pub end_height: Option<u64>,
     pub block_limit: Option<ExecutionBudget>,
 }
 
@@ -308,8 +311,17 @@ impl Pox {
         let current = self.current_epoch.as_deref()?;
         self.epochs
             .iter()
-            .find(|epoch| epoch.epoch_id.as_deref() == Some(current))
+            .find(|epoch| epoch.id.as_deref() == Some(current))
             .and_then(|epoch| epoch.block_limit)
+    }
+
+    pub fn epoch_at(&self, bitcoin_height: u64) -> Option<&Epoch> {
+        self.epochs.iter().find(|epoch| {
+            epoch
+                .start_height
+                .is_some_and(|start| bitcoin_height >= start)
+                && epoch.end_height.is_some_and(|end| bitcoin_height < end)
+        })
     }
 }
 
