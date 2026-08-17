@@ -1477,20 +1477,22 @@ impl SortitionTracker {
         directory: &Path,
         bitcoin_height: u64,
     ) -> Result<(), TrackerError> {
+        self.save_standing_on_with(directory, bitcoin_height, |name, bytes| {
+            replace_file(directory, name, bytes)
+        })
+    }
+
+    fn save_standing_on_with(
+        &self,
+        directory: &Path,
+        bitcoin_height: u64,
+        mut write: impl FnMut(&str, Vec<u8>) -> Result<(), TrackerError>,
+    ) -> Result<(), TrackerError> {
         // A chain that has nowhere to be written down is re-derived from the
         // checkpoint on the next start, one Bitcoin block download per burn block,
         // and the only sign of it is a line in a log. Making the directory is
         // cheaper than that, and the failure is reported rather than swallowed.
         fs::create_dir_all(directory).map_err(|error| TrackerError::Seed(error.to_string()))?;
-        let write = |name: &str, bytes: Vec<u8>| -> Result<(), TrackerError> {
-            let path = directory.join(name);
-            let temporary = directory.join(format!("{name}.partial"));
-            // Two files that have to agree, so neither is left half-written: a
-            // torn history and a tip that does not end it seed nothing, and the
-            // node would fall back to the capture and re-derive in silence.
-            fs::write(&temporary, bytes).map_err(|error| TrackerError::Seed(error.to_string()))?;
-            fs::rename(&temporary, &path).map_err(|error| TrackerError::Seed(error.to_string()))
-        };
         // The tip when execution has caught up to it, and never above what the
         // history can be truncated to.
         //
@@ -1745,6 +1747,13 @@ impl SortitionTracker {
         }
         tracker_from_capture_seed(directory, captured_seed, history)
     }
+}
+
+fn replace_file(directory: &Path, name: &str, bytes: Vec<u8>) -> Result<(), TrackerError> {
+    let path = directory.join(name);
+    let temporary = directory.join(format!("{name}.partial"));
+    fs::write(&temporary, bytes).map_err(|error| TrackerError::Seed(error.to_string()))?;
+    fs::rename(&temporary, &path).map_err(|error| TrackerError::Seed(error.to_string()))
 }
 
 fn captured_snapshots(directory: &Path) -> Result<Vec<CapturedSnapshot>, TrackerError> {
@@ -2082,15 +2091,16 @@ mod tests {
     use nano_bitcoin::{
         BitcoinBlock, BitcoinInput, BitcoinOperation, BitcoinOperationKind, BitcoinOutput,
     };
-    use nano_primitives::ConsensusHash;
+    use nano_primitives::{ConsensusHash, sha512_256};
     use nano_sortition::{
         OpsHash, PayoutSchedule, PoxId, RewardCycleSchedule, SortitionHash, SortitionSnapshot,
     };
     use nano_sync::BurnView as _;
 
     use super::{
-        CapturedSnapshot, History, SortitionTracker, TrackerError, captured_snapshots,
-        execution_rollback_floor, ordered_miner_slot_writers, seed_snapshot,
+        CapturedSnapshot, History, LEADER_KEY_FILE, SortitionTracker, TrackerError,
+        WATERFALL_PAYOUT_FILE, captured_snapshots, execution_rollback_floor,
+        ordered_miner_slot_writers, replace_file, seed_snapshot,
     };
 
     fn captured_sortitions() -> PathBuf {
@@ -2119,11 +2129,17 @@ mod tests {
         total_burn: u64,
     ) -> SortitionTracker {
         let behind = ConsensusHash::from_bytes([0xbe; 20]);
+        let bitcoin_header_hash = nano_primitives::BitcoinHeaderHash::from_bytes([1; 32]);
+        let pox_id = PoxId::initial();
+        let mut sortition_preimage = bitcoin_header_hash.as_bytes().to_vec();
+        sortition_preimage.extend_from_slice(&pox_id.as_consensus_bytes());
         let seed = SortitionSnapshot {
             bitcoin_height: 100,
-            bitcoin_header_hash: nano_primitives::BitcoinHeaderHash::from_bytes([1; 32]),
+            bitcoin_header_hash,
             bitcoin_timestamp: 0,
-            sortition_id: nano_primitives::SortitionId::from_bytes([2; 32]),
+            sortition_id: nano_primitives::SortitionId::from_bytes(
+                *sha512_256(&sortition_preimage).as_bytes(),
+            ),
             parent_sortition_id: nano_primitives::SortitionId::from_bytes([3; 32]),
             operations_hash: OpsHash::from_txids(&[]),
             consensus_hash: ConsensusHash::from_bytes([0x7f; 20]),
@@ -2138,7 +2154,7 @@ mod tests {
             parent_bitcoin_height: None,
             burn_spends: None,
             mining_competition: None,
-            pox_id: PoxId::initial(),
+            pox_id,
         };
         let history = vec![behind, seed.consensus_hash];
         SortitionTracker::new(seed, history).expect("the history ends at the seed")
@@ -2392,6 +2408,74 @@ mod tests {
         let resumed = SortitionTracker::resume_or_capture(state.path(), &capture)
             .expect("re-derive from the complete capture");
         assert_eq!(resumed.tip().num_sortitions, expected);
+    }
+
+    #[test]
+    fn every_saved_capture_rename_failure_preserves_or_refuses_the_generation() {
+        let mut tracker = tracker_with_seed(Some([8; 32]), Some([9; 32]), 1_000);
+        let prior_height = tracker.tip().bitcoin_height;
+        let payouts = PayoutSchedule::new(
+            RewardCycleSchedule::new(0, 1_000, None).expect("a schedule"),
+            2,
+        )
+        .expect("payouts");
+        tracker
+            .advance(&block_with(prior_height + 1, Vec::new()), payouts)
+            .expect("derive the next generation");
+        let prior_consensus = tracker
+            .snapshot_at(prior_height)
+            .expect("the prior burn view is retained")
+            .consensus_hash;
+        let capture = tempfile::tempdir().expect("a complete fallback capture");
+        tracker
+            .save_standing_on(capture.path(), prior_height)
+            .expect("save the complete fallback generation");
+        let files = [
+            "consensus-hashes.json",
+            LEADER_KEY_FILE,
+            WATERFALL_PAYOUT_FILE,
+            "snapshots.json",
+        ];
+
+        for (fail_at, failed_file) in files.into_iter().enumerate() {
+            let state = tempfile::tempdir().expect("a saved-chain directory");
+            tracker
+                .save_standing_on(state.path(), prior_height)
+                .expect("save the complete prior generation");
+            SortitionTracker::from_capture(state.path())
+                .expect("the complete prior generation reopens before injection");
+            let mut writes = 0;
+            let error = tracker
+                .save_standing_on_with(state.path(), tracker.tip().bitcoin_height, |name, bytes| {
+                    writes += 1;
+                    if writes == fail_at + 1 {
+                        assert_eq!(name, failed_file);
+                        return Err(TrackerError::Seed("injected rename failure".to_owned()));
+                    }
+                    replace_file(state.path(), name, bytes)
+                })
+                .expect_err("the selected rename fails");
+            assert!(error.to_string().contains("injected rename failure"));
+            assert_eq!(writes, fail_at + 1);
+
+            match SortitionTracker::from_capture(state.path()) {
+                Ok(saved) => {
+                    assert_eq!(
+                        fail_at, 0,
+                        "only a failure before the first rename is complete"
+                    );
+                    assert_eq!(saved.tip().consensus_hash, prior_consensus);
+                }
+                Err(_) => assert!(fail_at > 0, "the complete prior generation must reopen"),
+            }
+            let resumed = SortitionTracker::resume_or_capture_below(
+                state.path(),
+                capture.path(),
+                tracker.tip().bitcoin_height + 10,
+            )
+            .expect("a torn saved generation falls back to the checkpoint capture");
+            assert_eq!(resumed.tip().bitcoin_height, prior_height);
+        }
     }
 
     #[test]
