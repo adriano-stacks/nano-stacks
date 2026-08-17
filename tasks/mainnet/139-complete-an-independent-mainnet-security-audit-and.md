@@ -1,7 +1,7 @@
 ---
 id: "139"
 title: "Complete an independent mainnet security audit and launch bug bounty"
-status: pending
+status: cancelled
 priority: critical
 effort: large
 dependencies: ["134", "135", "137"]
@@ -9,6 +9,7 @@ tags: ["mainnet", "security", "audit", "release"]
 created_at: 2026-08-14
 parent: 053
 type: chore
+cancelled_at: 2026-08-17
 ---
 
 # Complete an independent mainnet security audit and launch bug bounty
