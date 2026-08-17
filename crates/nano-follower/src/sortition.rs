@@ -449,25 +449,48 @@ impl SortitionTracker {
         })
     }
 
-    /// The current locally derived burn view and recent winning elections.
+    /// The current locally derived burn views and recent winning elections.
     ///
     /// Signers need the current Bitcoin view even when Stacks execution has not
-    /// advanced under it yet. The previous election is included because the
-    /// current view names it as `last_sortition_consensus_hash`.
+    /// advanced under it yet. Recent consecutive views let diagnostics compare
+    /// every derived burn block even when the node catches up between polls. The
+    /// previous elections are retained separately because the current view names
+    /// one as `last_sortition_consensus_hash`.
     #[must_use]
     pub fn recent_sortitions(&self) -> Vec<nano_sync::SortitionInfo> {
-        const KEPT: usize = 12;
+        const KEPT_BURN_VIEWS: u64 = 64;
+        const KEPT_ELECTIONS: usize = 12;
         let mut sortitions = Vec::new();
-        let mut walk = Some(self.tip().bitcoin_height);
-        while let Some(height) = walk.take() {
+
+        for distance in 0..KEPT_BURN_VIEWS {
+            let Some(height) = self.tip().bitcoin_height.checked_sub(distance) else {
+                break;
+            };
             let Some(sortition) = self.sortition_info_at(height) else {
                 break;
             };
-            if height == self.tip().bitcoin_height || sortition.was_sortition {
-                sortitions.push(sortition);
-            }
-            if sortitions.len() == KEPT {
+            sortitions.push(sortition);
+        }
+
+        let mut elections = sortitions
+            .iter()
+            .filter(|sortition| sortition.was_sortition)
+            .count();
+        let mut walk = Some(self.tip().bitcoin_height);
+        while elections < KEPT_ELECTIONS {
+            let Some(height) = walk.take() else {
                 break;
+            };
+            let Some(sortition) = self.sortition_info_at(height) else {
+                break;
+            };
+            if sortition.was_sortition
+                && !sortitions
+                    .iter()
+                    .any(|retained| retained.bitcoin_height == height)
+            {
+                sortitions.push(sortition);
+                elections += 1;
             }
             walk = self.previous_sortition_height(height);
         }
@@ -2955,5 +2978,18 @@ mod anchor_tests {
         assert_eq!(notification.bitcoin_block_hash.as_bytes(), &[101; 32]);
         assert_eq!(notification.parent_bitcoin_block_hash.as_bytes(), &[1; 32]);
         assert_eq!(notification.burned, 0);
+
+        chain
+            .advance(&empty_block(102), payouts())
+            .expect("derive another no-winner burn");
+        let sortitions = chain.recent_sortitions();
+        assert_eq!(
+            sortitions
+                .iter()
+                .take(3)
+                .map(|sortition| sortition.bitcoin_height)
+                .collect::<Vec<_>>(),
+            vec![102, 101, 100]
+        );
     }
 }

@@ -840,6 +840,15 @@ fn v3_chain_routes(ingress: &limits::Registry) -> Router<RpcState> {
             ),
         )
         .route(
+            "/v3/sortitions/burn_height/{burn_height}",
+            limits::guard(
+                ingress,
+                "v3.sortition_burn_height",
+                get(sortition_at_burn_height),
+                limits::STATE_READ,
+            ),
+        )
+        .route(
             "/v3/stacker_set/{cycle}",
             limits::guard(
                 ingress,
@@ -1551,6 +1560,19 @@ async fn sortition(
         .sortitions
         .into_iter()
         .find(|sortition| sortition.consensus_hash.to_string() == consensus_hash)
+        .ok_or(RpcError::NotFound)?;
+    Ok(axum::Json(vec![SortitionInfoWire::from(sortition)]))
+}
+
+async fn sortition_at_burn_height(
+    State(state): State<RpcState>,
+    Path(burn_height): Path<u64>,
+) -> Result<axum::Json<Vec<SortitionInfoWire>>, RpcError> {
+    let sortition = executed(&state)
+        .await?
+        .sortitions
+        .into_iter()
+        .find(|sortition| sortition.bitcoin_height == burn_height)
         .ok_or(RpcError::NotFound)?;
     Ok(axum::Json(vec![SortitionInfoWire::from(sortition)]))
 }
@@ -4314,18 +4336,7 @@ mod tests {
         }
     }
 
-    /// The sortition routes answer from what this node derived, not from its peer.
-    ///
-    /// A sortition is arithmetic over Bitcoin blocks this node downloaded. Serving
-    /// the peer's account of one would hand a stranger the burn view, and through it
-    /// the fork — the one input a follower must not take on trust. These routes read
-    /// the peer's tenures, so a node deriving a perfectly good chain of its own
-    /// answered `503` for want of a peer walk, which is the wrong answer twice over.
-    ///
-    /// The peer's view is published too, and disagrees on every field that matters:
-    /// a route reading it would pass a test that only checked for `200`.
-    #[tokio::test]
-    async fn the_sortition_routes_answer_from_the_chain_this_node_derived() {
+    async fn state_with_derived_sortitions() -> RpcState {
         let state = RpcState::new(NETWORK);
         state.publish(captured_view()).await;
         let derived = SortitionInfo {
@@ -4360,6 +4371,22 @@ mod tests {
                 captured_pox(),
             )
             .await;
+        state
+    }
+
+    /// The sortition routes answer from what this node derived, not from its peer.
+    ///
+    /// A sortition is arithmetic over Bitcoin blocks this node downloaded. Serving
+    /// the peer's account of one would hand a stranger the burn view, and through it
+    /// the fork — the one input a follower must not take on trust. These routes read
+    /// the peer's tenures, so a node deriving a perfectly good chain of its own
+    /// answered `503` for want of a peer walk, which is the wrong answer twice over.
+    ///
+    /// The peer's view is published too, and disagrees on every field that matters:
+    /// a route reading it would pass a test that only checked for `200`.
+    #[tokio::test]
+    async fn the_sortition_routes_answer_from_the_chain_this_node_derived() {
+        let state = state_with_derived_sortitions().await;
 
         let latest = body_json(
             router(state.clone())
@@ -4432,6 +4459,26 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(peers.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_burn_height_route_answers_from_locally_derived_history() {
+        let by_height = body_json(
+            router(state_with_derived_sortitions().await)
+                .oneshot(
+                    Request::builder()
+                        .uri("/v3/sortitions/burn_height/10")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+        assert_eq!(
+            by_height[0]["consensus_hash"],
+            json!(format!("0x{}", "22".repeat(20)))
+        );
     }
 
     #[tokio::test]

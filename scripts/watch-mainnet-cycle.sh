@@ -66,72 +66,105 @@ while true; do
     current_height=${current_height:-0}
 
     if [ "$current_height" -gt "$last_height" ]; then
-        if [ "$last_height" -ne 0 ] && [ "$current_height" -ne $((last_height + 1)) ]; then
-            echo "cycle evidence skipped burn heights ${last_height}..${current_height}" >&2
-            exit 1
+        start_height=$current_height
+        if [ "$last_height" -ne 0 ]; then
+            start_height=$((last_height + 1))
         fi
 
-        height=$current_height
-        local_snapshot=$current_snapshot
-        local_info=$(curl -fsS --max-time 10 "$local_url/v2/info" || echo null)
-        local_pox_id=$(derive_unbroken_pox_id <<<"$local_snapshot" || echo null)
-        oracles='[]'
-        for oracle_url in "${oracle_urls[@]}"; do
-            oracle_url=${oracle_url%/}
-            snapshot=$(curl -fsS --max-time 10 \
-                "$oracle_url/v3/sortitions/burn_height/$height" 2>/dev/null |
-                jq -ce '.[0]' || true)
-            info=$(curl -fsS --max-time 10 "$oracle_url/v2/info" 2>/dev/null || echo null)
-            pox_id=null
-            if [ -n "$snapshot" ]; then
-                pox_id=$(derive_unbroken_pox_id <<<"$snapshot" || echo null)
+        for ((height = start_height; height <= current_height; height++)); do
+            if [ "$height" -eq "$current_height" ]; then
+                local_snapshot=$current_snapshot
+            else
+                local_snapshot=$(curl -fsS --max-time 10 \
+                    "$local_url/v3/sortitions/burn_height/$height" 2>/dev/null |
+                    jq -ce '.[0]' || true)
+                # Older deployed nano nodes retain the same recent local views
+                # under their consensus-hash route but do not expose the
+                # stacks-core-compatible burn-height route yet. Use an oracle's
+                # hash only as the lookup key, then require nano's own answer to
+                # name the requested height before comparing either oracle.
+                if [ -z "$local_snapshot" ]; then
+                    lookup_consensus=$(curl -fsS --max-time 10 \
+                        "${oracle_urls[0]%/}/v3/sortitions/burn_height/$height" \
+                        2>/dev/null | jq -er '.[0].consensus_hash' || true)
+                    local_snapshot=$(curl -fsS --max-time 10 \
+                        "$local_url/v3/sortitions/consensus/${lookup_consensus#0x}" \
+                        2>/dev/null | jq -ce '.[0]' || true)
+                fi
             fi
-            oracles=$(jq -cn \
-                --argjson entries "$oracles" \
-                --arg url "$oracle_url" \
-                --argjson snapshot "${snapshot:-null}" \
-                --argjson pox_id "$pox_id" \
-                --argjson info "$info" \
-                '$entries + [{url: $url, snapshot: $snapshot, pox_id: $pox_id, info: $info}]')
-        done
+            local_snapshot_height=$(jq -r '.burn_block_height // 0' \
+                <<<"${local_snapshot:-null}" 2>/dev/null || true)
+            if [ "$local_snapshot_height" -ne "$height" ]; then
+                echo "local node has no retained sortition at burn height ${height}" >&2
+                exit 1
+            fi
 
-        jq -cn \
-            --arg timestamp "$(date -u +%FT%TZ)" \
-            --argjson local "$local_snapshot" \
-            --argjson local_pox_id "$local_pox_id" \
-            --argjson local_info "$local_info" \
-            --argjson oracles "$oracles" '
-                def consensus_fields: {
-                    burn_block_hash,
-                    burn_block_height,
-                    sortition_id,
-                    parent_sortition_id,
-                    consensus_hash,
-                    was_sortition,
-                    miner_pk_hash160,
-                    stacks_parent_ch,
-                    last_sortition_ch,
-                    committed_block_hash,
-                    vrf_seed
-                };
-                ($local | consensus_fields) as $expected |
-                {
-                    timestamp: $timestamp,
-                    local: $local,
-                    local_pox_id: $local_pox_id,
-                    local_info: $local_info,
-                    oracles: [
-                        $oracles[] |
-                        . + {
-                            matches_local: (
-                                .snapshot != null and
-                                (.snapshot | consensus_fields) == $expected
-                            )
-                        }
-                    ]
-                }
-            ' >> "$output"
-        last_height=$height
+            local_info=$(curl -fsS --max-time 10 "$local_url/v2/info" || echo null)
+            local_pox_id=$(derive_unbroken_pox_id <<<"$local_snapshot" || echo null)
+            oracles='[]'
+            oracles_ready=true
+            for oracle_url in "${oracle_urls[@]}"; do
+                oracle_url=${oracle_url%/}
+                snapshot=$(curl -fsS --max-time 10 \
+                    "$oracle_url/v3/sortitions/burn_height/$height" 2>/dev/null |
+                    jq -ce '.[0]' || true)
+                if [ -z "$snapshot" ]; then
+                    oracles_ready=false
+                    break
+                fi
+                info=$(curl -fsS --max-time 10 "$oracle_url/v2/info" 2>/dev/null || echo null)
+                pox_id=$(derive_unbroken_pox_id <<<"$snapshot" || echo null)
+                oracles=$(jq -cn \
+                    --argjson entries "$oracles" \
+                    --arg url "$oracle_url" \
+                    --argjson snapshot "${snapshot:-null}" \
+                    --argjson pox_id "$pox_id" \
+                    --argjson info "$info" \
+                    '$entries + [{url: $url, snapshot: $snapshot, pox_id: $pox_id, info: $info}]')
+            done
+            if [ "$oracles_ready" = false ]; then
+                echo "waiting for oracle evidence at burn height ${height}" >&2
+                break
+            fi
+
+            jq -cn \
+                --arg timestamp "$(date -u +%FT%TZ)" \
+                --argjson local "$local_snapshot" \
+                --argjson local_pox_id "$local_pox_id" \
+                --argjson local_info "$local_info" \
+                --argjson oracles "$oracles" '
+                    def consensus_fields: {
+                        burn_block_hash,
+                        burn_block_height,
+                        sortition_id,
+                        parent_sortition_id,
+                        consensus_hash,
+                        was_sortition,
+                        miner_pk_hash160,
+                        stacks_parent_ch,
+                        last_sortition_ch,
+                        committed_block_hash,
+                        vrf_seed
+                    };
+                    ($local | consensus_fields) as $expected |
+                    {
+                        timestamp: $timestamp,
+                        local: $local,
+                        local_pox_id: $local_pox_id,
+                        local_info: $local_info,
+                        oracles: [
+                            $oracles[] |
+                            . + {
+                                matches_local: (
+                                    .snapshot != null and
+                                    (.snapshot | consensus_fields) == $expected
+                                )
+                            }
+                        ]
+                    }
+                ' >> "$output"
+            last_height=$height
+        done
     fi
 
     sleep 60
