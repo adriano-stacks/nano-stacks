@@ -38,6 +38,7 @@
               pkgs.cargo-audit
               pkgs.cargo-cyclonedx
               pkgs.cargo-fuzz
+              pkgs.cargo-mutants
               pkgs.clippy
               pkgs.curl
               pkgs.jq
