@@ -856,6 +856,7 @@ struct Inner {
     ingress_queues: IngressQueueGauges,
     rpc_admission: RpcAdmissionGauges,
     rpc_connections: AdmissionGauges,
+    metrics_connections: AdmissionGauges,
     p2p_frames: AdmissionGauges,
     p2p_inbound_sessions: AdmissionGauges,
     resources: ResourceGauges,
@@ -875,7 +876,12 @@ impl std::fmt::Debug for NodeMetrics {
 
 fn register_admission_gauges(
     registry: &mut Registry,
-) -> (AdmissionGauges, AdmissionGauges, AdmissionGauges) {
+) -> (
+    AdmissionGauges,
+    AdmissionGauges,
+    AdmissionGauges,
+    AdmissionGauges,
+) {
     let rpc_connections = AdmissionGauges::register(
         registry,
         AdmissionMetricNames {
@@ -895,6 +901,31 @@ fn register_admission_gauges(
             saturations: (
                 "rpc_connection_saturations",
                 "TCP connections refused by a global or per-address RPC limit.",
+            ),
+        },
+    );
+    let metrics_connections = AdmissionGauges::register(
+        registry,
+        AdmissionMetricNames {
+            used: (
+                "metrics_connections_active",
+                "Open Prometheus metrics TCP connections.",
+            ),
+            subjects: (
+                "metrics_connection_addresses",
+                "Client addresses with an open Prometheus metrics connection.",
+            ),
+            limit: (
+                "metrics_connection_limit",
+                "Maximum Prometheus metrics TCP connections.",
+            ),
+            per_subject_limit: (
+                "metrics_connection_per_address_limit",
+                "Maximum Prometheus metrics TCP connections from one address.",
+            ),
+            saturations: (
+                "metrics_connection_saturations",
+                "Prometheus metrics connections refused by a global or per-address limit.",
             ),
         },
     );
@@ -945,7 +976,12 @@ fn register_admission_gauges(
             ),
         },
     );
-    (rpc_connections, p2p_frames, p2p_inbound_sessions)
+    (
+        rpc_connections,
+        metrics_connections,
+        p2p_frames,
+        p2p_inbound_sessions,
+    )
 }
 
 impl Default for NodeMetrics {
@@ -959,7 +995,7 @@ impl Default for NodeMetrics {
         let peers = PeerGauges::register(&mut registry);
         let ingress_queues = IngressQueueGauges::register(&mut registry);
         let rpc_admission = RpcAdmissionGauges::register(&mut registry);
-        let (rpc_connections, p2p_frames, p2p_inbound_sessions) =
+        let (rpc_connections, metrics_connections, p2p_frames, p2p_inbound_sessions) =
             register_admission_gauges(&mut registry);
         let staged_blocks = gauge(
             &mut registry,
@@ -1019,6 +1055,7 @@ impl Default for NodeMetrics {
             ingress_queues,
             rpc_admission,
             rpc_connections,
+            metrics_connections,
             p2p_frames,
             p2p_inbound_sessions,
             resources,
@@ -1047,6 +1084,10 @@ impl NodeMetrics {
 
     pub(crate) fn publish_rpc_connections(&self, status: AdmissionStatus) {
         self.0.rpc_connections.publish(status);
+    }
+
+    pub(crate) fn publish_metrics_connections(&self, status: AdmissionStatus) {
+        self.0.metrics_connections.publish(status);
     }
 
     pub fn publish_p2p_frames(&self, status: AdmissionStatus) {
@@ -1296,7 +1337,7 @@ pub fn router(metrics: NodeMetrics) -> Router {
 
 /// Serve metrics until the listener is stopped.
 pub async fn serve(listener: tokio::net::TcpListener, metrics: NodeMetrics) -> std::io::Result<()> {
-    axum::serve(listener, router(metrics)).await
+    crate::server::serve_metrics(listener, router(metrics.clone()), metrics).await
 }
 
 async fn scrape(State(metrics): State<NodeMetrics>) -> impl IntoResponse {
@@ -1351,6 +1392,11 @@ mod tests {
         "nano_rpc_connection_limit 256",
         "nano_rpc_connection_per_address_limit 16",
         "nano_rpc_connection_saturations 7",
+        "nano_metrics_connections_active 3",
+        "nano_metrics_connection_addresses 1",
+        "nano_metrics_connection_limit 16",
+        "nano_metrics_connection_per_address_limit 4",
+        "nano_metrics_connection_saturations 2",
         "nano_p2p_frame_bytes 8",
         "nano_p2p_frame_addresses 3",
         "nano_p2p_frame_global_byte_limit 80",
@@ -1460,6 +1506,13 @@ mod tests {
             limit: 256,
             per_subject_limit: 16,
             saturations: 7,
+        });
+        metrics.publish_metrics_connections(AdmissionStatus {
+            used: 3,
+            subjects: 1,
+            limit: 16,
+            per_subject_limit: 4,
+            saturations: 2,
         });
         metrics.publish_p2p_frames(AdmissionStatus {
             used: 8,
