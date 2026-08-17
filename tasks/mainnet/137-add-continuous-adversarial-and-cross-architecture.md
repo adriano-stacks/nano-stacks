@@ -1,7 +1,7 @@
 ---
 id: "137"
 title: "Add continuous adversarial and cross-architecture verification"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["130", "131", "132", "136"]
