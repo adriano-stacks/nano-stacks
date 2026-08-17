@@ -1,9 +1,9 @@
 {
-  "schema": 1,
+  "schema": 2,
   "jobs": [
-    { "id": "continuous-fuzz", "workflow": "fuzz.yml", "owner": "137" },
-    { "id": "runtime-sanitizers", "workflow": "sanitizers.yml", "owner": "137" },
-    { "id": "cross-architecture", "workflow": "cross-architecture.yml", "owner": "137" },
-    { "id": "decision-mutations", "workflow": "mutations.yml", "owner": "137" }
+    { "id": "continuous-fuzz", "workflow": "fuzz.yml", "event": "schedule", "owner": "137" },
+    { "id": "runtime-sanitizers", "workflow": "sanitizers.yml", "event": "push", "owner": "137" },
+    { "id": "cross-architecture", "workflow": "cross-architecture.yml", "event": "push", "owner": "137" },
+    { "id": "decision-mutations", "workflow": "mutations.yml", "event": "push", "owner": "137" }
   ]
 }

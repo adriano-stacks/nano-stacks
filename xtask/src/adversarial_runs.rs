@@ -12,6 +12,7 @@ use crate::release_inventory::task_statuses;
 pub struct AdversarialJob {
     pub id: String,
     pub workflow: String,
+    pub event: String,
     pub owner: String,
 }
 
@@ -25,6 +26,7 @@ struct JobFile {
 pub struct WorkflowRun {
     pub id: u64,
     pub head_sha: String,
+    pub event: String,
     pub status: String,
     pub conclusion: String,
     pub completed_at: String,
@@ -35,6 +37,7 @@ pub struct WorkflowRun {
 pub struct JobRun {
     pub job: String,
     pub workflow: String,
+    pub event: String,
     pub latest: Option<WorkflowRun>,
     pub last_success: Option<WorkflowRun>,
 }
@@ -64,7 +67,7 @@ impl AdversarialInventory {
             .map_err(|error| error.to_string())
             .and_then(|bytes| serde_json::from_slice::<JobFile>(&bytes).map_err(|e| e.to_string()))
         {
-            Ok(file) if file.schema == 1 => file.jobs,
+            Ok(file) if file.schema == 2 => file.jobs,
             Ok(file) => {
                 errors.push(format!(
                     "adversarial-jobs.json has unsupported schema {}",
@@ -85,6 +88,12 @@ impl AdversarialInventory {
                 errors.push(format!(
                     "adversarial job {:?} is empty or duplicated",
                     job.id
+                ));
+            }
+            if !matches!(job.event.as_str(), "push" | "schedule") {
+                errors.push(format!(
+                    "adversarial job {} has unsupported event {:?}",
+                    job.id, job.event
                 ));
             }
             let path = Path::new(&job.workflow);
@@ -118,7 +127,7 @@ impl AdversarialInventory {
             .map_err(|error| error.to_string())
             .and_then(|bytes| serde_json::from_slice::<RunFile>(&bytes).map_err(|e| e.to_string()))
         {
-            Ok(file) if file.schema == 1 => file,
+            Ok(file) if file.schema == 2 => file,
             Ok(file) => {
                 errors.push(format!(
                     "{} has unsupported schema {}",
@@ -154,6 +163,12 @@ impl AdversarialInventory {
                 errors.push(format!(
                     "adversarial job {} reports workflow {:?}, expected {:?}",
                     job.id, run.workflow, job.workflow
+                ));
+            }
+            if run.event != job.event {
+                errors.push(format!(
+                    "adversarial job {} reports event {:?}, expected {:?}",
+                    job.id, run.event, job.event
                 ));
             }
             validate_run(
@@ -203,12 +218,13 @@ fn validate_run(
         || run.status != "completed"
         || run.conclusion != "success"
         || run.head_sha != revision
+        || run.event != job.event
         || run.completed_at.is_empty()
         || run.url.is_empty()
     {
         errors.push(format!(
-            "adversarial job {} {kind} run {} is status={:?} conclusion={:?} revision={:?}",
-            job.id, run.id, run.status, run.conclusion, run.head_sha
+            "adversarial job {} {kind} run {} is event={:?} status={:?} conclusion={:?} revision={:?}",
+            job.id, run.id, run.event, run.status, run.conclusion, run.head_sha
         ));
     }
 }
@@ -219,10 +235,11 @@ mod tests {
 
     use super::{AdversarialInventory, JobRun, RunFile, WorkflowRun};
 
-    fn run(id: u64, revision: &str) -> WorkflowRun {
+    fn run(id: u64, revision: &str, event: &str) -> WorkflowRun {
         WorkflowRun {
             id,
             head_sha: revision.to_owned(),
+            event: event.to_owned(),
             status: "completed".to_owned(),
             conclusion: "success".to_owned(),
             completed_at: "2026-08-17T00:00:00Z".to_owned(),
@@ -243,10 +260,15 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, job)| {
-                let observed = run(u64::try_from(index + 1).expect("small index"), &revision);
+                let observed = run(
+                    u64::try_from(index + 1).expect("small index"),
+                    &revision,
+                    &job.event,
+                );
                 JobRun {
                     job: job.id.clone(),
                     workflow: job.workflow.clone(),
+                    event: job.event.clone(),
                     latest: Some(observed.clone()),
                     last_success: Some(observed),
                 }
@@ -255,7 +277,7 @@ mod tests {
         let evidence = tempfile::NamedTempFile::new().expect("evidence file");
         fs::write(
             evidence.path(),
-            serde_json::to_vec(&RunFile { schema: 1, runs }).expect("encode evidence"),
+            serde_json::to_vec(&RunFile { schema: 2, runs }).expect("encode evidence"),
         )
         .expect("write evidence");
         assert!(
@@ -274,15 +296,16 @@ mod tests {
         let inventory = AdversarialInventory::load(root);
         let revision = "2".repeat(40);
         let job = inventory.jobs.first().expect("a mandatory job");
-        let mut latest = run(7, &"1".repeat(40));
+        let mut latest = run(7, &"1".repeat(40), &job.event);
         latest.conclusion = "failure".to_owned();
         let file = RunFile {
-            schema: 1,
+            schema: 2,
             runs: vec![JobRun {
                 job: job.id.clone(),
                 workflow: job.workflow.clone(),
+                event: job.event.clone(),
                 latest: Some(latest),
-                last_success: Some(run(6, &"1".repeat(40))),
+                last_success: Some(run(6, &"1".repeat(40), &job.event)),
             }],
         };
         let evidence = tempfile::NamedTempFile::new().expect("evidence file");
@@ -303,6 +326,44 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.contains("has no run evidence"))
+        );
+    }
+
+    #[test]
+    fn a_manual_fuzz_run_is_not_scheduled_evidence() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask is under the workspace");
+        let inventory = AdversarialInventory::load(root);
+        let revision = "3".repeat(40);
+        let job = inventory
+            .jobs
+            .iter()
+            .find(|job| job.id == "continuous-fuzz")
+            .expect("continuous fuzz job");
+        let manual = run(8, &revision, "workflow_dispatch");
+        let file = RunFile {
+            schema: 2,
+            runs: vec![JobRun {
+                job: job.id.clone(),
+                workflow: job.workflow.clone(),
+                event: job.event.clone(),
+                latest: Some(manual.clone()),
+                last_success: Some(manual),
+            }],
+        };
+        let evidence = tempfile::NamedTempFile::new().expect("evidence file");
+        fs::write(
+            evidence.path(),
+            serde_json::to_vec(&file).expect("encode evidence"),
+        )
+        .expect("write evidence");
+        let evaluated = inventory.evaluate(evidence.path(), &revision);
+        assert!(
+            evaluated
+                .errors
+                .iter()
+                .any(|error| error.contains("event=\"workflow_dispatch\""))
         );
     }
 }
