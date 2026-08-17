@@ -15,7 +15,7 @@ chainstate. It may:
 - derive the Bitcoin/sortition view locally;
 - discover peers and acquire Stacks blocks over outbound P2P;
 - authenticate blocks, select forks and execute Clarity through clarity-wasm;
-- seal durable state; and
+- seal durable state and retain bounded block and receipt commitments; and
 - expose health and metrics on loopback.
 
 It has no public HTTP surface. Inbound P2P serving and persistent native Wasm
@@ -28,6 +28,12 @@ native-module directory after any follower process exited. The exact artifact
 sizes, hashes and decisions are recorded in
 [`release/follower-liveness.json`](../release/follower-liveness.json). Neither
 omitted capability has a measured liveness justification for inclusion.
+
+The receipt commitment covers each transaction's identity, status, serialized
+result and five cost dimensions plus every ordered event. It is kept only for
+the same bounded recent-block window as the block archive and is removed with a
+retracted or pruned block. It provides release evidence without adding an event
+service or public route.
 
 ## Out-of-process capabilities
 
