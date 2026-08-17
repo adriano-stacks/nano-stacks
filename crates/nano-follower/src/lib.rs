@@ -11,6 +11,7 @@ pub mod config;
 pub mod executor;
 pub mod network;
 pub mod observation;
+pub mod runtime;
 pub mod sortition;
 pub mod staging;
 pub mod startup;
