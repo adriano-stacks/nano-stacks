@@ -1,7 +1,7 @@
 ---
 title: "Show per-transaction tenure budget consumption in nano-tui"
 id: "143"
-status: pending
+status: in-progress
 priority: high
 effort: medium
 type: feature
