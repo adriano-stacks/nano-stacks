@@ -38,7 +38,9 @@ use nano_mempool::{Account, ChainTip, Mempool};
 use nano_primitives::{
     BlockHeaderHash, ConsensusHash, Hash160, Network, Sha256Sum, StacksBlockId, TrieHash,
 };
-use nano_sync::{FollowedTenure, MAX_TENURE_RESPONSE_BYTES, NodeView, PoxInfo};
+use nano_sync::{
+    FOLLOWED_TENURE_HISTORY_BYTES, FollowedTenure, MAX_TENURE_RESPONSE_BYTES, NodeView, PoxInfo,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use siphasher::sip::SipHasher;
@@ -557,7 +559,11 @@ impl RpcState {
             .publish_executed(tip.stacks_height, tip.bitcoin_height, now_seconds());
         let followed = self.followed.read().await.clone();
         let chain = followed.map_or_else(Vec::new, |view| executed_chain(view.tenures, &tip));
-        self.metrics.publish_tenure_history(chain.len());
+        self.metrics.publish_tenure_history(
+            chain.len(),
+            chain.iter().map(FollowedTenure::wire_bytes).sum(),
+            FOLLOWED_TENURE_HISTORY_BYTES,
+        );
         *self.executed.write().await = Some(Executed {
             tip,
             chain,
@@ -659,27 +665,33 @@ fn executed_chain(tenures: Vec<FollowedTenure>, tip: &SealedTip) -> Vec<Followed
     }
     tenures
         .into_iter()
-        .filter_map(|mut tenure| {
-            if !tenure
+        .filter_map(|tenure| {
+            let blocks = if tenure
                 .blocks
                 .iter()
                 .all(|block| executed.contains(&block.block_id()))
             {
-                tenure.blocks = Arc::new(
+                tenure.blocks
+            } else {
+                Arc::new(
                     tenure
                         .blocks
                         .iter()
                         .filter(|block| executed.contains(&block.block_id()))
                         .cloned()
                         .collect(),
-                );
-            }
-            let last = tenure.blocks.last()?;
+                )
+            };
+            let last = blocks.last()?;
             // The tenure's own tip moves down with it: a tenure whose newest
             // blocks were dropped must not keep advertising them.
-            tenure.info.tip_block_id = last.block_id();
-            tenure.info.tip_height = last.header.chain_length;
-            Some(tenure)
+            let mut info = tenure.info;
+            info.tip_block_id = last.block_id();
+            info.tip_height = last.header.chain_length;
+            Some(
+                FollowedTenure::new(info, tenure.sortition, blocks)
+                    .expect("an executed subset stays within its followed tenure byte limit"),
+            )
         })
         .collect()
 }
@@ -3741,33 +3753,36 @@ mod tests {
                 v2_unlock_height: Some(207),
                 v3_unlock_height: Some(210),
             },
-            tenures: vec![FollowedTenure {
-                info: TenureInfo {
-                    consensus_hash: ConsensusHash::from_bytes([2; 20]),
-                    tenure_start_block_id: StacksBlockId::from_bytes([3; 32]),
-                    parent_consensus_hash: ConsensusHash::from_bytes([4; 20]),
-                    parent_tenure_start_block_id: StacksBlockId::from_bytes([5; 32]),
-                    tip_block_id: StacksBlockId::from_bytes([6; 32]),
-                    tip_height: 12,
-                    reward_cycle: 1,
-                },
-                sortition: SortitionInfo {
-                    bitcoin_block_hash: BitcoinHeaderHash::from_bytes([7; 32]),
-                    bitcoin_height: 11,
-                    bitcoin_timestamp: 0,
-                    sortition_id: SortitionId::from_bytes([8; 32]),
-                    parent_sortition_id: SortitionId::from_bytes([9; 32]),
-                    consensus_hash: ConsensusHash::from_bytes([2; 20]),
-                    was_sortition: true,
-                    miner_public_key_hash: None,
-                    stacks_parent_consensus_hash: None,
-                    last_sortition_consensus_hash: None,
-                    committed_block_hash: None,
-                    vrf_seed: None,
-                    mining_competition: None,
-                },
-                blocks: Arc::new(Vec::new()),
-            }],
+            tenures: vec![
+                FollowedTenure::new(
+                    TenureInfo {
+                        consensus_hash: ConsensusHash::from_bytes([2; 20]),
+                        tenure_start_block_id: StacksBlockId::from_bytes([3; 32]),
+                        parent_consensus_hash: ConsensusHash::from_bytes([4; 20]),
+                        parent_tenure_start_block_id: StacksBlockId::from_bytes([5; 32]),
+                        tip_block_id: StacksBlockId::from_bytes([6; 32]),
+                        tip_height: 12,
+                        reward_cycle: 1,
+                    },
+                    SortitionInfo {
+                        bitcoin_block_hash: BitcoinHeaderHash::from_bytes([7; 32]),
+                        bitcoin_height: 11,
+                        bitcoin_timestamp: 0,
+                        sortition_id: SortitionId::from_bytes([8; 32]),
+                        parent_sortition_id: SortitionId::from_bytes([9; 32]),
+                        consensus_hash: ConsensusHash::from_bytes([2; 20]),
+                        was_sortition: true,
+                        miner_public_key_hash: None,
+                        stacks_parent_consensus_hash: None,
+                        last_sortition_consensus_hash: None,
+                        committed_block_hash: None,
+                        vrf_seed: None,
+                        mining_competition: None,
+                    },
+                    Arc::new(Vec::new()),
+                )
+                .expect("an empty synthetic tenure fits"),
+            ],
         }
     }
 

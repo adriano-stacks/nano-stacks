@@ -273,6 +273,28 @@ pub struct FollowedTenure {
     pub sortition: SortitionInfo,
     /// Immutable once validated, and shared by the follower and every published view.
     pub blocks: Arc<Vec<NakamotoBlock>>,
+    wire_bytes: usize,
+}
+
+impl FollowedTenure {
+    pub fn new(
+        info: TenureInfo,
+        sortition: SortitionInfo,
+        blocks: Arc<Vec<NakamotoBlock>>,
+    ) -> Result<Self, SyncError> {
+        let wire_bytes = tenure_wire_bytes(&blocks)?;
+        Ok(Self {
+            info,
+            sortition,
+            blocks,
+            wire_bytes,
+        })
+    }
+
+    #[must_use]
+    pub const fn wire_bytes(&self) -> usize {
+        self.wire_bytes
+    }
 }
 
 /// How many followed tenures stay in memory.
@@ -284,15 +306,34 @@ pub struct FollowedTenure {
 /// runs to hundreds of blocks, so an unbounded history was a follower-lifetime
 /// memory leak — every block of every tenure since startup, deep-cloned into
 /// each published view.
-const TENURES_KEPT: usize = 16;
+pub const FOLLOWED_TENURE_HISTORY_ITEMS: usize = 16;
+pub const FOLLOWED_TENURE_HISTORY_BYTES: usize = 10 * MAX_TENURE_RESPONSE_BYTES;
+
+fn tenure_wire_bytes(blocks: &[NakamotoBlock]) -> Result<usize, SyncError> {
+    let mut total = 0usize;
+    for block in blocks {
+        total = add_tenure_wire_bytes(total, block.encode().len())?;
+    }
+    Ok(total)
+}
+
+const fn add_tenure_wire_bytes(total: usize, bytes: usize) -> Result<usize, SyncError> {
+    if bytes > MAX_TENURE_RESPONSE_BYTES.saturating_sub(total) {
+        return Err(SyncError::ResponseTooLarge {
+            limit: MAX_TENURE_RESPONSE_BYTES,
+        });
+    }
+    Ok(total + bytes)
+}
 
 /// Stateful HTTP follower for the peer's current tenure.
 #[derive(Clone, Debug)]
 pub struct TenureFollower {
     client: SyncClient,
     latest: Option<TenureInfo>,
-    /// The most recent [`TENURES_KEPT`] validated tenures, oldest first.
+    /// The most recent validated tenures, oldest first.
     history: Vec<FollowedTenure>,
+    history_bytes: usize,
 }
 
 /// One burn block on the view a peer holds.
@@ -2094,6 +2135,7 @@ impl TenureFollower {
             client,
             latest: None,
             history: Vec::new(),
+            history_bytes: 0,
         }
     }
 
@@ -2180,11 +2222,7 @@ impl TenureFollower {
         if !sortition.was_sortition {
             return Err(SyncError::InvalidSortition);
         }
-        let followed = FollowedTenure {
-            info: info.clone(),
-            sortition,
-            blocks: Arc::new(blocks),
-        };
+        let followed = FollowedTenure::new(info.clone(), sortition, Arc::new(blocks))?;
         self.record(followed.clone());
         Ok(Some(followed))
     }
@@ -2266,11 +2304,7 @@ impl TenureFollower {
             if !sortition.was_sortition {
                 return Err(SyncError::InvalidSortition);
             }
-            let followed = FollowedTenure {
-                info: info.clone(),
-                sortition,
-                blocks: Arc::new(blocks),
-            };
+            let followed = FollowedTenure::new(info.clone(), sortition, Arc::new(blocks))?;
             self.record(followed.clone());
             return Ok(Some(followed));
         }
@@ -2278,16 +2312,21 @@ impl TenureFollower {
     }
 
     fn record(&mut self, followed: FollowedTenure) {
-        if self.history.last().is_some_and(|latest| {
+        if let Some(replaced) = self.history.pop_if(|latest| {
             latest.info.tenure_start_block_id == followed.info.tenure_start_block_id
         }) {
-            self.history.pop();
+            self.history_bytes -= replaced.wire_bytes;
         }
         self.latest = Some(followed.info.clone());
-        self.history.push(followed);
-        if self.history.len() > TENURES_KEPT {
-            self.history.remove(0);
+        while !self.history.is_empty()
+            && (self.history.len() >= FOLLOWED_TENURE_HISTORY_ITEMS
+                || followed.wire_bytes
+                    > FOLLOWED_TENURE_HISTORY_BYTES.saturating_sub(self.history_bytes))
+        {
+            self.history_bytes -= self.history.remove(0).wire_bytes;
         }
+        self.history_bytes += followed.wire_bytes;
+        self.history.push(followed);
     }
 }
 
@@ -2655,23 +2694,24 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, SyncError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, env, fs, path::Path, time::Duration};
+    use std::{collections::BTreeSet, env, fs, path::Path, sync::Arc, time::Duration};
 
     use reqwest::Url;
     use tokio::time::{sleep, timeout};
 
     use super::{
-        BlockUploadWire, BurnView, ByteCache, CandidateTip, PoxInfo, RATE_LIMIT_RETRIES,
-        RETRY_AFTER_CEILING, Signer, SignerSet, SortitionInfoWire, StackerSetResponseWire,
-        StackerSetWire, SyncClient, SyncError, TenureSource, block_cache, choose_canonical_tip,
-        parse_block_hash, parse_block_id, parse_consensus_hash, parse_prefixed_hash160,
-        parse_sortition_info, parse_stacker_set, retry_after, validate_tenure,
-        validate_tenure_transition,
+        BlockUploadWire, BurnView, ByteCache, CandidateTip, FOLLOWED_TENURE_HISTORY_BYTES,
+        FOLLOWED_TENURE_HISTORY_ITEMS, FollowedTenure, MAX_TENURE_RESPONSE_BYTES, PoxInfo,
+        RATE_LIMIT_RETRIES, RETRY_AFTER_CEILING, Signer, SignerSet, SortitionInfo,
+        SortitionInfoWire, StackerSetResponseWire, StackerSetWire, SyncClient, SyncError,
+        TenureSource, add_tenure_wire_bytes, block_cache, choose_canonical_tip, parse_block_hash,
+        parse_block_id, parse_consensus_hash, parse_prefixed_hash160, parse_sortition_info,
+        parse_stacker_set, retry_after, validate_tenure, validate_tenure_transition,
     };
     use super::{Node, TenureFollower, TenureInfo};
     use nano_chainstate::{NakamotoBlock, TenureError};
     use nano_mempool::Mempool;
-    use nano_primitives::{ConsensusHash, Network, StacksBlockId};
+    use nano_primitives::{BitcoinHeaderHash, ConsensusHash, Network, SortitionId, StacksBlockId};
 
     #[test]
     fn node_starts_without_a_followed_tenure() {
@@ -2679,6 +2719,87 @@ mod tests {
             .expect("create sync client");
 
         assert!(Node::new(client).latest_tenure().is_none());
+    }
+
+    fn followed_tenure(index: u8, wire_bytes: usize) -> FollowedTenure {
+        FollowedTenure {
+            info: TenureInfo {
+                consensus_hash: ConsensusHash::from_bytes([index; 20]),
+                tenure_start_block_id: StacksBlockId::from_bytes([index; 32]),
+                parent_consensus_hash: ConsensusHash::from_bytes([index.saturating_sub(1); 20]),
+                parent_tenure_start_block_id: StacksBlockId::from_bytes(
+                    [index.saturating_sub(1); 32],
+                ),
+                tip_block_id: StacksBlockId::from_bytes([index; 32]),
+                tip_height: u64::from(index),
+                reward_cycle: 1,
+            },
+            sortition: SortitionInfo {
+                bitcoin_block_hash: BitcoinHeaderHash::from_bytes([index; 32]),
+                bitcoin_height: u64::from(index),
+                bitcoin_timestamp: 0,
+                sortition_id: SortitionId::from_bytes([index; 32]),
+                parent_sortition_id: SortitionId::from_bytes([index.saturating_sub(1); 32]),
+                consensus_hash: ConsensusHash::from_bytes([index; 20]),
+                was_sortition: true,
+                miner_public_key_hash: None,
+                stacks_parent_consensus_hash: None,
+                last_sortition_consensus_hash: None,
+                committed_block_hash: None,
+                vrf_seed: None,
+                mining_competition: None,
+            },
+            blocks: Arc::new(Vec::new()),
+            wire_bytes,
+        }
+    }
+
+    #[test]
+    fn followed_history_is_bounded_by_count_and_aggregate_bytes() {
+        let client = SyncClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid URL"))
+            .expect("create sync client");
+        let mut follower = TenureFollower::new(client);
+        for index in 0..=u8::try_from(FOLLOWED_TENURE_HISTORY_ITEMS).expect("small item limit") {
+            follower.record(followed_tenure(index, 1));
+        }
+        assert_eq!(follower.history.len(), FOLLOWED_TENURE_HISTORY_ITEMS);
+        assert_eq!(follower.history_bytes, FOLLOWED_TENURE_HISTORY_ITEMS);
+        assert_eq!(
+            follower.history[0].info.tenure_start_block_id,
+            StacksBlockId::from_bytes([1; 32])
+        );
+
+        let client = SyncClient::new(Url::parse("http://127.0.0.1:20443/").expect("valid URL"))
+            .expect("create sync client");
+        let mut follower = TenureFollower::new(client);
+        for index in 0..=10 {
+            follower.record(followed_tenure(index, MAX_TENURE_RESPONSE_BYTES));
+        }
+        assert_eq!(follower.history.len(), 10);
+        assert_eq!(follower.history_bytes, FOLLOWED_TENURE_HISTORY_BYTES);
+        assert_eq!(
+            follower.history[0].info.tenure_start_block_id,
+            StacksBlockId::from_bytes([1; 32])
+        );
+
+        let replacement = followed_tenure(10, 1);
+        follower.record(replacement);
+        assert_eq!(follower.history.len(), 10);
+        assert_eq!(follower.history_bytes, 9 * MAX_TENURE_RESPONSE_BYTES + 1);
+    }
+
+    #[test]
+    fn one_followed_tenure_cannot_grow_past_its_response_limit() {
+        assert!(matches!(
+            add_tenure_wire_bytes(MAX_TENURE_RESPONSE_BYTES - 1, 1),
+            Ok(MAX_TENURE_RESPONSE_BYTES)
+        ));
+        assert!(matches!(
+            add_tenure_wire_bytes(MAX_TENURE_RESPONSE_BYTES, 1),
+            Err(SyncError::ResponseTooLarge {
+                limit: MAX_TENURE_RESPONSE_BYTES
+            })
+        ));
     }
 
     #[test]

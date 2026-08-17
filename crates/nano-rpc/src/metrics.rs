@@ -557,6 +557,8 @@ struct PeerGauges {
 
 struct ResourceGauges {
     tenure_history_window: IntGauge,
+    tenure_history_bytes: IntGauge,
+    tenure_history_byte_limit: IntGauge,
     mempool_transactions: IntGauge,
     mempool_bytes: IntGauge,
     mempool_transaction_limit: IntGauge,
@@ -687,12 +689,12 @@ impl ProgressGauges {
 
 impl ResourceGauges {
     fn register(registry: &mut Registry) -> Self {
+        let (tenure_history_window, tenure_history_bytes, tenure_history_byte_limit) =
+            tenure_history_gauges(registry);
         Self {
-            tenure_history_window: gauge(
-                registry,
-                "tenure_history_window",
-                "Executed tenures retained in the served history window.",
-            ),
+            tenure_history_window,
+            tenure_history_bytes,
+            tenure_history_byte_limit,
             mempool_transactions: gauge(
                 registry,
                 "mempool_transactions",
@@ -780,6 +782,26 @@ impl ResourceGauges {
             ),
         }
     }
+}
+
+fn tenure_history_gauges(registry: &mut Registry) -> (IntGauge, IntGauge, IntGauge) {
+    (
+        gauge(
+            registry,
+            "tenure_history_window",
+            "Executed tenures retained in the served history window.",
+        ),
+        gauge(
+            registry,
+            "tenure_history_bytes",
+            "Canonical peer bytes retained in the followed tenure history.",
+        ),
+        gauge(
+            registry,
+            "tenure_history_byte_limit",
+            "Maximum canonical peer bytes retained in the followed tenure history.",
+        ),
+    )
 }
 
 impl SyncCounters {
@@ -1235,8 +1257,13 @@ impl NodeMetrics {
         self.0.peers.stackerdb_replication.set(as_i64(peers));
     }
 
-    pub(crate) fn publish_tenure_history(&self, tenures: usize) {
+    pub(crate) fn publish_tenure_history(&self, tenures: usize, bytes: usize, limit: usize) {
         self.0.resources.tenure_history_window.set(as_i64(tenures));
+        self.0.resources.tenure_history_bytes.set(as_i64(bytes));
+        self.0
+            .resources
+            .tenure_history_byte_limit
+            .set(as_i64(limit));
     }
 
     pub(crate) fn publish_executed(&self, stacks_height: u64, burn_height: u64, now: u64) {
@@ -1428,6 +1455,8 @@ mod tests {
         "nano_stackerdb_byte_limit 41",
         "nano_stackerdb_saturations 43",
         "nano_tenure_history_window 0",
+        "nano_tenure_history_bytes 0",
+        "nano_tenure_history_byte_limit 671088640",
         "nano_marf_node_cache_entries 13",
         "nano_marf_node_cache_bytes 17",
         "nano_marf_auxiliary_cache_bytes 19",
