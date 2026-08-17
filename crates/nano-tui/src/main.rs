@@ -636,6 +636,7 @@ impl State {
                 }
             }
             BlockUpdate::Finished(generation) if generation == self.block_generation => {
+                self.prune_receipts();
                 self.sources.blocks.succeeded();
             }
             BlockUpdate::Failed { generation, error } if generation == self.block_generation => {
@@ -662,6 +663,19 @@ impl State {
             }
             receipts::Update::Event(event) => self.apply_receipt_event(&event),
         }
+    }
+
+    fn prune_receipts(&mut self) {
+        let Some(newest) = self.blocks.first().map(|block| block.height) else {
+            return;
+        };
+        let blocks = &self.blocks;
+        self.receipt_blocks.retain(|receipt| {
+            receipt.block_height > newest
+                || blocks
+                    .iter()
+                    .any(|block| same_id(&block.id, &receipt.index_block_hash))
+        });
     }
 
     fn apply_receipt_event(&mut self, event: &receipts::StreamEvent) {
@@ -3895,6 +3909,34 @@ mod tests {
         assert_eq!(
             state.receipt_blocks.last().map(|block| block.block_height),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn receipt_lifetime_tracks_the_selected_block_history() {
+        let mut state = explorer_state();
+        for (sequence, id, height) in [(1, "block", 42), (2, "abandoned", 42), (3, "future", 43)] {
+            state.apply_receipt(receipts::Update::Event(receipts::StreamEvent {
+                sequence: Some(sequence),
+                kind: "new_block".to_owned(),
+                data: receipt_payload(id, height, "transaction", false),
+            }));
+        }
+
+        state.apply_block(BlockUpdate::Finished(0));
+
+        assert_eq!(state.receipt_blocks.len(), 2);
+        assert!(
+            state
+                .receipt_blocks
+                .iter()
+                .any(|receipt| receipt.index_block_hash == "0xblock")
+        );
+        assert!(
+            state
+                .receipt_blocks
+                .iter()
+                .any(|receipt| receipt.index_block_hash == "0xfuture")
         );
     }
 
