@@ -1,7 +1,7 @@
 ---
 id: "132"
 title: "Bound every RPC and P2P ingress path by bytes"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["063"]
@@ -9,6 +9,7 @@ tags: ["mainnet", "rpc", "p2p", "security", "liveness"]
 created_at: 2026-08-14
 parent: 053
 type: improvement
+completed_at: 2026-08-17
 ---
 
 # Bound every RPC and P2P ingress path by bytes
@@ -35,7 +36,7 @@ load shedding instead of an unbounded queue, allocation or task population.
       the maximum-size-message case across all allowed sessions.
 - [x] Limit slow reads, fragmented frames, decomposed/hex-expanded bodies and
       expensive read-only calls independently from consensus execution.
-- [ ] Add load and slowloris tests using authenticated valid traffic as well as
+- [x] Add load and slowloris tests using authenticated valid traffic as well as
       malformed traffic. Exercise recovery after every queue saturates.
 
 ## Acceptance Criteria
