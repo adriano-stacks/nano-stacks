@@ -17,6 +17,7 @@ test-support = ["dep:tempfile"]
 
 [dependencies]
 clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf", optional = true }
+getrandom = "0.3.4"
 hex = "0.4.3"
 nano-address = { path = "../nano-address" }
 nano-bitcoin = { path = "../nano-bitcoin" }
