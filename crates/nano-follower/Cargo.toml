@@ -9,6 +9,7 @@ hex = "0.4.3"
 nano-address = { path = "../nano-address" }
 nano-bitcoin = { path = "../nano-bitcoin" }
 nano-chainstate = { path = "../nano-chainstate" }
+nano-marf = { path = "../nano-marf" }
 nano-primitives = { path = "../nano-primitives" }
 nano-sortition = { path = "../nano-sortition" }
 nano-sync = { path = "../nano-sync", default-features = false }

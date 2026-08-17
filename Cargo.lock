@@ -2604,6 +2604,7 @@ dependencies = [
  "nano-bitcoin",
  "nano-chainstate",
  "nano-crypto",
+ "nano-marf",
  "nano-primitives",
  "nano-sortition",
  "nano-sync",
