@@ -22,6 +22,7 @@ run_gate() {
       ;;
     workflow)
       actionlint
+      scripts/check-actions-pinned.sh
       shellcheck scripts/*.sh .githooks/*
       ;;
     formatting)
