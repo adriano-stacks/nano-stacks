@@ -1,7 +1,7 @@
 ---
 id: "134"
 title: "Make checkpoint trust independently reproducible"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["050", "083"]
