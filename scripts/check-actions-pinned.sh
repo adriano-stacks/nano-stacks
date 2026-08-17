@@ -46,14 +46,16 @@ test "$failed" = false
 
 for upstream in "${!action_pins[@]}"; do
   read -r release revision <<<"${action_pins[$upstream]}"
-  latest=$(
-    curl --fail --silent --show-error --location --retry 3 \
-      --header 'Accept: application/vnd.github+json' \
-      --header 'X-GitHub-Api-Version: 2022-11-28' \
-      --header 'User-Agent: nano-stacks-action-pin-check' \
-      "https://api.github.com/repos/$upstream/releases/latest" |
-      jq --exit-status --raw-output .tag_name
-  )
+  latest_url=$(curl --fail --silent --show-error --location --head --retry 3 \
+    --output /dev/null --write-out '%{url_effective}' \
+    "https://github.com/$upstream/releases/latest")
+  release_prefix="https://github.com/$upstream/releases/tag/"
+  latest=${latest_url#"$release_prefix"}
+  if [[ $latest_url != "$release_prefix"* || -z $latest ]]; then
+    echo "GitHub Action $upstream has no latest release redirect: $latest_url" >&2
+    failed=true
+    continue
+  fi
   if [[ $release != "$latest" ]]; then
     echo "GitHub Action $upstream uses $release; latest release is $latest" >&2
     failed=true

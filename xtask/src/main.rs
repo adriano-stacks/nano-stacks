@@ -6952,8 +6952,8 @@ fn report_adversarial_jobs(source_revision: &str, run_gates: bool) -> bool {
         println!("  UNEXECUTED: --no-gates collected no hosted run history.");
         for job in &inventory.jobs {
             println!(
-                "    adversarial job {} in {} (owner task {})",
-                job.id, job.workflow, job.owner
+                "    adversarial job {} via {} in {} (owner task {})",
+                job.id, job.event, job.workflow, job.owner
             );
         }
         return !inventory.jobs.is_empty() && inventory.errors.is_empty();
@@ -6970,8 +6970,13 @@ fn report_adversarial_jobs(source_revision: &str, run_gates: bool) -> bool {
         };
         match &run.latest {
             Some(latest) => println!(
-                "  {:<24} latest {} / {} at run {} ({})",
-                job.id, latest.status, latest.conclusion, latest.id, latest.completed_at
+                "  {:<24} latest {} {} / {} at run {} ({})",
+                job.id,
+                latest.event,
+                latest.status,
+                latest.conclusion,
+                latest.id,
+                latest.completed_at
             ),
             None => println!("  {:<24} latest MISSING", job.id),
         }
