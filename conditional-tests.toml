@@ -180,6 +180,14 @@ requires = "checked-in captured blocks and timing isolation"
 policy = "required"
 
 [[conditional]]
+site = "storage_faults::storage_failures_leave_only_a_complete_replay_prefix#1"
+class = "infrastructure"
+owner = "137"
+job = "release-qualification"
+requires = "Linux, checked-in captured blocks and the pinned libfiu dev-shell package"
+policy = "required"
+
+[[conditional]]
 site = "mainnet_accounting::the_mainnet_checkpoint_owes_a_full_maturity_window#1"
 class = "infrastructure"
 owner = "052"

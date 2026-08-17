@@ -1234,6 +1234,11 @@ pub enum ChainStateError {
     Storage(MarfStoreError),
     Evaluation(ClarityEvalError),
     Execution(VmExecutionError),
+    TransactionExecution {
+        txid: [u8; 32],
+        height: u64,
+        error: Box<VmExecutionError>,
+    },
     InvalidTransaction(String),
     TransactionFailure {
         result: Box<TransactionResult>,
@@ -1267,6 +1272,15 @@ impl std::fmt::Display for ChainStateError {
             Self::Storage(error) => write!(formatter, "state storage error: {error}"),
             Self::Evaluation(error) => write!(formatter, "Clarity evaluation error: {error}"),
             Self::Execution(error) => write!(formatter, "Clarity execution error: {error}"),
+            Self::TransactionExecution {
+                txid,
+                height,
+                error,
+            } => write!(
+                formatter,
+                "transaction {} of {height} failed block execution: {error}",
+                hex::encode(txid)
+            ),
             Self::InvalidTransaction(error) => write!(formatter, "invalid transaction: {error}"),
             Self::TransactionFailure { status, .. } => {
                 write!(formatter, "transaction failed: {status:?}")
@@ -1302,6 +1316,7 @@ impl std::error::Error for ChainStateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Storage(error) => Some(error),
+            Self::TransactionExecution { error, .. } => Some(error.as_ref()),
             Self::Evaluation(_)
             | Self::Execution(_)
             | Self::InvalidTransaction(_)
@@ -2787,24 +2802,22 @@ impl ChainState {
                     "transaction authorization failed: {error}"
                 ))
             })?;
-            // Named, because a failure here fails the *block* and the error carries no
-            // transaction. An ordinary failed transaction is a receipt and does not
-            // reach this: what does is an internal one -- a VM invariant, a host
-            // failure -- and those are compiler gaps rather than transactions the
-            // network also failed, because the network executed this block.
+            // Preserve the transaction identity without relabelling an engine or
+            // host failure as a consensus-invalid transaction. An ordinary failed
+            // transaction is a receipt and does not reach this path.
             //
             // Mainnet 8,708,126 is the case: `Unexpected principal data`, from a block
             // with six transactions and no way to tell which. See
             // `fixtures/mainnet/divergence`.
             let receipt = self
                 .execute_transaction(transaction, &execution_cost)
-                .map_err(|error| {
-                    ChainStateError::InvalidTransaction(format!(
-                        "transaction {} of {} failed the block rather than its own receipt: \
-                         {error}",
-                        hex::encode(transaction.txid()),
-                        block.header.chain_length
-                    ))
+                .map_err(|error| match error {
+                    ChainStateError::Execution(error) => ChainStateError::TransactionExecution {
+                        txid: *transaction.txid().as_bytes(),
+                        height: block.header.chain_length,
+                        error: Box::new(error),
+                    },
+                    error => error,
                 })?;
             execution_cost.add(&receipt.result.cost).map_err(|error| {
                 ChainStateError::InvalidTransaction(format!("block cost overflow: {error}"))

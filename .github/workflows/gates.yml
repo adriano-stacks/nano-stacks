@@ -64,6 +64,9 @@ jobs:
       - name: deterministic network chaos
         run: nix develop --command scripts/ci.sh network-chaos
 
+      - name: deterministic storage faults
+        run: nix develop --command scripts/ci.sh storage-faults
+
       - name: structured fuzz frontend smoke
         run: nix develop --command scripts/ci.sh fuzz-smoke
 

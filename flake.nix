@@ -27,7 +27,19 @@
       '';
     in rec {
       devShells = forEachSystem (system:
-        let pkgs = nixpkgs.legacyPackages.${system};
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          fiu = pkgs.stdenv.mkDerivation {
+            pname = "libfiu";
+            version = "1.2";
+            src = pkgs.fetchurl {
+              url = "https://blitiri.com.ar/p/libfiu/files/1.2/libfiu-1.2.tar.gz";
+              hash = "sha256-NTqztQcJzdkVItfku3/4ALJ6l/crmJ4izkJsbeJmlnQ=";
+            };
+            nativeBuildInputs = [ pkgs.python3 ];
+            preConfigure = "patchShebangs .";
+            makeFlags = [ "PREFIX=$(out)" ];
+          };
         in {
           # The toolchain comes from the pinned nixpkgs. `rust-toolchain.toml`
           # asks rustup for the same channel, for anyone outside this shell.
@@ -41,6 +53,7 @@
               pkgs.cargo-mutants
               pkgs.clippy
               pkgs.curl
+              fiu
               pkgs.jq
               pkgs.minisign
               pkgs.openssl

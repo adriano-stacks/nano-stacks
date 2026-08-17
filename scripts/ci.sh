@@ -50,6 +50,9 @@ run_gate() {
     network-chaos)
       scripts/network-chaos.sh
       ;;
+    storage-faults)
+      scripts/storage-faults.sh
+      ;;
     fuzz-smoke)
       cargo fuzz build --fuzz-dir fuzz --sanitizer none --codegen-units 16
       for target in \
@@ -124,7 +127,7 @@ run_gate() {
 
 case "$gate" in
   all)
-    for name in toolchain workflow formatting clippy follower-artifact scoreboard fixtures checkpoint-sample adversarial-smoke network-chaos fuzz-smoke tests release release-integrity locks; do
+    for name in toolchain workflow formatting clippy follower-artifact scoreboard fixtures checkpoint-sample adversarial-smoke network-chaos storage-faults fuzz-smoke tests release release-integrity locks; do
       run_gate "$name"
     done
     ;;

@@ -77,6 +77,7 @@ mod replication_failover;
 mod restart;
 mod signer_weight_enforcement;
 mod stock_arity_deployment;
+mod storage_faults;
 mod submitted_transaction;
 mod tenure_block_reward;
 mod tenure_continuity;
