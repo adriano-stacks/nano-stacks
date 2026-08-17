@@ -15,6 +15,7 @@
 //! node that had executed nothing looked healthy for eighty minutes.
 
 mod node;
+mod receipts;
 
 use std::{
     collections::HashSet,
@@ -544,6 +545,8 @@ struct State {
     requested_tip: Option<String>,
     block_generation: u64,
     backfill_inserted: usize,
+    receipt_blocks: Vec<receipts::BlockOutcomes>,
+    receipt_stream: ReceiptStream,
 }
 
 impl State {
@@ -642,8 +645,112 @@ impl State {
         }
     }
 
+    fn apply_receipt(&mut self, update: receipts::Update) {
+        match update {
+            receipts::Update::Connected => {
+                self.receipt_stream.connected = true;
+                self.receipt_stream.error = None;
+                self.receipt_stream.connections += 1;
+                if self.receipt_stream.started_after_height.is_none() {
+                    self.receipt_stream.started_after_height =
+                        self.blocks.first().map(|block| block.height);
+                }
+            }
+            receipts::Update::Disconnected(error) => {
+                self.receipt_stream.connected = false;
+                self.receipt_stream.error = Some(one_line_error(&error));
+            }
+            receipts::Update::Event(event) => self.apply_receipt_event(&event),
+        }
+    }
+
+    fn apply_receipt_event(&mut self, event: &receipts::StreamEvent) {
+        self.receipt_stream.observe_sequence(event.sequence);
+        if event.kind != "new_block" {
+            return;
+        }
+        let block = match receipts::BlockOutcomes::parse(&event.data) {
+            Ok(block) => block,
+            Err(error) => {
+                self.receipt_stream.error = Some(one_line_error(&error));
+                return;
+            }
+        };
+        self.receipt_stream.observe_block(block.block_height);
+        self.receipt_blocks
+            .retain(|known| !same_id(&known.index_block_hash, &block.index_block_hash));
+        self.receipt_blocks.insert(0, block);
+        self.receipt_blocks.truncate(HISTORY);
+    }
+
     fn behind(&self) -> Option<u64> {
         self.sync.as_ref().and_then(|sync| sync.blocks_behind)
+    }
+}
+
+#[derive(Default)]
+struct ReceiptStream {
+    connected: bool,
+    connections: u64,
+    started_after_height: Option<u64>,
+    first_height: Option<u64>,
+    latest_height: Option<u64>,
+    last_sequence: Option<u64>,
+    pending_gap: Option<ReceiptGap>,
+    gaps: Vec<ReceiptGap>,
+    unsequenced: bool,
+    error: Option<String>,
+}
+
+impl ReceiptStream {
+    fn observe_sequence(&mut self, sequence: Option<u64>) {
+        let Some(sequence) = sequence else {
+            self.unsequenced = true;
+            return;
+        };
+        if let Some(last) = self.last_sequence {
+            let expected = last.saturating_add(1);
+            if sequence != expected {
+                let missing = sequence.saturating_sub(expected).max(1);
+                self.pending_gap = Some(ReceiptGap {
+                    after_height: self.latest_height,
+                    before_height: None,
+                    missing,
+                });
+            }
+        }
+        self.last_sequence = Some(sequence);
+    }
+
+    fn observe_block(&mut self, height: u64) {
+        self.first_height.get_or_insert(height);
+        self.latest_height = Some(self.latest_height.map_or(height, |known| known.max(height)));
+        if let Some(mut gap) = self.pending_gap.take() {
+            gap.before_height = Some(height);
+            self.gaps.push(gap);
+            self.gaps.truncate(HISTORY);
+        }
+    }
+
+    fn gap_at(&self, height: u64) -> Option<&ReceiptGap> {
+        self.gaps.iter().find(|gap| gap.covers(height)).or_else(|| {
+            self.pending_gap
+                .as_ref()
+                .filter(|gap| gap.after_height.is_none_or(|after| height > after))
+        })
+    }
+}
+
+struct ReceiptGap {
+    after_height: Option<u64>,
+    before_height: Option<u64>,
+    missing: u64,
+}
+
+impl ReceiptGap {
+    fn covers(&self, height: u64) -> bool {
+        self.after_height.is_none_or(|after| height > after)
+            && self.before_height.is_none_or(|before| height <= before)
     }
 }
 
@@ -991,6 +1098,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, node: &Node) -> io
     let mut state = State::default();
     let poller = Poller::start(node.clone());
     let blocks = BlockLoader::start(node.clone());
+    let receipt_listener = receipts::Listener::start(node.clone());
     loop {
         while let Some(update) = poller.try_recv() {
             if let Some(request) = state.apply_poll(update) {
@@ -999,6 +1107,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, node: &Node) -> io
         }
         while let Some(update) = blocks.try_recv() {
             state.apply_block(update);
+        }
+        while let Some(update) = receipt_listener.try_recv() {
+            state.apply_receipt(update);
         }
         terminal.draw(|frame| draw(frame, &mut state, node))?;
         if !event::poll(Duration::from_millis(200))? {
@@ -2662,11 +2773,22 @@ fn draw_transaction(frame: &mut Frame, area: Rect, state: &mut State) {
         state.screen = Screen::Block;
         return;
     };
-    let block_height = selected_block(state).map_or(0, |block| block.height);
+    let block = selected_block(state)
+        .cloned()
+        .expect("selected transaction has a block");
+    let block_height = block.height;
     let transaction_index = state.selected_transaction.selected().unwrap_or_default();
     let transaction_count = selected_block(state).map_or(0, |block| block.transactions.len());
-    let mut lines = vec![
-        detail("txid", transaction.txid),
+    let mut lines = vec![detail("txid", transaction.txid.clone())];
+    lines.extend(execution_lines(state, &block, &transaction.txid));
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(
+            "signed intent",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
         detail("type", transaction.kind),
         detail(
             "sender",
@@ -2709,7 +2831,7 @@ fn draw_transaction(frame: &mut Frame, area: Rect, state: &mut State) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
-    ];
+    ]);
     lines.extend(
         transaction
             .fields
@@ -2735,6 +2857,159 @@ fn draw_transaction(frame: &mut Frame, area: Rect, state: &mut State) {
             .scroll((state.transaction_scroll, 0)),
         area,
     );
+}
+
+fn execution_lines(state: &State, block: &node::Block, txid: &str) -> Vec<Line<'static>> {
+    let Some(receipt_block) = state
+        .receipt_blocks
+        .iter()
+        .find(|receipt| same_id(&receipt.index_block_hash, &block.id))
+    else {
+        return vec![
+            execution_heading(),
+            detail("outcome", receipt_unavailable(state, block.height)),
+        ];
+    };
+    let Some(view) = receipt_block.transaction(txid) else {
+        return vec![
+            execution_heading(),
+            detail(
+                "outcome",
+                "unavailable — receipt did not contain this transaction ID".to_owned(),
+            ),
+        ];
+    };
+    let outcome = view.outcome;
+    let budget = state.pox.as_ref().and_then(node::Pox::current_budget);
+    let mut lines = vec![
+        execution_heading(),
+        detail("outcome", outcome.status().to_owned()),
+        detail("result", outcome.result()),
+    ];
+    if let Some(error) = outcome.vm_error.as_ref() {
+        lines.extend(detail_lines("VM error", error));
+    }
+    lines.push(Line::from(Span::styled(
+        "charged cost / current block limit",
+        Style::default().fg(Color::Yellow),
+    )));
+    let cost = outcome.execution_cost;
+    lines.extend([
+        cost_line(
+            "runtime",
+            cost.runtime,
+            budget.and_then(|limit| limit.runtime),
+        ),
+        cost_line(
+            "read count",
+            cost.read_count,
+            budget.and_then(|limit| limit.read_count),
+        ),
+        cost_line(
+            "read length",
+            cost.read_length,
+            budget.and_then(|limit| limit.read_length),
+        ),
+        cost_line(
+            "write count",
+            cost.write_count,
+            budget.and_then(|limit| limit.write_count),
+        ),
+        cost_line(
+            "write length",
+            cost.write_length,
+            budget.and_then(|limit| limit.write_length),
+        ),
+    ]);
+    lines.push(Line::from(Span::styled(
+        "ordered events",
+        Style::default().fg(Color::Yellow),
+    )));
+    if view.events.is_empty() {
+        lines.push(detail("events", "none (known empty list)".to_owned()));
+    } else {
+        lines.extend(
+            view.events
+                .into_iter()
+                .enumerate()
+                .map(|(position, event)| {
+                    detail(
+                        &format!("event {}", event.index().unwrap_or(position as u64)),
+                        event.description(),
+                    )
+                }),
+        );
+    }
+    lines
+}
+
+fn execution_heading() -> Line<'static> {
+    Line::from(Span::styled(
+        "execution outcome",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn receipt_unavailable(state: &State, height: u64) -> String {
+    let stream = &state.receipt_stream;
+    if let Some(gap) = stream.gap_at(height) {
+        return format!(
+            "unavailable — live stream missed {} event(s) in this interval",
+            thousands(gap.missing)
+        );
+    }
+    if stream.unsequenced {
+        return "unavailable — node sent unsequenced events, so coverage cannot be proven"
+            .to_owned();
+    }
+    if stream
+        .started_after_height
+        .is_some_and(|started| height <= started)
+        || stream.first_height.is_some_and(|first| height < first)
+    {
+        return "unavailable — block predates this live receipt stream".to_owned();
+    }
+    if stream.latest_height.is_some_and(|latest| height <= latest) {
+        return "unavailable — no retained new_block event for this block".to_owned();
+    }
+    if !stream.connected {
+        return stream.error.as_ref().map_or_else(
+            || "unavailable — receipt stream has not connected".to_owned(),
+            |error| format!("unavailable — receipt stream disconnected: {error}"),
+        );
+    }
+    if stream.connections > 1 {
+        "waiting for a live receipt after reconnect".to_owned()
+    } else {
+        "waiting for this block's live receipt".to_owned()
+    }
+}
+
+fn cost_line(name: &str, used: u64, limit: Option<u64>) -> Line<'static> {
+    let value = limit.map_or_else(
+        || format!("{} exact · current limit unavailable", thousands(used)),
+        |limit| {
+            let share = if limit == 0 {
+                "undefined".to_owned()
+            } else {
+                exact_percent(used, limit)
+            };
+            format!(
+                "{} / {} exact · {share} of current limit",
+                thousands(used),
+                thousands(limit)
+            )
+        },
+    );
+    detail(name, value)
+}
+
+fn exact_percent(value: u64, limit: u64) -> String {
+    const DECIMALS: u128 = 1_000_000;
+    let scaled = u128::from(value) * 100 * DECIMALS / u128::from(limit);
+    format!("{}.{:06}%", scaled / DECIMALS, scaled % DECIMALS)
 }
 
 fn transaction_colour(kind: &str) -> Color {
@@ -2820,9 +3095,9 @@ const fn view_help(screen: Screen) -> (&'static str, &'static str, &'static str,
             "↑/↓ selects a transaction; enter or → opens it; esc or ← returns to activity; 1–4 change primary view.",
         ),
         Screen::Transaction => (
-            "The signed intent encoded by one transaction in the selected block.",
-            "Shows who authorized what, the fee and nonce ordering, and the payload. Intent alone does not prove execution success.",
-            "Transaction bytes from /v3/blocks/:id, decoded locally with nano-codec. Execution results are unavailable on this route.",
+            "The signed intent and live execution outcome for one transaction in the selected block.",
+            "Separates what was requested from what committed, including result, exact cost and ordered STX/FT/NFT/contract events.",
+            "Intent comes from /v3/blocks/:id and is decoded with nano-codec. Live outcomes come from the existing sequenced /events new_block stream; gaps stay unavailable.",
             "↑/↓, j/k, page, and home/end scroll; esc or ← returns to the block; 1–4 change primary view.",
         ),
         Screen::Election => (
@@ -3196,9 +3471,10 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::{
-        Action, BlockUpdate, Health, PollUpdate, Poller, STALL_AFTER, Screen, Source, State, draw,
-        exact_byte_limit, exact_compact_limit, handle_key, health_summary, node,
-        pox_schedule_story, short, stx_amount, thousands, thousands_u128, timestamp_context,
+        Action, BlockUpdate, HISTORY, Health, PollUpdate, Poller, STALL_AFTER, Screen, Source,
+        State, draw, exact_byte_limit, exact_compact_limit, handle_key, health_summary, node,
+        pox_schedule_story, receipt_unavailable, receipts, short, stx_amount, thousands,
+        thousands_u128, timestamp_context,
     };
 
     #[test]
@@ -3521,6 +3797,105 @@ mod tests {
         assert!(rendered.contains("argument 0"));
         assert!(rendered.contains("u42"));
         assert!(rendered.contains("0.000002 STX · 2 uSTX exact"));
+        assert!(rendered.contains("execution outcome"));
+        assert!(rendered.contains("receipt stream has not connected"));
+        assert!(rendered.contains("signed intent"));
+    }
+
+    #[test]
+    fn a_live_receipt_joins_by_block_and_transaction_and_renders_exact_costs() {
+        let mut state = explorer_state();
+        state.pox = Some(pox());
+        state.screen = Screen::Transaction;
+        state.selected_block.select(Some(0));
+        state.selected_transaction.select(Some(0));
+        state.apply_receipt(receipts::Update::Connected);
+        state.apply_receipt(receipts::Update::Event(receipts::StreamEvent {
+            sequence: Some(7),
+            kind: "new_block".to_owned(),
+            data: receipt_payload("block", 42, "transaction", true),
+        }));
+
+        let rendered = render(&mut state);
+        assert!(rendered.contains("success · committed"));
+        assert!(rendered.contains("result"));
+        assert!(rendered.contains("true"));
+        assert!(rendered.contains("5 / 5,000,000,000 exact"));
+        assert!(rendered.contains("0.000000% of current limit"));
+        assert!(rendered.contains("event 0"));
+        assert!(rendered.contains("transfer 9 uSTX from A to B"));
+        assert!(rendered.contains("signed intent"));
+    }
+
+    #[test]
+    fn an_empty_event_list_is_not_an_unavailable_outcome() {
+        let mut state = explorer_state();
+        state.screen = Screen::Transaction;
+        state.selected_block.select(Some(0));
+        state.selected_transaction.select(Some(0));
+        state.apply_receipt(receipts::Update::Connected);
+        state.apply_receipt(receipts::Update::Event(receipts::StreamEvent {
+            sequence: Some(1),
+            kind: "new_block".to_owned(),
+            data: receipt_payload("block", 42, "transaction", false),
+        }));
+
+        let rendered = render(&mut state);
+        assert!(rendered.contains("none (known empty list)"));
+        assert!(!rendered.contains("outcome unavailable"));
+    }
+
+    #[test]
+    fn a_reconnected_sequence_gap_is_explicit_and_keeps_decoded_blocks() {
+        let mut state = explorer_state();
+        state.blocks.insert(0, block("missing", "block", 44));
+        state.apply_receipt(receipts::Update::Connected);
+        state.apply_receipt(receipts::Update::Event(receipts::StreamEvent {
+            sequence: Some(10),
+            kind: "new_block".to_owned(),
+            data: receipt_payload("earlier", 43, "other", false),
+        }));
+        state.apply_receipt(receipts::Update::Disconnected(
+            "connection reset".to_owned(),
+        ));
+        state.apply_receipt(receipts::Update::Connected);
+        state.apply_receipt(receipts::Update::Event(receipts::StreamEvent {
+            sequence: Some(12),
+            kind: "new_block".to_owned(),
+            data: receipt_payload("later", 45, "other", false),
+        }));
+
+        assert_eq!(state.blocks.len(), 2, "stream loss does not discard blocks");
+        assert_eq!(state.receipt_stream.connections, 2);
+        assert!(receipt_unavailable(&state, 44).contains("missed 1 event"));
+    }
+
+    #[test]
+    fn receipt_history_is_bounded_like_block_history() {
+        let mut state = State::default();
+        state.apply_receipt(receipts::Update::Connected);
+        for height in 1..=HISTORY + 1 {
+            state.apply_receipt(receipts::Update::Event(receipts::StreamEvent {
+                sequence: Some(u64::try_from(height).expect("small test height")),
+                kind: "new_block".to_owned(),
+                data: receipt_payload(
+                    &format!("block-{height}"),
+                    u64::try_from(height).expect("small test height"),
+                    "transaction",
+                    false,
+                ),
+            }));
+        }
+
+        assert_eq!(state.receipt_blocks.len(), HISTORY);
+        assert_eq!(
+            state.receipt_blocks.first().map(|block| block.block_height),
+            Some(u64::try_from(HISTORY + 1).expect("small history"))
+        );
+        assert_eq!(
+            state.receipt_blocks.last().map(|block| block.block_height),
+            Some(2)
+        );
     }
 
     #[test]
@@ -3955,6 +4330,40 @@ mod tests {
             timestamp: 2,
         });
         state
+    }
+
+    fn receipt_payload(block_id: &str, height: u64, txid: &str, eventful: bool) -> String {
+        let events = eventful.then(|| {
+            serde_json::json!({
+                "txid": format!("0x{txid}"),
+                "event_index": 0,
+                "type": "stx_transfer_event",
+                "stx_transfer_event": {
+                    "amount": "9",
+                    "sender": "A",
+                    "recipient": "B"
+                }
+            })
+        });
+        serde_json::json!({
+            "index_block_hash": format!("0x{block_id}"),
+            "block_height": height,
+            "transactions": [{
+                "txid": format!("0x{txid}"),
+                "status": "success",
+                "raw_result": "0x0703",
+                "vm_error": null,
+                "execution_cost": {
+                    "write_length": 1,
+                    "write_count": 2,
+                    "read_length": 3,
+                    "read_count": 4,
+                    "runtime": 5
+                }
+            }],
+            "events": events.into_iter().collect::<Vec<_>>()
+        })
+        .to_string()
     }
 
     fn block(id: &str, parent_id: &str, height: u64) -> node::Block {

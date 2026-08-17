@@ -4,7 +4,7 @@
 //! rather than a zero: a dashboard that shows `0` for a height it failed to fetch
 //! teaches its reader to distrust every other number on the screen.
 
-use std::time::Duration;
+use std::{io::Read, time::Duration};
 
 use prometheus_parse::{Scrape, Value};
 use serde::Deserialize;
@@ -362,6 +362,7 @@ pub struct Node {
     url: String,
     metrics_url: Option<String>,
     agent: ureq::Agent,
+    event_agent: ureq::Agent,
 }
 
 impl Node {
@@ -371,6 +372,11 @@ impl Node {
             metrics_url: None,
             agent: ureq::AgentBuilder::new()
                 .timeout(TIMEOUT)
+                .user_agent("nano-tui")
+                .build(),
+            event_agent: ureq::AgentBuilder::new()
+                .timeout_connect(TIMEOUT)
+                .timeout_write(TIMEOUT)
                 .user_agent("nano-tui")
                 .build(),
         }
@@ -433,6 +439,17 @@ impl Node {
     pub fn sortitions(&self) -> Result<Vec<Sortition>, String> {
         self.json("/v3/sortitions/latest_and_last")
             .or_else(|_| self.json("/v3/sortitions"))
+    }
+
+    /// The node's live observer stream. Reading it belongs on a dedicated thread:
+    /// an idle, healthy SSE response intentionally has no read timeout.
+    pub fn events(&self) -> Result<Box<dyn Read + Send + Sync>, String> {
+        self.event_agent
+            .get(&format!("{}/events", self.url))
+            .set("accept", "text/event-stream")
+            .call()
+            .map_err(|error| format!("/events: {error}"))
+            .map(ureq::Response::into_reader)
     }
 
     /// A block, decoded rather than described: the bytes are consensus-serialized
@@ -740,7 +757,7 @@ fn principal(principal: &nano_codec::Principal) -> String {
     }
 }
 
-fn clarity_value(bytes: &[u8]) -> String {
+pub fn clarity_value(bytes: &[u8]) -> String {
     let mut input = bytes;
     match clarity::vm::Value::deserialize_read(&mut input, None, false) {
         Ok(value) if input.is_empty() => value.to_string(),
