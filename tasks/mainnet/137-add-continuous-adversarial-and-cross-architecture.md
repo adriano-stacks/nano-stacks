@@ -37,7 +37,7 @@ every finding as a deterministic regression.
 - [x] Add deterministic network-chaos scenarios for partitions, peer churn,
       equivocation, slow/fragmented peers, delayed Bitcoin views, reorgs and
       reward-boundary restarts.
-- [ ] Run the executable Epoch 4.0 corpus on x86-64 and AArch64 and compare roots,
+- [x] Run the executable Epoch 4.0 corpus on x86-64 and AArch64 and compare roots,
       receipts, costs, events and refusal classes byte-for-byte.
 - [x] Use mutation testing on authentication, fork-choice and commit decisions to
       prove the mandatory suite kills deliberately weakened checks.
