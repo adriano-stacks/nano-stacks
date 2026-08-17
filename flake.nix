@@ -135,7 +135,7 @@
             pname = "nano-stacks-follower";
             version = "0.1.0-${builtins.substring 0 12 sourceRevision}";
             src = self;
-            cargoHash = "sha256-d1wUTZliCixSmbo0uMQKyiH9RKLxNdnCg1wp3U3ZtXg=";
+            cargoHash = "sha256-3qn7V/YFRzy10WXHq0VxlObUVEoEWVHkgV81Fxh8jt0=";
             cargoBuildFlags = [ "-p" "nano-follower" "--bin" "stacks-follower" ];
             doCheck = false;
 
