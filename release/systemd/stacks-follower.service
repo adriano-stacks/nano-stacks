@@ -1,0 +1,32 @@
+[Unit]
+Description=nano-stacks minimal Epoch 4 follower
+After=network-online.target
+Wants=network-online.target
+ConditionPathIsReadWrite=/var/lib/nano-stacks
+
+[Service]
+Type=simple
+User=nano-stacks
+Group=nano-stacks
+StateDirectory=nano-stacks
+StateDirectoryMode=0700
+ExecStart=/usr/bin/stacks-follower start --config /etc/nano-stacks/config.toml
+Restart=on-failure
+RestartSec=10s
+KillSignal=SIGTERM
+TimeoutStopSec=180s
+LimitNOFILE=65536
+MemoryHigh=20G
+MemoryMax=24G
+TasksMax=4096
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stacks-follower
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/nano-stacks
+
+[Install]
+WantedBy=multi-user.target

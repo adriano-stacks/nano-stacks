@@ -131,7 +131,66 @@
             '';
           };
 
-          container = pkgs.dockerTools.buildLayeredImage {
+          stacks-follower = pkgs.rustPlatform.buildRustPackage {
+            pname = "nano-stacks-follower";
+            version = "0.1.0-${builtins.substring 0 12 sourceRevision}";
+            src = self;
+            cargoHash = "sha256-d1wUTZliCixSmbo0uMQKyiH9RKLxNdnCg1wp3U3ZtXg=";
+            cargoBuildFlags = [ "-p" "nano-follower" "--bin" "stacks-follower" ];
+            doCheck = false;
+
+            nativeBuildInputs = [
+              pkgs.cargo-cyclonedx
+              pkgs.jq
+              pkgs.pkg-config
+            ];
+            buildInputs = [ pkgs.openssl ];
+
+            NANO_SOURCE_REVISION = sourceRevision;
+            SOURCE_DATE_EPOCH = "1";
+
+            postPatch = ''
+              install -m644 ${stacksCoreVersions} \
+                "$cargoDepsCopy/source-git-0/versions.toml"
+            '';
+
+            postBuild = ''
+              cargo cyclonedx \
+                --manifest-path crates/nano-follower/Cargo.toml \
+                --format json \
+                --spec-version 1.5 \
+                --all \
+                --override-filename stacks-follower-sbom \
+                --quiet
+              cargo tree --locked --offline \
+                -p nano-follower \
+                --target ${pkgs.stdenv.hostPlatform.rust.rustcTarget} \
+                --edges normal,build,features \
+                --charset ascii \
+                > stacks-follower-dependencies.txt
+            '';
+
+            postInstall = ''
+              install -Dm644 crates/nano-follower/stacks-follower-sbom.json \
+                "$out/share/nano-stacks-follower/sbom.cdx.json"
+              install -Dm644 stacks-follower-dependencies.txt \
+                "$out/share/nano-stacks-follower/dependencies.txt"
+              install -Dm644 release/follower-policy.json \
+                "$out/share/nano-stacks-follower/follower-policy.json"
+              install -Dm644 release/systemd/stacks-follower.service \
+                "$out/share/nano-stacks-follower/systemd/stacks-follower.service"
+              install -Dm644 docs/follower-artifact.md \
+                "$out/share/doc/nano-stacks-follower/README.md"
+              "$out/bin/stacks-follower" config-schema \
+                > "$out/share/nano-stacks-follower/config.schema.json"
+              "$out/bin/stacks-follower" build-identity \
+                > "$out/share/nano-stacks-follower/build-identity.json"
+              "$out/bin/stacks-follower" compatibility-profile \
+                > "$out/share/nano-stacks-follower/compatibility-profile.json"
+            '';
+          };
+
+          node-container = pkgs.dockerTools.buildLayeredImage {
             name = "nano-stacks";
             tag = builtins.substring 0 12 sourceRevision;
             contents = [ stacks-node pkgs.cacert ];
@@ -148,7 +207,24 @@
             };
           };
 
-          default = stacks-node;
+          container = pkgs.dockerTools.buildLayeredImage {
+            name = "nano-stacks-follower";
+            tag = builtins.substring 0 12 sourceRevision;
+            contents = [ stacks-follower pkgs.cacert ];
+            config = {
+              Entrypoint = [ "${stacks-follower}/bin/stacks-follower" ];
+              Cmd = [ "start" "--config" "/etc/nano-stacks/config.toml" ];
+              Volumes = { "/var/lib/nano-stacks" = { }; };
+              WorkingDir = "/var/lib/nano-stacks";
+              StopSignal = "SIGTERM";
+              Labels = {
+                "org.opencontainers.image.revision" = sourceRevision;
+                "org.opencontainers.image.source" = self.sourceInfo.url or "nano-stacks";
+              };
+            };
+          };
+
+          default = stacks-follower;
         });
     };
 }
