@@ -209,6 +209,21 @@ impl CheckpointBundleManifest {
         &self.content_root
     }
 
+    /// Validate the signed manifest and its claims without rereading payload files.
+    ///
+    /// This is suitable for release evidence which carries the manifest but not
+    /// the potentially large checkpoint payload. Import must still call
+    /// [`Self::verify`] before using any payload byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid manifest or claims which disagree with
+    /// `checkpoint`.
+    pub fn validate_against(&self, checkpoint: &CheckpointManifest) -> Result<(), BundleError> {
+        self.validate()?;
+        self.checkpoint.check_checkpoint(checkpoint)
+    }
+
     fn validate(&self) -> Result<(), BundleError> {
         if self.schema != BUNDLE_SCHEMA {
             return Err(BundleError::Invalid(format!(

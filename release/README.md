@@ -12,12 +12,20 @@ The signing key stays outside the checkout. Its public key is the trust root an
 operator obtains independently. Preparing a candidate runs the pinned RustSec
 policy, records the clean Nix closure and copies the public package; it records
 only the SHA-256 of `config.toml`, because that file can contain passwords and
-private keys.
+private keys. It also runs that exact artifact's offline checkpoint verifier
+against local Bitcoin Core and binds its command, output, bundle manifest,
+builder policy/signatures, and immutable import provenance into the candidate.
 
 ```sh
 nix develop --command cargo xtask release-candidate prepare \
   --output /srv/nano-release/candidate \
   --checkpoint "$NANO_MAINNET_CHECKPOINT" \
+  --checkpoint-builder-policy "$NANO_CHECKPOINT_BUILDER_POLICY" \
+  --checkpoint-builder-signatures "$NANO_CHECKPOINT_BUILDER_SIGNATURES" \
+  --checkpoint-provenance "$NANO_CHECKPOINT_PROVENANCE" \
+  --bitcoin-rpc-url "$NANO_BITCOIN_RPC" \
+  --bitcoin-rpc-user "$NANO_BITCOIN_RPC_USER" \
+  --bitcoin-rpc-password-file "$NANO_BITCOIN_PASSWORD_FILE" \
   --config "$NANO_RELEASE_CONFIG" \
   --advisory-db "$NANO_RELEASE_ADVISORY_DB" \
   --secret-key "$NANO_RELEASE_SECRET_KEY" \
@@ -43,10 +51,13 @@ nix develop --command cargo xtask release-candidate verify \
 ```
 
 Qualification verifies the preliminary signature and the external config and
-checkpoint digests before and after every gate. Finalization refuses a report
-that does not say `PASS` and name that exact preliminary manifest, then signs a
-second complete checksum inventory containing the report. Any later byte or
-extra file makes verification fail.
+checkpoint evidence before and after every gate. It independently checks the
+builder threshold and that the bundle root, local Bitcoin view, attestation,
+builder names, persisted provenance, verifier output, and release artifact all
+name one trust root. Finalization refuses a report that does not say `PASS` and
+name that exact preliminary manifest, then signs a second complete checksum
+inventory containing the report. Any later byte or extra file makes
+verification fail.
 
 Before preparation, set `NANO_REPRODUCIBLE_STORE` to an absent path on the
 disk-backed temporary filesystem. `scripts/reproducible-release.sh` builds the clean Git

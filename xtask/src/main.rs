@@ -6273,6 +6273,22 @@ fn report_candidate(
     println!("  signed source        {}", verified.source_revision);
     println!("  configuration        {}", verified.configuration_sha256);
     println!("  checkpoint           {}", verified.checkpoint_sha256);
+    println!(
+        "  checkpoint bundle    {}",
+        verified.checkpoint_bundle_sha256
+    );
+    println!(
+        "  checkpoint root      {}",
+        verified.checkpoint_content_root
+    );
+    println!(
+        "  checkpoint builders  {}",
+        verified.checkpoint_builders.join(", ")
+    );
+    println!(
+        "  checkpoint verifier  {}",
+        verified.checkpoint_verification_sha256
+    );
     println!("  signature            PASS");
     Ok(verified)
 }
@@ -6280,14 +6296,26 @@ fn report_candidate(
 fn report_candidate_inputs(candidate: &CandidateVerification) -> bool {
     let configuration = env::var_os("NANO_RELEASE_CONFIG").map(PathBuf::from);
     let checkpoint = env::var_os("NANO_MAINNET_CHECKPOINT").map(PathBuf::from);
-    let (Some(configuration), Some(checkpoint)) = (configuration, checkpoint) else {
+    let policy = env::var_os("NANO_CHECKPOINT_BUILDER_POLICY").map(PathBuf::from);
+    let signatures = env::var_os("NANO_CHECKPOINT_BUILDER_SIGNATURES").map(PathBuf::from);
+    let provenance = env::var_os("NANO_CHECKPOINT_PROVENANCE").map(PathBuf::from);
+    let (Some(configuration), Some(checkpoint), Some(policy), Some(signatures), Some(provenance)) =
+        (configuration, checkpoint, policy, signatures, provenance)
+    else {
         println!(
-            "  FAIL: NANO_RELEASE_CONFIG and NANO_MAINNET_CHECKPOINT must name the frozen \
-             qualification inputs"
+            "  FAIL: NANO_RELEASE_CONFIG, NANO_MAINNET_CHECKPOINT and the three \
+             NANO_CHECKPOINT_* evidence paths must name the frozen qualification inputs"
         );
         return false;
     };
-    match verify_qualification_inputs(candidate, &configuration, &checkpoint) {
+    match verify_qualification_inputs(
+        candidate,
+        &configuration,
+        &checkpoint,
+        &policy,
+        &signatures,
+        &provenance,
+    ) {
         Ok(()) => {
             println!("  frozen inputs        PASS");
             true
@@ -6375,7 +6403,7 @@ fn report_checkpoint(state: Option<&Path>, qualifying: bool) -> bool {
             },
         );
     let (directory, loaded) = found.unwrap_or_else(|| (directory.to_path_buf(), Ok(None)));
-    let provenance_profile = match loaded {
+    let (provenance_profile, signed_bundle) = match loaded {
         Ok(Some(provenance)) => {
             let checkpoint = &provenance.checkpoint;
             println!("  state directory      {}", directory.display());
@@ -6410,7 +6438,8 @@ fn report_checkpoint(state: Option<&Path>, qualifying: bool) -> bool {
                      than from a signed header"
                 ),
             }
-            checkpoint.profile_fingerprint
+            let signed_bundle = report_signed_checkpoint_bundle(provenance.bundle.as_ref());
+            (checkpoint.profile_fingerprint, signed_bundle)
         }
         Ok(None) => {
             println!(
@@ -6418,11 +6447,11 @@ fn report_checkpoint(state: Option<&Path>, qualifying: bool) -> bool {
                  unrecorded",
                 directory.display()
             );
-            None
+            (None, false)
         }
         Err(error) => {
             println!("  {} is unreadable: {error}", directory.display());
-            None
+            (None, false)
         }
     };
     let active = nano_vm::compatibility_profile_fingerprint();
@@ -6433,13 +6462,36 @@ fn report_checkpoint(state: Option<&Path>, qualifying: bool) -> bool {
         state_profile.as_deref().unwrap_or("MISSING")
     );
     let exact = provenance_profile == Some(active)
-        && state_profile.as_deref() == Some(active_text.as_str());
+        && state_profile.as_deref() == Some(active_text.as_str())
+        && signed_bundle;
     println!(
         "  profile admission    {}",
         if exact { "PASS" } else { "FAIL" }
     );
     report_state_engines(&directory);
     exact
+}
+
+fn report_signed_checkpoint_bundle(bundle: Option<&nano_marf::CheckpointBundleReceipt>) -> bool {
+    bundle.map_or_else(
+        || {
+            println!("  signed bundle        MISSING");
+            false
+        },
+        |bundle| {
+            println!(
+                "  bundle content root  {}",
+                hex::encode(bundle.content_root)
+            );
+            println!(
+                "  bundle Bitcoin view  {} at height {}",
+                hex::encode(bundle.bitcoin_block_hash),
+                bundle.bitcoin_height
+            );
+            println!("  bundle builders      {}", bundle.builders.join(", "));
+            true
+        },
+    )
 }
 
 /// Which clarity-wasm builds wrote the state, and whether this artifact is one.

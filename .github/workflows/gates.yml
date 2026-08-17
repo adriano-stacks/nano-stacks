@@ -121,6 +121,12 @@ jobs:
           test -d "$NANO_RELEASE_ADVISORY_DB/.git"
           test -r "$NANO_RELEASE_SECRET_KEY"
           test -r "$NANO_RELEASE_PUBLIC_KEY"
+          test -r "$NANO_CHECKPOINT_BUILDER_POLICY"
+          test -d "$NANO_CHECKPOINT_BUILDER_SIGNATURES"
+          test -r "$NANO_CHECKPOINT_PROVENANCE"
+          test -n "$NANO_BITCOIN_RPC"
+          test -n "$NANO_BITCOIN_RPC_USER"
+          test -r "$NANO_BITCOIN_PASSWORD_FILE"
           mkdir -p "$NANO_RELEASE_TMP"
           mkdir -p "$NANO_RELEASE_OUTPUT"
           test "$(stat -c %d "$NANO_RELEASE_TMP")" = "$(stat -c %d "$NANO_MAINNET_MARF")"
@@ -160,6 +166,12 @@ jobs:
           nix develop --command cargo xtask release-candidate prepare \
             --output "$candidate" \
             --checkpoint "$NANO_MAINNET_CHECKPOINT" \
+            --checkpoint-builder-policy "$NANO_CHECKPOINT_BUILDER_POLICY" \
+            --checkpoint-builder-signatures "$NANO_CHECKPOINT_BUILDER_SIGNATURES" \
+            --checkpoint-provenance "$NANO_CHECKPOINT_PROVENANCE" \
+            --bitcoin-rpc-url "$NANO_BITCOIN_RPC" \
+            --bitcoin-rpc-user "$NANO_BITCOIN_RPC_USER" \
+            --bitcoin-rpc-password-file "$NANO_BITCOIN_PASSWORD_FILE" \
             --config "$NANO_RELEASE_CONFIG" \
             --advisory-db "$NANO_RELEASE_ADVISORY_DB" \
             --secret-key "$NANO_RELEASE_SECRET_KEY" \

@@ -19,6 +19,11 @@ use crate::{
 const ARTIFACT: &str = "artifact";
 const AUDIT: &str = "cargo-audit.json";
 const CHECKPOINT: &str = "checkpoint.toml";
+const CHECKPOINT_BUILDERS: &str = "checkpoint-builders.toml";
+const CHECKPOINT_BUNDLE: &str = nano_marf::BUNDLE_MANIFEST_FILE;
+const CHECKPOINT_PROVENANCE: &str = "checkpoint-provenance.toml";
+const CHECKPOINT_SIGNATURES: &str = "checkpoint-signatures";
+const CHECKPOINT_VERIFICATION: &str = "checkpoint-verification.json";
 const CLOSURE: &str = "nix-closure.json";
 const CONFIGURATION: &str = "configuration.json";
 const PREPARED_SUMS: &str = "candidate.SHA256SUMS";
@@ -40,7 +45,14 @@ const SOURCE_INPUTS: &[&str] = &[
 pub struct CandidateVerification {
     pub binary: PathBuf,
     pub candidate_manifest_sha256: String,
+    pub checkpoint_builders: Vec<String>,
+    pub checkpoint_bundle_sha256: String,
+    pub checkpoint_content_root: String,
+    pub checkpoint_policy_sha256: String,
+    pub checkpoint_provenance_sha256: String,
+    pub checkpoint_signatures_sha256: String,
     pub checkpoint_sha256: String,
+    pub checkpoint_verification_sha256: String,
     pub configuration_sha256: String,
     pub compatibility_fingerprint: Fingerprint,
     pub source_revision: String,
@@ -50,6 +62,9 @@ pub fn verify_qualification_inputs(
     candidate: &CandidateVerification,
     configuration: &Path,
     checkpoint: &Path,
+    policy: &Path,
+    signatures: &Path,
+    provenance: &Path,
 ) -> Result<(), String> {
     require_file(configuration, "release configuration")?;
     let checkpoint = checkpoint_path(checkpoint);
@@ -68,14 +83,47 @@ pub fn verify_qualification_inputs(
             candidate.checkpoint_sha256
         ));
     }
-    nano_marf::CheckpointManifest::load(
-        checkpoint
-            .parent()
-            .ok_or_else(|| "checkpoint manifest has no directory".to_owned())?,
-    )
-    .map_err(|error| error.to_string())?
-    .check_profile(candidate.compatibility_fingerprint)
-    .map_err(|error| error.to_string())?;
+    let bundle = checkpoint
+        .parent()
+        .ok_or_else(|| "checkpoint manifest has no directory".to_owned())?;
+    let evidence = authenticate_checkpoint_evidence(bundle, policy, signatures, provenance)?;
+    evidence
+        .checkpoint
+        .check_profile(candidate.compatibility_fingerprint)
+        .map_err(|error| error.to_string())?;
+    for (name, actual, expected) in [
+        (
+            "checkpoint bundle manifest",
+            file_sha256(&bundle.join(CHECKPOINT_BUNDLE))?,
+            &candidate.checkpoint_bundle_sha256,
+        ),
+        (
+            "checkpoint builder policy",
+            file_sha256(policy)?,
+            &candidate.checkpoint_policy_sha256,
+        ),
+        (
+            "checkpoint builder signatures",
+            directory_sha256(signatures)?,
+            &candidate.checkpoint_signatures_sha256,
+        ),
+        (
+            "checkpoint provenance",
+            file_sha256(&provenance_path(provenance))?,
+            &candidate.checkpoint_provenance_sha256,
+        ),
+    ] {
+        if actual != *expected {
+            return Err(format!(
+                "{name} changed: candidate {expected}, current {actual}"
+            ));
+        }
+    }
+    if evidence.content_root != candidate.checkpoint_content_root
+        || evidence.builders != candidate.checkpoint_builders
+    {
+        return Err("checkpoint signing evidence changed after candidate preparation".to_owned());
+    }
     Ok(())
 }
 
@@ -101,7 +149,11 @@ pub fn command(arguments: &[String], workspace: &Path) -> ExitCode {
 
 fn usage() -> String {
     "usage:\n  cargo xtask release-candidate audit --advisory-db <RustSec.git>\n  cargo xtask release-candidate prepare --output <dir> --checkpoint <dir-or-file> \
-     --config <config.toml> --advisory-db <RustSec.git> --secret-key <minisign.key> \
+     --checkpoint-builder-policy <builders.toml> \
+     --checkpoint-builder-signatures <dir> --checkpoint-provenance <file-or-state-dir> \
+     --bitcoin-rpc-url <url> --bitcoin-rpc-user <user> \
+     --bitcoin-rpc-password-file <file> --config <config.toml> \
+     --advisory-db <RustSec.git> --secret-key <minisign.key> \
      --public-key <minisign.pub> [--artifact <nix-output> \
      --artifact-store <rootless-store-root>]\n  cargo xtask release-candidate \
      finalize --candidate <dir> --report <release-report.txt> --secret-key <minisign.key> \
@@ -129,6 +181,64 @@ fn audit(arguments: &[String], workspace: &Path) -> Result<String, String> {
     ))
 }
 
+struct CheckpointCandidateInputs {
+    bitcoin_password: PathBuf,
+    bitcoin_url: String,
+    bitcoin_user: String,
+    checkpoint: PathBuf,
+    directory: PathBuf,
+    policy: PathBuf,
+    provenance: PathBuf,
+    signatures: PathBuf,
+}
+
+impl CheckpointCandidateInputs {
+    fn parse(options: &BTreeMap<&str, &str>) -> Result<Self, String> {
+        let checkpoint = checkpoint_path(&required_path(options, "--checkpoint")?);
+        let directory = checkpoint
+            .parent()
+            .ok_or_else(|| "checkpoint manifest has no directory".to_owned())?
+            .to_path_buf();
+        let inputs = Self {
+            bitcoin_password: required_path(options, "--bitcoin-rpc-password-file")?,
+            bitcoin_url: required_value(options, "--bitcoin-rpc-url")?.to_owned(),
+            bitcoin_user: required_value(options, "--bitcoin-rpc-user")?.to_owned(),
+            checkpoint,
+            directory,
+            policy: required_path(options, "--checkpoint-builder-policy")?,
+            provenance: provenance_path(&required_path(options, "--checkpoint-provenance")?),
+            signatures: required_path(options, "--checkpoint-builder-signatures")?,
+        };
+        require_file(&inputs.checkpoint, "checkpoint manifest")?;
+        require_file(
+            &inputs.directory.join(CHECKPOINT_BUNDLE),
+            "checkpoint bundle manifest",
+        )?;
+        require_file(&inputs.policy, "checkpoint builder policy")?;
+        require_directory(&inputs.signatures, "checkpoint builder signatures")?;
+        require_file(&inputs.provenance, "checkpoint provenance")?;
+        require_file(&inputs.bitcoin_password, "Bitcoin RPC password file")?;
+        let bundle = fs::canonicalize(&inputs.directory)
+            .map_err(|error| format!("cannot resolve checkpoint bundle: {error}"))?;
+        for (name, path) in [
+            ("checkpoint builder policy", &inputs.policy),
+            ("checkpoint builder signatures", &inputs.signatures),
+        ] {
+            if fs::canonicalize(path)
+                .map_err(|error| format!("cannot resolve {name}: {error}"))?
+                .starts_with(&bundle)
+            {
+                return Err(format!("{name} must remain outside the checkpoint bundle"));
+            }
+        }
+        Ok(inputs)
+    }
+
+    fn directory(&self) -> &Path {
+        &self.directory
+    }
+}
+
 fn prepare(arguments: &[String], workspace: &Path) -> Result<String, String> {
     let options = options(arguments)?;
     reject_unknown(
@@ -136,6 +246,12 @@ fn prepare(arguments: &[String], workspace: &Path) -> Result<String, String> {
         &[
             "--output",
             "--checkpoint",
+            "--checkpoint-builder-policy",
+            "--checkpoint-builder-signatures",
+            "--checkpoint-provenance",
+            "--bitcoin-rpc-url",
+            "--bitcoin-rpc-user",
+            "--bitcoin-rpc-password-file",
             "--config",
             "--advisory-db",
             "--secret-key",
@@ -145,13 +261,12 @@ fn prepare(arguments: &[String], workspace: &Path) -> Result<String, String> {
         ],
     )?;
     let output = required_path(&options, "--output")?;
-    let checkpoint = checkpoint_path(&required_path(&options, "--checkpoint")?);
+    let checkpoint = CheckpointCandidateInputs::parse(&options)?;
     let configuration = required_path(&options, "--config")?;
     let advisory_db = required_path(&options, "--advisory-db")?;
     let secret_key = required_path(&options, "--secret-key")?;
     let public_key = required_path(&options, "--public-key")?;
     require_absent(&output)?;
-    require_file(&checkpoint, "checkpoint manifest")?;
     require_file(&configuration, "node configuration")?;
     require_file(&secret_key, "minisign secret key")?;
     require_file(&public_key, "minisign public key")?;
@@ -165,6 +280,15 @@ fn prepare(arguments: &[String], workspace: &Path) -> Result<String, String> {
     }
     let (artifact, store_path, artifact_store) = artifact_input(&options, workspace)?;
     validate_artifact(&artifact, &source.revision)?;
+    let checkpoint_verification = run_checkpoint_verifier(
+        &artifact,
+        checkpoint.directory(),
+        &checkpoint.policy,
+        &checkpoint.signatures,
+        &checkpoint.bitcoin_url,
+        &checkpoint.bitcoin_user,
+        &checkpoint.bitcoin_password,
+    )?;
     let audit = run_advisory_policy(workspace, &advisory_db)?;
     let advisory_revision = clean_git_revision(&advisory_db, "advisory database")?;
     let closure = nix_closure(&store_path, artifact_store.as_deref())?;
@@ -182,7 +306,11 @@ fn prepare(arguments: &[String], workspace: &Path) -> Result<String, String> {
         staging.path(),
         workspace,
         &artifact,
-        &checkpoint,
+        &checkpoint.checkpoint,
+        &checkpoint.policy,
+        &checkpoint.signatures,
+        &checkpoint.provenance,
+        &checkpoint_verification,
         &configuration,
         &public_key,
         &audit,
@@ -216,6 +344,10 @@ fn populate_candidate(
     workspace: &Path,
     artifact: &Path,
     checkpoint: &Path,
+    checkpoint_policy: &Path,
+    checkpoint_signatures: &Path,
+    checkpoint_provenance: &Path,
+    checkpoint_verification: &Value,
     configuration: &Path,
     public_key: &Path,
     audit: &[u8],
@@ -226,6 +358,26 @@ fn populate_candidate(
     copy_tree(artifact, &candidate.join(ARTIFACT))?;
     fs::copy(checkpoint, candidate.join(CHECKPOINT))
         .map_err(|error| format!("cannot copy checkpoint manifest: {error}"))?;
+    fs::copy(
+        checkpoint
+            .parent()
+            .ok_or_else(|| "checkpoint manifest has no directory".to_owned())?
+            .join(CHECKPOINT_BUNDLE),
+        candidate.join(CHECKPOINT_BUNDLE),
+    )
+    .map_err(|error| format!("cannot copy checkpoint bundle manifest: {error}"))?;
+    fs::copy(checkpoint_policy, candidate.join(CHECKPOINT_BUILDERS))
+        .map_err(|error| format!("cannot copy checkpoint builder policy: {error}"))?;
+    copy_tree(
+        checkpoint_signatures,
+        &candidate.join(CHECKPOINT_SIGNATURES),
+    )?;
+    fs::copy(checkpoint_provenance, candidate.join(CHECKPOINT_PROVENANCE))
+        .map_err(|error| format!("cannot copy checkpoint provenance: {error}"))?;
+    write_json(
+        &candidate.join(CHECKPOINT_VERIFICATION),
+        checkpoint_verification,
+    )?;
     fs::copy(public_key, candidate.join(PUBLISHER_KEY))
         .map_err(|error| format!("cannot copy publisher key: {error}"))?;
     fs::write(candidate.join(AUDIT), audit)
@@ -248,6 +400,56 @@ fn populate_candidate(
     }
     let provenance = provenance(candidate, workspace, source_revision, advisory_revision)?;
     write_json(&candidate.join(PROVENANCE), &provenance)
+}
+
+fn run_checkpoint_verifier(
+    artifact: &Path,
+    bundle: &Path,
+    policy: &Path,
+    signatures: &Path,
+    bitcoin_rpc_url: &str,
+    bitcoin_rpc_user: &str,
+    bitcoin_rpc_password: &Path,
+) -> Result<Value, String> {
+    let binary = artifact.join("bin/stacks-node");
+    let arguments = [
+        "verify-checkpoint".to_owned(),
+        "--bundle".to_owned(),
+        utf8(bundle)?,
+        "--policy".to_owned(),
+        utf8(policy)?,
+        "--signatures".to_owned(),
+        utf8(signatures)?,
+        "--bitcoin-rpc-url".to_owned(),
+        bitcoin_rpc_url.to_owned(),
+        "--bitcoin-rpc-user".to_owned(),
+        bitcoin_rpc_user.to_owned(),
+        "--bitcoin-rpc-password-file".to_owned(),
+        utf8(bitcoin_rpc_password)?,
+    ];
+    let output = Command::new(&binary)
+        .args(&arguments)
+        .output()
+        .map_err(|error| format!("cannot run checkpoint verifier: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "checkpoint verifier refused the release input: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("checkpoint verifier output is not UTF-8: {error}"))?;
+    let stderr = String::from_utf8(output.stderr)
+        .map_err(|error| format!("checkpoint verifier diagnostics are not UTF-8: {error}"))?;
+    Ok(json!({
+        "schema": "nano-stacks/checkpoint-verification/v1",
+        "artifact_sha256": file_sha256(&binary)?,
+        "argv": std::iter::once(utf8(&binary)?)
+            .chain(arguments)
+            .collect::<Vec<_>>(),
+        "stdout": stdout,
+        "stderr": stderr,
+    }))
 }
 
 fn provenance(
@@ -273,6 +475,25 @@ fn provenance(
         "uri": "file:checkpoint.toml",
         "digest": { "sha256": file_sha256(&candidate.join(CHECKPOINT))? },
     }));
+    for input in [
+        CHECKPOINT_BUNDLE,
+        CHECKPOINT_BUILDERS,
+        CHECKPOINT_PROVENANCE,
+        CHECKPOINT_VERIFICATION,
+    ] {
+        dependencies.push(json!({
+            "uri": format!("file:{input}"),
+            "digest": { "sha256": file_sha256(&candidate.join(input))? },
+        }));
+    }
+    for signature in candidate_files(&candidate.join(CHECKPOINT_SIGNATURES), &BTreeSet::new())? {
+        dependencies.push(json!({
+            "uri": format!("file:{CHECKPOINT_SIGNATURES}/{signature}"),
+            "digest": {
+                "sha256": file_sha256(&candidate.join(CHECKPOINT_SIGNATURES).join(signature))?,
+            },
+        }));
+    }
     dependencies.push(json!({
         "uri": "private:config.toml",
         "digest": { "sha256": read_json(&candidate.join(CONFIGURATION))?["sha256"] },
@@ -394,21 +615,163 @@ pub fn verify_prepared_candidate(
     verify_publisher_key(candidate, public_key)?;
     let source_revision = verify_identity(candidate, expected_revision)?;
     let compatibility_fingerprint = candidate_fingerprint(candidate)?;
-    nano_marf::CheckpointManifest::load(candidate)
-        .map_err(|error| error.to_string())?
+    let checkpoint_evidence = authenticate_checkpoint_evidence(
+        candidate,
+        &candidate.join(CHECKPOINT_BUILDERS),
+        &candidate.join(CHECKPOINT_SIGNATURES),
+        &candidate.join(CHECKPOINT_PROVENANCE),
+    )?;
+    checkpoint_evidence
+        .checkpoint
         .check_profile(compatibility_fingerprint)
         .map_err(|error| error.to_string())?;
+    verify_checkpoint_command(candidate, &checkpoint_evidence)?;
     let configuration = read_json(&candidate.join(CONFIGURATION))?;
     let configuration_sha256 = json_sha256(&configuration, "sha256", CONFIGURATION)?;
     let checkpoint_sha256 = file_sha256(&candidate.join(CHECKPOINT))?;
     Ok(CandidateVerification {
         binary: candidate.join(ARTIFACT).join("bin/stacks-node"),
         candidate_manifest_sha256: file_sha256(&candidate.join(PREPARED_SUMS))?,
+        checkpoint_builders: checkpoint_evidence.builders,
+        checkpoint_bundle_sha256: file_sha256(&candidate.join(CHECKPOINT_BUNDLE))?,
+        checkpoint_content_root: checkpoint_evidence.content_root,
+        checkpoint_policy_sha256: file_sha256(&candidate.join(CHECKPOINT_BUILDERS))?,
+        checkpoint_provenance_sha256: file_sha256(&candidate.join(CHECKPOINT_PROVENANCE))?,
+        checkpoint_signatures_sha256: directory_sha256(&candidate.join(CHECKPOINT_SIGNATURES))?,
         checkpoint_sha256,
+        checkpoint_verification_sha256: file_sha256(&candidate.join(CHECKPOINT_VERIFICATION))?,
         configuration_sha256,
         compatibility_fingerprint,
         source_revision,
     })
+}
+
+struct AuthenticatedCheckpointEvidence {
+    builders: Vec<String>,
+    checkpoint: nano_marf::CheckpointManifest,
+    content_root: String,
+}
+
+fn authenticate_checkpoint_evidence(
+    bundle: &Path,
+    policy: &Path,
+    signatures: &Path,
+    provenance: &Path,
+) -> Result<AuthenticatedCheckpointEvidence, String> {
+    let checkpoint =
+        nano_marf::CheckpointManifest::load(bundle).map_err(|error| error.to_string())?;
+    let manifest =
+        nano_marf::CheckpointBundleManifest::load(bundle).map_err(|error| error.to_string())?;
+    manifest
+        .validate_against(&checkpoint)
+        .map_err(|error| error.to_string())?;
+    let policy = nano_node::checkpoint_signatures::BuilderPolicy::load(policy)
+        .map_err(|error| error.to_string())?;
+    let builders = nano_node::checkpoint_signatures::verify_builder_signatures(
+        manifest.content_root(),
+        manifest.checkpoint.checkpoint_stacks_height,
+        &policy,
+        signatures,
+    )
+    .map_err(|error| error.to_string())?;
+    if builders.names.len() < 2 {
+        return Err(
+            "release checkpoint evidence needs signatures from at least two builders".to_owned(),
+        );
+    }
+    let provenance_path = provenance_path(provenance);
+    require_file(&provenance_path, "checkpoint provenance")?;
+    let provenance = nano_marf::CheckpointProvenance::load(
+        provenance_path
+            .parent()
+            .ok_or_else(|| "checkpoint provenance has no directory".to_owned())?,
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "checkpoint provenance is absent".to_owned())?;
+    if provenance.checkpoint != checkpoint {
+        return Err("checkpoint provenance describes a different checkpoint".to_owned());
+    }
+    let receipt = provenance
+        .bundle
+        .ok_or_else(|| "checkpoint provenance has no signed bundle receipt".to_owned())?;
+    if hex::encode(receipt.content_root) != manifest.content_root()
+        || receipt.bitcoin_height != manifest.checkpoint.bitcoin_height
+        || hex::encode(receipt.bitcoin_block_hash) != manifest.checkpoint.bitcoin_block_hash
+        || receipt.builders != builders.names
+    {
+        return Err("checkpoint provenance disagrees with its signed bundle".to_owned());
+    }
+    let attestation = provenance
+        .attestation
+        .ok_or_else(|| "checkpoint provenance has no signed-header attestation".to_owned())?;
+    if hex::encode(attestation.attesting_block_id) != manifest.checkpoint.attesting_block_id
+        || attestation.signer_weight != manifest.checkpoint.signer_weight
+        || attestation.approval_threshold != manifest.checkpoint.approval_threshold
+    {
+        return Err("checkpoint provenance disagrees with its signer attestation".to_owned());
+    }
+    Ok(AuthenticatedCheckpointEvidence {
+        builders: builders.names,
+        checkpoint,
+        content_root: manifest.content_root().to_owned(),
+    })
+}
+
+fn verify_checkpoint_command(
+    candidate: &Path,
+    evidence: &AuthenticatedCheckpointEvidence,
+) -> Result<(), String> {
+    let document = read_json(&candidate.join(CHECKPOINT_VERIFICATION))?;
+    if document["schema"] != "nano-stacks/checkpoint-verification/v1"
+        || document["artifact_sha256"]
+            != file_sha256(&candidate.join(ARTIFACT).join("bin/stacks-node"))?
+    {
+        return Err("checkpoint verification names a different schema or artifact".to_owned());
+    }
+    let arguments = document["argv"]
+        .as_array()
+        .ok_or_else(|| "checkpoint verification has no argv".to_owned())?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| "checkpoint verification argv is not textual".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_flags = [
+        "verify-checkpoint",
+        "--bundle",
+        "--policy",
+        "--signatures",
+        "--bitcoin-rpc-url",
+        "--bitcoin-rpc-user",
+        "--bitcoin-rpc-password-file",
+    ];
+    if arguments.len() != 14
+        || Path::new(arguments[0]).file_name() != Some(OsStr::new("stacks-node"))
+        || expected_flags
+            .iter()
+            .enumerate()
+            .any(|(index, expected)| arguments[index.saturating_mul(2).max(1)] != *expected)
+        || arguments
+            .iter()
+            .skip(3)
+            .step_by(2)
+            .any(|value| value.is_empty())
+    {
+        return Err(
+            "checkpoint verification did not run the exact offline verifier command".to_owned(),
+        );
+    }
+    let expected = format!(
+        "checkpoint content root {} verified by {}\n",
+        evidence.content_root,
+        evidence.builders.join(", ")
+    );
+    if document["stdout"] != expected || document["stderr"] != "" {
+        return Err("checkpoint verifier output disagrees with signed evidence".to_owned());
+    }
+    Ok(())
 }
 
 fn verify_final_candidate(
@@ -453,6 +816,10 @@ fn required_candidate_files(candidate: &Path) -> Result<(), String> {
         "artifact/share/doc/nano-stacks/README.md",
         AUDIT,
         CHECKPOINT,
+        CHECKPOINT_BUILDERS,
+        CHECKPOINT_BUNDLE,
+        CHECKPOINT_PROVENANCE,
+        CHECKPOINT_VERIFICATION,
         CLOSURE,
         CONFIGURATION,
         PROVENANCE,
@@ -460,6 +827,10 @@ fn required_candidate_files(candidate: &Path) -> Result<(), String> {
     ] {
         require_file(&candidate.join(file), file)?;
     }
+    require_directory(
+        &candidate.join(CHECKPOINT_SIGNATURES),
+        CHECKPOINT_SIGNATURES,
+    )?;
     for input in SOURCE_INPUTS {
         require_file(&candidate.join("source-inputs").join(input), input)?;
     }
@@ -957,6 +1328,14 @@ fn checkpoint_path(path: &Path) -> PathBuf {
     }
 }
 
+fn provenance_path(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        path.join(CHECKPOINT_PROVENANCE)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 fn options(arguments: &[String]) -> Result<BTreeMap<&str, &str>, String> {
     let mut options = BTreeMap::new();
     let mut rest = arguments.iter();
@@ -1002,10 +1381,27 @@ fn required_path(options: &BTreeMap<&str, &str>, name: &str) -> Result<PathBuf, 
         .ok_or_else(|| format!("missing {name}\n{}", usage()))
 }
 
+fn required_value<'a>(options: &'a BTreeMap<&str, &str>, name: &str) -> Result<&'a str, String> {
+    options
+        .get(name)
+        .copied()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("missing {name}\n{}", usage()))
+}
+
 fn require_file(path: &Path, description: &str) -> Result<(), String> {
     path.is_file().then_some(()).ok_or_else(|| {
         format!(
             "{description} {} is absent or not a regular file",
+            path.display()
+        )
+    })
+}
+
+fn require_directory(path: &Path, description: &str) -> Result<(), String> {
+    path.is_dir().then_some(()).ok_or_else(|| {
+        format!(
+            "{description} {} is absent or not a directory",
             path.display()
         )
     })
@@ -1034,6 +1430,24 @@ fn file_sha256(path: &Path) -> Result<String, String> {
     fs::read(path)
         .map(|bytes| hex::encode(sha256(&bytes).as_bytes()))
         .map_err(|error| format!("cannot hash {}: {error}", path.display()))
+}
+
+fn directory_sha256(path: &Path) -> Result<String, String> {
+    require_directory(path, "hashed directory")?;
+    let mut inventory = Vec::new();
+    for relative in candidate_files(path, &BTreeSet::new())? {
+        inventory.extend_from_slice(relative.as_bytes());
+        inventory.push(0);
+        inventory.extend_from_slice(file_sha256(&path.join(relative))?.as_bytes());
+        inventory.push(b'\n');
+    }
+    Ok(hex::encode(sha256(&inventory).as_bytes()))
+}
+
+fn utf8(path: &Path) -> Result<String, String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{} is not a UTF-8 path", path.display()))
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
@@ -1105,16 +1519,23 @@ mod tests {
         process::Command,
     };
 
+    use nano_crypto::StacksPrivateKey;
+    use nano_marf::{
+        BundleClaims, CheckpointAttestation, CheckpointBundleManifest, CheckpointBundleReceipt,
+        CheckpointManifest, CheckpointProvenance,
+    };
+    use nano_primitives::sha256;
     use serde_json::json;
 
     use crate::release_advisory::ADVISORY_POLICY;
 
     use super::{
-        ARTIFACT, AUDIT, CHECKPOINT, CLOSURE, CONFIGURATION, PREPARED_SIGNATURE, PREPARED_SUMS,
+        ARTIFACT, AUDIT, CHECKPOINT, CHECKPOINT_BUILDERS, CHECKPOINT_SIGNATURES,
+        CHECKPOINT_VERIFICATION, CLOSURE, CONFIGURATION, PREPARED_SIGNATURE, PREPARED_SUMS,
         PROVENANCE, PUBLISHER_KEY, REPORT, RuntimeIdentities, SOURCE_INPUTS, artifact_input,
-        candidate_fingerprint, finalize, prepared_exclusions, read_json, required_candidate_files,
-        sign, verify_checksums, verify_final_candidate, verify_identity, verify_prepared_candidate,
-        write_checksum_file,
+        candidate_fingerprint, file_sha256, finalize, prepared_exclusions, read_json,
+        required_candidate_files, sign, verify_checksums, verify_final_candidate, verify_identity,
+        verify_prepared_candidate, write_checksum_file,
     };
 
     const REVISION: &str = "1111111111111111111111111111111111111111";
@@ -1185,16 +1606,7 @@ mod tests {
 
         write_artifact(&candidate, include_sbom);
         write_json_test(&candidate.join(AUDIT), audit);
-        fs::write(
-            candidate.join(CHECKPOINT),
-            format!(
-                "format = \"test\"\ncheckpoint_stacks_height = 1\nsource_state_id = \"{}\"\npublished_state_index_root = \"{}\"\nfirst_bitcoin_height = 1\nprofile_fingerprint = \"{}\"\n",
-                "11".repeat(32),
-                "22".repeat(32),
-                nano_consensus_profile::fingerprint(test_identities())
-            ),
-        )
-        .expect("write checkpoint");
+        write_checkpoint_evidence(&candidate);
         write_json_test(
             &candidate.join(CLOSURE),
             &json!({ "outputNarHash": "sha256:test" }),
@@ -1240,6 +1652,141 @@ mod tests {
             public_key,
             secret_key,
         }
+    }
+
+    fn write_checkpoint_evidence(candidate: &std::path::Path) {
+        fs::write(
+            candidate.join(CHECKPOINT),
+            format!(
+                "format = \"test\"\ncheckpoint_stacks_height = 1\nsource_state_id = \"{}\"\npublished_state_index_root = \"{}\"\nfirst_bitcoin_height = 1\nprofile_fingerprint = \"{}\"\n",
+                "11".repeat(32),
+                "22".repeat(32),
+                nano_consensus_profile::fingerprint(test_identities())
+            ),
+        )
+        .expect("write checkpoint");
+        let bundle = CheckpointBundleManifest::write_new(
+            candidate,
+            BundleClaims {
+                state_format: "test".to_owned(),
+                checkpoint_stacks_height: 1,
+                source_state_id: "11".repeat(32),
+                published_state_index_root: "22".repeat(32),
+                bitcoin_height: 1,
+                bitcoin_block_hash: "33".repeat(32),
+                attesting_block_id: "11".repeat(32),
+                signer_weight: 1,
+                approval_threshold: 1,
+                semantic_epoch: "Epoch40".to_owned(),
+                compiler_identity: TEST_COMPILER.to_owned(),
+                profile_fingerprint: nano_consensus_profile::fingerprint(test_identities())
+                    .to_string(),
+            },
+        )
+        .expect("write bundle manifest");
+        let content_root = write_builder_signatures(candidate, &bundle);
+        CheckpointProvenance {
+            checkpoint: CheckpointManifest::load(candidate).expect("load checkpoint"),
+            attestation: Some(CheckpointAttestation {
+                attesting_block_id: [0x11; 32],
+                signer_weight: 1,
+                approval_threshold: 1,
+            }),
+            bundle: Some(CheckpointBundleReceipt {
+                content_root,
+                bitcoin_height: 1,
+                bitcoin_block_hash: [0x33; 32],
+                builders: vec!["archive-east".to_owned(), "archive-west".to_owned()],
+            }),
+        }
+        .record(candidate)
+        .expect("record checkpoint provenance");
+        write_json_test(
+            &candidate.join(CHECKPOINT_VERIFICATION),
+            &json!({
+                "schema": "nano-stacks/checkpoint-verification/v1",
+                "artifact_sha256": file_sha256(&candidate.join(ARTIFACT).join("bin/stacks-node"))
+                    .expect("hash test artifact"),
+                "argv": [
+                    "/test/artifact/bin/stacks-node", "verify-checkpoint",
+                    "--bundle", "/test/bundle", "--policy", "/test/builders.toml",
+                    "--signatures", "/test/signatures", "--bitcoin-rpc-url",
+                    "http://127.0.0.1:8332", "--bitcoin-rpc-user", "test",
+                    "--bitcoin-rpc-password-file", "/test/password",
+                ],
+                "stdout": format!(
+                    "checkpoint content root {} verified by archive-east, archive-west\n",
+                    bundle.content_root()
+                ),
+                "stderr": "",
+            }),
+        );
+    }
+
+    fn write_builder_signatures(
+        candidate: &std::path::Path,
+        bundle: &CheckpointBundleManifest,
+    ) -> [u8; 32] {
+        let content_root: [u8; 32] = hex::decode(bundle.content_root())
+            .expect("content root bytes")
+            .try_into()
+            .expect("32-byte root");
+        let builders = [
+            (
+                "archive-east",
+                StacksPrivateKey::from_seed(b"release-candidate-builder-east"),
+            ),
+            (
+                "archive-west",
+                StacksPrivateKey::from_seed(b"release-candidate-builder-west"),
+            ),
+        ];
+        fs::write(
+            candidate.join(CHECKPOINT_BUILDERS),
+            format!(
+                "schema = \"nano-stacks/checkpoint-builder-policy/v1\"\nrequired_signatures = 2\n\n[[builders]]\nname = \"archive-east\"\npublic_key = \"{}\"\nvalid_from_height = 0\n\n[[builders]]\nname = \"archive-west\"\npublic_key = \"{}\"\nvalid_from_height = 0\n",
+                hex::encode(builders[0].1.public_key().to_bytes_compressed()),
+                hex::encode(builders[1].1.public_key().to_bytes_compressed()),
+            ),
+        )
+        .expect("write builder policy");
+        fs::create_dir(candidate.join(CHECKPOINT_SIGNATURES))
+            .expect("create builder signature directory");
+        let digest = sha256(
+            &[
+                b"nano-stacks/checkpoint-builder-signature/v1\0".as_slice(),
+                content_root.as_slice(),
+            ]
+            .concat(),
+        );
+        for (name, builder) in &builders {
+            fs::write(
+                candidate
+                    .join(CHECKPOINT_SIGNATURES)
+                    .join(format!("{name}.toml")),
+                format!(
+                    "schema = \"nano-stacks/checkpoint-builder-signature/v1\"\nbuilder = \"{name}\"\ncontent_root = \"{}\"\nsignature = \"{}\"\n",
+                    bundle.content_root(),
+                    hex::encode(builder.sign(digest.as_bytes()).as_bytes())
+                ),
+            )
+            .expect("write builder signature");
+        }
+        content_root
+    }
+
+    fn resign(candidate: &SignedCandidate) {
+        fs::remove_file(candidate.path.join(PREPARED_SUMS)).expect("remove prior checksums");
+        fs::remove_file(candidate.path.join(PREPARED_SIGNATURE)).expect("remove prior signature");
+        write_checksum_file(&candidate.path, PREPARED_SUMS, &prepared_exclusions())
+            .expect("rewrite candidate checksums");
+        sign(
+            &candidate.path.join(PREPARED_SUMS),
+            &candidate.path.join(PREPARED_SIGNATURE),
+            &candidate.secret_key,
+            "test candidate",
+        )
+        .expect("resign candidate");
     }
 
     fn write_artifact(candidate: &std::path::Path, include_sbom: bool) {
@@ -1371,6 +1918,40 @@ mod tests {
             verify_prepared_candidate(&candidate.path, &candidate.public_key, Some(REVISION))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_signed_verifier_transcript_must_name_the_authenticated_checkpoint() {
+        let candidate = candidate(&green_audit(), true, true);
+        let path = candidate.path.join(CHECKPOINT_VERIFICATION);
+        let mut evidence = read_json(&path).expect("read checkpoint verification");
+        evidence["stdout"] = serde_json::Value::String(format!(
+            "checkpoint content root {} verified by archive\n",
+            "ff".repeat(32)
+        ));
+        write_json_test(&path, &evidence);
+        resign(&candidate);
+        let error =
+            verify_prepared_candidate(&candidate.path, &candidate.public_key, Some(REVISION))
+                .expect_err("reject a signed but false verifier transcript");
+        assert!(error.contains("verifier output disagrees"), "{error}");
+    }
+
+    #[test]
+    fn release_evidence_requires_two_authenticated_builders() {
+        let candidate = candidate(&green_audit(), true, true);
+        fs::remove_file(
+            candidate
+                .path
+                .join(CHECKPOINT_SIGNATURES)
+                .join("archive-west.toml"),
+        )
+        .expect("remove one builder signature");
+        resign(&candidate);
+        let error =
+            verify_prepared_candidate(&candidate.path, &candidate.public_key, Some(REVISION))
+                .expect_err("reject one remaining builder");
+        assert!(error.contains("threshold 2"), "{error}");
     }
 
     #[test]
