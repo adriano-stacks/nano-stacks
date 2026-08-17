@@ -1,0 +1,70 @@
+name: cross-architecture Epoch 4 debugging
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  execute:
+    name: ${{ matrix.architecture }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            runner: ubuntu-24.04
+          - architecture: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: epoch4-${{ matrix.architecture }}
+
+      - name: execute the canonical corpus
+        run: |
+          mkdir -p report
+          nix develop --command cargo run --profile ci \
+            -p nano-adversarial --bin epoch4-corpus > report/epoch4.json
+          (cd report && sha256sum -c \
+            ../crates/nano-adversarial/corpus/epoch4-report.sha256)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epoch4-${{ matrix.architecture }}
+          path: report/epoch4.json
+          if-no-files-found: error
+          retention-days: 30
+
+  compare:
+    needs: execute
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: epoch4-x86_64
+          path: reports/x86_64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: epoch4-aarch64
+          path: reports/aarch64
+
+      - name: compare every consensus-visible byte
+        run: cmp reports/x86_64/epoch4.json reports/aarch64/epoch4.json

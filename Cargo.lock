@@ -2505,6 +2505,7 @@ dependencies = [
  "nano-primitives",
  "nano-stackerdb",
  "nano-vm",
+ "serde_json",
  "stacks-common",
  "stackslib",
  "tempfile",

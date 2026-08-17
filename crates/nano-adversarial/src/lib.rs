@@ -645,9 +645,11 @@ pub fn clarity_result_and_cost_differential(input: &[u8]) -> u8 {
 /// Compare the compiler and interpreter's typed refusal for a structured failure.
 #[must_use]
 pub fn clarity_refusal_differential(input: &[u8]) -> u8 {
-    let Some((&template, _)) = input.split_first() else {
-        return 0;
-    };
+    checked_refusal(input).map_or(0, |(template, _)| 1 << template)
+}
+
+fn checked_refusal(input: &[u8]) -> Option<(u8, String)> {
+    let (&template, _) = input.split_first()?;
     let template = template % 6;
     let source = match template {
         0 => "(/ u1 u0)",
@@ -664,7 +666,18 @@ pub fn clarity_refusal_differential(input: &[u8]) -> u8 {
         compiled, interpreted,
         "compiled and interpreted refusal diverged"
     );
-    1 << template
+    Some((template, format!("{compiled:?}")))
+}
+
+/// Return the canonical refusal observation for the cross-architecture corpus.
+#[must_use]
+pub fn clarity_refusal_report(input: &[u8]) -> Option<serde_json::Value> {
+    checked_refusal(input).map(|(template, refusal)| {
+        serde_json::json!({
+            "template": template,
+            "refusal": refusal,
+        })
+    })
 }
 
 const STATEFUL_VARIABLE: &str = r#"
@@ -968,21 +981,15 @@ fn interpreted_stateful(case: &StatefulCase) -> StatefulObservation {
 /// Compare state, transaction receipts and roots for one generated public call.
 #[must_use]
 pub fn clarity_stateful_receipt_differential(input: &[u8]) -> u8 {
-    let Some(input) = within(input, MAX_CLARITY_STATEFUL_BYTES) else {
-        return 0;
-    };
-    let Some((&template, input)) = input.split_first() else {
-        return 0;
-    };
-    let Some((&flags, input)) = input.split_first() else {
-        return 0;
-    };
-    let Some((amount, input)) = input.split_at_checked(8) else {
-        return 0;
-    };
-    let Some((key, note)) = input.split_at_checked(8) else {
-        return 0;
-    };
+    checked_stateful(input).map_or(0, |(template, _)| 1 << template)
+}
+
+fn checked_stateful(input: &[u8]) -> Option<(u8, StatefulObservation)> {
+    let input = within(input, MAX_CLARITY_STATEFUL_BYTES)?;
+    let (&template, input) = input.split_first()?;
+    let (&flags, input) = input.split_first()?;
+    let (amount, input) = input.split_at_checked(8)?;
+    let (key, note) = input.split_at_checked(8)?;
     let amount = u128::from(u64::from_le_bytes(
         amount.try_into().expect("fixed integer width"),
     )) + 1;
@@ -1015,5 +1022,75 @@ pub fn clarity_stateful_receipt_differential(input: &[u8]) -> u8 {
         compiled, interpreted,
         "compiled and interpreted stateful observations diverged"
     );
-    1 << template
+    Some((template, compiled))
+}
+
+fn execution_cost_json(cost: &ExecutionCost) -> serde_json::Value {
+    serde_json::json!({
+        "read_count": cost.read_count,
+        "read_length": cost.read_length,
+        "runtime": cost.runtime,
+        "write_count": cost.write_count,
+        "write_length": cost.write_length,
+    })
+}
+
+fn transaction_result_json(result: &TransactionResult) -> serde_json::Value {
+    let value = result
+        .value
+        .as_ref()
+        .map_or(serde_json::Value::Null, |value| {
+            serde_json::json!({
+                "hex": value.serialize_to_hex().expect("serialize generated result"),
+                "repr": value.to_string(),
+            })
+        });
+    let events = result
+        .events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            event
+                .json_serialize(index, &[0_u8; 32], true)
+                .expect("serialize generated event")
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "assets": result.assets.to_json(),
+        "cost": execution_cost_json(&result.cost),
+        "events": events,
+        "value": value,
+    })
+}
+
+fn receipt_outcome_json(outcome: &ReceiptOutcome) -> serde_json::Value {
+    match outcome {
+        ReceiptOutcome::Success(result) => serde_json::json!({
+            "result": transaction_result_json(result),
+            "status": "success",
+        }),
+        ReceiptOutcome::Aborted(result) => serde_json::json!({
+            "result": transaction_result_json(result),
+            "status": "aborted-by-response",
+        }),
+        ReceiptOutcome::RuntimeFailure { cost, error } => serde_json::json!({
+            "cost": execution_cost_json(cost),
+            "error": format!("{error:?}"),
+            "status": "runtime-failure",
+        }),
+    }
+}
+
+/// Return the canonical receipt and root observation for the architecture corpus.
+#[must_use]
+pub fn clarity_stateful_receipt_report(input: &[u8]) -> Option<serde_json::Value> {
+    checked_stateful(input).map(|(template, observation)| {
+        serde_json::json!({
+            "call": receipt_outcome_json(&observation.call),
+            "deployment": transaction_result_json(&observation.deployment),
+            "root": stacks_common::util::hash::to_hex(&observation.root),
+            "snapshot": receipt_outcome_json(&observation.snapshot),
+            "template": template,
+        })
+    })
 }
