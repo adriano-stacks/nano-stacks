@@ -1035,7 +1035,7 @@ fn growing_queue(state: &State) -> Option<(&'static str, u64)> {
     .find_map(|(name, current, opened)| {
         current
             .zip(opened)
-            .and_then(|(current, opened)| (current > opened).then_some((name, current - opened)))
+            .and_then(|(current, opened)| (current > opened).then(|| (name, current - opened)))
     })
 }
 
@@ -3522,9 +3522,9 @@ mod tests {
 
     use super::{
         Action, BlockUpdate, HISTORY, Health, PollUpdate, Poller, STALL_AFTER, Screen, Source,
-        State, draw, exact_byte_limit, exact_compact_limit, handle_key, health_summary, node,
-        pox_schedule_story, receipt_unavailable, receipts, short, stx_amount, thousands,
-        thousands_u128, timestamp_context,
+        State, draw, exact_byte_limit, exact_compact_limit, growing_queue, handle_key,
+        health_summary, node, pox_schedule_story, receipt_unavailable, receipts, short, stx_amount,
+        thousands, thousands_u128, timestamp_context,
     };
 
     #[test]
@@ -3746,6 +3746,17 @@ mod tests {
         let health = health_summary(&state);
         assert_eq!(health.state, Health::Stalled);
         assert!(health.reason.contains("staged block queue grew by 3"));
+    }
+
+    #[test]
+    fn a_reset_queue_counter_is_not_growth() {
+        let mut state = dashboard_state();
+        state.sync.as_mut().expect("sync fixture").staged_blocks = Some(1);
+        let mut baseline = state.sync.clone().expect("sync fixture");
+        baseline.staged_blocks = Some(4);
+        state.sync_baseline = Some(baseline);
+
+        assert_eq!(growing_queue(&state), None);
     }
 
     #[test]
