@@ -1,177 +1,224 @@
-# What you trust when you start nano from a checkpoint
+# Checkpoint trust and recovery
 
-nano is an epoch-4.0-only node. It has no code for epochs 2.05 through 3.4 and
-no boot contract sources, so it cannot build the Stacks state from genesis. The
-state it runs on always arrives as a file somebody else produced: a checkpoint,
-exported from a stacks-core MARF at some Stacks height H.
+nano supports Epoch 4.0 only. It cannot replay mainnet from genesis, so its
+initial state is a checkpoint built by somebody else. A wrong checkpoint makes
+every later state wrong. Mainnet therefore requires three independent proofs
+before the node creates or imports production state.
 
-Every block nano executes afterwards is validated against that state. If the
-state is wrong, everything after it is wrong. This document says what nano
-checks, what it cannot check, and what is therefore left for the operator to
-decide.
+## What is authenticated
 
-## The claims a checkpoint makes
-
-A checkpoint directory carries a `checkpoint.toml` next to its MARF:
+`checkpoint.toml` names the state:
 
 ```toml
 format = "stacks-core-marf-sqlite-v2"
-checkpoint_stacks_height = 400
-source_state_id = "59fddf16…"          # the block_id of the block that sealed the state
-published_state_index_root = "34644adb…" # the state root at that block
-first_bitcoin_height = 277
-profile_fingerprint = "0123456789abcdef…" # exact `stacks-node compatibility-profile` fingerprint
+checkpoint_stacks_height = 8665600
+source_state_id = "a87338900f279efc1b1df130004238cac8e09a2a4244fea39436fc66afae932d"
+published_state_index_root = "67596465d4a6642ad6fcec1df57c6ef758fcdb0003c7ed7f952e3ced1d7f44ec"
+first_bitcoin_height = 960231
+profile_fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 ```
 
-Three separate assertions live in a running node, and they are not the same
-thing:
+`checkpoint-bundle.toml` then binds every regular payload file by portable
+path, exact byte length, whole-file SHA-256 and fixed 4 MiB chunk hashes. Its
+domain-separated `content_root` also binds the state claims, exact locally
+observed Bitcoin block hash, checkpoint block and signer threshold, Epoch40,
+compiler identity and compatibility profile. Missing, extra, changed,
+truncated, symlinked and special files are refused.
 
-- **the published root** — what the checkpoint's own manifest says;
-- **the declared root** — what the operator's configuration says;
-- **the computed root** — what nano recomputes by hashing the imported trie
-  graph.
+The import separately recomputes the trie root. The following three values must
+agree:
 
-The import refuses to proceed unless all three agree, and says which pair
-disagreed: `DeclaredRootMismatch` when the configuration and the checkpoint's
-manifest name different roots for the state the checkpoint publishes,
-`RootMismatch` when the trie graph does not hash to the root that was asked for.
+- the root published in `checkpoint.toml`;
+- the root selected in the operator configuration;
+- the root computed from the imported trie.
 
-Mainnet import also requires `profile_fingerprint` to equal the profile embedded
-in the release artifact. That fingerprint covers the declared Epoch-4 domain,
-the clarity-wasm compiler and the exact Wasmtime version/configuration. Missing
-or different values are refused before any state is copied. A compiler or
-consensus-profile upgrade therefore uses a new directory and a complete replay;
-opening an existing state is never an implicit migration.
+That proves byte integrity and self-consistency, but not that the network ever
+accepted the state. Two independent checks supply that evidence.
 
-That agreement is worth having, but it is only self-consistency. A checkpoint
-fabricated end to end — a doctored trie whose root is recomputed and written
-into its own manifest and into the operator's configuration — passes all three.
+## Network attestation
 
-## The one external check: the signed header
+The Nakamoto block at the checkpoint height commits to `state_index_root` in
+the preimage signed by that cycle's reward set. nano requires:
 
-`signer_signature_hash` is taken over a preimage that contains
-`state_index_root`, and `block_id` is derived from that hash together with the
-consensus hash. So the Nakamoto block header at height H is a statement, signed
-by the reward set of that cycle with at least 70% of its weight, that the state
-root at H was exactly this value.
+- the block height, block ID and state root to equal the checkpoint claims;
+- unique, reward-set-ordered signatures reaching the network threshold;
+- the reward set to be obtained independently of the state it attests;
+- the Bitcoin block hash at the checkpoint's exact burn height to equal the
+  answer from the operator's locally verified Bitcoin Core.
 
-`nano_node::attest_checkpoint` checks a checkpoint's manifest against such a
-header:
+The reward set must not be derived from the checkpoint being authenticated.
+That would let one producer invent both the state and the keys which approve
+it. A hosted Stacks API may help acquire data, but it is not a consensus trust
+root. Mainnet signed-bundle verification deliberately refuses Esplora and
+requires local Bitcoin Core for the Bitcoin view.
 
-- `chain_length` equals the checkpoint's Stacks height;
-- `block_id()` equals `source_state_id`;
-- `state_index_root` equals `published_state_index_root`;
-- `SignerSet::verify` recovers unique, reward-set-ordered signatures carrying at
-  least the approval threshold.
+## Independent builders
 
-The header is fetched by identifier — `GET /v3/blocks/<source_state_id>` — so
-any peer can serve it and no peer can substitute a different block: the
-identifier is the hash of the thing being asked for.
+The bundle does not declare who is trusted to build it. The operator pins a
+separate builder policy and a threshold of distinct builders. Each builder
+signs the content root with a height-valid key. The signature command creates
+one new file and never replaces it; the policy and signature directory must be
+outside the bundle so the payload cannot declare its own trust.
 
-This moves the root from "a number in a configuration file" to "a number the
-chain's signers put threshold weight behind".
+Use builders which acquire and construct the checkpoint in distinct failure
+domains. Two processes reading the same archive, host, disk or operator are a
+reproducibility test, not independent evidence. Before signing, builders must
+compare the complete `checkpoint-bundle.toml` bytes and content root.
 
-## Where the trust actually sits
+The policy schema is shown in
+[`checkpoint-builders.example.toml`](checkpoint-builders.example.toml). Entries
+are sorted by builder name and `valid_from_height`. Rotation uses adjacent,
+non-overlapping height ranges. To revoke a key, publish a new operator-pinned
+policy with `revoked_from_height` set to the first checkpoint height that must
+reject it. Never edit or delete an already published signature; publish the new
+policy and new signatures beside the old evidence.
 
-**The reward set has to come from somewhere other than the checkpoint.** The
-signer set for a cycle is derived from `.pox-5` state — that is, from the state
-being bootstrapped. Deriving it from the imported checkpoint and then using it to
-attest that same checkpoint is circular: whoever fabricated the state can
-fabricate its signer set and sign a matching header with the keys they invented.
+## Build, sign and verify
 
-So attestation is only as strong as the independence of the reward set. In
-descending order of what it buys you:
+Build the release binary, then set paths to local Bitcoin Core and evidence
+which is outside the bundle:
 
-1. **Reward set pinned in configuration**, taken out of band (a release
-   artifact, a block explorer, several unrelated peers that agree). The
-   attestation is then a genuine external check on the checkpoint.
-2. **Reward set fetched from peers** via `/v3/stacker_set/<cycle>`. Sound as long
-   as the peers are not the same party that supplied the checkpoint. Fetch from
-   more than one and require agreement.
-3. **Reward set derived from the checkpoint itself.** Circular; it proves the
-   checkpoint is internally consistent and nothing more. Do not treat this as
-   attestation.
+```sh
+nix develop --command cargo build --release -p nano-node --bin stacks-node
 
-**The checkpoint is not verifiable in-protocol at all in one respect.** PCS
-export is out of protocol: no consensus rule commits to a squashed archival
-MARF, so there is no rule that can be checked. The header attestation is a check
-on the *root*, and the recomputation is a check that the *graph* hashes to that
-root. Together they leave one unfalsifiable assumption — that Sha512/256 is not
-broken — which is the same assumption the chain itself rests on.
+export NANO_BUNDLE=/srv/nano-checkpoints/8665600/bundle
+export NANO_BUILDER_POLICY=/srv/nano-checkpoints/policy/builders.toml
+export NANO_BUILDER_SIGNATURES=/srv/nano-checkpoints/8665600/signatures
+export NANO_BITCOIN_RPC=http://127.0.0.1:8332
+export NANO_BITCOIN_USER=nano-checkpoint
+export NANO_BITCOIN_PASSWORD_FILE=/run/secrets/nano-bitcoin-rpc-password
+```
 
-**Divergence is loud, and quickly.** `append_block` compares the state root nano
-computes for every block against the `state_index_root` in that block's signed
-header and rejects the block on mismatch. A wrong checkpoint therefore fails on
-the first block nano executes after it, not silently later. This is the backstop
-that makes a bad checkpoint an outage rather than a fork: nano stops, it does not
-serve wrong answers. Operators should treat "first block after import fails to
-match" as "the checkpoint is wrong", not as a nano bug.
+Each independent builder assembles a new directory without a manifest and
+runs:
 
-## Recommended procedure for a mainnet checkpoint
+```sh
+./target/release/stacks-node build-checkpoint-manifest \
+  --bundle "$NANO_BUNDLE" \
+  --bitcoin-rpc-url "$NANO_BITCOIN_RPC" \
+  --bitcoin-rpc-user "$NANO_BITCOIN_USER" \
+  --bitcoin-rpc-password-file "$NANO_BITCOIN_PASSWORD_FILE"
+```
 
-1. Obtain the checkpoint and its `checkpoint.toml` from a source you would trust
-   with a binary — the same bar, since it is the same power.
-2. Obtain the reward set for the cycle containing the checkpoint independently
-   of that source, and pin it.
-3. Start nano. Before importing it fetches the header at `source_state_id`,
-   attests it against the pinned reward set and records what it found
-   (`nano_node::adopt_checkpoint`); the import then recomputes the root from the
-   trie graph.
-4. Watch the first tenure execute. A checkpoint that survives one block of
-   execution against signed headers is a checkpoint the network agrees with.
+Compare the resulting manifest bytes and reported content root out of band.
+Only after they agree does each builder sign its independently built copy:
 
-## Provenance
+```sh
+./target/release/stacks-node sign-checkpoint-manifest \
+  --bundle "$NANO_BUNDLE" \
+  --policy "$NANO_BUILDER_POLICY" \
+  --signatures "$NANO_BUILDER_SIGNATURES" \
+  --builder archive-east \
+  --private-key /run/secrets/archive-east-checkpoint-key \
+  --bitcoin-rpc-url "$NANO_BITCOIN_RPC" \
+  --bitcoin-rpc-user "$NANO_BITCOIN_USER" \
+  --bitcoin-rpc-password-file "$NANO_BITCOIN_PASSWORD_FILE"
+```
 
-nano writes `checkpoint-provenance.toml` into its state directory when it
-imports, holding the manifest it imported and the attestation it obtained:
+The private-key file is 32-byte lowercase hexadecimal and must never be stored
+in the bundle, signature directory or repository. Publish the immutable bundle
+manifest and signatures through append-only release storage. Publish the
+operator policy through a separately authenticated channel.
+
+A fresh operator verifies everything without opening node state:
+
+```sh
+./target/release/stacks-node verify-checkpoint \
+  --bundle "$NANO_BUNDLE" \
+  --policy "$NANO_BUILDER_POLICY" \
+  --signatures "$NANO_BUILDER_SIGNATURES" \
+  --bitcoin-rpc-url "$NANO_BITCOIN_RPC" \
+  --bitcoin-rpc-user "$NANO_BITCOIN_USER" \
+  --bitcoin-rpc-password-file "$NANO_BITCOIN_PASSWORD_FILE"
+```
+
+Verification reads every payload byte, recomputes the signer proof and active
+profile, checks the local Bitcoin view, and verifies the builder threshold. It
+writes no node state. Startup repeats this verification before first import.
+
+## Provenance and restart
+
+Before import, nano durably writes immutable `checkpoint-provenance.toml` into
+the state directory:
 
 ```toml
 [checkpoint]
 format = "stacks-core-marf-sqlite-v2"
-checkpoint_stacks_height = 400
-source_state_id = "59fddf16…"
-published_state_index_root = "34644adb…"
-first_bitcoin_height = 277
-profile_fingerprint = "0123456789abcdef…"
+checkpoint_stacks_height = 8665600
+source_state_id = "a87338900f279efc1b1df130004238cac8e09a2a4244fea39436fc66afae932d"
+published_state_index_root = "67596465d4a6642ad6fcec1df57c6ef758fcdb0003c7ed7f952e3ced1d7f44ec"
+first_bitcoin_height = 960231
+profile_fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 [attestation]
-attesting_block_id = "59fddf16…"
-signer_weight = 12
-approval_threshold = 9
+attesting_block_id = "a87338900f279efc1b1df130004238cac8e09a2a4244fea39436fc66afae932d"
+signer_weight = 2708
+approval_threshold = 2599
+
+[bundle]
+content_root = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+bitcoin_height = 960231
+bitcoin_block_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+builders = ["archive-east", "archive-west"]
 ```
 
-A restart reads it back. State on disk descends from the checkpoint it was
-imported from, so a directory that already names a different checkpoint is
-refused (`ProvenanceMismatch`) rather than resumed — otherwise editing the
-configured checkpoint would graft one chain's blocks onto another chain's state,
-and nothing downstream could tell. An absent `[attestation]` section is the
-record that the state was taken on the operator's word alone.
+A restart refuses a different checkpoint, profile or trust receipt. It rechecks
+the persisted content root against the current external builder policy,
+signature threshold and local Bitcoin view, but does not hash the imported MARF
+again. The durable state records its own profile and network and refuses a
+mismatch. Legacy mainnet state without signed-bundle provenance must be imported
+again; it is not silently upgraded.
 
-## Why boot contract sources are not embedded
+## Retention and recovery
 
-The alternative trust root would be building the state ourselves: embed the boot
-`.clar` sources, run genesis, replay to the 4.0 boundary, and compare the root.
-We are not doing that, for three reasons.
+Keep the following indefinitely as release evidence:
 
-*It would not be an independent check.* Reaching the 4.0 boundary from genesis
-means executing epochs 2.0 through 3.4 bit-exactly: microblocks, PoX-1 through
-PoX-4, cost-voting, `at-block`, every epoch transition and the genesis balance
-import. That is precisely the decade of legacy nano exists to not carry — it is
-most of stacks-core's 724k lines. A partial reimplementation that disagreed with
-the checkpoint would not tell us which side was wrong, and a complete one would
-be stacks-core.
+- `checkpoint.toml`, `checkpoint-bundle.toml`, `block.bin` and the independent
+  reward set;
+- the builder policy version used, every builder signature and their publication
+  timestamps or object versions;
+- the release binary identity and exact verification command/output;
+- at least one complete bundle in archival storage.
 
-*The check we have is stronger.* "The reward set signed this root" is a statement
-about what the network accepted. "Our own from-genesis replay agrees" is a
-statement about our own code. The first is the thing an operator actually wants
-to know.
+Keep the local bundle until the import finishes, the first post-checkpoint block
+is sealed, and a clean restart succeeds. The large imported MARF source can then
+be removed from the node host; retain the small configured evidence and an
+archival copy for disaster recovery.
 
-*The cost is not just the sources.* The 11k lines of `.clar` are the cheap part;
-the epoch initializers, the genesis account import and the pre-4.0 consensus
-rules around them are not.
+If import is interrupted, nano leaves
+`checkpoint-import-unfinished.toml` and refuses the directory. Do not remove the
+marker or resume the partial files. Remove the entire target state directory,
+verify the archived bundle again, and import into a new empty directory. The
+same procedure applies to corrupted state: preserve it for diagnosis, restore
+no individual database files, and reimport into a different directory.
 
-This decision is worth revisiting for a chain that begins at epoch 4.0 — a fresh
-network has no legacy epochs to replay, so boot sources plus a genesis path
-would cost roughly what the sources themselves cost. Hacknet is such a chain, but
-nano already replays it from a checkpoint, so building it there would buy a
-duplicate of a path we already have rather than a second opinion on mainnet.
+## New and incrementally distributed checkpoints
+
+A new checkpoint is a new immutable release:
+
+1. build it independently from at least two separately acquired archives or
+   nodes;
+2. compare state root, manifest bytes and content root;
+3. sign the new root with keys active at the new checkpoint height;
+4. publish the bundle, policy version and signatures without changing the old
+   release;
+5. verify and import it into a new node working directory;
+6. follow and execute from the checkpoint using local Bitcoin and Stacks P2P.
+
+Chunk hashes allow transport systems to fetch or deduplicate pieces
+incrementally, but nano does not apply an incremental state patch. The complete
+new bundle must verify before import. A compiler/profile change likewise uses a
+new checkpoint and full replay; opening old state is never an implicit
+migration.
+
+## Remaining trust and failure behavior
+
+No consensus rule commits to a particular archival MARF encoding. The signed
+header authenticates the state root, and the importer proves the supplied graph
+hashes to it. Independent builders reduce archive and construction risk. This
+still rests on the chain's hash and signature assumptions.
+
+Every later block is checked against the state root in its signed header. A bad
+checkpoint therefore stops at the first disagreement; nano does not fall back
+to another engine or continue serving a fork. Treat a first-block root mismatch
+as failed checkpoint evidence until independently disproved.

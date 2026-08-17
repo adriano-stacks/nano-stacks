@@ -260,10 +260,96 @@ nix develop --command cargo xtask verify-block \
 
 The command must print `accepted with weight` and exit with status 0.
 
-## 9. Use the bundle
+## 9. Build the content manifest with local Bitcoin Core
 
-The finished bundle is `NANO_CHECKPOINT_DIR`. It now has all paths used by
-[`mainnet-node.example.toml`](mainnet-node.example.toml).
+The Esplora service used during capture is not accepted as checkpoint trust.
+Use the builder's own synced Bitcoin Core for the exact checkpoint-height hash:
+
+```sh
+export NANO_BITCOIN_RPC=http://127.0.0.1:8332
+export NANO_BITCOIN_USER=nano-checkpoint
+export NANO_BITCOIN_PASSWORD_FILE=/run/secrets/nano-bitcoin-rpc-password
+
+nix develop --command cargo build --release -p nano-node --bin stacks-node
+./target/release/stacks-node build-checkpoint-manifest \
+  --bundle "$NANO_CHECKPOINT_DIR" \
+  --bitcoin-rpc-url "$NANO_BITCOIN_RPC" \
+  --bitcoin-rpc-user "$NANO_BITCOIN_USER" \
+  --bitcoin-rpc-password-file "$NANO_BITCOIN_PASSWORD_FILE"
+```
+
+The command recomputes the block/reward-set threshold and active compiler
+profile before writing the new `checkpoint-bundle.toml`. It refuses to replace
+an existing manifest.
+
+## 10. Rebuild independently
+
+The Hiro procedure above produces one builder's candidate. It is not sufficient
+release evidence by itself. At least one other builder in a distinct failure
+domain must independently acquire an archive or node state, convert it, obtain
+the reward set and Bitcoin header view independently, and run the same manifest
+command in a different directory.
+
+Exchange only these results first:
+
+```sh
+sha256sum "$NANO_CHECKPOINT_DIR/checkpoint-bundle.toml"
+sed -n 's/^content_root = "\([0-9a-f]*\)"/\1/p' \
+  "$NANO_CHECKPOINT_DIR/checkpoint-bundle.toml"
+```
+
+Both the complete manifest bytes and content root must agree. A matching root
+from two processes which share the same archive, host, storage or operator is a
+useful reproducibility check but not independent failure-domain evidence. Stop
+on any mismatch; do not choose one candidate by majority or edit either
+manifest.
+
+## 11. Sign and publish the agreed manifest
+
+Each builder uses an independently held key named by the operator-pinned
+policy. Start from
+[`checkpoint-builders.example.toml`](checkpoint-builders.example.toml), replace
+every example key, and keep the policy and signatures outside the bundle:
+
+```sh
+export NANO_BUILDER_POLICY=/srv/nano-checkpoints/policy/builders.toml
+export NANO_BUILDER_SIGNATURES=/srv/nano-checkpoints/$NANO_CHECKPOINT_HEIGHT/signatures
+
+./target/release/stacks-node sign-checkpoint-manifest \
+  --bundle "$NANO_CHECKPOINT_DIR" \
+  --policy "$NANO_BUILDER_POLICY" \
+  --signatures "$NANO_BUILDER_SIGNATURES" \
+  --builder archive-east \
+  --private-key /run/secrets/archive-east-checkpoint-key \
+  --bitcoin-rpc-url "$NANO_BITCOIN_RPC" \
+  --bitcoin-rpc-user "$NANO_BITCOIN_USER" \
+  --bitcoin-rpc-password-file "$NANO_BITCOIN_PASSWORD_FILE"
+```
+
+The signature file is created once and never replaced. Publish the manifest and
+signatures in append-only release storage, and distribute the builder policy
+through a separately authenticated operator channel. Never publish the private
+key.
+
+## 12. Verify and use the bundle
+
+A fresh operator verifies every byte, local Bitcoin view and builder threshold
+without opening node state:
+
+```sh
+./target/release/stacks-node verify-checkpoint \
+  --bundle "$NANO_CHECKPOINT_DIR" \
+  --policy "$NANO_BUILDER_POLICY" \
+  --signatures "$NANO_BUILDER_SIGNATURES" \
+  --bitcoin-rpc-url "$NANO_BITCOIN_RPC" \
+  --bitcoin-rpc-user "$NANO_BITCOIN_USER" \
+  --bitcoin-rpc-password-file "$NANO_BITCOIN_PASSWORD_FILE"
+```
+
+The finished bundle now has all paths used by
+[`mainnet-node.example.toml`](mainnet-node.example.toml), plus
+`checkpoint-bundle.toml`. Configure `checkpoint.bundle`, `builder_policy` and
+`builder_signatures` as well as the payload paths below.
 
 Copy the example and set these values:
 
@@ -282,14 +368,18 @@ Copy `source_state_id`, `published_state_index_root`, and
 [`Run a mainnet node`](running-a-mainnet-node.md).
 
 Keep the downloaded and extracted data until nano-stacks imports the checkpoint
-and executes new blocks. After that, you can keep only the finished bundle and
-the node working directory.
+and executes new blocks. Retain at least one complete bundle, policy version and
+all signatures in archival storage. After a clean post-import restart, the node
+host may discard the large source MARF, but it must keep the small configured
+evidence and the external signing evidence available.
 
 ## Trust limit
 
 Hiro publishes the archive and its checksum. This gives one source for both
 items. The separate reward-set check proves that the checkpoint block has
 enough signer weight. nano-stacks also rebuilds the state root during import.
+Only an independently acquired second build and threshold builder signatures
+turn this one-source procedure into release evidence.
 
 These checks lower the risk, but they do not remove all trust. Read
 [`Checkpoint trust`](checkpoint-trust.md) before you use this data.

@@ -1,0 +1,23 @@
+# Example-only public keys. Replace all builders through an independently
+# authenticated operator policy before verifying a real checkpoint.
+schema = "nano-stacks/checkpoint-builder-policy/v1"
+required_signatures = 2
+
+[[builders]]
+name = "archive-east"
+public_key = "022150d4ea6dc60e75e162455553a92adea0a0f3000c192cc55d0bffed22c0a8e0"
+valid_from_height = 0
+valid_through_height = 8699999
+
+[[builders]]
+name = "archive-east"
+public_key = "0228a566db9a7b3212d612aa06e34fa981351a4372737849bfcaa1a28e8a044e5d"
+valid_from_height = 8700000
+
+[[builders]]
+name = "archive-west"
+public_key = "02292037d39e7e86b087935d48364ccc0fab52821b8487a78ee936bd1c1d0cd8d1"
+valid_from_height = 0
+
+# To reject a compromised key before its declared end, add:
+# revoked_from_height = 8680000

@@ -191,7 +191,12 @@ fn the_checkpoint_procedure_names_the_fields_the_node_writes() {
             signer_weight: 12,
             approval_threshold: 9,
         }),
-        bundle: None,
+        bundle: Some(nano_marf::CheckpointBundleReceipt {
+            content_root: [0xab; 32],
+            bitcoin_height: 277,
+            bitcoin_block_hash: [0x12; 32],
+            builders: vec!["archive-east".to_owned(), "archive-west".to_owned()],
+        }),
     };
     // Written through the real `record`, so the keys compared are the ones a node
     // puts on disk rather than the ones a test thought it would. In a fresh
@@ -213,7 +218,19 @@ fn the_checkpoint_procedure_names_the_fields_the_node_writes() {
         );
         checked += 1;
     }
-    assert!(checked >= 8, "only {checked} provenance keys were checked");
+    assert!(checked >= 12, "only {checked} provenance keys were checked");
+}
+
+#[test]
+fn checkpoint_operator_examples_are_accepted_by_the_node() {
+    let root = workspace();
+    nano_node::checkpoint_signatures::BuilderPolicy::load(
+        root.join("docs/checkpoint-builders.example.toml"),
+    )
+    .expect("the builder policy example is valid");
+    let config = std::fs::read_to_string(root.join("docs/mainnet-node.example.toml"))
+        .expect("read mainnet config example");
+    nano_node::config::Config::parse(&config).expect("the mainnet config example is valid");
 }
 
 /// `developer-mode` stays on, deliberately.

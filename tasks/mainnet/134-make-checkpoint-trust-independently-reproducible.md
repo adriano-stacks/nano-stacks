@@ -37,7 +37,7 @@ claims.
       manifests before touching production state.
 - [x] Rebuild a sample checkpoint from its published inputs in CI or scheduled
       infrastructure and compare it with the released manifest.
-- [ ] Document recovery, retention and incremental/new-checkpoint procedures
+- [x] Document recovery, retention and incremental/new-checkpoint procedures
       without introducing a hosted service dependency into consensus following.
 
 ## Acceptance Criteria

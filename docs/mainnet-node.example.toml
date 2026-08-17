@@ -22,6 +22,11 @@ magic = "X2"
 pox_5_activation_height = 960230
 
 [checkpoint]
+bundle = "/path/to/mainnet-checkpoint"
+# Both are external trust evidence and must not be inside the bundle.
+builder_policy = "/path/to/checkpoint-builders.toml"
+builder_signatures = "/path/to/checkpoint-signatures"
+
 # checkpoint.toml, marf.sqlite.blobs, and block-headers.sqlite must be next
 # to this file.
 marf = "/path/to/mainnet-checkpoint/marf.sqlite"

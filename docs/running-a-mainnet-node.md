@@ -16,7 +16,9 @@ You need:
 - a Linux host with Nix and Git;
 - a large local disk;
 - a complete mainnet checkpoint bundle;
-- a synced Bitcoin Core RPC, or a Bitcoin Esplora endpoint;
+- an operator-pinned builder policy and threshold signature directory, obtained
+  separately from the bundle;
+- a synced local Bitcoin Core RPC;
 - outbound TCP access to Stacks peers on port `20444`.
 
 A mainnet checkpoint can use hundreds of gigabytes. The first import can take
@@ -33,6 +35,7 @@ The bundle must contain these files:
 
 ```text
 mainnet-checkpoint/
+├── checkpoint-bundle.toml
 ├── checkpoint.toml
 ├── marf.sqlite
 ├── marf.sqlite.blobs
@@ -51,6 +54,9 @@ mainnet-checkpoint/
         └── *.bin
 ```
 
+Keep the builder policy and signatures outside `mainnet-checkpoint/`. The
+bundle cannot be allowed to declare the keys which authenticate itself.
+
 Get `reward-set.json` without using the checkpoint as its source. It must be the
 signer set for the cycle that signed `block.bin`.
 
@@ -58,6 +64,7 @@ The files have these roles:
 
 | File | Use |
 |---|---|
+| `checkpoint-bundle.toml` | Content-addresses every payload byte and consensus claim. |
 | `checkpoint.toml` | Names the checkpoint height, state ID, root, and Bitcoin height. |
 | `marf.sqlite` and `marf.sqlite.blobs` | Hold the Clarity state. |
 | `block-headers.sqlite` | Holds old block data used by Clarity reads. |
@@ -69,7 +76,8 @@ The files have these roles:
 | `authentication-history/` | Holds the block proof before the checkpoint. |
 
 Do not build a reward set from the checkpoint that it will check. That check is
-circular and gives no trust.
+circular and gives no trust. Read [Checkpoint trust](checkpoint-trust.md) for
+the builder policy, rotation and publication procedure.
 
 ## Build the node
 
@@ -80,6 +88,26 @@ nix develop --command cargo build --release -p nano-node --bin stacks-node
 ```
 
 The binary is `target/release/stacks-node`.
+
+## Verify the checkpoint offline
+
+Point the verifier at your local Bitcoin Core and at evidence acquired outside
+the bundle:
+
+```sh
+./target/release/stacks-node verify-checkpoint \
+  --bundle /path/to/mainnet-checkpoint \
+  --policy /path/to/checkpoint-builders.toml \
+  --signatures /path/to/checkpoint-signatures \
+  --bitcoin-rpc-url http://127.0.0.1:8332 \
+  --bitcoin-rpc-user REPLACE_WITH_BITCOIN_RPC_USER \
+  --bitcoin-rpc-password-file /run/secrets/bitcoin-rpc-password
+```
+
+This hashes every file, recomputes the checkpoint signer proof and active
+compiler/profile, checks the builder threshold, and binds the exact checkpoint
+burn height to local Bitcoin Core. It opens no node state. Stop if it does not
+print the content root and every expected builder name.
 
 ## Write the configuration
 
@@ -94,21 +122,20 @@ Edit `mainnet-node.toml`:
 1. Set `node.working_dir` to a new, empty directory. The node user must be able
    to write there.
 2. Set the Bitcoin RPC URL, user, and password.
-3. Set every checkpoint path.
-4. Copy `source_state_id` and `published_state_index_root` from
+3. Set `checkpoint.bundle`, `builder_policy` and `builder_signatures`. Keep the
+   last two outside the bundle.
+4. Set every checkpoint payload path to its file inside the verified bundle.
+5. Copy `source_state_id` and `published_state_index_root` from
    `checkpoint.toml`. Put the second value in `state_root`.
-5. Copy `first_bitcoin_height` from `checkpoint.toml` to
+6. Copy `first_bitcoin_height` from `checkpoint.toml` to
    `anchor_bitcoin_height`.
-6. Set the path to the independent `reward-set.json`.
+7. Set the path to the independently acquired `reward-set.json` inside the
+   verified bundle.
 
 Keep the configuration file private. It contains the Bitcoin RPC password.
 
-The example uses a local Bitcoin Core node. To use Esplora, remove `rpc_url`,
-`rpc_user`, and `rpc_password`, then add:
-
-```toml
-rest_url = "https://your-esplora.example/api"
-```
+Mainnet signed-checkpoint startup requires local Bitcoin Core. A REST/Esplora
+burn source is deliberately refused for this trust decision.
 
 The node uses the built-in mainnet P2P seeds when `p2p_seeds` is absent. It
 does not need a hosted Stacks HTTP API. The example is outbound-only. Read
@@ -123,9 +150,9 @@ Run:
 ./target/release/stacks-node check-config --config mainnet-node.toml
 ```
 
-This checks the TOML values. It does not read all checkpoint files. The first
-start checks the checkpoint manifest, state root, block signatures, reward set,
-and history.
+This checks the TOML shape. It does not replace `verify-checkpoint`. The first
+start repeats full bundle, Bitcoin, signer and builder verification before it
+creates or imports production state.
 
 ## Start the node
 
@@ -136,8 +163,8 @@ Run the node in the foreground for the first start:
 ```
 
 The first start imports the checkpoint. Do not stop the process during the
-import. Wait for the log to show that the checkpoint passed attestation and
-that blocks are being executed.
+import. Wait for the log to show the authenticated content root and builders,
+the checkpoint attestation, and then blocks being executed.
 
 The node stores all new files under `node.working_dir`. Never run two node
 processes with the same working directory.
@@ -175,8 +202,15 @@ Restart with the same command and the same configuration:
 ./target/release/stacks-node start --config mainnet-node.toml
 ```
 
-The node reads the saved tip and continues. It does not import the checkpoint
-again.
+The node reads the saved tip and continues. It rechecks the persisted content
+root against the current external signatures/policy and local Bitcoin view, but
+does not hash or import the source MARF again. Keep the policy, signatures and
+small checkpoint evidence available on every start.
+
+If the first import was interrupted, do not delete
+`checkpoint-import-unfinished.toml`. Remove the whole target working directory,
+verify the archived bundle, and import into a new empty directory. See
+[Checkpoint trust and recovery](checkpoint-trust.md#retention-and-recovery).
 
 Keep `p2p-seed` under the working directory. It is the node identity. Do not
 copy one working directory to two live nodes.
