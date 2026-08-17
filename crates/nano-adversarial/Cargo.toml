@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
+stacks-common = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
+stackslib = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf" }
 nano-chainstate = { path = "../nano-chainstate", default-features = false }
 nano-codec = { path = "../nano-codec" }
 nano-marf = { path = "../nano-marf" }

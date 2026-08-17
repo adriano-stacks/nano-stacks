@@ -14,6 +14,10 @@ case "$target" in
     seed_directory=crates/nano-adversarial/corpus/codecs
     max_length=65536
     ;;
+  transaction_and_block_differential)
+    seed_directory=crates/nano-adversarial/corpus/codecs
+    max_length=65536
+    ;;
   signer_and_stackerdb_codecs)
     seed_directory=crates/nano-adversarial/corpus/signer-stackerdb
     max_length=65536

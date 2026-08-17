@@ -5,7 +5,7 @@ use std::{
 
 use nano_adversarial::{
     checkpoint_manifests, clarity_wasm_abi, marf_operations, p2p_frame_and_protocol,
-    signer_and_stackerdb_codecs, transaction_and_block_codecs,
+    signer_and_stackerdb_codecs, transaction_and_block_codecs, transaction_and_block_differential,
 };
 
 const MAX_SEEDS_PER_TARGET: usize = 32;
@@ -28,6 +28,11 @@ fn owned_corpora_stay_bounded_and_replay() {
         Target {
             name: "codecs",
             run: transaction_and_block_codecs,
+            required_coverage: 3,
+        },
+        Target {
+            name: "codecs",
+            run: transaction_and_block_differential,
             required_coverage: 3,
         },
         Target {

@@ -1,7 +1,11 @@
 //! Bounded entry points shared by deterministic corpus replay and fuzz engines.
 
-use std::{collections::BTreeMap, fs};
+use std::{collections::BTreeMap, fs, io::Cursor};
 
+use blockstack_lib::chainstate::{
+    nakamoto::NakamotoBlock as ReferenceNakamotoBlock,
+    stacks::StacksTransaction as ReferenceTransaction,
+};
 use clarity::vm::{ClarityVersion, types::QualifiedContractIdentifier};
 use nano_chainstate::NakamotoBlock;
 use nano_codec::Transaction;
@@ -15,6 +19,7 @@ use nano_p2p::{
 use nano_primitives::Network;
 use nano_stackerdb::{Chunk, SignerMessage};
 use nano_vm::{SemanticEpochInspection, Vm, semantic_epoch_at_burn_height};
+use stacks_common::codec::StacksMessageCodec;
 
 const MAX_WIRE_BYTES: usize = 1024 * 1024;
 const MAX_CODEC_BYTES: usize = 2 * 1024 * 1024;
@@ -93,6 +98,72 @@ pub fn transaction_and_block_codecs(input: &[u8]) -> u8 {
         coverage |= 2;
     }
     coverage
+}
+
+/// Compare canonical transaction and Nakamoto block codecs with pinned stacks-core.
+#[must_use]
+pub fn transaction_and_block_differential(input: &[u8]) -> u8 {
+    let Some(input) = within(input, MAX_CODEC_BYTES) else {
+        return 0;
+    };
+
+    let nano_transaction = Transaction::decode(input).map(|(transaction, consumed)| {
+        (
+            transaction.encode(),
+            u64::try_from(consumed).expect("bounded input"),
+        )
+    });
+    let mut reference_input = Cursor::new(input);
+    let reference_transaction = ReferenceTransaction::consensus_deserialize(&mut reference_input)
+        .map(|transaction| {
+            let mut encoded = Vec::new();
+            transaction
+                .consensus_serialize(&mut encoded)
+                .expect("decoded reference transaction re-encodes");
+            (encoded, reference_input.position())
+        });
+    let transaction_coverage = match (nano_transaction, reference_transaction) {
+        (Ok(nano), Ok(reference)) => {
+            assert_eq!(nano, reference, "transaction codec divergence");
+            1
+        }
+        (Err(_), Err(_)) => 0,
+        (nano, reference) => panic!(
+            "transaction acceptance divergence: nano={}, reference={}",
+            nano.is_ok(),
+            reference.is_ok()
+        ),
+    };
+
+    let nano_block = NakamotoBlock::decode(input).map(|block| block.encode());
+    let mut reference_input = Cursor::new(input);
+    let reference_block = ReferenceNakamotoBlock::consensus_deserialize(&mut reference_input)
+        .and_then(|block| {
+            if reference_input.position()
+                != u64::try_from(input.len()).expect("bounded input length")
+            {
+                return Err(stacks_common::codec::Error::DeserializeError(
+                    "trailing Nakamoto block bytes".to_owned(),
+                ));
+            }
+            let mut encoded = Vec::new();
+            block.consensus_serialize(&mut encoded)?;
+            Ok(encoded)
+        });
+    let block_coverage = match (nano_block, reference_block) {
+        (Ok(nano), Ok(reference)) => {
+            assert_eq!(nano, reference, "Nakamoto block codec divergence");
+            2
+        }
+        (Err(_), Err(_)) => 0,
+        (nano, reference) => panic!(
+            "Nakamoto block acceptance divergence: nano={}, reference={}",
+            nano.is_ok(),
+            reference.is_ok()
+        ),
+    };
+
+    transaction_coverage | block_coverage
 }
 
 /// Exercise signer messages and their enclosing `StackerDB` chunks.

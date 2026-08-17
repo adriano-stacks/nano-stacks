@@ -51,6 +51,7 @@ run_gate() {
       for target in \
         p2p_frame_and_protocol \
         transaction_and_block_codecs \
+        transaction_and_block_differential \
         signer_and_stackerdb_codecs \
         checkpoint_manifests \
         marf_operations \

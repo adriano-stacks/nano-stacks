@@ -28,6 +28,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "transaction_and_block_differential"
+path = "fuzz_targets/transaction_and_block_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "signer_and_stackerdb_codecs"
 path = "fuzz_targets/signer_and_stackerdb_codecs.rs"
 test = false
