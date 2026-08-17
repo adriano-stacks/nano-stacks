@@ -25,10 +25,10 @@ artifact and its dependency closure.
 - [x] Define the minimal follower capability and dependency matrix: local
       Bitcoin view, Stacks P2P acquisition, authentication/fork choice,
       clarity-wasm execution, durable state, health and metrics.
-- [ ] Produce a separate follower binary/package that does not link miner,
+- [x] Produce a separate follower binary/package that does not link miner,
       signer, TUI, proposal validation, StackerDB hosting or mutation-capable
       compatibility RPC code.
-- [ ] Default the follower to outbound P2P and loopback health/metrics. Make any
+- [x] Default the follower to outbound P2P and loopback health/metrics. Make any
       public serving edge an explicit separately supervised component.
 - [ ] Keep optional miner, signer, TUI, event and compatibility adapters as
       separate processes with bounded protocols and no direct chainstate write
