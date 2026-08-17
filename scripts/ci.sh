@@ -55,6 +55,7 @@ run_gate() {
         transaction_and_block_differential \
         signer_and_stackerdb_codecs \
         checkpoint_manifests \
+        checkpoint_import \
         marf_operations \
         clarity_wasm_abi
       do

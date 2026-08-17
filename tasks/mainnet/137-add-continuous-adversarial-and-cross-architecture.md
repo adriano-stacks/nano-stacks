@@ -21,7 +21,7 @@ every finding as a deterministic regression.
 
 ## Tasks
 
-- [ ] Add structure-aware fuzz targets for P2P framing/session state,
+- [x] Add structure-aware fuzz targets for P2P framing/session state,
       transaction and block codecs, signer/StackerDB messages, checkpoint
       manifests/import, MARF operations and clarity-wasm ABI boundaries.
 - [ ] Differentially fuzz consensus-visible outputs against compatible

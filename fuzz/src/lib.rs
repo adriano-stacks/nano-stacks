@@ -153,6 +153,35 @@ pub fn session_bytes(mut case: SessionCase) -> Vec<u8> {
 }
 
 #[derive(Arbitrary, Debug)]
+pub struct CheckpointImportCase {
+    blocks: Vec<CheckpointBlock>,
+}
+
+#[derive(Arbitrary, Debug)]
+struct CheckpointBlock {
+    entries: Vec<CheckpointEntry>,
+}
+
+#[derive(Arbitrary, Debug)]
+struct CheckpointEntry {
+    key: u8,
+    value: u8,
+}
+
+pub fn checkpoint_import_bytes(mut case: CheckpointImportCase) -> Vec<u8> {
+    case.blocks.truncate(4);
+    let mut bytes = vec![u8::try_from(case.blocks.len()).expect("four bounded blocks")];
+    for mut block in case.blocks {
+        block.entries.truncate(16);
+        bytes.push(u8::try_from(block.entries.len()).expect("sixteen bounded entries"));
+        for entry in block.entries {
+            bytes.extend_from_slice(&[entry.key, entry.value]);
+        }
+    }
+    bytes
+}
+
+#[derive(Arbitrary, Debug)]
 pub struct MarfCase {
     operations: Vec<MarfOperation>,
 }

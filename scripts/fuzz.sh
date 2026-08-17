@@ -30,6 +30,10 @@ case "$target" in
     seed_directory=crates/nano-adversarial/corpus/checkpoint
     max_length=65536
     ;;
+  checkpoint_import)
+    seed_directory=crates/nano-adversarial/corpus/checkpoint-import
+    max_length=133
+    ;;
   marf_operations)
     seed_directory=crates/nano-adversarial/corpus/marf
     max_length=32768

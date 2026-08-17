@@ -56,6 +56,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "checkpoint_import"
+path = "fuzz_targets/checkpoint_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "marf_operations"
 path = "fuzz_targets/marf_operations.rs"
 test = false

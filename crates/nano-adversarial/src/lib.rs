@@ -4,7 +4,13 @@ use std::{collections::BTreeMap, fs, io::Cursor};
 
 use blockstack_lib::chainstate::{
     nakamoto::NakamotoBlock as ReferenceNakamotoBlock,
-    stacks::StacksTransaction as ReferenceTransaction,
+    stacks::{
+        StacksTransaction as ReferenceTransaction,
+        index::{
+            ClarityMarfTrieId as _, MARFValue as ReferenceMarfValue,
+            marf::{MARF as ReferenceMarf, MARFOpenOpts as ReferenceMarfOpenOpts},
+        },
+    },
 };
 use clarity::vm::{ClarityVersion, types::QualifiedContractIdentifier};
 use nano_chainstate::NakamotoBlock;
@@ -12,19 +18,22 @@ use nano_codec::Transaction;
 use nano_crypto::StacksPrivateKey;
 use nano_marf::{
     BUNDLE_MANIFEST_FILE, CheckpointBundleManifest, CheckpointManifest, MarfTrie, MarfValue,
+    import_checkpoint,
 };
 use nano_p2p::{
     InboundLimits, Listener, LocalPeer, Protocol, Service, Session, SessionError, serve_peer,
     wire::{ChainView, Message, NeighborAddress, PREAMBLE_LEN, PeerAddress, Preamble, nack},
 };
-use nano_primitives::{BitVec, BitcoinHeaderHash, ConsensusHash, Hash160, Network};
+use nano_primitives::{BitVec, BitcoinHeaderHash, ConsensusHash, Hash160, Network, TrieHash};
 use nano_stackerdb::{Chunk, SignerMessage};
 use nano_vm::{SemanticEpochInspection, Vm, semantic_epoch_at_burn_height};
 use stacks_common::codec::StacksMessageCodec;
+use stacks_common::types::chainstate::StacksBlockId as ReferenceStacksBlockId;
 
 const MAX_WIRE_BYTES: usize = 1024 * 1024;
 const MAX_CODEC_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+const MAX_CHECKPOINT_IMPORT_BYTES: usize = 1 + 4 * (1 + 16 * 2);
 const MAX_CLARITY_BYTES: usize = 128 * 1024;
 const MAX_MARF_OPERATIONS: usize = 256;
 const MAX_SESSION_OPERATIONS: usize = 32;
@@ -382,6 +391,98 @@ pub fn checkpoint_manifests(input: &[u8]) -> u8 {
 
     let _ = CheckpointBundleManifest::verify(directory.path());
     coverage
+}
+
+/// Build a bounded stacks-core checkpoint and import its complete graph through nano.
+#[must_use]
+pub fn checkpoint_import(input: &[u8]) -> u8 {
+    let Some(input) = within(input, MAX_CHECKPOINT_IMPORT_BYTES) else {
+        return 0;
+    };
+    let Some((&block_count, mut input)) = input.split_first() else {
+        return 0;
+    };
+    let block_count = usize::from(block_count).min(4);
+    if block_count == 0 {
+        return 0;
+    }
+
+    let mut blocks = Vec::with_capacity(block_count);
+    let mut expected = BTreeMap::new();
+    let mut overwrote = false;
+    for _ in 0..block_count {
+        let Some((&entry_count, rest)) = input.split_first() else {
+            return 0;
+        };
+        let entry_count = usize::from(entry_count).min(16);
+        let Some((entries, rest)) = rest.split_at_checked(entry_count * 2) else {
+            return 0;
+        };
+        input = rest;
+
+        let mut writes = BTreeMap::new();
+        for entry in entries.chunks_exact(2) {
+            let key = format!("fuzz-key-{:02x}", entry[0]);
+            let value = [entry[1]; 40];
+            writes.insert(key.clone(), value);
+            overwrote |= expected.insert(key, value).is_some();
+        }
+        if writes.is_empty() {
+            return 0;
+        }
+        blocks.push(writes);
+    }
+
+    let directory = tempfile::tempdir().expect("temporary checkpoint directory");
+    let checkpoint = directory.path().join("marf.sqlite");
+    fs::write(format!("{}.blobs", checkpoint.display()), []).expect("create external blob file");
+    let mut options = ReferenceMarfOpenOpts::default();
+    options.external_blobs = true;
+    let mut reference = ReferenceMarf::<ReferenceStacksBlockId>::from_path(
+        checkpoint.to_str().expect("temporary path is UTF-8"),
+        options,
+    )
+    .expect("create reference checkpoint");
+    let mut parent = ReferenceStacksBlockId::sentinel();
+    for (index, writes) in blocks.iter().enumerate() {
+        let block =
+            ReferenceStacksBlockId([u8::try_from(index + 1).expect("four bounded blocks"); 32]);
+        let keys = writes.keys().cloned().collect::<Vec<_>>();
+        let values = writes.values().copied().map(ReferenceMarfValue).collect();
+        let mut transaction = reference.begin_tx().expect("begin reference transaction");
+        transaction
+            .begin(&parent, &block)
+            .expect("begin reference block");
+        transaction
+            .insert_batch(&keys, values)
+            .expect("write reference block");
+        transaction.seal().expect("seal reference block");
+        transaction.commit().expect("commit reference block");
+        parent = block;
+    }
+    let root = reference
+        .get_root_hash_at(&parent)
+        .expect("read reference root");
+    drop(reference);
+
+    let source = parent.0;
+    let root = TrieHash::from_bytes(root.0);
+    let imported =
+        import_checkpoint(&checkpoint, source, root).expect("import generated checkpoint");
+    assert_eq!(
+        imported.root(source).expect("read imported root"),
+        Some(root)
+    );
+    for (key, value) in expected {
+        assert_eq!(
+            imported
+                .get(source, key.as_bytes())
+                .expect("read imported key"),
+            Some(MarfValue::from_bytes(value))
+        );
+    }
+
+    1 | (u8::from(block_count > 1) << 1) | (u8::from(overwrote) << 2)
 }
 
 /// Exercise a bounded stream of in-memory MARF inserts and reads against an oracle.
