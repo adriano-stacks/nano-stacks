@@ -17,7 +17,8 @@ type: chore
 
 Act as the fail-closed roll-up for the new hardening program. Apply the
 mainnet-ready label only to the minimal follower artifact whose complete
-dependency graph, independent audit and full-cycle evidence are finished.
+dependency graph, independently reproduced checkpoint and full-cycle evidence
+are finished.
 
 ## Tasks
 
@@ -27,8 +28,8 @@ dependency graph, independent audit and full-cycle evidence are finished.
 - [ ] Run the qualifying release report against the signed artifact, checkpoint,
       mainnet capture and state from [[138-run-a-multi-operator-full-reward-cycle-qualificati]].
 - [ ] Verify that the report binds the clean source, reproducible artifact,
-      Epoch 4.0 profile, engine/SBOM, checkpoint builders, audit revision and raw
-      operator evidence.
+      Epoch 4.0 profile, engine/SBOM, checkpoint builders and raw operator
+      evidence.
 - [ ] Reconcile [[053-pass-the-mainnet-node-release-gate]] line by line; a stale
       checked box is not evidence and an unexecuted gate is not a pass.
 - [ ] Publish a signed go/no-go record naming residual operational assumptions,
