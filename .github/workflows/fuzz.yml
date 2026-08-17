@@ -65,7 +65,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TARGET: ${{ matrix.target }}
         run: |
-          if git diff --quiet -- "fuzz/corpus/$TARGET"; then
+          if test -z "$(git status --porcelain -- "fuzz/corpus/$TARGET")"; then
             exit 0
           fi
           branch="fuzz-finding/$TARGET-$GITHUB_RUN_ID"
