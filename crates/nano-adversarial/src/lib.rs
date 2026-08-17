@@ -9,14 +9,15 @@ use blockstack_lib::chainstate::{
 use clarity::vm::{ClarityVersion, types::QualifiedContractIdentifier};
 use nano_chainstate::NakamotoBlock;
 use nano_codec::Transaction;
+use nano_crypto::StacksPrivateKey;
 use nano_marf::{
     BUNDLE_MANIFEST_FILE, CheckpointBundleManifest, CheckpointManifest, MarfTrie, MarfValue,
 };
 use nano_p2p::{
-    Protocol,
-    wire::{Message, PREAMBLE_LEN, Preamble},
+    InboundLimits, Listener, LocalPeer, Protocol, Service, Session, SessionError, serve_peer,
+    wire::{ChainView, Message, NeighborAddress, PREAMBLE_LEN, PeerAddress, Preamble, nack},
 };
-use nano_primitives::Network;
+use nano_primitives::{BitVec, BitcoinHeaderHash, ConsensusHash, Hash160, Network};
 use nano_stackerdb::{Chunk, SignerMessage};
 use nano_vm::{SemanticEpochInspection, Vm, semantic_epoch_at_burn_height};
 use stacks_common::codec::StacksMessageCodec;
@@ -26,7 +27,9 @@ const MAX_CODEC_BYTES: usize = 2 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_CLARITY_BYTES: usize = 128 * 1024;
 const MAX_MARF_OPERATIONS: usize = 256;
+const MAX_SESSION_OPERATIONS: usize = 32;
 const CHECKPOINT_SEPARATOR: &[u8] = b"\n--- checkpoint.toml ---\n";
+const SESSION_CYCLE: ConsensusHash = ConsensusHash::from_bytes([0x61; 20]);
 
 fn within(input: &[u8], maximum: usize) -> Option<&[u8]> {
     (input.len() <= maximum).then_some(input)
@@ -68,6 +71,146 @@ pub fn p2p_frame_and_protocol(input: &[u8]) -> u8 {
     assert_eq!(message.encode(), input);
     assert_eq!(message.wire_len(), input.len());
     coverage | 1
+}
+
+#[derive(Default)]
+struct SessionService;
+
+impl Service for SessionService {
+    fn chain_view(&self) -> ChainView {
+        session_view(100)
+    }
+
+    fn neighbors(&self) -> Vec<NeighborAddress> {
+        vec![NeighborAddress {
+            address: PeerAddress::from_bytes([0x12; 16]),
+            port: 20444,
+            public_key_hash: Hash160::from_bytes([0x34; 20]),
+        }]
+    }
+
+    fn tenure_inventory(&self, cycle_start: ConsensusHash) -> Option<BitVec<2100>> {
+        (cycle_start == SESSION_CYCLE).then(|| {
+            let mut inventory = BitVec::zeros(2100).expect("fixed inventory width");
+            inventory.set(0, true).expect("first inventory bit");
+            inventory.set(2099, true).expect("last inventory bit");
+            inventory
+        })
+    }
+}
+
+fn session_view(height: u64) -> ChainView {
+    ChainView::with_stable_confirmations(
+        height,
+        BitcoinHeaderHash::from_bytes([0x45; 32]),
+        BitcoinHeaderHash::from_bytes([0x67; 32]),
+        1,
+    )
+    .expect("height exceeds one confirmation")
+}
+
+/// Exercise a bounded authenticated P2P conversation over a real loopback socket.
+#[must_use]
+pub fn p2p_session_state(input: &[u8]) -> u8 {
+    let Some(input) = within(input, MAX_SESSION_OPERATIONS) else {
+        return 0;
+    };
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build bounded session runtime")
+        .block_on(session_state(input))
+}
+
+async fn session_state(operations: &[u8]) -> u8 {
+    let protocol = Protocol::testnet()
+        .with_stable_confirmations(1)
+        .expect("one confirmation is valid");
+    let listener = Listener::bind("127.0.0.1:0".parse().expect("loopback address"))
+        .await
+        .expect("bind loopback session");
+    let address = listener.local_addr().expect("bound loopback address");
+    let server_peer = LocalPeer::quiet(StacksPrivateKey::from_seed(b"fuzz server"), address.port());
+    let client_peer = LocalPeer::quiet(StacksPrivateKey::from_seed(b"fuzz client"), 20444);
+    let service = SessionService;
+    let timeout = std::time::Duration::from_secs(1);
+
+    let serve_session = async {
+        let (stream, from) = listener.accept().await.expect("accept loopback session");
+        serve_peer(
+            stream,
+            from,
+            &server_peer,
+            protocol,
+            &service,
+            InboundLimits {
+                timeout,
+                idle: timeout,
+                max_messages: u64::try_from(operations.len() + 1).expect("bounded operations"),
+            },
+        )
+        .await
+        .expect("serve bounded session")
+    };
+    let client = async {
+        let mut session =
+            Session::open(address, &client_peer, protocol, session_view(101), timeout)
+                .await
+                .expect("complete loopback handshake");
+        let mut coverage = 0;
+        let mut answered = 1_u64;
+        let mut nacked = 0_u64;
+        for operation in operations {
+            match operation % 5 {
+                0 => {
+                    session.ping().await.expect("ping reply");
+                    coverage |= 1;
+                    answered += 1;
+                }
+                1 => {
+                    assert_eq!(session.neighbors().await.expect("neighbor reply").len(), 1);
+                    coverage |= 2;
+                    answered += 1;
+                }
+                2 => {
+                    let inventory = session
+                        .nakamoto_inventory(SESSION_CYCLE)
+                        .await
+                        .expect("known inventory reply");
+                    assert!(inventory.get(0).expect("first inventory bit"));
+                    assert!(inventory.get(2099).expect("last inventory bit"));
+                    coverage |= 4;
+                    answered += 1;
+                }
+                3 => {
+                    assert!(matches!(
+                        session
+                            .nakamoto_inventory(ConsensusHash::from_bytes([0xff; 20]))
+                            .await,
+                        Err(SessionError::Nack(code)) if code == nack::NO_SUCH_BITCOIN_BLOCK
+                    ));
+                    coverage |= 8;
+                    nacked += 1;
+                }
+                _ => {
+                    session.advertise(session_view(102));
+                    session.ping().await.expect("ping after view update");
+                    coverage |= 16;
+                    answered += 1;
+                }
+            }
+        }
+        assert_eq!(session.take_unsolicited_count(), 0);
+        drop(session);
+        (coverage, answered, nacked)
+    };
+
+    let (report, (coverage, answered, nacked)) = tokio::join!(serve_session, client);
+    assert_eq!(report.peer, Some(client_peer.public_key_hash()));
+    assert_eq!(report.answered, answered);
+    assert_eq!(report.nacked, nacked);
+    assert_eq!(report.ignored, 0);
+    coverage
 }
 
 /// Exercise transaction and Nakamoto block codecs and their canonical encoders.

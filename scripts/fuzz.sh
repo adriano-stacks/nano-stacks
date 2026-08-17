@@ -10,6 +10,10 @@ case "$target" in
     seed_directory=crates/nano-adversarial/corpus/p2p
     max_length=65536
     ;;
+  p2p_session_state)
+    seed_directory=crates/nano-adversarial/corpus/p2p-session
+    max_length=256
+    ;;
   transaction_and_block_codecs)
     seed_directory=crates/nano-adversarial/corpus/codecs
     max_length=65536

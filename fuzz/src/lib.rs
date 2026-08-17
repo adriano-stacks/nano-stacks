@@ -143,6 +143,16 @@ pub fn p2p_bytes(mut case: P2pCase) -> Vec<u8> {
 }
 
 #[derive(Arbitrary, Debug)]
+pub struct SessionCase {
+    operations: Vec<u8>,
+}
+
+pub fn session_bytes(mut case: SessionCase) -> Vec<u8> {
+    case.operations.truncate(32);
+    case.operations
+}
+
+#[derive(Arbitrary, Debug)]
 pub struct MarfCase {
     operations: Vec<MarfOperation>,
 }

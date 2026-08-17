@@ -21,6 +21,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "p2p_session_state"
+path = "fuzz_targets/p2p_session_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "transaction_and_block_codecs"
 path = "fuzz_targets/transaction_and_block_codecs.rs"
 test = false

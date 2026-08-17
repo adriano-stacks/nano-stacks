@@ -50,6 +50,7 @@ run_gate() {
       cargo fuzz build --fuzz-dir fuzz --sanitizer none --codegen-units 16
       for target in \
         p2p_frame_and_protocol \
+        p2p_session_state \
         transaction_and_block_codecs \
         transaction_and_block_differential \
         signer_and_stackerdb_codecs \
