@@ -186,7 +186,7 @@ impl From<CheckpointTrustError> for CheckpointBundleError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs;
 
     use nano_chainstate::{NakamotoBlock, NakamotoBlockHeader};
@@ -199,7 +199,7 @@ mod tests {
         observed_claims, verify_checkpoint_bundle,
     };
 
-    fn fixture(all_signers: bool) -> tempfile::TempDir {
+    pub fn fixture(all_signers: bool) -> (tempfile::TempDir, [StacksPrivateKey; 2]) {
         let root = tempfile::tempdir().expect("checkpoint bundle");
         let miner = StacksPrivateKey::from_seed(b"checkpoint miner");
         let first = StacksPrivateKey::from_seed(b"checkpoint builder signer one");
@@ -265,12 +265,12 @@ mod tests {
         )
         .expect("checkpoint manifest");
         fs::write(root.path().join("marf.sqlite"), b"state bytes").expect("state");
-        root
+        (root, [first, second])
     }
 
     #[test]
     fn offline_bundle_build_and_verification_recompute_the_signer_proof() {
-        let root = fixture(true);
+        let (root, _) = fixture(true);
         let manifest = build_checkpoint_bundle_manifest(root.path(), &"06".repeat(32))
             .expect("build manifest");
         let verified = verify_checkpoint_bundle(root.path()).expect("verify manifest");
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn a_self_consistent_but_false_signer_claim_is_refused() {
-        let root = fixture(true);
+        let (root, _) = fixture(true);
         let mut claims = observed_claims(root.path(), &"06".repeat(32)).expect("observed claims");
         claims.signer_weight += 1;
         CheckpointBundleManifest::write_new(root.path(), claims).expect("false manifest");
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn a_checkpoint_below_its_signer_threshold_gets_no_manifest() {
-        let root = fixture(false);
+        let (root, _) = fixture(false);
         assert!(matches!(
             build_checkpoint_bundle_manifest(root.path(), &"06".repeat(32)),
             Err(CheckpointBundleError::Trust(_))

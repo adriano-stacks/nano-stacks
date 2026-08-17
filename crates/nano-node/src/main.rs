@@ -2,6 +2,7 @@
 
 use std::{
     error::Error,
+    fs,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -41,10 +42,27 @@ enum Command {
         #[arg(long)]
         bitcoin_block_hash: String,
     },
+    /// Add one immutable builder signature over a verified checkpoint manifest.
+    SignCheckpointManifest {
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        signatures: PathBuf,
+        #[arg(long)]
+        builder: String,
+        #[arg(long)]
+        private_key: PathBuf,
+    },
     /// Verify a checkpoint bundle without opening or writing node state.
     VerifyCheckpoint {
         #[arg(long)]
         bundle: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        signatures: PathBuf,
     },
 }
 
@@ -67,7 +85,18 @@ async fn main() -> ExitCode {
             bundle,
             bitcoin_block_hash,
         } => build_checkpoint_manifest(&bundle, &bitcoin_block_hash),
-        Command::VerifyCheckpoint { bundle } => verify_checkpoint(&bundle),
+        Command::SignCheckpointManifest {
+            bundle,
+            policy,
+            signatures,
+            builder,
+            private_key,
+        } => sign_checkpoint_manifest(&bundle, &policy, &signatures, &builder, &private_key),
+        Command::VerifyCheckpoint {
+            bundle,
+            policy,
+            signatures,
+        } => verify_checkpoint(&bundle, &policy, &signatures),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -120,11 +149,43 @@ fn build_checkpoint_manifest(
     Ok(())
 }
 
-fn verify_checkpoint(bundle: &Path) -> Result<(), Box<dyn Error>> {
-    let manifest = nano_node::checkpoint_bundle::verify_checkpoint_bundle(bundle)?;
+fn sign_checkpoint_manifest(
+    bundle: &Path,
+    policy: &Path,
+    signatures: &Path,
+    builder: &str,
+    private_key: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let policy = nano_node::checkpoint_signatures::BuilderPolicy::load(policy)?;
+    let private_key = fs::read_to_string(private_key)?;
+    let bytes: [u8; 32] = hex::decode(private_key.trim())?
+        .try_into()
+        .map_err(|_| "builder private key is not 32-byte hexadecimal")?;
+    let private_key = nano_crypto::StacksPrivateKey::from_bytes(bytes)?;
+    let path = nano_node::checkpoint_signatures::sign_checkpoint_bundle(
+        bundle,
+        &policy,
+        signatures,
+        builder,
+        &private_key,
+    )?;
+    println!("wrote builder signature {}", path.display());
+    Ok(())
+}
+
+fn verify_checkpoint(
+    bundle: &Path,
+    policy: &Path,
+    signatures: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let policy = nano_node::checkpoint_signatures::BuilderPolicy::load(policy)?;
+    let verified = nano_node::checkpoint_signatures::verify_signed_checkpoint_bundle(
+        bundle, &policy, signatures,
+    )?;
     println!(
-        "checkpoint content root {} verified",
-        manifest.content_root()
+        "checkpoint content root {} verified by {}",
+        verified.content_root,
+        verified.names.join(", ")
     );
     Ok(())
 }

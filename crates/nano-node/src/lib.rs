@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod checkpoint_bundle;
+pub mod checkpoint_signatures;
 pub mod config;
 pub mod hosting;
 pub mod miner;
