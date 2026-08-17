@@ -33,7 +33,7 @@ artifact and its dependency closure.
 - [ ] Keep optional miner, signer, TUI, event and compatibility adapters as
       separate processes with bounded protocols and no direct chainstate write
       authority.
-- [ ] Add dependency-tree, route-inventory and binary-inspection gates proving
+- [x] Add dependency-tree, route-inventory and binary-inspection gates proving
       forbidden roles and fallback engines are absent rather than disabled by
       configuration.
 - [ ] Run checkpoint import, P2P catch-up, fork/reorg, restart and tip following
