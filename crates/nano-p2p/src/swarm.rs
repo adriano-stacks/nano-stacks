@@ -348,6 +348,11 @@ impl Swarm {
         )
     }
 
+    #[must_use]
+    pub fn frame_budget_status(&self) -> crate::FrameBudgetStatus {
+        self.frame_budget.status()
+    }
+
     /// Record a configured bootstrap peer, resolving its host.
     ///
     /// The key in a seed specification is ignored beyond being parsed: a session

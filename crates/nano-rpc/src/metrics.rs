@@ -78,6 +78,57 @@ pub struct IngressQueueStatus {
     pub saturations: u64,
 }
 
+/// Current use and cumulative saturation of a global/per-subject admission budget.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AdmissionStatus {
+    pub used: usize,
+    pub subjects: usize,
+    pub limit: usize,
+    pub per_subject_limit: usize,
+    pub saturations: u64,
+}
+
+#[derive(Clone, Copy)]
+struct AdmissionMetricNames {
+    used: (&'static str, &'static str),
+    subjects: (&'static str, &'static str),
+    limit: (&'static str, &'static str),
+    per_subject_limit: (&'static str, &'static str),
+    saturations: (&'static str, &'static str),
+}
+
+struct AdmissionGauges {
+    used: IntGauge,
+    subjects: IntGauge,
+    limit: IntGauge,
+    per_subject_limit: IntGauge,
+    saturations: IntGauge,
+}
+
+impl AdmissionGauges {
+    fn register(registry: &mut Registry, names: AdmissionMetricNames) -> Self {
+        Self {
+            used: gauge(registry, names.used.0, names.used.1),
+            subjects: gauge(registry, names.subjects.0, names.subjects.1),
+            limit: gauge(registry, names.limit.0, names.limit.1),
+            per_subject_limit: gauge(
+                registry,
+                names.per_subject_limit.0,
+                names.per_subject_limit.1,
+            ),
+            saturations: gauge(registry, names.saturations.0, names.saturations.1),
+        }
+    }
+
+    fn publish(&self, status: AdmissionStatus) {
+        self.used.set(as_i64(status.used));
+        self.subjects.set(as_i64(status.subjects));
+        self.limit.set(as_i64(status.limit));
+        self.per_subject_limit.set(as_i64(status.per_subject_limit));
+        self.saturations.set(as_i64(status.saturations));
+    }
+}
+
 impl From<nano_queue::Status> for IngressQueueStatus {
     fn from(status: nano_queue::Status) -> Self {
         Self {
@@ -750,6 +801,9 @@ struct Inner {
     queued_transactions: IntGauge,
     ingress_queues: IngressQueueGauges,
     rpc_admission: RpcAdmissionGauges,
+    rpc_connections: AdmissionGauges,
+    p2p_frames: AdmissionGauges,
+    p2p_inbound_sessions: AdmissionGauges,
     resources: ResourceGauges,
 }
 
@@ -765,6 +819,81 @@ impl std::fmt::Debug for NodeMetrics {
     }
 }
 
+fn register_admission_gauges(
+    registry: &mut Registry,
+) -> (AdmissionGauges, AdmissionGauges, AdmissionGauges) {
+    let rpc_connections = AdmissionGauges::register(
+        registry,
+        AdmissionMetricNames {
+            used: ("rpc_connections_active", "Open public RPC TCP connections."),
+            subjects: (
+                "rpc_connection_addresses",
+                "Client addresses with an open public RPC connection.",
+            ),
+            limit: (
+                "rpc_connection_limit",
+                "Maximum public RPC TCP connections.",
+            ),
+            per_subject_limit: (
+                "rpc_connection_per_address_limit",
+                "Maximum public RPC TCP connections from one address.",
+            ),
+            saturations: (
+                "rpc_connection_saturations",
+                "TCP connections refused by a global or per-address RPC limit.",
+            ),
+        },
+    );
+    let p2p_frames = AdmissionGauges::register(
+        registry,
+        AdmissionMetricNames {
+            used: (
+                "p2p_frame_bytes",
+                "Peer-controlled frame bytes reserved in memory.",
+            ),
+            subjects: (
+                "p2p_frame_addresses",
+                "Peer addresses currently holding frame-byte reservations.",
+            ),
+            limit: (
+                "p2p_frame_global_byte_limit",
+                "Maximum peer-controlled frame bytes reserved across the node.",
+            ),
+            per_subject_limit: (
+                "p2p_frame_per_address_byte_limit",
+                "Maximum frame bytes reserved by one peer address.",
+            ),
+            saturations: (
+                "p2p_frame_saturations",
+                "Frames refused by a global or per-address byte limit.",
+            ),
+        },
+    );
+    let p2p_inbound_sessions = AdmissionGauges::register(
+        registry,
+        AdmissionMetricNames {
+            used: ("p2p_inbound_sessions", "Open inbound P2P conversations."),
+            subjects: (
+                "p2p_inbound_addresses",
+                "Peer addresses with an open inbound P2P conversation.",
+            ),
+            limit: (
+                "p2p_inbound_session_limit",
+                "Maximum inbound P2P conversations.",
+            ),
+            per_subject_limit: (
+                "p2p_inbound_per_address_limit",
+                "Maximum inbound P2P conversations from one address.",
+            ),
+            saturations: (
+                "p2p_inbound_saturations",
+                "Inbound P2P connections refused by a global or per-address limit.",
+            ),
+        },
+    );
+    (rpc_connections, p2p_frames, p2p_inbound_sessions)
+}
+
 impl Default for NodeMetrics {
     fn default() -> Self {
         let mut registry = Registry::with_prefix("nano");
@@ -776,6 +905,8 @@ impl Default for NodeMetrics {
         let peers = PeerGauges::register(&mut registry);
         let ingress_queues = IngressQueueGauges::register(&mut registry);
         let rpc_admission = RpcAdmissionGauges::register(&mut registry);
+        let (rpc_connections, p2p_frames, p2p_inbound_sessions) =
+            register_admission_gauges(&mut registry);
         let staged_blocks = gauge(
             &mut registry,
             "staged_blocks",
@@ -833,6 +964,9 @@ impl Default for NodeMetrics {
             queued_transactions,
             ingress_queues,
             rpc_admission,
+            rpc_connections,
+            p2p_frames,
+            p2p_inbound_sessions,
             resources,
         }))
     }
@@ -855,6 +989,18 @@ impl NodeMetrics {
         self.0
             .rpc_admission
             .route(route, body_bytes, concurrent, per_second, global)
+    }
+
+    pub(crate) fn publish_rpc_connections(&self, status: AdmissionStatus) {
+        self.0.rpc_connections.publish(status);
+    }
+
+    pub fn publish_p2p_frames(&self, status: AdmissionStatus) {
+        self.0.p2p_frames.publish(status);
+    }
+
+    pub fn publish_p2p_inbound_sessions(&self, status: AdmissionStatus) {
+        self.0.p2p_inbound_sessions.publish(status);
     }
 
     /// Record a block rejected at an explicit validation boundary.
@@ -1014,7 +1160,7 @@ impl NodeMetrics {
         set_option(&self.0.queued_transactions, queues.queued_transactions);
     }
 
-    fn encode(&self) -> Result<String, std::fmt::Error> {
+    pub(crate) fn encode(&self) -> Result<String, std::fmt::Error> {
         let mut body = String::new();
         encode(&mut body, &self.0.registry)?;
         Ok(body)
@@ -1098,8 +1244,8 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::{
-        ExecutionCacheReport, IngressQueue, IngressQueueStatus, NodeMetrics, RefusalReason, router,
-        serve,
+        AdmissionStatus, ExecutionCacheReport, IngressQueue, IngressQueueStatus, NodeMetrics,
+        RefusalReason, router, serve,
     };
     use crate::{PeerReport, QueueReport, RpcState, SealedTip, SelectedTip};
     use nano_primitives::{BlockHeaderHash, ConsensusHash, Network, StacksBlockId, TrieHash};
@@ -1122,6 +1268,21 @@ mod tests {
         "nano_ingress_queue_oldest_age_seconds{queue=\"block_uploads\"} 2.5",
         "nano_ingress_queue_dropped{queue=\"block_uploads\"} 4",
         "nano_ingress_queue_saturations{queue=\"block_uploads\"} 5",
+        "nano_rpc_connections_active 6",
+        "nano_rpc_connection_addresses 2",
+        "nano_rpc_connection_limit 256",
+        "nano_rpc_connection_per_address_limit 16",
+        "nano_rpc_connection_saturations 7",
+        "nano_p2p_frame_bytes 8",
+        "nano_p2p_frame_addresses 3",
+        "nano_p2p_frame_global_byte_limit 80",
+        "nano_p2p_frame_per_address_byte_limit 20",
+        "nano_p2p_frame_saturations 9",
+        "nano_p2p_inbound_sessions 10",
+        "nano_p2p_inbound_addresses 4",
+        "nano_p2p_inbound_session_limit 64",
+        "nano_p2p_inbound_per_address_limit 4",
+        "nano_p2p_inbound_saturations 11",
         "nano_block_refusals_total{reason=\"compiler_gap\"} 1",
         "nano_block_refusals_total{reason=\"root_mismatch\"} 1",
         "nano_block_refusals_total{reason=\"signature\"} 1",
@@ -1193,6 +1354,42 @@ mod tests {
         }
     }
 
+    fn publish_ingress_metrics(metrics: &NodeMetrics) {
+        metrics.publish_ingress_queue(
+            IngressQueue::BlockUploads,
+            IngressQueueStatus {
+                items: 3,
+                bytes: 1024,
+                item_limit: 8,
+                byte_limit: 2048,
+                oldest_age: Some(std::time::Duration::from_millis(2500)),
+                dropped: 4,
+                saturations: 5,
+            },
+        );
+        metrics.publish_rpc_connections(AdmissionStatus {
+            used: 6,
+            subjects: 2,
+            limit: 256,
+            per_subject_limit: 16,
+            saturations: 7,
+        });
+        metrics.publish_p2p_frames(AdmissionStatus {
+            used: 8,
+            subjects: 3,
+            limit: 80,
+            per_subject_limit: 20,
+            saturations: 9,
+        });
+        metrics.publish_p2p_inbound_sessions(AdmissionStatus {
+            used: 10,
+            subjects: 4,
+            limit: 64,
+            per_subject_limit: 4,
+            saturations: 11,
+        });
+    }
+
     #[tokio::test]
     async fn metrics_are_well_formed_and_name_the_three_chain_heights() {
         let state = RpcState::new(Network::MAINNET);
@@ -1211,18 +1408,7 @@ mod tests {
         metrics.publish_stackerdb_peers(4);
         metrics.publish_mempool_size(11);
         metrics.publish_execution_caches(execution_cache_fixture());
-        metrics.publish_ingress_queue(
-            IngressQueue::BlockUploads,
-            IngressQueueStatus {
-                items: 3,
-                bytes: 1024,
-                item_limit: 8,
-                byte_limit: 2048,
-                oldest_age: Some(std::time::Duration::from_millis(2500)),
-                dropped: 4,
-                saturations: 5,
-            },
-        );
+        publish_ingress_metrics(&metrics);
         metrics.publish_block_execution(
             &half_limit_cost(),
             3,

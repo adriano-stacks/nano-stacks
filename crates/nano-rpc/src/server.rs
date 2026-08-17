@@ -42,15 +42,17 @@ impl Default for ServerLimits {
 
 /// Serve the public RPC until the listener is stopped.
 pub async fn serve(listener: tokio::net::TcpListener, state: RpcState) -> std::io::Result<()> {
-    serve_with_limits(listener, router(state), ServerLimits::default()).await
+    let metrics = state.metrics();
+    serve_with_limits(listener, router(state), ServerLimits::default(), metrics).await
 }
 
 async fn serve_with_limits(
     listener: tokio::net::TcpListener,
     app: Router,
     limits: ServerLimits,
+    metrics: crate::NodeMetrics,
 ) -> std::io::Result<()> {
-    let slots = ConnectionSlots::new(limits);
+    let slots = ConnectionSlots::new(limits, metrics);
     let mut connections = JoinSet::new();
     loop {
         while connections.try_join_next().is_some() {}
@@ -94,17 +96,22 @@ async fn serve_connection(stream: TcpStream, app: Router, limits: ServerLimits) 
 #[derive(Clone)]
 struct ConnectionSlots {
     accounting: Arc<Mutex<ConnectionAccounting>>,
+    metrics: crate::NodeMetrics,
 }
 
 impl ConnectionSlots {
-    fn new(limits: ServerLimits) -> Self {
-        Self {
+    fn new(limits: ServerLimits, metrics: crate::NodeMetrics) -> Self {
+        let slots = Self {
             accounting: Arc::new(Mutex::new(ConnectionAccounting {
                 limits,
                 total: 0,
                 addresses: HashMap::new(),
+                saturations: 0,
             })),
-        }
+            metrics,
+        };
+        slots.publish(&lock(&slots.accounting));
+        slots
     }
 
     fn try_acquire(&self, address: IpAddr) -> Option<ConnectionSlot> {
@@ -113,20 +120,29 @@ impl ConnectionSlots {
             || accounting.addresses.get(&address).copied().unwrap_or(0)
                 >= accounting.limits.connections_per_address
         {
+            accounting.saturations = accounting.saturations.saturating_add(1);
+            self.publish(&accounting);
             return None;
         }
         accounting.total += 1;
         *accounting.addresses.entry(address).or_default() += 1;
+        self.publish(&accounting);
         drop(accounting);
         Some(ConnectionSlot {
             accounting: self.accounting.clone(),
+            metrics: self.metrics.clone(),
             address,
         })
+    }
+
+    fn publish(&self, accounting: &ConnectionAccounting) {
+        self.metrics.publish_rpc_connections(accounting.status());
     }
 }
 
 struct ConnectionSlot {
     accounting: Arc<Mutex<ConnectionAccounting>>,
+    metrics: crate::NodeMetrics,
     address: IpAddr,
 }
 
@@ -142,6 +158,7 @@ impl Drop for ConnectionSlot {
         if *count == 0 {
             accounting.addresses.remove(&self.address);
         }
+        self.metrics.publish_rpc_connections(accounting.status());
     }
 }
 
@@ -149,6 +166,19 @@ struct ConnectionAccounting {
     limits: ServerLimits,
     total: usize,
     addresses: HashMap<IpAddr, usize>,
+    saturations: u64,
+}
+
+impl ConnectionAccounting {
+    fn status(&self) -> crate::AdmissionStatus {
+        crate::AdmissionStatus {
+            used: self.total,
+            subjects: self.addresses.len(),
+            limit: self.limits.connections,
+            per_subject_limit: self.limits.connections_per_address,
+            saturations: self.saturations,
+        }
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -181,7 +211,8 @@ mod tests {
 
     #[test]
     fn connection_slots_are_bounded_globally_and_per_address() {
-        let slots = ConnectionSlots::new(limits());
+        let metrics = crate::NodeMetrics::default();
+        let slots = ConnectionSlots::new(limits(), metrics.clone());
         let first = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let second = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
         let held = slots.try_acquire(first).expect("first address");
@@ -193,8 +224,15 @@ mod tests {
                 .is_none()
         );
         drop(held);
-        assert!(slots.try_acquire(first).is_some());
+        let recovered = slots.try_acquire(first).expect("the slot recovers");
         drop(other);
+        let body = metrics.encode().expect("metrics encode");
+        assert!(body.contains("nano_rpc_connections_active 1"));
+        assert!(body.contains("nano_rpc_connection_addresses 1"));
+        assert!(body.contains("nano_rpc_connection_limit 2"));
+        assert!(body.contains("nano_rpc_connection_per_address_limit 1"));
+        assert!(body.contains("nano_rpc_connection_saturations 2"));
+        drop(recovered);
     }
 
     #[tokio::test]
@@ -207,6 +245,7 @@ mod tests {
             listener,
             router(RpcState::new(Network::TESTNET)),
             limits(),
+            crate::NodeMetrics::default(),
         ));
         let mut slow = tokio::net::TcpStream::connect(address)
             .await

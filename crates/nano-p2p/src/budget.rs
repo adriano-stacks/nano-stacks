@@ -45,6 +45,8 @@ impl Default for FrameLimits {
 pub struct FrameBudgetStatus {
     pub bytes: usize,
     pub addresses: usize,
+    pub global_byte_limit: usize,
+    pub per_address_byte_limit: usize,
     pub saturations: u64,
 }
 
@@ -102,6 +104,8 @@ impl FrameBudget {
         FrameBudgetStatus {
             bytes: accounting.bytes,
             addresses: accounting.addresses.len(),
+            global_byte_limit: accounting.limits.global_bytes,
+            per_address_byte_limit: accounting.limits.per_address_bytes,
             saturations: accounting.saturations,
         }
     }
@@ -177,7 +181,10 @@ mod tests {
         assert!(budget.try_reserve(first, 1).is_err(), "per-address bound");
         let second_permit = budget.try_reserve(second, 4).expect("global remainder");
         assert!(budget.try_reserve(third, 1).is_err(), "global bound");
-        assert_eq!(budget.status().bytes, 10);
+        let status = budget.status();
+        assert_eq!(status.bytes, 10);
+        assert_eq!(status.global_byte_limit, 10);
+        assert_eq!(status.per_address_byte_limit, 6);
         assert_eq!(budget.status().addresses, 2);
         assert_eq!(budget.status().saturations, 2);
 

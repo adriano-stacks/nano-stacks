@@ -3801,6 +3801,7 @@ async fn start_transport(
         nano_rpc::IngressQueue::PeerPushes,
         swarm.pushed_status().into(),
     );
+    publish_frame_budget(&metrics, swarm.frame_budget_status());
     println!(
         "p2p: {} peers connected, {} known, {} endpoints to fetch from",
         round.connected,
@@ -3815,6 +3816,7 @@ async fn start_transport(
     let tick = Duration::from_secs(config.node.poll_interval_secs.max(1));
     let advertised = advertised.clone();
     let relay = relay.clone();
+    let discovery_metrics = metrics.clone();
     roles.spawn(async move {
         (
             Job::Peers,
@@ -3823,7 +3825,7 @@ async fn start_transport(
                 bitcoin,
                 advertised,
                 relay,
-                metrics,
+                discovery_metrics,
                 tick,
                 stable_confirmations,
             )
@@ -3832,7 +3834,7 @@ async fn start_transport(
     });
 
     if let Some(bind) = bind {
-        start_listener(config, network, bind, service, frame_budget, roles);
+        start_listener(config, network, bind, service, frame_budget, metrics, roles);
     }
     Some(discovered)
 }
@@ -3911,6 +3913,7 @@ async fn peer_discovery(
             nano_rpc::IngressQueue::PeerPushes,
             swarm.pushed_status().into(),
         );
+        publish_frame_budget(&metrics, swarm.frame_budget_status());
         let carried = swarm.take_pushed().len();
         if round.collected > 0 {
             println!(
@@ -3920,6 +3923,16 @@ async fn peer_discovery(
             );
         }
     }
+}
+
+fn publish_frame_budget(metrics: &nano_rpc::NodeMetrics, status: nano_p2p::FrameBudgetStatus) {
+    metrics.publish_p2p_frames(nano_rpc::AdmissionStatus {
+        used: status.bytes,
+        subjects: status.addresses,
+        limit: status.global_byte_limit,
+        per_subject_limit: status.per_address_byte_limit,
+        saturations: status.saturations,
+    });
 }
 
 /// Answer peers that dial this node.
@@ -3933,6 +3946,7 @@ fn start_listener(
     bind: std::net::SocketAddr,
     service: Arc<PeerService>,
     frame_budget: nano_p2p::FrameBudget,
+    metrics: nano_rpc::NodeMetrics,
     roles: &mut JoinSet<(Job, Role)>,
 ) {
     let Ok(identity) = p2p_identity(&config.node.working_dir) else {
@@ -3950,7 +3964,7 @@ fn start_listener(
     roles.spawn(async move {
         (
             Job::Peers,
-            answer_peers(bind, local, protocol, service, frame_budget).await,
+            answer_peers(bind, local, protocol, service, frame_budget, metrics).await,
         )
     });
 }
@@ -3962,6 +3976,7 @@ async fn answer_peers(
     protocol: nano_p2p::Protocol,
     service: Arc<PeerService>,
     frame_budget: nano_p2p::FrameBudget,
+    metrics: nano_rpc::NodeMetrics,
 ) -> Role {
     {
         let listener = nano_p2p::Listener::bind(bind)
@@ -3969,7 +3984,7 @@ async fn answer_peers(
             .map_err(|error| format!("cannot listen for peers on {bind}: {error}"))?;
         println!("p2p: listening for peers on {bind}");
         let mut conversations: JoinSet<()> = JoinSet::new();
-        let address_slots = InboundAddressSlots::default();
+        let address_slots = InboundAddressSlots::new(metrics);
         loop {
             let (stream, from) = match listener.accept().await {
                 Ok(accepted) => accepted,
@@ -3982,12 +3997,6 @@ async fn answer_peers(
             let Some(address_slot) = address_slots.try_acquire(from.ip()) else {
                 continue;
             };
-            // Drop excess sockets before spawning a task. Keeping an accepted
-            // connection around while waiting for another peer to leave would let
-            // the network choose the listener's pending socket memory.
-            if conversations.len() >= MAX_INBOUND_PEERS {
-                continue;
-            }
             let service = service.clone();
             let local = local.clone();
             let frame_budget = frame_budget.clone();
@@ -4019,32 +4028,66 @@ const MAX_INBOUND_PEERS: usize = 64;
 /// How many inbound conversations one IP may hold simultaneously.
 const MAX_INBOUND_PEERS_PER_ADDRESS: usize = 4;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct InboundAddressSlots {
-    held: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>,
+    held: Arc<std::sync::Mutex<InboundSessionAccounting>>,
+    metrics: nano_rpc::NodeMetrics,
 }
 
 impl InboundAddressSlots {
+    fn new(metrics: nano_rpc::NodeMetrics) -> Self {
+        let slots = Self {
+            held: Arc::new(std::sync::Mutex::new(InboundSessionAccounting::default())),
+            metrics,
+        };
+        slots.publish(
+            &slots
+                .held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        slots
+    }
+
     fn try_acquire(&self, address: std::net::IpAddr) -> Option<InboundAddressSlot> {
         let mut held = self
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = held.entry(address).or_default();
-        if *count >= MAX_INBOUND_PEERS_PER_ADDRESS {
+        if held.total >= MAX_INBOUND_PEERS
+            || held.addresses.get(&address).copied().unwrap_or(0) >= MAX_INBOUND_PEERS_PER_ADDRESS
+        {
+            held.saturations = held.saturations.saturating_add(1);
+            self.publish(&held);
             return None;
         }
-        *count += 1;
+        held.total += 1;
+        *held.addresses.entry(address).or_default() += 1;
+        self.publish(&held);
         drop(held);
         Some(InboundAddressSlot {
             held: self.held.clone(),
+            metrics: self.metrics.clone(),
             address,
         })
+    }
+
+    fn publish(&self, held: &InboundSessionAccounting) {
+        self.metrics.publish_p2p_inbound_sessions(held.status());
+    }
+
+    #[cfg(test)]
+    fn status(&self) -> nano_rpc::AdmissionStatus {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .status()
     }
 }
 
 struct InboundAddressSlot {
-    held: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>,
+    held: Arc<std::sync::Mutex<InboundSessionAccounting>>,
+    metrics: nano_rpc::NodeMetrics,
     address: std::net::IpAddr,
 }
 
@@ -4054,12 +4097,34 @@ impl Drop for InboundAddressSlot {
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.total -= 1;
         let count = held
+            .addresses
             .get_mut(&self.address)
             .expect("an inbound slot has an address count");
         *count -= 1;
         if *count == 0 {
-            held.remove(&self.address);
+            held.addresses.remove(&self.address);
+        }
+        self.metrics.publish_p2p_inbound_sessions(held.status());
+    }
+}
+
+#[derive(Default)]
+struct InboundSessionAccounting {
+    total: usize,
+    addresses: HashMap<std::net::IpAddr, usize>,
+    saturations: u64,
+}
+
+impl InboundSessionAccounting {
+    fn status(&self) -> nano_rpc::AdmissionStatus {
+        nano_rpc::AdmissionStatus {
+            used: self.total,
+            subjects: self.addresses.len(),
+            limit: MAX_INBOUND_PEERS,
+            per_subject_limit: MAX_INBOUND_PEERS_PER_ADDRESS,
+            saturations: self.saturations,
         }
     }
 }
@@ -4176,7 +4241,7 @@ mod tests {
 
     #[test]
     fn one_address_cannot_own_the_inbound_task_set() {
-        let slots = super::InboundAddressSlots::default();
+        let slots = super::InboundAddressSlots::new(nano_rpc::NodeMetrics::default());
         let first = "127.0.0.1".parse().expect("an address");
         let second = "127.0.0.2".parse().expect("an address");
         let mut held = (0..super::MAX_INBOUND_PEERS_PER_ADDRESS)
@@ -4188,8 +4253,35 @@ mod tests {
             .expect("another address has independent capacity");
 
         drop(held.pop());
-        assert!(slots.try_acquire(first).is_some(), "a closed slot recovers");
-        drop((held, other));
+        let recovered = slots.try_acquire(first).expect("a closed slot recovers");
+        drop((held, other, recovered));
+
+        let global = (0..super::MAX_INBOUND_PEERS)
+            .map(|index| {
+                let address = format!("127.0.1.{}", index + 1)
+                    .parse()
+                    .expect("a distinct address");
+                slots.try_acquire(address).expect("the global slot fits")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            slots
+                .try_acquire("127.0.2.1".parse().expect("an address"))
+                .is_none(),
+            "the global session limit is enforced in the same accounting"
+        );
+        assert_eq!(
+            slots.status(),
+            nano_rpc::AdmissionStatus {
+                used: super::MAX_INBOUND_PEERS,
+                subjects: super::MAX_INBOUND_PEERS,
+                limit: super::MAX_INBOUND_PEERS,
+                per_subject_limit: super::MAX_INBOUND_PEERS_PER_ADDRESS,
+                saturations: 2,
+            }
+        );
+        drop(global);
+        assert_eq!(slots.status().used, 0);
     }
 
     #[test]

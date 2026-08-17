@@ -54,7 +54,8 @@ pub use events::{
     proposal_response_payload, stacker_set_payload, stackerdb_chunks_payload,
 };
 pub use metrics::{
-    ExecutionCacheReport, IngressQueue, IngressQueueStatus, NodeMetrics, serve as serve_metrics,
+    AdmissionStatus, ExecutionCacheReport, IngressQueue, IngressQueueStatus, NodeMetrics,
+    serve as serve_metrics,
 };
 pub use server::serve;
 pub use stackerdb::{ChunkRefusal, StackerDbStore};
