@@ -7,13 +7,25 @@ license.workspace = true
 [features]
 default = []
 node-rpc = ["dep:nano-rpc"]
+node-adapters = [
+    "node-rpc",
+    "dep:clarity",
+    "dep:nano-mempool",
+    "dep:nano-miner",
+]
 
 [dependencies]
+clarity = { git = "https://github.com/stacks-network/stacks-core.git", rev = "efc34a07a225c4b950ab9404a1652aa5e14affaf", optional = true }
 hex = "0.4.3"
 nano-address = { path = "../nano-address" }
 nano-bitcoin = { path = "../nano-bitcoin" }
 nano-chainstate = { path = "../nano-chainstate" }
+nano-codec = { path = "../nano-codec" }
+nano-crypto = { path = "../nano-crypto" }
 nano-marf = { path = "../nano-marf" }
+nano-mempool = { path = "../nano-mempool", optional = true }
+nano-miner = { path = "../nano-miner", optional = true }
+nano-p2p = { path = "../nano-p2p" }
 nano-primitives = { path = "../nano-primitives" }
 nano-rpc = { path = "../nano-rpc", optional = true }
 nano-sortition = { path = "../nano-sortition" }
@@ -21,9 +33,9 @@ nano-sync = { path = "../nano-sync", default-features = false }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+tokio = { version = "1.53.1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
-nano-crypto = { path = "../nano-crypto" }
 tempfile = "3"
 
 [lints]

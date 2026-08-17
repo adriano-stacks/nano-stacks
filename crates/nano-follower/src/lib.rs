@@ -2,6 +2,7 @@
 
 pub mod archive;
 pub mod checkpoint;
+pub mod executor;
 pub mod sortition;
 pub mod staging;
 
@@ -10,3 +11,4 @@ pub use checkpoint::{
     CheckpointProvenance, CheckpointTrustError, adopt_checkpoint, adopt_checkpoint_bundle,
     attest_checkpoint,
 };
+pub use executor::*;

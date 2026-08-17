@@ -2599,12 +2599,17 @@ dependencies = [
 name = "nano-follower"
 version = "0.1.0"
 dependencies = [
+ "clarity",
  "hex",
  "nano-address",
  "nano-bitcoin",
  "nano-chainstate",
+ "nano-codec",
  "nano-crypto",
  "nano-marf",
+ "nano-mempool",
+ "nano-miner",
+ "nano-p2p",
  "nano-primitives",
  "nano-rpc",
  "nano-sortition",
@@ -2613,6 +2618,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

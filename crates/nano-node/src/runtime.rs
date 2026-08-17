@@ -443,20 +443,6 @@ async fn publish_sealed_tip(
     }
 }
 
-/// A block offered over the public API passes the same self-contained envelope
-/// check as a peer push before it can be retained as a download.
-///
-/// Full local burn, miner, VRF and signer-set authentication requires the
-/// block's execution context. It runs later, through the same typed constructor
-/// as every peer-fetched direct child, before executable staging.
-impl<S: Send> nano_rpc::BlockAdmission for CheckpointExecutor<S> {
-    fn authenticate(&mut self, block: &NakamotoBlock) -> Result<(), String> {
-        self.chainstate
-            .authenticate_block(block)
-            .map_err(|error| error.to_string())
-    }
-}
-
 /// What this node has sealed, for the RPC to answer from.
 pub(crate) fn sealed_tip(tip: &NakamotoBlock, bitcoin_height: u64) -> SealedTip {
     SealedTip {
@@ -2822,7 +2808,7 @@ async fn backfill_missing_header(
     // just answers `none`, the contract takes its error path, and the only
     // symptom is a state root that does not match. So take both: what the error
     // named, and what the VM recorded asking for.
-    let mut wanted = executor.chainstate.take_missing_headers();
+    let mut wanted = executor.take_missing_headers();
     if let Some(named) = block_without_a_header(error) {
         wanted.push(named);
     }
@@ -2836,7 +2822,7 @@ async fn backfill_one_header(
     peer: &SyncClient,
     block: [u8; 32],
 ) {
-    if executor.chainstate.knows_block_header(&block) {
+    if executor.knows_block_header(&block) {
         return;
     }
     let id = nano_primitives::StacksBlockId::from_bytes(block);
@@ -2855,7 +2841,7 @@ async fn backfill_one_header(
     let Ok(burn_block_height) = u32::try_from(burn_height) else {
         return;
     };
-    if let Err(error) = executor.chainstate.backfill_ancestor_header(
+    if let Err(error) = executor.backfill_ancestor_header(
         block,
         burn_hash,
         burn_block_height,
