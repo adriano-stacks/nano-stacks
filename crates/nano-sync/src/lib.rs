@@ -36,7 +36,7 @@ use nano_chainstate::{
 };
 use nano_codec::Transaction;
 use nano_crypto::{CryptoError, StacksPublicKey};
-use nano_mempool::{Account, Admission, ChainTip, Mempool};
+use nano_mempool::{Account, Admission, ChainTip, Mempool, Rejection};
 use nano_primitives::{
     BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, Hash160, Sha256Sum, SortitionId,
     StacksBlockId,
@@ -91,6 +91,8 @@ pub const MAX_TENURE_RESPONSE_BYTES: usize = 64 * MIB;
 pub const MAX_TENURE_JSON_RESPONSE_BYTES: usize = 2 * MAX_TENURE_RESPONSE_BYTES + MIB;
 /// One bounded mempool page and its optional 32-byte cursor.
 pub const MAX_MEMPOOL_RESPONSE_BYTES: usize = 8 * MIB + 32;
+/// Full 128-transaction pages needed to fill the default 8,192-entry pool.
+pub const MAX_MEMPOOL_PAGES: usize = 64;
 /// A small acknowledgement to a block upload.
 pub const MAX_UPLOAD_RESPONSE_BYTES: usize = 64 * 1024;
 
@@ -831,37 +833,38 @@ impl SyncClient {
     /// what it will mine: every transaction it hands over is admitted on this
     /// node's own rules against this node's own view of the accounts.
     pub async fn fill_mempool(&self, mempool: &mut Mempool, now: u64) -> Result<usize, SyncError> {
-        let mut pending = Vec::new();
         let mut page = None;
-        loop {
+        let mut cursors = HashSet::new();
+        let mut accounts = PeerAccounts::default();
+        let mut admitted = 0;
+        for _ in 0..MAX_MEMPOOL_PAGES {
             let (transactions, next) = self.mempool_page(page).await?;
-            pending.extend(transactions);
-            match next {
-                Some(next) => page = Some(next),
-                None => break,
-            }
-        }
-
-        let mut accounts = HashMap::new();
-        for transaction in &pending {
-            for address in [transaction.origin_address(), transaction.sponsor_address()]
-                .into_iter()
-                .flatten()
-            {
-                if let std::collections::hash_map::Entry::Vacant(slot) = accounts.entry(address) {
-                    slot.insert(self.account(address).await?);
+            for transaction in &transactions {
+                for address in [transaction.origin_address(), transaction.sponsor_address()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let std::collections::hash_map::Entry::Vacant(slot) =
+                        accounts.0.entry(address)
+                    {
+                        slot.insert(self.account(address).await?);
+                    }
                 }
             }
-        }
-        let accounts = PeerAccounts(accounts);
-        let mut admitted = 0;
-        for transaction in pending {
-            if matches!(
-                mempool.submit(transaction, &accounts, now),
-                Ok(Admission::Added | Admission::Replaced(_))
-            ) {
-                admitted += 1;
+            for transaction in transactions {
+                match mempool.submit(transaction, &accounts, now) {
+                    Ok(Admission::Added | Admission::Replaced(_)) => admitted += 1,
+                    Err(Rejection::MempoolFull { .. }) => return Ok(admitted),
+                    _ => {}
+                }
             }
+            let Some(next) = next else {
+                return Ok(admitted);
+            };
+            if !cursors.insert(next) {
+                return Err(SyncError::InvalidMempool);
+            }
+            page = Some(next);
         }
         Ok(admitted)
     }
@@ -2560,7 +2563,8 @@ mod tests {
     };
     use super::{Node, TenureFollower, TenureInfo};
     use nano_chainstate::{NakamotoBlock, TenureError};
-    use nano_primitives::{ConsensusHash, StacksBlockId};
+    use nano_mempool::Mempool;
+    use nano_primitives::{ConsensusHash, Network, StacksBlockId};
 
     #[test]
     fn node_starts_without_a_followed_tenure() {
@@ -2844,6 +2848,76 @@ mod tests {
                 .expect("a response at the limit"),
             b"abc"
         );
+        server.await.expect("peer exits");
+    }
+
+    #[tokio::test]
+    async fn a_cyclic_mempool_cursor_retains_no_unbounded_page_backlog() {
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let address = peer.local_addr().expect("the bound address");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = peer.accept().await.expect("a request");
+                tokio::io::AsyncWriteExt::write_all(
+                    &mut stream,
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 32\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("answer header");
+                tokio::io::AsyncWriteExt::write_all(&mut stream, &[7; 32])
+                    .await
+                    .expect("answer cursor");
+            }
+        });
+        let client =
+            SyncClient::new(Url::parse(&format!("http://{address}/")).expect("a base url"))
+                .expect("a client");
+        let mut mempool = Mempool::new(Network::TESTNET);
+
+        assert!(matches!(
+            client.fill_mempool(&mut mempool, 0).await,
+            Err(SyncError::InvalidMempool)
+        ));
+        assert_eq!(mempool.status().transactions, 0);
+        server.await.expect("peer exits");
+    }
+
+    #[tokio::test]
+    async fn a_peer_cannot_choose_how_many_mempool_pages_one_fill_retains() {
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let address = peer.local_addr().expect("the bound address");
+        let server = tokio::spawn(async move {
+            for page in 0..super::MAX_MEMPOOL_PAGES {
+                let (mut stream, _) = peer.accept().await.expect("a request");
+                tokio::io::AsyncWriteExt::write_all(
+                    &mut stream,
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 32\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("answer header");
+                let cursor = [u8::try_from(page).expect("the page limit fits u8"); 32];
+                tokio::io::AsyncWriteExt::write_all(&mut stream, &cursor)
+                    .await
+                    .expect("answer cursor");
+            }
+        });
+        let client =
+            SyncClient::new(Url::parse(&format!("http://{address}/")).expect("a base url"))
+                .expect("a client");
+        let mut mempool = Mempool::new(Network::TESTNET);
+
+        assert_eq!(
+            client
+                .fill_mempool(&mut mempool, 0)
+                .await
+                .expect("the local page ceiling is normal shedding"),
+            0
+        );
+        assert_eq!(mempool.status().transactions, 0);
         server.await.expect("peer exits");
     }
 
