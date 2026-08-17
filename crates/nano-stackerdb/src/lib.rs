@@ -28,6 +28,13 @@ pub struct StackerDbClient {
     base_url: Url,
 }
 
+/// One raw slot payload returned by a peer.
+pub const MAX_CHUNK_RESPONSE_BYTES: usize = MAX_CHUNK_SIZE;
+/// All slot versions and signatures for one replicated contract.
+pub const MAX_METADATA_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// One chunk-upload acknowledgement.
+pub const MAX_ACK_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// The current version of a `StackerDB` writer slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SlotVersion {
@@ -49,6 +56,8 @@ pub struct ChunkAck {
 pub enum StackerDbClientError {
     InvalidBaseUrl,
     Http(reqwest::Error),
+    Json(serde_json::Error),
+    ResponseTooLarge { limit: usize },
 }
 
 impl fmt::Display for StackerDbClientError {
@@ -56,6 +65,13 @@ impl fmt::Display for StackerDbClientError {
         match self {
             Self::InvalidBaseUrl => formatter.write_str("StackerDB base URL cannot be a base"),
             Self::Http(error) => write!(formatter, "StackerDB HTTP error: {error}"),
+            Self::Json(error) => write!(formatter, "invalid StackerDB JSON response: {error}"),
+            Self::ResponseTooLarge { limit } => {
+                write!(
+                    formatter,
+                    "StackerDB response exceeds its {limit}-byte limit"
+                )
+            }
         }
     }
 }
@@ -64,7 +80,8 @@ impl std::error::Error for StackerDbClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Http(error) => Some(error),
-            Self::InvalidBaseUrl => None,
+            Self::Json(error) => Some(error),
+            Self::InvalidBaseUrl | Self::ResponseTooLarge { .. } => None,
         }
     }
 }
@@ -73,6 +90,43 @@ impl From<reqwest::Error> for StackerDbClientError {
     fn from(error: reqwest::Error) -> Self {
         Self::Http(error)
     }
+}
+
+impl From<serde_json::Error> for StackerDbClientError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+async fn bounded_response(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, StackerDbClientError> {
+    let declared = response
+        .content_length()
+        .map(usize::try_from)
+        .transpose()
+        .map_err(|_| StackerDbClientError::ResponseTooLarge { limit })?;
+    if declared.is_some_and(|length| length > limit) {
+        return Err(StackerDbClientError::ResponseTooLarge { limit });
+    }
+    let mut body = Vec::with_capacity(declared.unwrap_or(0));
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(StackerDbClientError::ResponseTooLarge { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn bounded_json<T: for<'de> Deserialize<'de>>(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<T, StackerDbClientError> {
+    Ok(serde_json::from_slice(
+        &bounded_response(response, limit).await?,
+    )?)
 }
 
 impl StackerDbClient {
@@ -141,7 +195,9 @@ impl StackerDbClient {
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        Ok(Some(response.error_for_status()?.bytes().await?.to_vec()))
+        Ok(Some(
+            bounded_response(response.error_for_status()?, MAX_CHUNK_RESPONSE_BYTES).await?,
+        ))
     }
 
     /// Fetch the latest bytes written to a slot, if that slot has content.
@@ -156,7 +212,9 @@ impl StackerDbClient {
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        Ok(Some(response.error_for_status()?.bytes().await?.to_vec()))
+        Ok(Some(
+            bounded_response(response.error_for_status()?, MAX_CHUNK_RESPONSE_BYTES).await?,
+        ))
     }
 
     /// Upload one signed chunk and return the node's acknowledgement.
@@ -166,15 +224,14 @@ impl StackerDbClient {
         chunk: &Chunk,
     ) -> Result<ChunkAck, StackerDbClientError> {
         let path = format!("v2/stackerdb/{}/{}/chunks", contract.address, contract.name);
-        let acknowledgement: ChunkAckWire = self
+        let response = self
             .client
             .post(self.url(&path)?)
             .json(&ChunkWire::from(chunk))
             .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?;
+            .error_for_status()?;
+        let acknowledgement: ChunkAckWire = bounded_json(response, MAX_ACK_RESPONSE_BYTES).await?;
         Ok(ChunkAck {
             accepted: acknowledgement.accepted,
             reason: acknowledgement.reason,
@@ -190,14 +247,13 @@ impl StackerDbClient {
         &self,
         path: &str,
     ) -> Result<T, StackerDbClientError> {
-        Ok(self
+        let response = self
             .client
             .get(self.url(path)?)
             .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .error_for_status()?;
+        bounded_json(response, MAX_METADATA_RESPONSE_BYTES).await
     }
 
     fn url(&self, path: &str) -> Result<Url, StackerDbClientError> {
@@ -478,7 +534,13 @@ impl<'a> ChunkReader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, str::FromStr, thread, time::Duration};
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        str::FromStr,
+        thread,
+        time::Duration,
+    };
 
     use nano_address::StacksAddress;
     use nano_crypto::StacksPrivateKey;
@@ -486,9 +548,37 @@ mod tests {
     use reqwest::Url;
 
     use super::{
-        BlockAcceptance, BlockResponse, Chunk, MAX_CHUNK_SIZE, SignerMessage, StackerDbClient,
+        BlockAcceptance, BlockResponse, Chunk, MAX_ACK_RESPONSE_BYTES, MAX_CHUNK_RESPONSE_BYTES,
+        MAX_CHUNK_SIZE, MAX_METADATA_RESPONSE_BYTES, SignerMessage, StackerDbClient,
         StackerDbClientError, StackerDbContract, StackerDbError,
     };
+
+    fn read_http_request(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let read = stream.read(&mut buffer).expect("read request");
+            request.extend_from_slice(&buffer[..read]);
+            let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers_end = headers_end + 4;
+            let headers = std::str::from_utf8(&request[..headers_end]).expect("HTTP headers");
+            let body_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                        .and_then(|length| length.parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if request.len() >= headers_end + body_length {
+                return;
+            }
+        }
+    }
 
     #[tokio::test]
     async fn a_stalled_stackerdb_peer_does_not_hold_a_role_forever() {
@@ -518,6 +608,89 @@ mod tests {
             StackerDbClientError::Http(error) if error.is_timeout()
         ));
         server.join().expect("stalled peer exits");
+    }
+
+    #[tokio::test]
+    async fn peer_responses_are_bounded_by_class_and_recover() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer");
+        let address = listener.local_addr().expect("peer address");
+        let server = thread::spawn(move || {
+            let responses = [
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    MAX_METADATA_RESPONSE_BYTES + 1
+                ),
+                format!(
+                    "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                    MAX_CHUNK_RESPONSE_BYTES + 1,
+                    "x".repeat(MAX_CHUNK_RESPONSE_BYTES + 1),
+                ),
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    MAX_ACK_RESPONSE_BYTES + 1
+                ),
+                "HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nabc".to_owned(),
+                concat!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: 59\r\nconnection: close\r\n\r\n",
+                    r#"{"accepted":true,"reason":null,"code":null,"metadata":null}"#,
+                )
+                .to_owned(),
+            ];
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                read_http_request(&mut stream);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let client = StackerDbClient::new(
+            Url::parse(&format!("http://{address}/")).expect("local peer URL"),
+        )
+        .expect("create client");
+        let contract = StackerDbContract {
+            address: StacksAddress::from_str("ST000000000000000000002AMW42H")
+                .expect("system address"),
+            name: "miners".to_owned(),
+        };
+
+        assert!(matches!(
+            client.slot_metadata(&contract).await,
+            Err(StackerDbClientError::ResponseTooLarge {
+                limit: MAX_METADATA_RESPONSE_BYTES
+            })
+        ));
+        let chunk_error = client
+            .latest_chunk(&contract, 0)
+            .await
+            .expect_err("chunked overflow is refused");
+        assert!(
+            matches!(
+                chunk_error,
+                StackerDbClientError::ResponseTooLarge {
+                    limit: MAX_CHUNK_RESPONSE_BYTES
+                }
+            ),
+            "{chunk_error:?}"
+        );
+        assert!(matches!(
+            client
+                .put_chunk(&contract, &Chunk::new(0, 1, vec![1]))
+                .await,
+            Err(StackerDbClientError::ResponseTooLarge {
+                limit: MAX_ACK_RESPONSE_BYTES
+            })
+        ));
+        assert_eq!(
+            client.latest_chunk(&contract, 0).await.expect("recovery"),
+            Some(b"abc".to_vec())
+        );
+        assert!(
+            client
+                .put_chunk(&contract, &Chunk::new(0, 2, vec![2]))
+                .await
+                .expect("bounded acknowledgement")
+                .accepted
+        );
+        server.join().expect("peer exits");
     }
 
     #[test]

@@ -2797,6 +2797,7 @@ dependencies = [
  "nano-primitives",
  "reqwest",
  "serde",
+ "serde_json",
  "tokio",
 ]
 
