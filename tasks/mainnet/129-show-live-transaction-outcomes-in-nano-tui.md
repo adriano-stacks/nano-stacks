@@ -1,7 +1,7 @@
 ---
 id: "129"
 title: "Show live transaction outcomes in nano-tui"
-status: in-progress
+status: completed
 priority: medium
 effort: medium
 type: feature
@@ -15,6 +15,7 @@ verify:
     run: "nix develop -c cargo test -p nano-tui"
   - type: bash
     run: "nix develop -c cargo clippy -p nano-tui --all-targets -- -D warnings"
+completed_at: 2026-08-17
 ---
 
 # Show live transaction outcomes in nano-tui
@@ -28,21 +29,21 @@ This is delivery slice 4 from task 125's usability study.
 
 ## Tasks
 
-- [ ] Subscribe to the node's existing `/events` SSE stream without blocking the
+- [x] Subscribe to the node's existing `/events` SSE stream without blocking the
       render loop or ordinary status refresh.
-- [ ] Join new-block transaction receipts to decoded transactions by block and
+- [x] Join new-block transaction receipts to decoded transactions by block and
       transaction ID.
-- [ ] Show success, abort or VM error; committed result; emitted events; and all
+- [x] Show success, abort or VM error; committed result; emitted events; and all
       charged cost dimensions.
-- [ ] Present exact costs together with their share of the current limit.
-- [ ] Distinguish a known empty event list from an outcome that was not retained.
-- [ ] Keep event history bounded with the same lifetime and selection guarantees
+- [x] Present exact costs together with their share of the current limit.
+- [x] Distinguish a known empty event list from an outcome that was not retained.
+- [x] Keep event history bounded with the same lifetime and selection guarantees
       as block history.
-- [ ] Reconnect after stream loss and mark the uncovered interval rather than
+- [x] Reconnect after stream loss and mark the uncovered interval rather than
       silently implying complete receipt history.
-- [ ] Cover successful, aborted, error, eventful, empty, missed and reconnected
+- [x] Cover successful, aborted, error, eventful, empty, missed and reconnected
       streams.
-- [ ] Run rustfmt, tests and strict clippy without warnings.
+- [x] Run rustfmt, tests and strict clippy without warnings.
 
 ## Acceptance Criteria
 
