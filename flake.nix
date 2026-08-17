@@ -26,6 +26,7 @@
               pkgs.cargo
               pkgs.cargo-audit
               pkgs.cargo-cyclonedx
+              pkgs.cargo-fuzz
               pkgs.clippy
               pkgs.curl
               pkgs.jq

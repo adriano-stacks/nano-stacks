@@ -1,0 +1,59 @@
+[package]
+name = "nano-adversarial-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+hex = "0.4.3"
+libfuzzer-sys = "0.4"
+nano-adversarial = { path = "../crates/nano-adversarial" }
+
+[[bin]]
+name = "p2p_frame_and_protocol"
+path = "fuzz_targets/p2p_frame_and_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transaction_and_block_codecs"
+path = "fuzz_targets/transaction_and_block_codecs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signer_and_stackerdb_codecs"
+path = "fuzz_targets/signer_and_stackerdb_codecs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "checkpoint_manifests"
+path = "fuzz_targets/checkpoint_manifests.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "marf_operations"
+path = "fuzz_targets/marf_operations.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clarity_wasm_abi"
+path = "fuzz_targets/clarity_wasm_abi.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
