@@ -1,7 +1,7 @@
 ---
 id: "135"
 title: "Ship a minimal follower-only mainnet artifact"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["130", "131", "132", "133"]
@@ -22,7 +22,7 @@ artifact and its dependency closure.
 
 ## Tasks
 
-- [ ] Define the minimal follower capability and dependency matrix: local
+- [x] Define the minimal follower capability and dependency matrix: local
       Bitcoin view, Stacks P2P acquisition, authentication/fork choice,
       clarity-wasm execution, durable state, health and metrics.
 - [ ] Produce a separate follower binary/package that does not link miner,

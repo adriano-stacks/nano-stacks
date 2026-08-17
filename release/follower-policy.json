@@ -1,0 +1,89 @@
+{
+  "schema": "nano-stacks/follower-capability-policy/v1",
+  "artifact": {
+    "package": "nano-follower",
+    "binary": "stacks-follower",
+    "chainstate_writer": true
+  },
+  "capabilities": {
+    "local_bitcoin_view": [
+      "nano-bitcoin",
+      "nano-sortition"
+    ],
+    "stacks_p2p_acquisition": [
+      "nano-p2p",
+      "nano-sync"
+    ],
+    "authentication_and_fork_choice": [
+      "nano-chainstate",
+      "nano-crypto",
+      "nano-primitives"
+    ],
+    "clarity_wasm_execution": [
+      "nano-vm"
+    ],
+    "durable_state": [
+      "nano-chainstate",
+      "nano-marf"
+    ],
+    "loopback_health_and_metrics": [
+      "nano-follower"
+    ]
+  },
+  "allowed_internal_packages": [
+    "nano-address",
+    "nano-bitcoin",
+    "nano-chainstate",
+    "nano-codec",
+    "nano-consensus-profile",
+    "nano-crypto",
+    "nano-follower",
+    "nano-marf",
+    "nano-p2p",
+    "nano-primitives",
+    "nano-queue",
+    "nano-sortition",
+    "nano-sync",
+    "nano-vm",
+    "nano-wasm-cache"
+  ],
+  "loopback_surfaces": [
+    "/health",
+    "/metrics"
+  ],
+  "public_surfaces": [],
+  "forbidden_internal_packages": [
+    "nano-conformance",
+    "nano-mempool",
+    "nano-miner",
+    "nano-node",
+    "nano-oracle",
+    "nano-rpc",
+    "nano-signer",
+    "nano-stackerdb",
+    "nano-tui"
+  ],
+  "forbidden_config_keys": [
+    "event_observer",
+    "miner",
+    "node.block_proposal_token",
+    "node.rpc_bind",
+    "signer"
+  ],
+  "forbidden_routes": [
+    "/extended/v1/tx",
+    "/v2/accounts",
+    "/v2/contracts/call-read",
+    "/v2/contracts/interface",
+    "/v2/pox",
+    "/v2/transactions",
+    "/v3/block_proposal",
+    "/v3/blocks/upload",
+    "/v3/stacker_set",
+    "/v3/stackerdb"
+  ],
+  "measurement_decisions": [
+    "inbound_p2p_serving",
+    "persistent_native_modules"
+  ]
+}

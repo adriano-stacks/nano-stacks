@@ -15,6 +15,8 @@
 
 use std::process::Command;
 
+use serde_json::Value;
+
 /// The crates the shipped `stacks-node` is built from.
 const PRODUCTION: [&str; 17] = [
     "nano-primitives",
@@ -42,6 +44,83 @@ fn workspace() -> std::path::PathBuf {
         .and_then(|path| path.parent())
         .expect("the workspace root is two levels above this crate")
         .to_path_buf()
+}
+
+#[test]
+fn the_follower_policy_is_a_closed_minimal_capability_matrix() {
+    let policy: Value = serde_json::from_slice(
+        &std::fs::read(workspace().join("release/follower-policy.json"))
+            .expect("read follower capability policy"),
+    )
+    .expect("parse follower capability policy");
+    assert_eq!(
+        policy["schema"],
+        "nano-stacks/follower-capability-policy/v1"
+    );
+    assert_eq!(policy["artifact"]["package"], "nano-follower");
+    assert_eq!(policy["artifact"]["binary"], "stacks-follower");
+    assert_eq!(policy["artifact"]["chainstate_writer"], true);
+
+    let capabilities = policy["capabilities"]
+        .as_object()
+        .expect("capabilities are an object");
+    let expected = [
+        "authentication_and_fork_choice",
+        "clarity_wasm_execution",
+        "durable_state",
+        "local_bitcoin_view",
+        "loopback_health_and_metrics",
+        "stacks_p2p_acquisition",
+    ];
+    assert_eq!(
+        capabilities.keys().map(String::as_str).collect::<Vec<_>>(),
+        expected
+    );
+    assert!(
+        capabilities.values().all(|packages| packages
+            .as_array()
+            .is_some_and(|packages| !packages.is_empty())),
+        "every follower capability needs an owning package"
+    );
+
+    let allowed = string_set(&policy, "allowed_internal_packages");
+    let forbidden = string_set(&policy, "forbidden_internal_packages");
+    assert!(allowed.is_disjoint(&forbidden));
+    for package in [
+        "nano-mempool",
+        "nano-miner",
+        "nano-node",
+        "nano-oracle",
+        "nano-rpc",
+        "nano-signer",
+        "nano-stackerdb",
+        "nano-tui",
+    ] {
+        assert!(forbidden.contains(package), "{package} is not forbidden");
+    }
+    assert_eq!(
+        string_set(&policy, "loopback_surfaces"),
+        ["/health", "/metrics"].into_iter().collect()
+    );
+    assert!(
+        policy["public_surfaces"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "the first follower artifact must expose no public HTTP route"
+    );
+}
+
+fn string_set<'a>(document: &'a Value, field: &str) -> std::collections::BTreeSet<&'a str> {
+    document[field]
+        .as_array()
+        .unwrap_or_else(|| panic!("{field} is not an array"))
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} contains a non-string"))
+        })
+        .collect()
 }
 
 fn tree(edges: &str) -> String {
