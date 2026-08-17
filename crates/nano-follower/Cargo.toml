@@ -32,7 +32,9 @@ nano-rpc = { path = "../nano-rpc", optional = true }
 nano-sortition = { path = "../nano-sortition" }
 nano-sync = { path = "../nano-sync", default-features = false }
 nano-vm = { path = "../nano-vm" }
+reqwest = { version = "0.13.4", default-features = false }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
+schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", default-features = false, features = ["rt"] }
