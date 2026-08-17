@@ -1259,14 +1259,37 @@ pub fn durable_replay_chainstate(
         state_root,
     )
     .map_err(|error| format!("the checkpoint cannot be opened: {error}"))?;
-    let recovered = match chainstate
+    let sealed = chainstate
         .tip()
         .map_err(|error| format!("the state tip cannot be read: {error}"))?
-        .filter(|tip| *tip != source)
-    {
-        Some(tip) => chainstate
-            .recover_ledger_at(tip)
-            .map_err(|error| format!("the ledger cannot be read back: {error}"))?,
+        .filter(|tip| *tip != source);
+    let recovered = match sealed {
+        Some(sealed) => {
+            let mut tip = sealed;
+            while !chainstate.has_ledger(tip) {
+                tip = chainstate
+                    .parent_of(tip)
+                    .map_err(|error| format!("the state ancestry cannot be read: {error}"))?
+                    .filter(|parent| *parent != source)
+                    .ok_or_else(|| {
+                        format!(
+                            "sealed state {} and its descendants of the checkpoint have no \
+                             committed ledger",
+                            hex::encode(sealed)
+                        )
+                    })?;
+            }
+            let height = chainstate
+                .height_of(tip)
+                .map_err(|error| format!("the ledger tip height cannot be read: {error}"))?
+                .ok_or_else(|| format!("ledger tip {} has no height", hex::encode(tip)))?;
+            chainstate
+                .discard_above(height)
+                .map_err(|error| format!("incomplete states cannot be discarded: {error}"))?;
+            chainstate
+                .recover_ledger_at(tip)
+                .map_err(|error| format!("the ledger cannot be read back: {error}"))?
+        }
         None => false,
     };
     if !recovered {

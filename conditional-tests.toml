@@ -188,6 +188,14 @@ requires = "Linux, checked-in captured blocks and the pinned libfiu dev-shell pa
 policy = "required"
 
 [[conditional]]
+site = "storage_faults::mismatched_store_generations_expose_only_a_complete_state#1"
+class = "infrastructure"
+owner = "137"
+job = "release-qualification"
+requires = "checked-in captured blocks"
+policy = "required"
+
+[[conditional]]
 site = "mainnet_accounting::the_mainnet_checkpoint_owes_a_full_maturity_window#1"
 class = "infrastructure"
 owner = "052"

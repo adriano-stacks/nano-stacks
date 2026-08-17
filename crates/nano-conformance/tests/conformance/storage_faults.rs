@@ -206,10 +206,10 @@ fn set_read_only(path: &Path, read_only: bool) {
     }
 }
 
-fn prepare_state() -> tempfile::TempDir {
+fn prepare_state(blocks: u64) -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("a damaged state directory");
     assert!(
-        replay(directory.path(), 2).success(),
+        replay(directory.path(), blocks).success(),
         "prepare the state to damage"
     );
     directory
@@ -338,12 +338,64 @@ fn storage_failures_leave_only_a_complete_replay_prefix() {
     );
 
     for database in ["marf.sqlite", "clarity.sqlite"] {
-        let directory = prepare_state();
+        let directory = prepare_state(2);
         corrupt_first_page(&directory.path().join(database));
         assert_damage_is_refused(directory.path(), &format!("a corrupt {database} page"));
 
-        let directory = prepare_state();
+        let directory = prepare_state(2);
         truncate_half(&directory.path().join(database));
         assert_damage_is_refused(directory.path(), &format!("a torn {database}"));
     }
+}
+
+#[test]
+fn mismatched_store_generations_expose_only_a_complete_state() {
+    if !fixtures().join("nakamoto/blocks").is_dir() {
+        nano_conformance::skip_gate("the captured blocks are unavailable");
+        return;
+    }
+
+    let reference = prepare_state(TARGET_BLOCKS);
+    let expected = fingerprint(reference.path());
+
+    let parent = prepare_state(2);
+    let parent_before = fingerprint(parent.path());
+    let child = prepare_state(3);
+    fs::copy(
+        child.path().join("marf.sqlite"),
+        parent.path().join("marf.sqlite"),
+    )
+    .expect("copy the child MARF beside the parent side store");
+    assert_eq!(
+        fingerprint(parent.path()),
+        parent_before,
+        "a MARF ahead of its side store exposes exactly the complete parent"
+    );
+    assert_eq!(
+        finish(parent.path()),
+        expected,
+        "the recovered parent replays to the clean state"
+    );
+
+    // The side store is committed first. If a file-by-file snapshot sees it one
+    // block ahead of the MARF, those rows are unreachable and the complete
+    // parent remains the only visible state.
+    let parent = prepare_state(2);
+    let parent_before = fingerprint(parent.path());
+    let child = prepare_state(3);
+    fs::copy(
+        child.path().join("clarity.sqlite"),
+        parent.path().join("clarity.sqlite"),
+    )
+    .expect("copy the child side store beside the parent MARF");
+    assert_eq!(
+        fingerprint(parent.path()),
+        parent_before,
+        "an ahead side store exposes exactly the complete parent"
+    );
+    assert_eq!(
+        finish(parent.path()),
+        expected,
+        "the safe half of a file-generation tear replays to the clean state"
+    );
 }
