@@ -47,6 +47,9 @@ run_gate() {
       cargo test --profile ci -p nano-adversarial --test corpus_smoke \
         owned_corpora_stay_bounded_and_replay -- --exact --test-threads=1
       ;;
+    network-chaos)
+      scripts/network-chaos.sh
+      ;;
     fuzz-smoke)
       cargo fuzz build --fuzz-dir fuzz --sanitizer none --codegen-units 16
       for target in \
@@ -121,7 +124,7 @@ run_gate() {
 
 case "$gate" in
   all)
-    for name in toolchain workflow formatting clippy follower-artifact scoreboard fixtures checkpoint-sample adversarial-smoke fuzz-smoke tests release release-integrity locks; do
+    for name in toolchain workflow formatting clippy follower-artifact scoreboard fixtures checkpoint-sample adversarial-smoke network-chaos fuzz-smoke tests release release-integrity locks; do
       run_gate "$name"
     done
     ;;

@@ -61,6 +61,9 @@ jobs:
       - name: bounded adversarial corpus replay
         run: nix develop --command scripts/ci.sh adversarial-smoke
 
+      - name: deterministic network chaos
+        run: nix develop --command scripts/ci.sh network-chaos
+
       - name: structured fuzz frontend smoke
         run: nix develop --command scripts/ci.sh fuzz-smoke
 

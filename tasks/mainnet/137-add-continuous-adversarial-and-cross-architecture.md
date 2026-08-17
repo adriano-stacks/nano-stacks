@@ -34,7 +34,7 @@ every finding as a deterministic regression.
 - [ ] Inject `ENOSPC`, `EIO`, short reads/writes, read-only filesystems, corrupt
       pages, torn/truncated files and failure at every fsync/rename/commit point,
       in addition to process-kill timing tests.
-- [ ] Add deterministic network-chaos scenarios for partitions, peer churn,
+- [x] Add deterministic network-chaos scenarios for partitions, peer churn,
       equivocation, slow/fragmented peers, delayed Bitcoin views, reorgs and
       reward-boundary restarts.
 - [ ] Run the executable Epoch 4.0 corpus on x86-64 and AArch64 and compare roots,

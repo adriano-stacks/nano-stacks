@@ -511,6 +511,39 @@ async fn the_full_capture_closes_without_peer_sortitions_across_reward_cycles() 
     );
 }
 
+/// Restarting after every committed chunk while crossing a reward cycle is lossless.
+#[tokio::test]
+async fn a_restart_across_a_reward_cycle_reaches_the_same_state() {
+    let chain = captured_chain();
+    let rows = snapshots();
+    let boundary = fixture_boundary_blocks(&chain);
+    let anchor = chain.get(boundary - 1).expect("the fixture boundary block");
+    let anchor_cycle = burn_height_of(&rows, anchor) / cycle();
+    let served = chain[boundary..]
+        .iter()
+        .position(|block| burn_height_of(&rows, block) / cycle() > anchor_cycle)
+        .map(|index| index + 1)
+        .expect("the captured suffix crosses a reward-cycle boundary");
+    let budget = CatchUpBudget {
+        fetch: 16,
+        execute: 3,
+    };
+
+    let straight = Policy::default();
+    let (_, unbroken) = close_the_gap(Run::new(served, budget, &straight)).await;
+    let across = Policy::default();
+    let (progress, restarted) = close_the_gap(Run::new(served, budget, &across).restarting()).await;
+
+    assert!(
+        progress.rounds > 1,
+        "the boundary was crossed in one chunk, so no restart occurred around it"
+    );
+    assert_eq!(
+        restarted, unbroken,
+        "restarting while crossing the reward cycle changed the committed state"
+    );
+}
+
 fn assert_refused_round_preserved_descent(
     executor: &CheckpointExecutor<MovableBurnchain>,
     refused_round: &CatchUpRound,
