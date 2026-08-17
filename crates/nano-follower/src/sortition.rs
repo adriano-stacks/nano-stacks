@@ -218,7 +218,7 @@ struct WaterfallPayout {
 
 /// One newly derived Bitcoin block to publish to event observers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BurnNotification {
+pub struct BurnNotification {
     pub bitcoin_block_hash: BitcoinHeaderHash,
     pub bitcoin_height: u64,
     pub consensus_hash: ConsensusHash,
@@ -482,7 +482,7 @@ impl SortitionTracker {
 
     /// Every locally derived Bitcoin block above a previously published height.
     #[must_use]
-    pub(crate) fn burn_notifications_after(&self, bitcoin_height: u64) -> Vec<BurnNotification> {
+    pub fn burn_notifications_after(&self, bitcoin_height: u64) -> Vec<BurnNotification> {
         let mut notifications = Vec::new();
         for height in bitcoin_height.saturating_add(1)..=self.tip().bitcoin_height {
             let Some(parent) = self.snapshot_at(height.saturating_sub(1)) else {

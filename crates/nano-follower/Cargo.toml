@@ -1,0 +1,24 @@
+[package]
+name = "nano-follower"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hex = "0.4.3"
+nano-address = { path = "../nano-address" }
+nano-bitcoin = { path = "../nano-bitcoin" }
+nano-chainstate = { path = "../nano-chainstate" }
+nano-primitives = { path = "../nano-primitives" }
+nano-sortition = { path = "../nano-sortition" }
+nano-sync = { path = "../nano-sync", default-features = false }
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[dev-dependencies]
+nano-crypto = { path = "../nano-crypto" }
+tempfile = "3"
+
+[lints]
+workspace = true

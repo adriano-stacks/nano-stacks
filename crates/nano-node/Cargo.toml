@@ -18,6 +18,7 @@ nano-chainstate = { path = "../nano-chainstate" }
 nano-codec = { path = "../nano-codec" }
 nano-consensus-profile = { path = "../nano-consensus-profile" }
 nano-crypto = { path = "../nano-crypto" }
+nano-follower = { path = "../nano-follower" }
 nano-marf = { path = "../nano-marf" }
 nano-mempool = { path = "../nano-mempool" }
 nano-miner = { path = "../nano-miner" }

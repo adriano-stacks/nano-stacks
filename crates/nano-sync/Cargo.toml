@@ -4,12 +4,16 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["mempool"]
+mempool = ["dep:nano-codec", "dep:nano-mempool"]
+
 [dependencies]
 nano-address = { path = "../nano-address" }
 nano-chainstate = { path = "../nano-chainstate" }
-nano-codec = { path = "../nano-codec" }
+nano-codec = { path = "../nano-codec", optional = true }
 nano-crypto = { path = "../nano-crypto" }
-nano-mempool = { path = "../nano-mempool" }
+nano-mempool = { path = "../nano-mempool", optional = true }
 lru = "0.18.2"
 nano-primitives = { path = "../nano-primitives" }
 nano-sortition = { path = "../nano-sortition" }

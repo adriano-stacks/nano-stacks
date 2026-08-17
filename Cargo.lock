@@ -2596,6 +2596,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-follower"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "nano-address",
+ "nano-bitcoin",
+ "nano-chainstate",
+ "nano-crypto",
+ "nano-primitives",
+ "nano-sortition",
+ "nano-sync",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "nano-marf"
 version = "0.1.0"
 dependencies = [
@@ -2661,6 +2679,7 @@ dependencies = [
  "nano-codec",
  "nano-consensus-profile",
  "nano-crypto",
+ "nano-follower",
  "nano-marf",
  "nano-mempool",
  "nano-miner",

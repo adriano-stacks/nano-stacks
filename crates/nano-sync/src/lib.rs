@@ -1,5 +1,7 @@
+#[cfg(feature = "mempool")]
+use std::collections::HashMap;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashSet},
     fmt,
     hash::Hash,
     num::NonZeroUsize,
@@ -30,17 +32,22 @@ pub fn request_stats() -> (u64, f64) {
     )
 }
 
-use nano_address::{PoxAddress, PoxAddressType32, StacksAddress};
+#[cfg(feature = "mempool")]
+use nano_address::StacksAddress;
+use nano_address::{PoxAddress, PoxAddressType32};
 use nano_chainstate::{
     BitcoinBlockContext, CoinbaseSchedule, NakamotoBlock, NakamotoCodecError, Signer, SignerSet,
     SignerSetError, TenureError,
 };
+#[cfg(feature = "mempool")]
 use nano_codec::Transaction;
 use nano_crypto::{CryptoError, StacksPublicKey};
+#[cfg(feature = "mempool")]
 use nano_mempool::{Account, Admission, ChainTip, Mempool, Rejection};
+#[cfg(feature = "mempool")]
+use nano_primitives::Sha256Sum;
 use nano_primitives::{
-    BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, Hash160, Sha256Sum, SortitionId,
-    StacksBlockId,
+    BitcoinHeaderHash, BlockHeaderHash, ConsensusHash, Hash160, SortitionId, StacksBlockId,
 };
 pub use nano_sortition::{MiningCompetition, SortitionParticipant};
 use reqwest::{Client, Url, header::CONTENT_TYPE};
@@ -218,8 +225,10 @@ pub struct SyncClient {
 /// A node that follows a peer has no account index of its own until it
 /// executes, so the peer's view of the tip is the one it admits against.
 #[derive(Clone, Debug, Default)]
+#[cfg(feature = "mempool")]
 pub struct PeerAccounts(HashMap<StacksAddress, Account>);
 
+#[cfg(feature = "mempool")]
 impl ChainTip for PeerAccounts {
     fn account(&self, address: &StacksAddress) -> Account {
         self.0.account(address)
@@ -933,11 +942,13 @@ impl SyncClient {
     }
 
     /// Fetch the next nonce an account's transactions must use.
+    #[cfg(feature = "mempool")]
     pub async fn account_nonce(&self, address: StacksAddress) -> Result<u64, SyncError> {
         Ok(self.account(address).await?.nonce)
     }
 
     /// Fetch the nonce and spendable balance a peer holds for an account.
+    #[cfg(feature = "mempool")]
     pub async fn account(&self, address: StacksAddress) -> Result<Account, SyncError> {
         let response: AccountWire = self.get(&format!("v2/accounts/{address}?proof=0")).await?;
         let balance = u128::from_str_radix(response.balance.trim_start_matches("0x"), 16)
@@ -950,6 +961,7 @@ impl SyncClient {
 
     /// Fetch the account state every transaction a mempool holds is judged
     /// against.
+    #[cfg(feature = "mempool")]
     pub async fn accounts_for(&self, mempool: &Mempool) -> Result<PeerAccounts, SyncError> {
         let mut accounts = HashMap::new();
         for address in mempool.addresses() {
@@ -963,6 +975,7 @@ impl SyncClient {
     /// A peer's mempool is a source of transactions, not the node's answer to
     /// what it will mine: every transaction it hands over is admitted on this
     /// node's own rules against this node's own view of the accounts.
+    #[cfg(feature = "mempool")]
     pub async fn fill_mempool(&self, mempool: &mut Mempool, now: u64) -> Result<usize, SyncError> {
         let mut page = None;
         let mut cursors = HashSet::new();
@@ -1054,6 +1067,7 @@ impl SyncClient {
     /// empty set of tags asks for everything. The response is the transactions
     /// back to back with the page identifier for the next request as its last
     /// thirty-two bytes (`core/mempool.rs`, `decode_tx_stream`).
+    #[cfg(feature = "mempool")]
     pub async fn mempool_page(
         &self,
         page: Option<Sha256Sum>,
@@ -2461,6 +2475,7 @@ struct BlockUploadWire {
 }
 
 #[derive(Deserialize)]
+#[cfg(feature = "mempool")]
 struct AccountWire {
     nonce: u64,
     /// The balance the account can spend now, as thirty-two hexadecimal digits.
@@ -2519,6 +2534,7 @@ fn decode_tenure_blocks(encoded: &str) -> Result<Vec<NakamotoBlock>, SyncError> 
 
 /// Wire tag for a mempool query that lists the transactions already known
 /// (`core/mempool.rs`, `MemPoolSyncDataID::TxTags`).
+#[cfg(feature = "mempool")]
 const MEMPOOL_QUERY_TX_TAGS: u8 = 0x02;
 
 /// Split a mempool page into its transactions and the identifier of the page
@@ -2528,6 +2544,7 @@ const MEMPOOL_QUERY_TX_TAGS: u8 = 0x02;
 /// more to send appends the next page's identifier, which is why a stream that
 /// ends on a transaction boundary is the last page (`core/mempool.rs`,
 /// `decode_tx_stream`).
+#[cfg(feature = "mempool")]
 fn decode_mempool_page(body: &[u8]) -> Result<(Vec<Transaction>, Option<Sha256Sum>), SyncError> {
     let mut stream = body;
     let mut transactions = Vec::new();

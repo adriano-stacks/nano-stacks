@@ -18,7 +18,7 @@ use std::process::Command;
 use serde_json::Value;
 
 /// The crates the shipped `stacks-node` is built from.
-const PRODUCTION: [&str; 17] = [
+const PRODUCTION: [&str; 18] = [
     "nano-primitives",
     "nano-crypto",
     "nano-address",
@@ -31,6 +31,7 @@ const PRODUCTION: [&str; 17] = [
     "nano-chainstate",
     "nano-p2p",
     "nano-sync",
+    "nano-follower",
     "nano-stackerdb",
     "nano-signer",
     "nano-miner",
@@ -124,6 +125,10 @@ fn string_set<'a>(document: &'a Value, field: &str) -> std::collections::BTreeSe
 }
 
 fn tree(edges: &str) -> String {
+    tree_for("nano-node", edges)
+}
+
+fn tree_for(package: &str, edges: &str) -> String {
     let output = Command::new(env!("CARGO"))
         // CI asks Cargo to colour every stream. Keep that hostile setting in
         // local tests too, then override it for the output parsed below.
@@ -133,7 +138,7 @@ fn tree(edges: &str) -> String {
             "--color",
             "never",
             "--package",
-            "nano-node",
+            package,
             "--edges",
             edges,
         ])
@@ -146,6 +151,37 @@ fn tree(edges: &str) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn the_follower_core_links_only_policy_packages() {
+    let policy: Value = serde_json::from_slice(
+        &std::fs::read(workspace().join("release/follower-policy.json"))
+            .expect("read follower capability policy"),
+    )
+    .expect("parse follower capability policy");
+    let allowed = string_set(&policy, "allowed_internal_packages");
+    let forbidden = string_set(&policy, "forbidden_internal_packages");
+    let tree = tree_for("nano-follower", "normal");
+    let linked = tree
+        .lines()
+        .filter_map(|line| {
+            line.trim_start_matches(['│', '├', '└', '─', ' '])
+                .split_whitespace()
+                .next()
+                .filter(|name| name.starts_with("nano-"))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        linked.is_subset(&allowed),
+        "follower links internal packages outside policy: {:?}",
+        linked.difference(&allowed).collect::<Vec<_>>()
+    );
+    assert!(
+        linked.is_disjoint(&forbidden),
+        "follower links forbidden packages: {:?}",
+        linked.intersection(&forbidden).collect::<Vec<_>>()
+    );
 }
 
 /// No reference crate is built with its test behaviour.

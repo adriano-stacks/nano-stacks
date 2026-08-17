@@ -6,8 +6,7 @@ pub mod hosting;
 pub mod miner;
 pub mod runtime;
 pub mod signer;
-pub mod sortition;
-pub mod staging;
+pub use nano_follower::{sortition, staging};
 
 use std::{collections::HashMap, fmt, path::Path, time::Duration};
 

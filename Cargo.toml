@@ -17,6 +17,7 @@ members = [
     "crates/nano-chainstate",
     "crates/nano-p2p",
     "crates/nano-sync",
+    "crates/nano-follower",
     "crates/nano-stackerdb",
     "crates/nano-signer",
     "crates/nano-miner",
