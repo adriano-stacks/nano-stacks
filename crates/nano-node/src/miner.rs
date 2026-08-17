@@ -580,25 +580,25 @@ impl State {
         let now = now_unix();
         // Held only while the pool is touched: the peer calls below await, and
         // the RPC admits into the same pool meanwhile.
-        let mempool_size = {
+        let mempool_status = {
             let mut mempool = self.mempool.lock().await;
             // Candidate transport only. A peer may omit transactions (including
             // through its admission view) just as it may serve an empty page;
             // the local account map below decides what can enter this block.
             self.peer.fill_mempool(&mut mempool, now).await?;
-            mempool.len()
+            mempool.status()
         };
-        self.metrics.publish_mempool_size(mempool_size);
+        self.metrics.publish_mempool(mempool_status);
         let accounts = {
             let mempool = self.mempool.lock().await;
             executor.local_mempool_accounts(&mempool)?
         };
-        let (pending, mempool_size) = {
+        let (pending, mempool_status) = {
             let mut mempool = self.mempool.lock().await;
             mempool.advance(&accounts, now);
-            (mempool.candidates(&accounts), mempool.len())
+            (mempool.candidates(&accounts), mempool.status())
         };
-        self.metrics.publish_mempool_size(mempool_size);
+        self.metrics.publish_mempool(mempool_status);
         let extend_due = !state.extended
             && state.since.elapsed() >= Duration::from_secs(self.miner.tenure_extend_after_secs);
         if pending.is_empty() && !extend_due {
@@ -661,7 +661,7 @@ impl State {
         for transaction in &block.transactions {
             mempool.remove(transaction.txid());
         }
-        self.metrics.publish_mempool_size(mempool.len());
+        self.metrics.publish_mempool(mempool.status());
         drop(mempool);
         Ok(Some(block))
     }

@@ -558,6 +558,10 @@ struct PeerGauges {
 struct ResourceGauges {
     tenure_history_window: IntGauge,
     mempool_transactions: IntGauge,
+    mempool_bytes: IntGauge,
+    mempool_transaction_limit: IntGauge,
+    mempool_byte_limit: IntGauge,
+    mempool_saturations: IntGauge,
     marf_node_cache_entries: IntGauge,
     marf_node_cache_bytes: IntGauge,
     marf_auxiliary_cache_bytes: IntGauge,
@@ -688,6 +692,26 @@ impl ResourceGauges {
                 registry,
                 "mempool_transactions",
                 "Transactions currently retained in the local mempool.",
+            ),
+            mempool_bytes: gauge(
+                registry,
+                "mempool_bytes",
+                "Canonical transaction bytes currently retained in the local mempool.",
+            ),
+            mempool_transaction_limit: gauge(
+                registry,
+                "mempool_transaction_limit",
+                "Maximum transactions retained in the local mempool.",
+            ),
+            mempool_byte_limit: gauge(
+                registry,
+                "mempool_byte_limit",
+                "Maximum canonical transaction bytes retained in the local mempool.",
+            ),
+            mempool_saturations: gauge(
+                registry,
+                "mempool_saturations",
+                "Transactions refused because a local mempool limit was full.",
             ),
             marf_node_cache_entries: gauge(
                 registry,
@@ -1072,12 +1096,20 @@ impl NodeMetrics {
             .observe(duration.as_secs_f64());
     }
 
-    /// Publish the current local mempool size after a mutation.
-    pub fn publish_mempool_size(&self, transactions: usize) {
-        self.0
-            .resources
+    /// Publish the producer-owned accounting for the local mempool.
+    pub fn publish_mempool(&self, status: nano_mempool::MempoolStatus) {
+        let resources = &self.0.resources;
+        resources
             .mempool_transactions
-            .set(as_i64(transactions));
+            .set(as_i64(status.transactions));
+        resources.mempool_bytes.set(as_i64(status.bytes));
+        resources
+            .mempool_transaction_limit
+            .set(as_i64(status.transaction_limit));
+        resources.mempool_byte_limit.set(as_i64(status.byte_limit));
+        resources
+            .mempool_saturations
+            .set(as_i64(status.saturations));
     }
 
     /// Publish execution-cache residency observed while the VM was already owned.
@@ -1294,6 +1326,10 @@ mod tests {
         "nano_pushed_blocks_accepted_total 3",
         "nano_pushed_blocks_refused_total 2",
         "nano_mempool_transactions 11",
+        "nano_mempool_bytes 13",
+        "nano_mempool_transaction_limit 17",
+        "nano_mempool_byte_limit 19",
+        "nano_mempool_saturations 23",
         "nano_tenure_history_window 0",
         "nano_marf_node_cache_entries 13",
         "nano_marf_node_cache_bytes 17",
@@ -1406,7 +1442,13 @@ mod tests {
         metrics.record_pushed_blocks(3, 2);
         metrics.publish_proposal_peers(2);
         metrics.publish_stackerdb_peers(4);
-        metrics.publish_mempool_size(11);
+        metrics.publish_mempool(nano_mempool::MempoolStatus {
+            transactions: 11,
+            bytes: 13,
+            transaction_limit: 17,
+            byte_limit: 19,
+            saturations: 23,
+        });
         metrics.publish_execution_caches(execution_cache_fixture());
         publish_ingress_metrics(&metrics);
         metrics.publish_block_execution(

@@ -1792,11 +1792,19 @@ async fn submit_transaction(
         &ExecutedTip::new(&mut *chain),
         now_seconds(),
     );
-    let mempool_size = mempool.len();
+    let mempool_status = mempool.status();
     drop(chain);
     drop(mempool);
-    state.metrics.publish_mempool_size(mempool_size);
-    admission.map_err(|rejection| RpcError::Rejected(rejection.into_json(txid)))?;
+    state.metrics.publish_mempool(mempool_status);
+    match admission {
+        Ok(_) => {}
+        Err(nano_mempool::Rejection::MempoolFull { .. }) => {
+            return Err(RpcError::Overloaded(
+                "the local mempool is at capacity".to_owned(),
+            ));
+        }
+        Err(rejection) => return Err(RpcError::Rejected(rejection.into_json(txid))),
+    }
     // Admitted here is admitted for the whole network: the pool this node keeps
     // is only read by its own miner, and a transaction nobody else hears about
     // cannot be mined by anybody else.
@@ -2800,7 +2808,7 @@ mod tests {
         AnchorMode, Principal, Transaction, TransactionPayloadData, TransactionVersion,
     };
     use nano_crypto::StacksPrivateKey;
-    use nano_mempool::Mempool;
+    use nano_mempool::{Mempool, MempoolLimits};
     use nano_primitives::Network;
     use serde_json::json;
     use tokio::sync::Mutex;
@@ -3339,6 +3347,94 @@ mod tests {
         assert_eq!(
             submitted.recv().await.expect("relay").txid(),
             transaction.txid()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_mempool_refuses_without_relaying_and_recovers() {
+        let first_sender = key(b"mempool capacity first");
+        let second_sender = key(b"mempool capacity second");
+        let funded = AccountEntry {
+            balance: 4_000_000,
+            locked: 0,
+            unlock_height: 0,
+            nonce: 0,
+        };
+        let mempool = Arc::new(Mutex::new(Mempool::with_limits(
+            NETWORK,
+            MempoolLimits::new(1, usize::MAX),
+        )));
+        let (relayed, mut submitted) = nano_queue::channel(TRANSACTION_QUEUE_LIMITS);
+        let state = RpcState::new(NETWORK)
+            .with_chain(chain(
+                &[
+                    (address(&first_sender), funded),
+                    (address(&second_sender), funded),
+                ],
+                None,
+            ))
+            .with_mempool(Arc::clone(&mempool))
+            .with_transaction_relay(relayed);
+        let metrics = state.metrics();
+        let app = router(state);
+        let request = |transaction: &Transaction| {
+            Request::builder()
+                .method("POST")
+                .uri("/v2/transactions")
+                .body(Body::from(transaction.encode()))
+                .expect("request")
+        };
+
+        let first = transfer(&first_sender, 0);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(&first))
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            submitted
+                .recv()
+                .await
+                .expect("the first transaction")
+                .txid(),
+            first.txid()
+        );
+
+        let second = transfer(&second_sender, 0);
+        let overloaded = app
+            .clone()
+            .oneshot(request(&second))
+            .await
+            .expect("response");
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers()[header::RETRY_AFTER], "1");
+        assert!(!mempool.lock().await.contains(second.txid()));
+        assert!(
+            submitted.try_recv().is_err(),
+            "a refused transaction was relayed"
+        );
+        let scrape = metrics.encode().expect("metrics");
+        assert!(scrape.contains("nano_mempool_transaction_limit 1"));
+        assert!(scrape.contains("nano_mempool_saturations 1"));
+
+        mempool.lock().await.remove(first.txid());
+        assert_eq!(
+            app.oneshot(request(&second))
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            submitted
+                .recv()
+                .await
+                .expect("the second transaction")
+                .txid(),
+            second.txid()
         );
     }
 

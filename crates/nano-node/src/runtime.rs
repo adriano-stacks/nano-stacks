@@ -281,6 +281,9 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let (wiring, api_to_loop, hosted) = ApiWiring::new(executor.clone(), mempool.clone(), archive);
     let rpc_enabled = config.node.rpc_bind.is_some();
     let state = start_rpc(&config, network, wiring, &dispatcher, metrics, &mut roles).await?;
+    state
+        .metrics()
+        .publish_mempool(mempool.lock().await.status());
     if let Some(executor) = executor.as_ref() {
         executor.lock().await.publish_execution_to(state.metrics());
     }
@@ -1139,12 +1142,12 @@ async fn admit_relayed(
             kept.push((from, transaction));
         }
     }
-    let mempool_size = mempool.len();
+    let mempool_status = mempool.status();
     drop(accounts);
     drop(executor);
     drop(mempool);
     if let Some(metrics) = metrics {
-        metrics.publish_mempool_size(mempool_size);
+        metrics.publish_mempool(mempool_status);
     }
     for (from, transaction) in &kept {
         relay.announce(nano_p2p::Offer::transaction(*from, transaction.clone()));

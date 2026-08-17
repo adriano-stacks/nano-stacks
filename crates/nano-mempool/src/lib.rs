@@ -41,6 +41,47 @@ pub const MAX_TRANSACTION_AGE_SECS: u64 = 256 * 10 * 60;
 /// Serialized transaction bytes a block may carry (`MAX_BLOCK_LEN`).
 pub const MAX_BLOCK_LEN: u64 = 2 * 1024 * 1024;
 
+/// Transactions retained in memory for future blocks.
+pub const MAX_MEMPOOL_TRANSACTIONS: usize = 8_192;
+
+/// Canonical transaction bytes retained in memory for future blocks.
+pub const MAX_MEMPOOL_BYTES: usize = 64 * 1024 * 1024;
+
+/// Local retention limits for submitted and peer-relayed transactions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MempoolLimits {
+    pub transactions: usize,
+    pub bytes: usize,
+}
+
+impl MempoolLimits {
+    #[must_use]
+    pub const fn new(transactions: usize, bytes: usize) -> Self {
+        assert!(transactions > 0, "a mempool must hold a transaction");
+        assert!(bytes > 0, "a mempool must hold transaction bytes");
+        Self {
+            transactions,
+            bytes,
+        }
+    }
+}
+
+impl Default for MempoolLimits {
+    fn default() -> Self {
+        Self::new(MAX_MEMPOOL_TRANSACTIONS, MAX_MEMPOOL_BYTES)
+    }
+}
+
+/// Current mempool retention and cumulative capacity refusals.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MempoolStatus {
+    pub transactions: usize,
+    pub bytes: usize,
+    pub transaction_limit: usize,
+    pub byte_limit: usize,
+    pub saturations: u64,
+}
+
 /// What a chain tip says about one account.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Account {
@@ -93,11 +134,21 @@ impl NonceMismatch {
 pub enum Rejection {
     BadTransactionVersion,
     SignatureValidation(String),
-    FeeTooLow { expected: u64, actual: u64 },
+    FeeTooLow {
+        expected: u64,
+        actual: u64,
+    },
     BadNonce(NonceMismatch),
     TooMuchChaining(NonceMismatch),
-    NotEnoughFunds { expected: u128, actual: u128 },
+    NotEnoughFunds {
+        expected: u128,
+        actual: u128,
+    },
     ConflictingNonceInMempool,
+    MempoolFull {
+        max_transactions: usize,
+        max_bytes: usize,
+    },
     TransferRecipientCannotEqualSender(StacksAddress),
     TransferAmountMustBePositive,
     BadAddressVersionByte,
@@ -118,12 +169,12 @@ impl Rejection {
             Self::TooMuchChaining(_) => "TooMuchChaining",
             Self::NotEnoughFunds { .. } => "NotEnoughFunds",
             Self::ConflictingNonceInMempool => "ConflictingNonceInMempool",
+            Self::MempoolFull { .. } | Self::Other(_) => "ServerFailureOther",
             Self::TransferRecipientCannotEqualSender(_) => "TransferRecipientCannotEqualSender",
             Self::TransferAmountMustBePositive => "TransferAmountMustBePositive",
             Self::BadAddressVersionByte => "BadAddressVersionByte",
             Self::NoCoinbaseViaMempool => "NoCoinbaseViaMempool",
             Self::NoTenureChangeViaMempool => "NoTenureChangeViaMempool",
-            Self::Other(_) => "ServerFailureOther",
         }
     }
 
@@ -140,6 +191,14 @@ impl Rejection {
             Self::SignatureValidation(message) | Self::Other(message) => {
                 Some(json!({ "message": message }))
             }
+            Self::MempoolFull {
+                max_transactions,
+                max_bytes,
+            } => Some(json!({
+                "message": format!(
+                    "mempool capacity is {max_transactions} transactions or {max_bytes} bytes"
+                ),
+            })),
             Self::FeeTooLow { expected, actual } => Some(json!({
                 "expected": expected,
                 "actual": actual,
@@ -269,21 +328,32 @@ impl Eq for Candidate<'_> {}
 #[derive(Clone, Debug)]
 pub struct Mempool {
     network: Network,
+    limits: MempoolLimits,
     entries: HashMap<Sha256Sum, Entry>,
     /// The transaction holding each origin nonce, which is the key a
     /// replacement bids against.
     origins: HashMap<(StacksAddress, u64), Sha256Sum>,
     sponsors: HashMap<(StacksAddress, u64), Sha256Sum>,
+    bytes: usize,
+    saturations: u64,
 }
 
 impl Mempool {
     #[must_use]
     pub fn new(network: Network) -> Self {
+        Self::with_limits(network, MempoolLimits::default())
+    }
+
+    #[must_use]
+    pub fn with_limits(network: Network, limits: MempoolLimits) -> Self {
         Self {
             network,
+            limits,
             entries: HashMap::new(),
             origins: HashMap::new(),
             sponsors: HashMap::new(),
+            bytes: 0,
+            saturations: 0,
         }
     }
 
@@ -295,6 +365,17 @@ impl Mempool {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    #[must_use]
+    pub fn status(&self) -> MempoolStatus {
+        MempoolStatus {
+            transactions: self.entries.len(),
+            bytes: self.bytes,
+            transaction_limit: self.limits.transactions,
+            byte_limit: self.limits.bytes,
+            saturations: self.saturations,
+        }
     }
 
     #[must_use]
@@ -387,6 +468,22 @@ impl Mempool {
         entry.accepted_at = now;
 
         let replaced = self.outbid(&entry)?;
+        let replaced_bytes = replaced
+            .iter()
+            .map(|txid| Self::entry_bytes(&self.entries[txid]))
+            .sum::<usize>();
+        let retained_transactions = self.entries.len() + 1 - replaced.len();
+        let retained_bytes = self.bytes - replaced_bytes;
+        let entry_bytes = Self::entry_bytes(&entry);
+        if retained_transactions > self.limits.transactions
+            || entry_bytes > self.limits.bytes.saturating_sub(retained_bytes)
+        {
+            self.saturations = self.saturations.saturating_add(1);
+            return Err(Rejection::MempoolFull {
+                max_transactions: self.limits.transactions,
+                max_bytes: self.limits.bytes,
+            });
+        }
         for prior in &replaced {
             self.remove(*prior);
         }
@@ -395,6 +492,7 @@ impl Mempool {
         if let Some(sponsor) = entry.sponsor {
             self.sponsors.insert(sponsor, txid);
         }
+        self.bytes += entry_bytes;
         self.entries.insert(txid, entry);
         Ok(if replaced.is_empty() {
             Admission::Added
@@ -406,11 +504,16 @@ impl Mempool {
     /// Forget one transaction, whatever became of it.
     pub fn remove(&mut self, txid: Sha256Sum) -> Option<Transaction> {
         let entry = self.entries.remove(&txid)?;
+        self.bytes -= Self::entry_bytes(&entry);
         self.origins.remove(&(entry.origin, entry.origin_nonce));
         if let Some(sponsor) = entry.sponsor {
             self.sponsors.remove(&sponsor);
         }
         Some(entry.transaction)
+    }
+
+    fn entry_bytes(entry: &Entry) -> usize {
+        usize::try_from(entry.length).unwrap_or(usize::MAX)
     }
 
     /// Drop what a new tip confirmed, what it invalidated, and what has aged
@@ -762,8 +865,8 @@ mod tests {
     use nano_crypto::StacksPrivateKey;
 
     use super::{
-        Account, Admission, HashMap, MAXIMUM_MEMPOOL_TX_CHAINING, Mempool, Network, Principal,
-        Rejection, StacksAddress, Transaction,
+        Account, Admission, HashMap, MAXIMUM_MEMPOOL_TX_CHAINING, Mempool, MempoolLimits, Network,
+        Principal, Rejection, StacksAddress, Transaction,
     };
 
     const NETWORK: Network = Network::TESTNET;
@@ -816,6 +919,75 @@ mod tests {
             Ok(Admission::AlreadyPresent)
         );
         assert_eq!(mempool.len(), 1);
+    }
+
+    #[test]
+    fn retained_transactions_are_bounded_by_count_and_recover_after_removal() {
+        let transactions = [
+            transfer(&key(b"capacity-a"), 0, 400, 1),
+            transfer(&key(b"capacity-b"), 0, 400, 1),
+            transfer(&key(b"capacity-c"), 0, 400, 1),
+        ];
+        let mut mempool = Mempool::with_limits(NETWORK, MempoolLimits::new(2, usize::MAX));
+        for transaction in &transactions[..2] {
+            assert_eq!(
+                mempool.submit(transaction.clone(), &tip(&[]), 0),
+                Ok(Admission::Added)
+            );
+        }
+        assert!(matches!(
+            mempool.submit(transactions[2].clone(), &tip(&[]), 0),
+            Err(Rejection::MempoolFull {
+                max_transactions: 2,
+                max_bytes: usize::MAX,
+            })
+        ));
+        assert_eq!(mempool.status().transactions, 2);
+        assert_eq!(mempool.status().saturations, 1);
+
+        mempool.remove(transactions[0].txid());
+        assert_eq!(
+            mempool.submit(transactions[2].clone(), &tip(&[]), 0),
+            Ok(Admission::Added)
+        );
+        assert_eq!(mempool.status().transactions, 2);
+        assert_eq!(
+            mempool.status().bytes,
+            transactions[1].as_bytes().len() + transactions[2].as_bytes().len()
+        );
+    }
+
+    #[test]
+    fn retained_transaction_bytes_are_bounded_without_losing_a_replaced_entry() {
+        let sender = key(b"capacity replacement");
+        let first = transfer(&sender, 0, 400, 1);
+        let first_bytes = first.as_bytes().len();
+        let mut mempool = Mempool::with_limits(NETWORK, MempoolLimits::new(8, first_bytes));
+        assert_eq!(
+            mempool.submit(first.clone(), &tip(&[]), 0),
+            Ok(Admission::Added)
+        );
+
+        let too_large = transfer(&key(b"capacity other"), 0, 400, 1);
+        assert!(matches!(
+            mempool.submit(too_large, &tip(&[]), 0),
+            Err(Rejection::MempoolFull {
+                max_transactions: 8,
+                max_bytes,
+            }) if max_bytes == first_bytes
+        ));
+        assert!(mempool.contains(first.txid()));
+        assert_eq!(mempool.status().bytes, first_bytes);
+
+        let replacement = transfer(&sender, 0, 500, 1);
+        assert_eq!(replacement.as_bytes().len(), first_bytes);
+        assert_eq!(
+            mempool.submit(replacement.clone(), &tip(&[]), 0),
+            Ok(Admission::Replaced(vec![first.txid()]))
+        );
+        assert!(!mempool.contains(first.txid()));
+        assert!(mempool.contains(replacement.txid()));
+        assert_eq!(mempool.status().bytes, first_bytes);
     }
 
     #[test]
