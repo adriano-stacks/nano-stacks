@@ -299,11 +299,6 @@ impl ComplexWord for MapSet {
         generator.set_expr_type(key, key_ty.clone())?;
         generator.traverse_expr(builder, key)?;
 
-        if let Some(cost_local) = &post205_cost_local {
-            generator.serialization_size(builder, &key_ty)?;
-            builder.local_set(**cost_local);
-        }
-
         // Write the key to the memory (it's already on the data stack)
         let key_size = generator.write_to_memory(builder, key_offset, 0, &key_ty)?;
 
@@ -316,18 +311,6 @@ impl ComplexWord for MapSet {
         // Push the value to the data stack
         generator.set_expr_type(value, value_type.clone())?;
         generator.traverse_expr(builder, value)?;
-        if let Some(cost_local) = &post205_cost_local {
-            generator.serialization_size(builder, &value_type)?;
-            builder
-                .local_get(**cost_local)
-                .binop(BinaryOp::I32Add)
-                // A map stores its value wrapped in an optional, so what lands
-                // in the store is one `some` tag longer than the value itself.
-                .i32_const(1)
-                .binop(BinaryOp::I32Add)
-                .local_set(**cost_local);
-        }
-
         // Write the value to the memory (it's already on the data stack)
         let val_size = generator.write_to_memory(builder, val_offset, 0, &value_type)?;
 
@@ -336,6 +319,11 @@ impl ComplexWord for MapSet {
 
         // Call the host interface function, `map_set`
         builder.call(generator.func_by_name("stdlib.map_set"));
+        if let Some(cost_local) = &post205_cost_local {
+            builder.local_set(**cost_local);
+        } else {
+            builder.drop();
+        }
 
         // In > 2.05 we have two different costs depending if
         //      - an error occurred in the interpreter
@@ -433,10 +421,7 @@ impl ComplexWord for MapInsert {
         // cost tracking. In this case, the cost tracking charge is applied after the delete operation.
         // In epoch < 2.05, the charge is immediately computed like it is in the interpreter.
         let post205_cost_local = if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
-            Some((
-                generator.borrow_local(ValType::I32),
-                generator.borrow_local(ValType::I32),
-            ))
+            Some(generator.borrow_local(ValType::I32))
         } else {
             let (key_ty, value_ty) = get_original_types(&generator.map_types_original, name)?;
             charge_ok_or_throw_runtime_error(
@@ -452,11 +437,6 @@ impl ComplexWord for MapInsert {
         generator.set_expr_type(key, key_ty.clone())?;
         generator.traverse_expr(builder, key)?;
 
-        if let Some((cost_local, _)) = &post205_cost_local {
-            generator.serialization_size(builder, &key_ty)?;
-            builder.local_set(**cost_local);
-        }
-
         // Write the key to the memory (it's already on the data stack)
         let key_size = generator.write_to_memory(builder, key_offset, 0, &key_ty)?;
 
@@ -469,20 +449,19 @@ impl ComplexWord for MapInsert {
         // Push the value to the data stack
         generator.set_expr_type(value, value_type.clone())?;
         generator.traverse_expr(builder, value)?;
-        // for epoch >= 2.05, we compute the serialization size of the key.
-        if let Some((_, serialized_sized_value_local)) = &post205_cost_local {
-            generator.serialization_size(builder, &value_type)?;
-            builder.local_set(**serialized_sized_value_local);
-        };
-
         // Write the value to the memory (it's already on the data stack)
         let val_size = generator.write_to_memory(builder, val_offset, 0, &value_type)?;
 
         // Push the value offset and size to the data stack
         builder.local_get(val_offset).i32_const(val_size as i32);
 
-        // Call the host interface function, `map_set`
+        // Call the host interface function, `map_insert`
         builder.call(generator.func_by_name("stdlib.map_insert"));
+        if let Some(cost_local) = &post205_cost_local {
+            builder.local_set(**cost_local);
+        } else {
+            builder.drop();
+        }
 
         let block_ty = generator.bounded_control_type(&[ValType::I32], &[ValType::I32])?;
 
@@ -495,21 +474,9 @@ impl ComplexWord for MapInsert {
             // When the linked operation does not fail due to an interpreter error
             let mut success_block = builder.dangling_instr_seq(block_ty);
             // The cost in < 2.05 has already been handled before
-            if let Some((cost_local, value_serialized_size_local)) = &post205_cost_local {
+            if let Some(cost_local) = &post205_cost_local {
                 let entry_status = generator.borrow_local(ValType::I32);
-                // When the element the operation is performed on was found in the map
-                // Then we charge the serialized size of the entry we want to store + serialized size of the key
-                // Otherwise just the serialized size of the key
-                success_block
-                    .local_set(*entry_status)
-                    .local_get(**value_serialized_size_local)
-                    .i32_const(0)
-                    .local_get(*entry_status)
-                    .select(None);
-                success_block
-                    .local_get(**cost_local)
-                    .binop(BinaryOp::I32Add)
-                    .local_set(**cost_local);
+                success_block.local_set(*entry_status);
                 self.charge(generator, &mut success_block, **cost_local)?;
                 success_block.local_get(*entry_status);
             }
@@ -712,7 +679,8 @@ mod tests {
     use clarity::vm::{ClarityName, Value};
 
     use crate::tools::{
-        crosscheck, crosscheck_cost_multi_contract, crosscheck_expect_failure, evaluate,
+        crosscheck, crosscheck_cost, crosscheck_cost_multi_contract, crosscheck_expect_failure,
+        evaluate,
     };
 
     //
@@ -905,6 +873,29 @@ mod tests {
             RuntimeCheckErrorKind::IncorrectArgumentCount(2, 3),
         ));
         crosscheck(snippet, expected);
+    }
+
+    /// A written map entry is charged for the exact bytes the database
+    /// stored: the serialized key plus the persisted `(some value)` envelope.
+    #[test]
+    fn a_written_entry_charges_the_bytes_the_database_wrote() {
+        let snippet = "(define-map entries uint { amount: uint, note: (buff 32) })
+             (define-public (mutate (key uint) (amount uint) (note (buff 32)) (replace bool))
+               (ok (if replace
+                     (map-set entries key { amount: amount, note: note })
+                     (map-insert entries key { amount: amount, note: note }))))";
+        for replace in [false, true] {
+            crosscheck_cost(
+                snippet,
+                "mutate",
+                &[
+                    Value::UInt(0),
+                    Value::UInt(1),
+                    Value::buff_from(vec![]).expect("empty note"),
+                    Value::Bool(replace),
+                ],
+            );
+        }
     }
 
     /// A deleted map entry is charged for its persisted one-byte tombstone as

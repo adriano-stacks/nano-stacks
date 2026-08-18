@@ -4380,10 +4380,12 @@ fn link_map_set_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                 match result {
                     Err(error) => {
                         handle_vm_execution_errors(&mut caller, error)?;
-                        Ok(1i32)
+                        Ok((1i32, 0i32))
                     }
 
                     Ok(data) => {
+                        let serialized_byte_len = i32::try_from(data.serialized_byte_len)
+                            .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
                         caller
                             .data_mut()
                             .global_context
@@ -4391,7 +4393,7 @@ fn link_map_set_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
                             .map_err(VmExecutionError::from)?;
 
                         if let Value::Bool(value) = data.value {
-                            Ok(value as i32)
+                            Ok((value as i32, serialized_byte_len))
                         } else {
                             Err(
                                 VmExecutionError::Internal(VmInternalError::InvariantViolation(
@@ -4491,9 +4493,11 @@ fn link_map_insert_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
                 match result {
                     Err(error) => {
                         handle_vm_execution_errors(&mut caller, error)?;
-                        Ok(1i32)
+                        Ok((1i32, 0i32))
                     }
                     Ok(data) => {
+                        let serialized_byte_len = i32::try_from(data.serialized_byte_len)
+                            .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
                         caller
                             .data_mut()
                             .global_context
@@ -4501,7 +4505,7 @@ fn link_map_insert_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmE
                             .map_err(VmExecutionError::from)?;
 
                         if let Value::Bool(value) = data.value {
-                            Ok(value as i32)
+                            Ok((value as i32, serialized_byte_len))
                         } else {
                             Err(
                                 VmExecutionError::Internal(VmInternalError::InvariantViolation(
@@ -8333,7 +8337,7 @@ pub fn dummy_linker<T: 'static>(engine: &Engine) -> Result<Linker<T>, wasmtime::
          _key_offset: i32,
          _key_length: i32,
          _value_offset: i32,
-         _value_length: i32| { Ok(0i32) },
+         _value_length: i32| { Ok((0i32, 0i32)) },
     )?;
 
     linker.func_wrap(
@@ -8344,7 +8348,7 @@ pub fn dummy_linker<T: 'static>(engine: &Engine) -> Result<Linker<T>, wasmtime::
          _key_offset: i32,
          _key_length: i32,
          _value_offset: i32,
-         _value_length: i32| { Ok(0i32) },
+         _value_length: i32| { Ok((0i32, 0i32)) },
     )?;
 
     linker.func_wrap(
