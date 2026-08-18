@@ -36,6 +36,39 @@ else:
 '
 }
 
+# A burn view that elected nobody is not servable by older deployed nodes once
+# it leaves the tip: their retained list keeps the current view and recent
+# elections only. The node does persist its whole consensus-hash history, so
+# a missed empty view's local hash is recovered from that file, anchored on an
+# election the node can still serve. The file sits in the node's state
+# directory, which deployments keep beside the evidence file.
+readonly persisted_consensus=${NANO_PERSISTED_CONSENSUS:-$(dirname "$output")/state/consensus-hashes.json}
+
+persisted_local_consensus() {
+    local height="$1" anchor_ch anchor_height
+    anchor_ch=$(jq -r '.last_sortition_ch // empty' <<<"$current_snapshot")
+    anchor_ch=${anchor_ch#0x}
+    test -n "$anchor_ch" || return 1
+    anchor_height=$(curl -fsS --max-time 10 \
+        "$local_url/v3/sortitions/consensus/$anchor_ch" 2>/dev/null |
+        jq -er '.[0].burn_block_height') || return 1
+    python3 - "$persisted_consensus" "$anchor_ch" "$anchor_height" "$height" <<'EOF'
+import json
+import sys
+
+path, anchor_ch, anchor_height, height = sys.argv[1:]
+hashes = json.load(open(path))["hashes"]
+try:
+    offset = hashes.index(anchor_ch) - int(anchor_height)
+except ValueError:
+    raise SystemExit(1)
+index = int(height) + offset
+if not 0 <= index < len(hashes):
+    raise SystemExit(1)
+print(hashes[index])
+EOF
+}
+
 last_height=0
 if [ -f "$output" ]; then
     if ! last_height=$(jq -se '
@@ -91,6 +124,20 @@ while true; do
                         "$local_url/v3/sortitions/consensus/${lookup_consensus#0x}" \
                         2>/dev/null | jq -ce '.[0]' || true)
                 fi
+                # A view neither route serves was an empty burn block. Its
+                # local consensus hash is still on disk; the reduced record is
+                # marked so the whole-cycle analysis compares it on the hash
+                # alone rather than mistaking it for a full local row.
+                if [ -z "$local_snapshot" ]; then
+                    persisted_hash=$(persisted_local_consensus "$height" || true)
+                    if [ -n "${persisted_hash:-}" ]; then
+                        local_snapshot=$(jq -cn \
+                            --argjson height "$height" \
+                            --arg ch "0x$persisted_hash" \
+                            '{burn_block_height: $height, consensus_hash: $ch,
+                              local_source: "persisted-consensus-history"}')
+                    fi
+                fi
             fi
             local_snapshot_height=$(jq -r '.burn_block_height // 0' \
                 <<<"${local_snapshot:-null}" 2>/dev/null || true)
@@ -100,7 +147,11 @@ while true; do
             fi
 
             local_info=$(curl -fsS --max-time 10 "$local_url/v2/info" || echo null)
-            local_pox_id=$(derive_unbroken_pox_id <<<"$local_snapshot" || echo null)
+            if [ -z "$(jq -r '.local_source // empty' <<<"$local_snapshot")" ]; then
+                local_pox_id=$(derive_unbroken_pox_id <<<"$local_snapshot" || echo null)
+            else
+                local_pox_id=null
+            fi
             oracles='[]'
             oracles_ready=true
             for oracle_url in "${oracle_urls[@]}"; do
@@ -147,6 +198,7 @@ while true; do
                         vrf_seed
                     };
                     ($local | consensus_fields) as $expected |
+                    ($local.local_source != null) as $recovered |
                     {
                         timestamp: $timestamp,
                         local: $local,
@@ -154,12 +206,24 @@ while true; do
                         local_info: $local_info,
                         oracles: [
                             $oracles[] |
-                            . + {
-                                matches_local: (
-                                    .snapshot != null and
-                                    (.snapshot | consensus_fields) == $expected
-                                )
-                            }
+                            . + (if $recovered then
+                                {
+                                    matches_local_consensus: (
+                                        .snapshot != null and
+                                        .snapshot.burn_block_height
+                                            == $local.burn_block_height and
+                                        .snapshot.consensus_hash
+                                            == $local.consensus_hash
+                                    )
+                                }
+                            else
+                                {
+                                    matches_local: (
+                                        .snapshot != null and
+                                        (.snapshot | consensus_fields) == $expected
+                                    )
+                                }
+                            end)
                         ]
                     }
                 ' >> "$output"
