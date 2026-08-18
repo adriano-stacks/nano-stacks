@@ -1775,8 +1775,8 @@ mod word {
                                             (map-set squares {x: 1} {y : 0})
                                             (map-insert squares { x: 0 } { y: 1 })", {
         1 => CostMeter {runtime: 155000, read_count: 2, read_length: 0, write_count: 3, write_length: 141},
-        2 => CostMeter {runtime: 10993, read_count: 2, read_length: 0, write_count: 3, write_length: 146},
-        3 => CostMeter {runtime: 13412, read_count: 2, read_length: 0, write_count: 3, write_length: 146},
+        2 => CostMeter {runtime: 10997, read_count: 2, read_length: 0, write_count: 3, write_length: 147},
+        3 => CostMeter {runtime: 13416, read_count: 2, read_length: 0, write_count: 3, write_length: 147},
     });
     decl_tests!("map_set_existing", "(define-map squares { x: int } { y: int }) \
                                      (map-set squares {x: 1} {y : 0})
