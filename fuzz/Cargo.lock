@@ -1909,6 +1909,7 @@ version = "0.1.0"
 dependencies = [
  "clar2wasm",
  "clarity",
+ "hex",
  "nano-chainstate",
  "nano-codec",
  "nano-crypto",
@@ -1918,6 +1919,7 @@ dependencies = [
  "nano-primitives",
  "nano-stackerdb",
  "nano-vm",
+ "serde_json",
  "stacks-common",
  "stackslib",
  "tempfile",
