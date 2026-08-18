@@ -291,7 +291,6 @@ pub struct Transaction {
 pub enum TransactionVersion {
     Mainnet,
     Testnet,
-    Other(u8),
 }
 
 impl TransactionVersion {
@@ -306,10 +305,10 @@ impl TransactionVersion {
     }
 
     const fn parse(value: u8) -> Self {
-        match value {
-            0x00 => Self::Mainnet,
-            0x80 => Self::Testnet,
-            other => Self::Other(other),
+        if value & 0x80 == 0 {
+            Self::Mainnet
+        } else {
+            Self::Testnet
         }
     }
 
@@ -317,7 +316,6 @@ impl TransactionVersion {
         match self {
             Self::Mainnet => 0,
             Self::Testnet => 0x80,
-            Self::Other(value) => value,
         }
     }
 }
@@ -903,25 +901,21 @@ impl Transaction {
     /// Return the origin address implied by the authorization and transaction network.
     #[must_use]
     pub fn origin_address(&self) -> Option<StacksAddress> {
-        self.network_mainnet()
-            .map(|mainnet| self.auth.origin().account_address(mainnet))
+        Some(self.auth.origin().account_address(self.network_mainnet()))
     }
 
     /// Return the sponsor address for a sponsored transaction.
     #[must_use]
     pub fn sponsor_address(&self) -> Option<StacksAddress> {
-        self.network_mainnet().and_then(|mainnet| {
-            self.auth
-                .sponsor()
-                .map(|sponsor| sponsor.account_address(mainnet))
-        })
+        self.auth
+            .sponsor()
+            .map(|sponsor| sponsor.account_address(self.network_mainnet()))
     }
 
-    const fn network_mainnet(&self) -> Option<bool> {
+    const fn network_mainnet(&self) -> bool {
         match self.version {
-            TransactionVersion::Mainnet => Some(true),
-            TransactionVersion::Testnet => Some(false),
-            TransactionVersion::Other(_) => None,
+            TransactionVersion::Mainnet => true,
+            TransactionVersion::Testnet => false,
         }
     }
 }
@@ -2082,6 +2076,19 @@ mod tests {
             read_stacks_string(&mut reader),
             Err(CodecError::InvalidString)
         );
+    }
+
+    #[test]
+    fn transaction_version_uses_only_the_network_bit() {
+        for byte in 0..=u8::MAX {
+            let expected = if byte & 0x80 == 0 {
+                TransactionVersion::Mainnet
+            } else {
+                TransactionVersion::Testnet
+            };
+            assert_eq!(TransactionVersion::parse(byte), expected);
+            assert_eq!(expected.byte(), byte & 0x80);
+        }
     }
 
     #[test]

@@ -601,7 +601,6 @@ impl Mempool {
         let mainnet = match transaction.version() {
             TransactionVersion::Mainnet => true,
             TransactionVersion::Testnet => false,
-            TransactionVersion::Other(_) => return Err(Rejection::BadTransactionVersion),
         };
         if mainnet != self.network.is_mainnet() {
             return Err(Rejection::BadTransactionVersion);
