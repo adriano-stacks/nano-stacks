@@ -59,13 +59,17 @@ jobs:
           RUN_SECONDS: ${{ inputs.seconds || '900' }}
         run: nix develop --command scripts/fuzz.sh "${{ matrix.target }}" "$RUN_SECONDS"
 
-      - name: retain a reproducible input on a durable branch
+      # Retention is split into observable steps: their pass/fail conclusions
+      # are public run metadata, so a future failure names its own stage
+      # without requiring authenticated access to the step logs.
+      - name: commit a reproducible input to a durable branch
+        id: retain
         if: failure()
         env:
-          GH_TOKEN: ${{ github.token }}
           TARGET: ${{ matrix.target }}
         run: |
           if test -z "$(git status --porcelain -- "fuzz/corpus/$TARGET")"; then
+            echo "retained=false" >>"$GITHUB_OUTPUT"
             exit 0
           fi
           branch="fuzz-finding/$TARGET-$GITHUB_RUN_ID"
@@ -74,10 +78,31 @@ jobs:
           git switch -c "$branch"
           git add -- "fuzz/corpus/$TARGET"
           git commit -m "test(fuzz): retain $TARGET finding"
-          git push origin "$branch"
+          echo "retained=true" >>"$GITHUB_OUTPUT"
+          echo "branch=$branch" >>"$GITHUB_OUTPUT"
+
+      - name: push the durable branch
+        if: failure() && steps.retain.outputs.retained == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.retain.outputs.branch }}
+        # The push authenticates through its own header so it cannot depend on
+        # whatever credentials the checkout step did or did not leave behind.
+        run: |
+          authorization=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $authorization" \
+            push origin "$BRANCH"
+
+      - name: open a retention pull request
+        if: failure() && steps.retain.outputs.retained == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+          BRANCH: ${{ steps.retain.outputs.branch }}
+        run: |
           gh pr create \
             --base main \
-            --head "$branch" \
+            --head "$BRANCH" \
             --title "test(fuzz): retain $TARGET finding" \
             --body "Automated reproducible input from workflow run $GITHUB_RUN_ID."
 
