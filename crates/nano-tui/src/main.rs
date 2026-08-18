@@ -52,6 +52,7 @@ use url::Url;
 const POLL: Duration = Duration::from_secs(2);
 const STALL_AFTER: Duration = Duration::from_secs(30);
 const OLD_SEAL: Duration = Duration::from_mins(2);
+const STALL_LAG_TOLERANCE: u64 = 2;
 
 /// How many executed blocks the explorer keeps.
 const HISTORY: usize = 200;
@@ -966,6 +967,9 @@ fn metric_increased(current: Option<f64>, opened: Option<f64>) -> bool {
 
 fn stall_problem(state: &State) -> Option<String> {
     let behind = state.behind().unwrap_or_default();
+    if behind > 0 && behind <= STALL_LAG_TOLERANCE {
+        return None;
+    }
     let progress_old = state
         .progress
         .unchanged_for()
@@ -3732,6 +3736,7 @@ mod tests {
     #[test]
     fn a_growing_queue_and_stationary_height_are_stalled() {
         let mut state = dashboard_state();
+        state.sync.as_mut().expect("sync fixture").blocks_behind = Some(3);
         state.progress.height = Some(8_716_524);
         state.progress.changed = Some(
             Instant::now()
@@ -3746,6 +3751,33 @@ mod tests {
         let health = health_summary(&state);
         assert_eq!(health.state, Health::Stalled);
         assert!(health.reason.contains("staged block queue grew by 3"));
+    }
+
+    #[test]
+    fn one_or_two_blocks_of_lag_are_not_stalled() {
+        for behind in [1, 2] {
+            let mut state = dashboard_state();
+            state.sync.as_mut().expect("sync fixture").blocks_behind = Some(behind);
+            state.progress.height = Some(8_716_524);
+            state.progress.changed = Some(
+                Instant::now()
+                    .checked_sub(STALL_AFTER + Duration::from_secs(1))
+                    .expect("test instant is old enough"),
+            );
+
+            assert_eq!(health_summary(&state).state, Health::Syncing);
+        }
+
+        let mut state = dashboard_state();
+        state.sync.as_mut().expect("sync fixture").blocks_behind = Some(3);
+        state.progress.height = Some(8_716_524);
+        state.progress.changed = Some(
+            Instant::now()
+                .checked_sub(STALL_AFTER + Duration::from_secs(1))
+                .expect("test instant is old enough"),
+        );
+
+        assert_eq!(health_summary(&state).state, Health::Stalled);
     }
 
     #[test]
