@@ -1577,10 +1577,19 @@ impl WasmGenerator {
                     self.charge_function_lookup(builder)?;
                 }
 
+                let calls_user_function = functions::lookup_reserved_functions(
+                    function_name.as_str(),
+                    &self.contract_analysis.clarity_version,
+                )
+                .is_none()
+                    && self.is_user_defined_function(function_name.as_str());
+
                 // Complex words handle their own argument traversal, and have priority
                 // since we need to have a slight overlap for the words `and` and `or`
                 // which exist in both complex and simple forms
-                if let Some(word) = words::lookup_complex(function_name) {
+                if calls_user_function {
+                    self.traverse_call_user_defined(builder, expr, function_name, args)?;
+                } else if let Some(word) = words::lookup_complex(function_name) {
                     word.traverse(self, builder, expr, args)?;
                 } else if let Some(simpleword) = words::lookup_simple(function_name) {
                     let (arg_types, return_type) = get_types()?;

@@ -176,7 +176,7 @@ mod tests {
 
     use crate::tools::{
         crosscheck, crosscheck_cost, crosscheck_expect_failure, crosscheck_multi_contract,
-        evaluate, TestEnvironment,
+        crosscheck_with_epoch_and_version, evaluate, TestEnvironment,
     };
 
     const ARITY_INT_FIELDS: u32 = 499;
@@ -678,6 +678,20 @@ mod tests {
                 (call-log)
             "#,
             evaluate("(ok true)"),
+        );
+    }
+
+    #[test]
+    fn older_contract_function_precedes_newer_native() {
+        crosscheck_with_epoch_and_version(
+            r#"
+                (define-read-only (verify-merkle-proof (a uint) (b uint) (c uint))
+                    (+ a b c))
+                (verify-merkle-proof u1 u2 u3)
+            "#,
+            evaluate("u6"),
+            StacksEpochId::Epoch34,
+            ClarityVersion::Clarity5,
         );
     }
 
