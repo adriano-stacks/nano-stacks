@@ -750,6 +750,19 @@ impl Transaction {
         }
         let payload_start = reader.position();
         let data = read_payload(&mut reader)?;
+        // A coinbase or a poisoned-microblock proof must be anchored on-chain:
+        // otherwise the leader it accuses could simply orphan the proof.
+        if anchor_mode != AnchorMode::OnChainOnly
+            && matches!(
+                data,
+                TransactionPayloadData::Coinbase { .. }
+                    | TransactionPayloadData::CoinbaseToAltRecipient { .. }
+                    | TransactionPayloadData::NakamotoCoinbase { .. }
+                    | TransactionPayloadData::PoisonMicroblock { .. }
+            )
+        {
+            return Err(CodecError::InvalidTransaction);
+        }
         let payload = TransactionPayload {
             data,
             bytes: reader.bytes[payload_start..reader.position()].to_vec(),
@@ -2172,6 +2185,32 @@ mod tests {
             assert_eq!(decoded.encode(), canonical);
             assert_eq!(decoded.as_bytes(), canonical);
             assert_eq!(decoded.txid(), sha512_256(&canonical));
+        }
+    }
+
+    #[test]
+    fn a_coinbase_is_rejected_unless_it_is_anchored_on_chain() {
+        for anchor_mode in [
+            AnchorMode::OnChainOnly,
+            AnchorMode::OffChainOnly,
+            AnchorMode::Any,
+        ] {
+            let transaction = Transaction::sign_standard(
+                TransactionVersion::Testnet,
+                0x8000_0000,
+                anchor_mode,
+                &StacksPrivateKey::from_seed(b"anchor-mode"),
+                0,
+                0,
+                TransactionPayloadData::Coinbase { payload: [0; 32] },
+            )
+            .expect("sign transaction");
+            let decoded = Transaction::decode(&transaction.encode());
+            assert_eq!(
+                decoded.is_ok(),
+                anchor_mode == AnchorMode::OnChainOnly,
+                "coinbase anchored {anchor_mode:?}"
+            );
         }
     }
 
