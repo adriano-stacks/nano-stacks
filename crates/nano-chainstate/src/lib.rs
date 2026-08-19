@@ -1240,6 +1240,10 @@ pub enum ChainStateError {
         error: Box<VmExecutionError>,
     },
     InvalidTransaction(String),
+    /// A typed consensus refusal: what the block claimed that this chain does
+    /// not accept, preserved rather than flattened into a sentence so two
+    /// implementations can be compared refusal for refusal.
+    Consensus(ConsensusError),
     TransactionFailure {
         result: Box<TransactionResult>,
         status: TransactionStatus,
@@ -1282,6 +1286,9 @@ impl std::fmt::Display for ChainStateError {
                 hex::encode(txid)
             ),
             Self::InvalidTransaction(error) => write!(formatter, "invalid transaction: {error}"),
+            // The same sentence the flattened form printed, so a log line or a
+            // recorded receipt does not change because the type got richer.
+            Self::Consensus(error) => write!(formatter, "invalid transaction: {error}"),
             Self::TransactionFailure { status, .. } => {
                 write!(formatter, "transaction failed: {status:?}")
             }
@@ -1320,6 +1327,7 @@ impl std::error::Error for ChainStateError {
             Self::Evaluation(_)
             | Self::Execution(_)
             | Self::InvalidTransaction(_)
+            | Self::Consensus(_)
             | Self::TransactionFailure { .. }
             | Self::UnsupportedPayload
             | Self::NoSignerSet(_)
@@ -2571,8 +2579,8 @@ impl ChainState {
                     set.approval_threshold(),
                 ))
             }),
-            Err(ChainStateError::NoSignerSet(cycle)) => Err(ChainStateError::InvalidTransaction(
-                ConsensusError::SignerSetUnavailable(cycle).to_string(),
+            Err(ChainStateError::NoSignerSet(cycle)) => Err(ChainStateError::Consensus(
+                ConsensusError::SignerSetUnavailable(cycle),
             )),
             Err(error) => Err(error),
         }
@@ -2610,12 +2618,12 @@ impl ChainState {
             authenticate::Signatures::Present
         };
         authenticate::authenticate_block(block, self.vm.network(), signatures)
-            .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+            .map_err(ChainStateError::Consensus)?;
         self.check_tenure_continuity(block, parent)
-            .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+            .map_err(ChainStateError::Consensus)?;
         if !assembled {
             Self::check_miner_won_the_sortition(block, context, operations)
-                .map_err(|error| ChainStateError::InvalidTransaction(error.to_string()))?;
+                .map_err(ChainStateError::Consensus)?;
         }
         // Not conditional: a coinbase proof is the miner's own work rather than
         // anyone's signature, so a candidate carries a real one and a miner that
@@ -2828,9 +2836,7 @@ impl ChainState {
         // Refused here rather than after sealing, so a miner whose pool offered
         // nothing admissible leaves no state behind.
         if assembled && block.transactions.is_empty() {
-            return Err(ChainStateError::InvalidTransaction(
-                ConsensusError::EmptyBlock.to_string(),
-            ));
+            return Err(ChainStateError::Consensus(ConsensusError::EmptyBlock));
         }
         Ok((execution_cost, receipts))
     }
