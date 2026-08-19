@@ -5695,6 +5695,7 @@ checkpoint execution failed: state storage error: MARF error: MARF version alrea
                     &nano_vm::BlockCommit {
                         header: nano_vm::BlockHeader::default(),
                         ledger: b"a block this node committed".to_vec(),
+                        decision: None,
                     },
                 )
                 .expect("commit");
@@ -5776,6 +5777,7 @@ checkpoint execution failed: state storage error: MARF error: MARF version alrea
                 &nano_vm::BlockCommit {
                     header: nano_vm::BlockHeader::default(),
                     ledger: b"the only ledger".to_vec(),
+                    decision: None,
                 },
             )
             .expect("commit");
