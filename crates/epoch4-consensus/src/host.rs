@@ -108,6 +108,20 @@ pub fn serve(
                 continue;
             }
         };
+        // The parent's locally derived burn headers land before the decision:
+        // Clarity may ask about any recent burn block, and the executor never
+        // fetches — a reorganization's replacement hash supersedes by height.
+        let mut seeded = true;
+        for seed in &request.burn_headers {
+            if let Err(error) = chainstate.record_burn_header(seed.height, seed.hash) {
+                protocol_error(&mut out, &format!("burn header {}: {error}", seed.height))?;
+                seeded = false;
+                break;
+            }
+        }
+        if !seeded {
+            continue;
+        }
         let decision = judge(&mut chainstate, &opened, &tip, registry);
         if decision.applied.is_some() {
             tip = opened.block;

@@ -24,6 +24,18 @@ pub struct DecisionRequest {
     pub operations: Vec<BitcoinOperation>,
     /// The exact parent the caller stands on; refused when it is not the tip.
     pub parent: Option<String>,
+    /// Locally derived canonical burn header hashes for the window behind the
+    /// view, which Clarity may ask about and the executor must not fetch: the
+    /// parent derives them from its own sortition chain and carries them here.
+    #[serde(default)]
+    pub burn_headers: Vec<BurnHeaderSeed>,
+}
+
+/// One locally derived canonical burn header, carried in the request.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BurnHeaderSeed {
+    pub height: u64,
+    pub hash: [u8; 32],
 }
 
 /// [`BitcoinBlockContext`], flattened for the wire.
@@ -136,6 +148,7 @@ impl DecisionRequest {
             context: ContextWire::from(context),
             operations,
             parent: parent.map(hex::encode),
+            burn_headers: Vec::new(),
         }
     }
 

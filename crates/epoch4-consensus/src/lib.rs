@@ -17,7 +17,7 @@
 pub mod host;
 mod request;
 
-pub use request::{ContextWire, DecisionRequest, OpenedRequest, REQUEST_SCHEMA};
+pub use request::{BurnHeaderSeed, ContextWire, DecisionRequest, OpenedRequest, REQUEST_SCHEMA};
 
 use nano_chainstate::{
     AppliedBlock, AuthenticatedBlock, ChainState, NakamotoBlock,
