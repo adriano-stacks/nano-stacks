@@ -4221,19 +4221,32 @@ fn check_module(arguments: &[String]) -> ExitCode {
         eprintln!("cannot write the source: {error}");
     }
 
-    match vm.check_module(
+    match vm.inspect_module(
         &identifier,
         version,
         &source,
         clarity::types::StacksEpochId::Epoch40,
     ) {
-        Ok(()) => {
+        Ok(inspection) => report_module_inspection(contract, inspection),
+        Err(error) => {
+            println!("{contract}: {error:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Say whether an inspected module loads, keeping refused bytes when asked.
+fn report_module_inspection(contract: &str, inspection: nano_vm::ModuleInspection) -> ExitCode {
+    match inspection.refusal {
+        None => {
             println!("{contract} compiles to a module that loads");
             ExitCode::SUCCESS
         }
-        Err(error) => {
+        Some(error) => {
             println!("{contract}: {error:?}");
-            dump_refused_wasm();
+            if let Some(wasm) = inspection.refused_wasm {
+                dump_refused_wasm(&wasm);
+            }
             ExitCode::FAILURE
         }
     }
@@ -4251,13 +4264,19 @@ const fn clarity_version(text: &str) -> Option<clarity::vm::ClarityVersion> {
     }
 }
 
-/// Disassemble a module the runtime refused, which is the only readable form.
-fn dump_refused_wasm() {
+/// Keep and disassemble a module the runtime refused — bytes are its only
+/// form, and the production path deliberately writes no file for them, so the
+/// diagnostic caller does.
+fn dump_refused_wasm(wasm: &[u8]) {
     let Some(path) = env::var_os("NANO_DUMP_REFUSED_WASM") else {
         return;
     };
-    match fs::read(&path).map(wasmprinter::print_bytes) {
-        Ok(Ok(text)) => {
+    if let Err(error) = fs::write(&path, wasm) {
+        eprintln!("cannot write the refused module: {error}");
+        return;
+    }
+    match wasmprinter::print_bytes(wasm) {
+        Ok(text) => {
             let text_path = Path::new(&path).with_extension("wat");
             if let Err(error) = fs::write(&text_path, text) {
                 eprintln!("cannot write the disassembly: {error}");
@@ -4265,8 +4284,7 @@ fn dump_refused_wasm() {
                 println!("disassembled to {}", text_path.display());
             }
         }
-        Ok(Err(error)) => eprintln!("cannot disassemble the module: {error}"),
-        Err(error) => eprintln!("cannot read the module: {error}"),
+        Err(error) => eprintln!("cannot disassemble the module: {error}"),
     }
 }
 

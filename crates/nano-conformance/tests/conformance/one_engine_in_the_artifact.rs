@@ -273,10 +273,12 @@ fn the_artifact_names_no_retired_engine_switch() {
         );
     }
     // The binary does read *some* environment, so the absence above is not
-    // because nothing is ever compared: this one is real and documented.
+    // because nothing is ever compared: this one is real and documented. It was
+    // NANO_DUMP_REFUSED_WASM until the consensus firewall removed the decision
+    // path's only arbitrary-path file write along with its switch.
     assert!(
-        contains(&bytes, b"NANO_DUMP_REFUSED_WASM"),
-        "not even the diagnostic dump variable is in the image, so this test \
+        contains(&bytes, b"NANO_TRACE_WRITES"),
+        "not even the diagnostic trace variable is in the image, so this test \
          cannot distinguish an absent switch from an absent string table"
     );
 }

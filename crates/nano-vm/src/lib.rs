@@ -1289,6 +1289,10 @@ pub struct ModuleInspection {
     pub arity_report: ArityReport,
     pub locals_report: LocalsReport,
     pub refusal: Option<VmExecutionError>,
+    /// The module bytes the runtime refused, which only exist as bytes: the
+    /// caller decides where a disassembler can reach them. Production callers
+    /// drop them; nothing in the decision path writes a file for them.
+    pub refused_wasm: Option<Vec<u8>>,
 }
 
 /// Resident execution caches published for process-memory observability.
@@ -1977,15 +1981,17 @@ impl Vm {
         })?;
         let refusal = loadable(
             contract,
-            CompiledContract::new(wasm, compiled.contract_analysis),
+            CompiledContract::new(wasm.clone(), compiled.contract_analysis),
             self.modules.engine(),
         )
         .err();
+        let refused_wasm = refusal.is_some().then_some(wasm);
         Ok(SemanticEpochInspection::Inspected(Box::new(
             ModuleInspection {
                 arity_report,
                 locals_report,
                 refusal,
+                refused_wasm,
             },
         )))
     }
@@ -5080,17 +5086,7 @@ fn loadable(
     compiled: CompiledContract,
     engine: &wasmtime::Engine,
 ) -> Result<CompiledContract, VmExecutionError> {
-    if std::env::var("NANO_DUMP_WASM_CONTRACT").as_deref() == Ok(contract.to_string().as_str())
-        && let Some(path) = std::env::var_os("NANO_DUMP_WASM")
-    {
-        let _ = std::fs::write(path, &compiled.wasm);
-    }
     if let Err(error) = wasmtime::Module::validate(engine, &compiled.wasm) {
-        // A module the runtime refuses can only be read as bytes, so leave them
-        // somewhere a disassembler can reach when asked.
-        if let Some(path) = std::env::var_os("NANO_DUMP_REFUSED_WASM") {
-            let _ = std::fs::write(path, &compiled.wasm);
-        }
         return Err(VmInternalError::Expect(format!(
             "{ANALYSIS_FAILED}: {contract} compiles to a module that will not load: {error}"
         ))
