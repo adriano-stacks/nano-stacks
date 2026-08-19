@@ -23,9 +23,9 @@ consensus rules in place.
 
 - [x] Write an architecture decision describing the process/crate boundary,
       deterministic inputs and outputs, failure semantics and migration plan.
-- [ ] Extract an `epoch4-consensus` API with no Tokio, HTTP, sockets, wall clock,
+- [x] Extract an `epoch4-consensus` API with no Tokio, HTTP, sockets, wall clock,
       environment reads or arbitrary filesystem access in its decision path.
-- [ ] Accept only authenticated Bitcoin views, typed block candidates and parent
+- [x] Accept only authenticated Bitcoin views, typed block candidates and parent
       state references; return a canonical decision record containing verdict,
       writes, root, receipts, costs and effects.
 - [ ] Host the API in a separately supervised executor process that is the sole
