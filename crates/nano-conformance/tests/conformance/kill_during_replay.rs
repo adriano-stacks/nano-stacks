@@ -231,6 +231,32 @@ fn survived(
         *expected_root,
         "as does the state it sealed"
     );
+    // The decision record travels in the transaction before the MARF commit,
+    // so a block that survived a kill has one, whole, content-addressed and
+    // naming the accepted verdict with the sealed root. A record for a block
+    // the trie never sealed was discarded at reopen; a sealed block without
+    // its record would be the impossible order.
+    let sealed = chainstate
+        .decision_record(tip)
+        .expect("read the tip's decision record")
+        .expect("a block sealed under this revision carries its decision record");
+    let record: nano_chainstate::DecisionRecord =
+        serde_json::from_slice(&sealed.record).expect("the sealed record parses");
+    assert_eq!(
+        record.content_hash().expect("hash the parsed record"),
+        sealed.content_hash,
+        "the record is the bytes its content hash names"
+    );
+    assert_eq!(
+        record.verdict,
+        nano_chainstate::Verdict::Accepted,
+        "a sealed block's record says accepted"
+    );
+    assert_eq!(
+        record.block_id,
+        hex::encode(tip),
+        "the record names the block it was sealed under"
+    );
     chainstate.executed_blocks().len()
 }
 

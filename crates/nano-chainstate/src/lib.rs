@@ -1449,6 +1449,14 @@ impl ChainState {
         Ok(self.vm.tip()?)
     }
 
+    /// The sealed decision record a block committed under, when retained.
+    pub fn decision_record(
+        &self,
+        block: [u8; 32],
+    ) -> Result<Option<nano_vm::SealedDecision>, ChainStateError> {
+        Ok(self.vm.decision_record(block)?)
+    }
+
     /// The parent the next block must extend.
     ///
     /// The MARF retains abandoned fork states, so its deepest sealed block can be

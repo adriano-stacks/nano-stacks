@@ -1528,6 +1528,14 @@ impl Vm {
         self.store.tip()
     }
 
+    /// The decision record a block committed under, when one is retained.
+    pub fn decision_record(
+        &self,
+        block: [u8; 32],
+    ) -> Result<Option<SealedDecision>, MarfStoreError> {
+        self.store.decision_record(block)
+    }
+
     /// The chain this VM executes against.
     #[must_use]
     pub const fn network(&self) -> Network {
