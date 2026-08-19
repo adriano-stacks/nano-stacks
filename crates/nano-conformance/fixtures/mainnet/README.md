@@ -29,7 +29,15 @@ inputs in two new directories, runs the production manifest builder and
 verifier, and requires both byte streams to equal the checked-in
 `checkpoint-bundle.toml`. A compiler/profile or serialization change therefore
 needs an explicit sample-manifest update instead of quietly changing release
-content addressing.
+content addressing. That update is:
+
+    # set profile_fingerprint in checkpoint-sample/checkpoint.toml to
+    # `stacks-node build-identity`'s compatibility_fingerprint, then
+    NANO_UPDATE_CHECKPOINT_SAMPLE=1 cargo test -p nano-follower --lib \
+      checkpoint_bundle::tests::published_sample_rebuilds_byte_for_byte -- --exact
+
+which rewrites `checkpoint-bundle.toml` and still requires the two independent
+rebuilds to agree, so it records a reproducible build rather than replacing one.
 
 `mainnet_envelope.rs` checks that nano derives the same signer signature hash
 mainnet signed, recovers the same keys from it, orders them the same way, and

@@ -379,6 +379,18 @@ mod tests {
         let second = fs::read(second.path().join(nano_marf::BUNDLE_MANIFEST_FILE))
             .expect("second manifest bytes");
         assert_eq!(first, second, "independent sample builds differ");
+        // The sample binds the active compiler and profile, so a deliberate
+        // change to either needs the published manifest rewritten. This is that
+        // update, as a command rather than a description of one: it rewrites the
+        // fixture only when asked, and the assertion below still has to hold
+        // afterwards, so a rewrite cannot stand in for a reproducible build.
+        if std::env::var_os("NANO_UPDATE_CHECKPOINT_SAMPLE").is_some() {
+            fs::write(
+                published_sample().join(nano_marf::BUNDLE_MANIFEST_FILE),
+                &first,
+            )
+            .expect("rewrite published manifest");
+        }
         let published = fs::read(published_sample().join(nano_marf::BUNDLE_MANIFEST_FILE))
             .expect("published manifest bytes");
         assert_eq!(first, published, "sample differs from released manifest");
