@@ -1,5 +1,6 @@
 mod authenticate;
 mod nakamoto;
+pub mod receipts;
 pub mod signers;
 
 pub use authenticate::{
@@ -10,6 +11,7 @@ pub use nakamoto::{
     NakamotoBlock, NakamotoBlockHeader, NakamotoCodecError, ProblematicTransaction, Signer,
     SignerSet, SignerSetError, SignerWeights, TenureError,
 };
+pub use receipts::{ReceiptCommitment, receipt_commitment};
 pub use signers::reward_cycle_at;
 
 use clarity::vm::ClarityVersion as VmClarityVersion;
