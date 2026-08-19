@@ -1,7 +1,7 @@
 ---
 id: "137"
 title: "Add continuous adversarial and cross-architecture verification"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["130", "131", "132", "136"]
@@ -9,6 +9,7 @@ tags: ["mainnet", "testing", "fuzzing", "chaos", "conformance"]
 created_at: 2026-08-14
 parent: 053
 type: chore
+completed_at: 2026-08-19
 ---
 
 # Add continuous adversarial and cross-architecture verification
@@ -26,7 +27,7 @@ every finding as a deterministic regression.
       manifests/import, MARF operations and clarity-wasm ABI boundaries.
 - [x] Differentially fuzz consensus-visible outputs against compatible
       stacks-core implementations and persist minimized corpora in CI.
-- [ ] Run a bounded deterministic fuzz corpus on every change and continuous
+- [x] Run a bounded deterministic fuzz corpus on every change and continuous
       long-running fuzzers with crash artifact retention and ownership.
 - [x] Add Miri where applicable plus address, undefined-behavior and thread
       sanitizer jobs for the unsafe cache boundary, FFI/dependencies and
