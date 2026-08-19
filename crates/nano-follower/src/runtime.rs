@@ -64,6 +64,7 @@ struct Follower {
     history: History,
     executor: CheckpointExecutor<BurnchainSource>,
     staging: Staging,
+    stall: StallWatch,
 }
 
 impl Follower {
@@ -109,6 +110,7 @@ impl Follower {
             history,
             executor,
             staging,
+            stall: StallWatch::new(),
         })
     }
 
@@ -144,7 +146,7 @@ impl Follower {
         self.executor.follow_burnchain(&self.pox);
         self.transport
             .publish_cycle(self.executor.cycle_start_consensus_hash(&self.pox));
-        let error = outcome.err().map(|error| {
+        let mut error = outcome.err().map(|error| {
             eprintln!("follower round failed: {error}");
             error.to_string()
         });
@@ -152,6 +154,13 @@ impl Follower {
             println!(
                 "followed {from} -> {}",
                 self.executor.tip().header.chain_length
+            );
+        }
+        if error.is_none() {
+            error = self.stall.observe(
+                self.executor.tip().header.chain_length,
+                self.executor.bitcoin_height(),
+                self.pox.bitcoin_height,
             );
         }
         observation
@@ -162,6 +171,60 @@ impl Follower {
                 error,
             ))
             .await;
+    }
+}
+
+/// Notice a follower that stops without saying so.
+///
+/// The 2026-08-19 qualification catch-up sat for 45 minutes at the last burn
+/// block of a reward cycle with every round returning success, `ready: true`
+/// and nothing to read: no executed block, no burn-view movement, no error.
+/// A round is allowed to wait — on staging, on a peer, on Bitcoin — but a
+/// follower whose burn view sits far behind the network's while round after
+/// round changes nothing is stalled, and a stall an operator cannot see is a
+/// defect regardless of its cause.
+struct StallWatch {
+    stacks: u64,
+    bitcoin: u64,
+    rounds_without_progress: u32,
+}
+
+impl StallWatch {
+    /// The follower's burn view legitimately trails the network by its stable
+    /// confirmations; only a gap beyond that can indicate a stall.
+    const NETWORK_MARGIN: u64 = 12;
+    /// Stalled rounds are fast, so this is minutes of wall clock, not hours.
+    const ROUNDS: u32 = 300;
+
+    const fn new() -> Self {
+        Self {
+            stacks: 0,
+            bitcoin: 0,
+            rounds_without_progress: 0,
+        }
+    }
+
+    fn observe(&mut self, stacks: u64, bitcoin: u64, network_bitcoin: u64) -> Option<String> {
+        let progressed = stacks != self.stacks || bitcoin != self.bitcoin;
+        self.stacks = stacks;
+        self.bitcoin = bitcoin;
+        let behind = network_bitcoin > bitcoin.saturating_add(Self::NETWORK_MARGIN);
+        if progressed || !behind {
+            self.rounds_without_progress = 0;
+            return None;
+        }
+        self.rounds_without_progress = self.rounds_without_progress.saturating_add(1);
+        if self.rounds_without_progress < Self::ROUNDS {
+            return None;
+        }
+        let stall = format!(
+            "stalled: no executed block and no burn-view progress across {} rounds \
+             while the peer's burn tip {network_bitcoin} stands {} above this node's {bitcoin}",
+            self.rounds_without_progress,
+            network_bitcoin.saturating_sub(bitcoin),
+        );
+        eprintln!("{stall}");
+        Some(stall)
     }
 }
 
@@ -321,7 +384,35 @@ impl Drop for StateLock {
 
 #[cfg(test)]
 mod tests {
-    use super::StateLock;
+    use super::{StallWatch, StateLock};
+
+    /// A quiet chain is not a stall, a trailing burn view within the stable
+    /// margin is not a stall, and progress of either kind resets the count.
+    #[test]
+    fn a_stall_is_reported_only_behind_the_network_and_without_progress() {
+        let mut watch = StallWatch::new();
+        // Far behind and frozen: the report arrives at the threshold.
+        for _ in 0..StallWatch::ROUNDS {
+            assert_eq!(watch.observe(100, 950_000, 951_000), None);
+        }
+        let stall = watch
+            .observe(100, 950_000, 951_000)
+            .expect("a frozen follower far behind the network reports itself");
+        assert!(stall.contains("stalled"), "{stall}");
+
+        // One executed block resets the count entirely.
+        assert_eq!(watch.observe(101, 950_000, 951_000), None);
+        for _ in 0..StallWatch::ROUNDS - 1 {
+            assert_eq!(watch.observe(101, 950_000, 951_000), None);
+        }
+        assert!(watch.observe(101, 950_000, 951_000).is_some());
+
+        // At tip, no rounds ever accumulate, however long the chain is quiet.
+        let mut quiet = StallWatch::new();
+        for _ in 0..(StallWatch::ROUNDS * 2) {
+            assert_eq!(quiet.observe(500, 963_000, 963_007), None);
+        }
+    }
 
     #[test]
     fn only_one_follower_can_own_a_state_directory() {
