@@ -5,6 +5,16 @@ export CARGO_TERM_COLOR=always
 
 gate=${1:-all}
 
+# libtest reports success when a name filter matches nothing, so a test that is
+# renamed or moved to another crate turns its own gate green. Every gate that
+# names a single test runs it through here, which additionally requires that at
+# least one test actually ran. Output is still streamed as it arrives.
+run_named_test() {
+  local output
+  output=$(cargo test "$@" 2>&1 | tee /dev/stderr)
+  grep -qE '^test result: ok\. [1-9][0-9]* passed' <<<"$output"
+}
+
 run_gate() {
   echo "==> $1"
   case "$1" in
@@ -40,11 +50,11 @@ run_gate() {
       cargo run --profile ci -p xtask -- validate-fixtures
       ;;
     checkpoint-sample)
-      cargo test --profile ci -p nano-node \
+      run_named_test --profile ci -p nano-follower --lib \
         checkpoint_bundle::tests::published_sample_rebuilds_byte_for_byte -- --exact
       ;;
     adversarial-smoke)
-      cargo test --profile ci -p nano-adversarial --test corpus_smoke \
+      run_named_test --profile ci -p nano-adversarial --test corpus_smoke \
         owned_corpora_stay_bounded_and_replay -- --exact --test-threads=1
       ;;
     network-chaos)
@@ -88,10 +98,10 @@ run_gate() {
       test "$status" -eq 2
       ;;
     release-integrity)
-      cargo test --profile ci -p xtask --bin xtask \
+      run_named_test --profile ci -p xtask --bin xtask \
         release_artifact::tests::tracked_staged_untracked_and_ignored_source_are_each_dirty \
         -- --exact
-      cargo test --profile ci -p xtask --test release_report \
+      run_named_test --profile ci -p xtask --test release_report \
         an_artifact_from_another_revision_is_an_audit_failure -- --exact
       cargo test --profile ci -p xtask --bin xtask release_candidate::tests -- --nocapture
       ;;
@@ -106,7 +116,7 @@ run_gate() {
       cmp "$inspection_dir/actual.sorted.json" "$inspection_dir/installed.sorted.json"
       NANO_FOLLOWER_ARTIFACT="$artifact/bin/stacks-follower" \
         NANO_FOLLOWER_REVISION=$(git rev-parse HEAD) \
-        cargo test --profile ci -p nano-conformance --test conformance \
+        run_named_test --profile ci -p nano-conformance --test conformance \
           packaged_follower::the_packaged_follower_imports_catches_up_forks_restarts_and_tracks_tip \
           -- --exact --nocapture --test-threads=1
       rm -rf -- "$inspection_dir"
