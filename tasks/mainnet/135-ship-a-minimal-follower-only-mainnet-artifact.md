@@ -1,7 +1,7 @@
 ---
 id: "135"
 title: "Ship a minimal follower-only mainnet artifact"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["130", "131", "132", "133"]
