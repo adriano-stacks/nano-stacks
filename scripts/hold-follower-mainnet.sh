@@ -40,6 +40,7 @@ usage: hold-follower-mainnet.sh, configured by environment:
   HOLD_ORACLE_A          stock node base URL
   HOLD_ORACLE_B          stock node base URL
   HOLD_BITCOIN_TIP_URL   URL answering the Bitcoin tip height as decimal
+  HOLD_BLOCK_IDENTITY    path to the block-identity binary
   HOLD_DURATION_SECONDS  optional, default 86400
 EOF
     exit 2
@@ -47,7 +48,7 @@ EOF
 
 for name in HOLD_OUTPUT HOLD_HEALTH_URL HOLD_METRICS_URL HOLD_STATE_DIR \
     HOLD_CONFIG HOLD_PID HOLD_EXE_SHA256 HOLD_ORACLE_A \
-    HOLD_ORACLE_B HOLD_BITCOIN_TIP_URL; do
+    HOLD_ORACLE_B HOLD_BITCOIN_TIP_URL HOLD_BLOCK_IDENTITY; do
     [ -n "${!name:-}" ] || { echo "$name is not set" >&2; usage; }
 done
 
@@ -61,6 +62,7 @@ readonly expected_exe_sha256="$HOLD_EXE_SHA256"
 readonly oracle_a="${HOLD_ORACLE_A%/}"
 readonly oracle_b="${HOLD_ORACLE_B%/}"
 readonly bitcoin_tip_url="$HOLD_BITCOIN_TIP_URL"
+readonly block_identity_bin="$HOLD_BLOCK_IDENTITY"
 readonly duration_seconds="${HOLD_DURATION_SECONDS:-86400}"
 readonly interval_seconds=60
 readonly executed_db="$state_dir/chainstate/executed.sqlite"
@@ -104,22 +106,36 @@ check_process() {
         fail "the follower executable changed: $sha"
 }
 
-# Byte-compare one archived block against both stock oracles and record its
-# receipt commitment for the deferred verification. Failures are terminal.
+# Compare one archived block's consensus identity against both stock oracles
+# and record its receipt commitment for the deferred verification. Identity
+# rather than bytes: the signer signature vector is outside the block hash,
+# so two valid representations of one block may legitimately differ in it —
+# the first hold attempt failed on a fourteen- versus fifteen-signature
+# representation of the same block. The block hash covers every header field
+# and the transaction merkle root, so its equality is the consensus claim.
+# Failures are terminal.
 verify_block() {
     local height="$1" block_id="$2"
     local follower_block="$work/follower.bin"
     executed_query "SELECT lower(hex(bytes)) FROM executed
                     WHERE block_id = x'$block_id'" | xxd -r -p > "$follower_block"
     [ -s "$follower_block" ] || fail "block $height left the archive before verification"
+    local follower_identity
+    follower_identity="$("$block_identity_bin" "$follower_block")" || \
+        fail "the archived block $height does not decode"
+    [ "$(jq -er .block_id <<< "$follower_identity")" = "$block_id" ] || \
+        fail "the archived block at height $height is not the block the archive names"
 
-    local oracle
+    local oracle oracle_identity
     for oracle in "$oracle_a" "$oracle_b"; do
         curl -fsS --max-time 20 --retry 5 --retry-all-errors \
             "$oracle/v3/blocks/$block_id" > "$work/oracle.bin" || \
             fail "block $height is not served by $oracle"
-        cmp -s "$follower_block" "$work/oracle.bin" || \
-            fail "block $height differs from $oracle"
+        oracle_identity="$("$block_identity_bin" "$work/oracle.bin")" || \
+            fail "block $height from $oracle does not decode"
+        [ "$(jq -c 'del(.signer_signatures)' <<< "$follower_identity")" = \
+          "$(jq -c 'del(.signer_signatures)' <<< "$oracle_identity")" ] || \
+            fail "block $height differs from $oracle: local $follower_identity, served $oracle_identity"
     done
 
     local summary
@@ -128,8 +144,7 @@ verify_block() {
     [ -n "$summary" ] || fail "block $height has no archived receipt commitment"
 
     local root
-    root="$(dd if="$follower_block" bs=1 skip=101 count=32 status=none | \
-        od -An -tx1 | tr -d ' \n')"
+    root="$(jq -er .state_index_root <<< "$follower_identity")"
     jq -cn \
         --arg timestamp "$(date -u +%FT%TZ)" \
         --argjson height "$height" \
