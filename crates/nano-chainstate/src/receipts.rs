@@ -32,12 +32,20 @@ pub fn receipt_commitment(
     block: &NakamotoBlock,
     applied: &AppliedBlock,
 ) -> Result<ReceiptCommitment, String> {
-    let receipts = applied
-        .receipts
+    receipt_commitment_parts(block, &applied.receipts, &applied.observer_transactions)
+}
+
+/// The same commitment from its parts, for the seal, where no
+/// [`AppliedBlock`] has been assembled yet.
+pub fn receipt_commitment_parts(
+    block: &NakamotoBlock,
+    block_receipts: &[TransactionReceipt],
+    observer_transactions: &[crate::ObservedTransaction],
+) -> Result<ReceiptCommitment, String> {
+    let receipts = block_receipts
         .iter()
         .chain(
-            applied
-                .observer_transactions
+            observer_transactions
                 .iter()
                 .map(|observed| &observed.receipt),
         )

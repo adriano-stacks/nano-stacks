@@ -69,6 +69,7 @@ fn sealed_state(state: &Path) -> [u8; 32] {
                 ..BlockHeader::default()
             },
             ledger: b"one block".to_vec(),
+            decision: None,
         },
     )
     .expect("commit");

@@ -1,4 +1,5 @@
 mod authenticate;
+pub mod decision;
 mod nakamoto;
 pub mod receipts;
 pub mod signers;
@@ -6,6 +7,9 @@ pub mod signers;
 pub use authenticate::{
     ConsensusError, MAX_PROBLEMATIC_TRANSACTION_MARKERS, NAKAMOTO_BLOCK_VERSION_EPOCH_4,
     recovered_miner_key_hash, registered_signing_key_hash, verify_miner_signature,
+};
+pub use decision::{
+    CostSummary, DECISION_SCHEMA, DecisionRecord, RefusalKind, Verdict, refusal_kind,
 };
 pub use nakamoto::{
     NakamotoBlock, NakamotoBlockHeader, NakamotoCodecError, ProblematicTransaction, Signer,
@@ -146,6 +150,7 @@ impl ExecutedBlock {
 pub struct CommittedBlock {
     block: AuthenticatedBlock,
     applied: AppliedBlock,
+    record: DecisionRecord,
 }
 
 impl CommittedBlock {
@@ -162,6 +167,17 @@ impl CommittedBlock {
     #[must_use]
     pub fn into_applied(self) -> AppliedBlock {
         self.applied
+    }
+
+    /// The canonical decision record this commit sealed, and the applied block.
+    #[must_use]
+    pub fn into_record_and_applied(self) -> (DecisionRecord, AppliedBlock) {
+        (self.record, self.applied)
+    }
+
+    #[must_use]
+    pub const fn record(&self) -> &DecisionRecord {
+        &self.record
     }
 }
 
@@ -1938,6 +1954,7 @@ impl ChainState {
                 persistence: BlockPersistence::Seal,
             },
         )?;
+        let record = decision::accepted_record(&block, bitcoin_context, &applied);
         Ok(CommittedBlock {
             block: AuthenticatedBlock {
                 block,
@@ -1946,6 +1963,7 @@ impl ChainState {
                 parent,
             },
             applied,
+            record,
         })
     }
 
@@ -2899,18 +2917,14 @@ impl ChainState {
             }
             self.vm.setup_block_metadata(block.header.timestamp)?;
             if block_starts_new_tenure(block) {
-                let matured = self.start_tenure(&mut ledger, bitcoin_context, operations, block)?;
-                (matured_coinbase, matured_anchored_fees) = matured_reward_amounts(&matured)?;
-                matured_rewards.clone_from(&matured.credits);
-                effects.credits.extend(matured.credits);
-                effects.liquid_supply_increase = effects
-                    .liquid_supply_increase
-                    .checked_add(matured.liquid_supply_increase)
-                    .ok_or_else(|| {
-                        ChainStateError::InvalidTransaction(
-                            "native liquid supply increase overflow".to_owned(),
-                        )
-                    })?;
+                (matured_coinbase, matured_anchored_fees) = self.apply_tenure_start(
+                    &mut ledger,
+                    bitcoin_context,
+                    operations,
+                    block,
+                    &mut effects,
+                    &mut matured_rewards,
+                )?;
             }
             // The signer set is written before the block's transactions, so it
             // must be computed here rather than alongside the matured rewards.
@@ -2921,10 +2935,9 @@ impl ChainState {
                 self.waterfall_payout(reward_set.as_ref(), waterfall_registry)?;
             let (execution_cost, mut receipts) =
                 self.run_transactions(block, candidates, assembled)?;
-            let coinbase_height = u64::from(self.vm.tenure_height()?);
             ledger
                 .accounting
-                .add_fees(coinbase_height, block_fees(block));
+                .add_fees(u64::from(self.vm.tenure_height()?), block_fees(block));
             let credited = effects.credits.len();
             // Only a block that actually matures miner rewards touches the
             // liquid supply for them — stacks-core guards this on having
@@ -2950,14 +2963,21 @@ impl ChainState {
                 sip_031_minted,
             };
             self.settle_state_root(block, root, &receipts, executed)?;
-            let execution =
-                self.finish_block_execution(block, bitcoin_context, persistence, &mut ledger)?;
+            let (observer_transactions, execution) = self.seal_and_finish(
+                block,
+                bitcoin_context,
+                persistence,
+                &mut ledger,
+                &execution_cost,
+                &receipts,
+                unlock_events,
+            )?;
             Ok(AppliedBlock {
                 bitcoin_height: bitcoin_context.height,
                 execution,
                 execution_cost,
                 receipts,
-                observer_transactions: self.phantom_unlocks_for_observer(block, unlock_events),
+                observer_transactions,
                 matured_rewards: std::mem::take(&mut matured_rewards),
                 matured_coinbase,
                 matured_anchored_fees,
@@ -2981,12 +3001,68 @@ impl ChainState {
         }
     }
 
+    /// The canonical decision record, built after the root settled so the
+    /// header names the sealed root on every policy, and made durable inside
+    /// the same transaction as the header and ledger.
+    /// Start the block's tenure and fold its matured rewards into the
+    /// block's native effects, answering the coinbase and anchored-fee split.
+    fn apply_tenure_start(
+        &mut self,
+        ledger: &mut ChainLedger,
+        bitcoin_context: BitcoinBlockContext,
+        operations: &[BitcoinOperation],
+        block: &NakamotoBlock,
+        effects: &mut NativeBlockEffects,
+        matured_rewards: &mut Vec<NativeStxCredit>,
+    ) -> Result<(u128, u128), ChainStateError> {
+        let matured = self.start_tenure(ledger, bitcoin_context, operations, block)?;
+        let amounts = matured_reward_amounts(&matured)?;
+        matured_rewards.clone_from(&matured.credits);
+        effects.credits.extend(matured.credits);
+        effects.liquid_supply_increase = effects
+            .liquid_supply_increase
+            .checked_add(matured.liquid_supply_increase)
+            .ok_or_else(|| {
+                ChainStateError::InvalidTransaction(
+                    "native liquid supply increase overflow".to_owned(),
+                )
+            })?;
+        Ok(amounts)
+    }
+
+    /// Build the canonical decision record — after the root settled, so the
+    /// header names the sealed root on every policy — and commit it in the
+    /// same transaction as the block's header, metadata and ledger.
+    #[allow(clippy::too_many_arguments)]
+    fn seal_and_finish(
+        &mut self,
+        block: &NakamotoBlock,
+        bitcoin_context: BitcoinBlockContext,
+        persistence: BlockPersistence,
+        ledger: &mut ChainLedger,
+        execution_cost: &ExecutionCost,
+        receipts: &[TransactionReceipt],
+        unlock_events: Vec<StacksTransactionEvent>,
+    ) -> Result<(Vec<ObservedTransaction>, ExecutionResult), ChainStateError> {
+        let observer_transactions = self.phantom_unlocks_for_observer(block, unlock_events);
+        let commitment =
+            receipts::receipt_commitment_parts(block, receipts, &observer_transactions)
+                .map_err(ChainStateError::Ledger)?;
+        let record =
+            decision::accepted_record_parts(block, bitcoin_context, execution_cost, commitment);
+        let sealed = decision::sealed(&record).map_err(ChainStateError::Ledger)?;
+        let execution =
+            self.finish_block_execution(block, bitcoin_context, persistence, ledger, sealed)?;
+        Ok((observer_transactions, execution))
+    }
+
     fn finish_block_execution(
         &mut self,
         block: &NakamotoBlock,
         bitcoin_context: BitcoinBlockContext,
         persistence: BlockPersistence,
         ledger: &mut ChainLedger,
+        decision: nano_vm::SealedDecision,
     ) -> Result<ExecutionResult, ChainStateError> {
         if persistence == BlockPersistence::Discard {
             let state_root = self.vm.pending_state_root()?;
@@ -3006,9 +3082,7 @@ impl ChainState {
             &nano_vm::BlockCommit {
                 header,
                 ledger: ledger.encode()?,
-                // Threaded by the decision-record slice of task 141; the
-                // storage beneath is already transactional and bounded.
-                decision: None,
+                decision: Some(decision),
             },
         )?;
         Ok(ExecutionResult { state_root })
