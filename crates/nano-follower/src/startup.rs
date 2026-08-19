@@ -229,6 +229,7 @@ mod tests {
                 &BlockCommit {
                     header: BlockHeader::default(),
                     ledger: b"committed ledger".to_vec(),
+                    decision: None,
                 },
             )
             .expect("commit block");
