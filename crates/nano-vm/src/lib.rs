@@ -2631,6 +2631,7 @@ impl MarfStore {
                 directory.join(MARF_FILE).display()
             ))
         })?;
+        discard_orphan_decision_records(&side_store, &marf)?;
         Ok(Self::assemble(network, marf, side_store, tip))
     }
 
@@ -3919,6 +3920,44 @@ fn exported_header(row: &rusqlite::Row<'_>) -> Option<RecordedHeader> {
 const SQLITE_PAGE_BYTES: i64 = 16 * 1024;
 const SQLITE_RUNTIME_CACHE_KIB: i64 = 256 * 1024;
 const SQLITE_IMPORT_CACHE_KIB: i64 = 1_000_000;
+
+/// Discard decision records for blocks the MARF never sealed.
+///
+/// The record is written in the side-store transaction that precedes the MARF
+/// commit, so a crash between the two leaves a record for a block the trie
+/// does not hold — the parent-or-child shape recovery already expects for the
+/// ledger. A record without its trie is not a committed block; discarding it
+/// at open is what makes "record present and trie sealed" the one visibility
+/// rule a reader needs.
+fn discard_orphan_decision_records(
+    side_store: &rusqlite::Connection,
+    marf: &VersionedMarf,
+) -> Result<(), MarfStoreError> {
+    let mut statement =
+        side_store.prepare_cached("SELECT block_id FROM decision_records ORDER BY sequence")?;
+    let recorded: Vec<Vec<u8>> = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    drop(statement);
+    for block in recorded {
+        let Ok(id) = <[u8; 32]>::try_from(block.as_slice()) else {
+            return Err(MarfStoreError::IncoherentState(
+                "a decision record names a block id that is not 32 bytes".to_owned(),
+            ));
+        };
+        if !marf.contains(id).map_err(MarfStoreError::from)? {
+            eprintln!(
+                "discarding the decision record for {}: the trie never sealed it,                  so it was never committed",
+                hex::encode(id)
+            );
+            side_store.execute(
+                "DELETE FROM decision_records WHERE block_id = ?1",
+                params![block],
+            )?;
+        }
+    }
+    Ok(())
+}
 
 fn open_side_store(path: &Path) -> Result<rusqlite::Connection, rusqlite::Error> {
     open_side_store_with_journal(path, true)
@@ -5649,7 +5688,9 @@ mod tests {
 
     use stacks_common::types::StacksEpochId;
 
-    use super::{BlockCommit, BlockHeader, HeaderFields, HeaderKnowledge, RecordedHeader};
+    use super::{
+        BlockCommit, BlockHeader, HeaderFields, HeaderKnowledge, RecordedHeader, SealedDecision,
+    };
     use stacks_common::codec::StacksMessageCodec;
     use stacks_common::types::chainstate::StacksBlockId;
 
@@ -6315,6 +6356,60 @@ mod tests {
         assert_eq!(
             vm.recorded_ledger([1; 32]).as_deref(),
             Some(b"owed as of block one".as_slice())
+        );
+    }
+
+    /// A decision record is exactly as durable as the block it describes.
+    ///
+    /// The record travels in the side-store transaction that precedes the MARF
+    /// commit, so the crash window leaves a record for a block the trie never
+    /// sealed. Reopening discards that record — a record without its trie was
+    /// never a committed block — and keeps the committed parent's record whole.
+    #[test]
+    fn a_decision_record_without_its_sealed_trie_is_discarded_at_open() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let sealed = |tag: u8| SealedDecision {
+            content_hash: [tag; 32],
+            record: vec![tag; 16],
+        };
+        {
+            let mut store = MarfStore::open(Network::MAINNET, directory.path()).expect("open");
+            store.begin(None, [1; 32]).expect("begin the parent");
+            store
+                .commit_to(
+                    [1; 32],
+                    &BlockCommit {
+                        header: BlockHeader::default(),
+                        ledger: b"as of the parent".to_vec(),
+                        decision: Some(sealed(7)),
+                    },
+                )
+                .expect("commit the parent");
+            store
+                .begin(Some([1; 32]), [2; 32])
+                .expect("begin the child");
+            store
+                .prepare_commit(
+                    [2; 32],
+                    &BlockCommit {
+                        header: BlockHeader::default(),
+                        ledger: b"as of the child".to_vec(),
+                        decision: Some(sealed(9)),
+                    },
+                )
+                .expect("prepare the child");
+        }
+
+        let store = MarfStore::open(Network::MAINNET, directory.path()).expect("reopen");
+        assert_eq!(
+            store.decision_record([1; 32]).expect("read the parent"),
+            Some(sealed(7)),
+            "the committed parent's record survives the reopen"
+        );
+        assert_eq!(
+            store.decision_record([2; 32]).expect("read the child"),
+            None,
+            "the prepared child's record was discarded with the crash residue"
         );
     }
 
