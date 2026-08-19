@@ -3006,6 +3006,9 @@ impl ChainState {
             &nano_vm::BlockCommit {
                 header,
                 ledger: ledger.encode()?,
+                // Threaded by the decision-record slice of task 141; the
+                // storage beneath is already transactional and bounded.
+                decision: None,
             },
         )?;
         Ok(ExecutionResult { state_root })

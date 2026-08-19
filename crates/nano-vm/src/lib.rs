@@ -559,6 +559,17 @@ pub struct BlockCommit {
     pub header: BlockHeader,
     /// The state its caller keeps beside the MARF, opaque here.
     pub ledger: Vec<u8>,
+    /// The canonical decision record the block commits under, opaque here:
+    /// the caller serializes it, this store makes it durable in the same
+    /// transaction as the header and ledger. See task 141.
+    pub decision: Option<SealedDecision>,
+}
+
+/// A content-addressed decision record, ready to be made durable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedDecision {
+    pub content_hash: [u8; 32],
+    pub record: Vec<u8>,
 }
 
 /// Everything outside the MARF that Clarity may read.
@@ -2969,6 +2980,56 @@ impl MarfStore {
         Ok(())
     }
 
+    fn write_decision(
+        &self,
+        block: [u8; 32],
+        decision: &SealedDecision,
+    ) -> Result<(), MarfStoreError> {
+        self.side_store
+            .prepare_cached(
+                "INSERT INTO decision_records (block_id, sequence, content_hash, record) \
+                 VALUES (?1, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM decision_records), ?2, ?3) \
+                 ON CONFLICT(block_id) DO UPDATE \
+                 SET content_hash = excluded.content_hash, record = excluded.record",
+            )?
+            .execute(params![
+                block.as_slice(),
+                decision.content_hash.as_slice(),
+                decision.record
+            ])?;
+        self.side_store
+            .prepare_cached(
+                "DELETE FROM decision_records \
+                 WHERE sequence <= (SELECT MAX(sequence) FROM decision_records) - ?1",
+            )?
+            .execute(params![LEDGER_HISTORY])?;
+        Ok(())
+    }
+
+    /// The decision record a block committed under, when one is retained.
+    pub fn decision_record(
+        &self,
+        block: [u8; 32],
+    ) -> Result<Option<SealedDecision>, MarfStoreError> {
+        Ok(self
+            .side_store
+            .prepare_cached(
+                "SELECT content_hash, record FROM decision_records WHERE block_id = ?1",
+            )?
+            .query_row(params![block.as_slice()], |row| {
+                let hash: Vec<u8> = row.get(0)?;
+                let record: Vec<u8> = row.get(1)?;
+                Ok((hash, record))
+            })
+            .optional()?
+            .and_then(|(hash, record)| {
+                Some(SealedDecision {
+                    content_hash: <[u8; 32]>::try_from(hash.as_slice()).ok()?,
+                    record,
+                })
+            }))
+    }
+
     /// Whether this block has a ledger, without reading the ledger itself.
     #[must_use]
     pub fn has_ledger(&self, block: [u8; 32]) -> bool {
@@ -3205,6 +3266,9 @@ impl MarfStore {
             self.write_metadata(block)?;
             self.write_block_header(block, &RecordedHeader::complete(commit.header))?;
             self.write_ledger(block, &commit.ledger)?;
+            if let Some(decision) = commit.decision.as_ref() {
+                self.write_decision(block, decision)?;
+            }
             transaction.commit()?;
             Ok(())
         })();
@@ -3431,6 +3495,18 @@ CREATE TABLE IF NOT EXISTS chain_ledger (
     data BLOB NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS chain_ledger_sequence ON chain_ledger(sequence);
+-- The canonical decision record each block committed under: verdict, root,
+-- costs and the receipt commitment, content-addressed. Written in the same
+-- transaction as the block header and ledger, before the MARF commit, which
+-- is what makes record-present-and-trie-sealed the one visibility rule a
+-- reader needs. Bounded like the ledger: the record floor is the oldest row.
+CREATE TABLE IF NOT EXISTS decision_records (
+    block_id BLOB PRIMARY KEY,
+    sequence INTEGER NOT NULL,
+    content_hash BLOB NOT NULL,
+    record BLOB NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS decision_records_sequence ON decision_records(sequence);
 -- The Stacks height each tenure began at, for tenures older than anything this
 -- node executed. `get-tenure-info?` reaches every field of a tenure through this
 -- mapping, and a node that could not answer it told a contract the tenure never
@@ -6227,6 +6303,7 @@ mod tests {
                 &BlockCommit {
                     header,
                     ledger: b"owed as of block one".to_vec(),
+                    decision: None,
                 },
             )
             .expect("commit");
@@ -6261,6 +6338,7 @@ mod tests {
                     &BlockCommit {
                         header: BlockHeader::default(),
                         ledger: b"as of the parent".to_vec(),
+                        decision: None,
                     },
                 )
                 .expect("commit the parent");
@@ -6275,6 +6353,7 @@ mod tests {
                     &BlockCommit {
                         header: BlockHeader::default(),
                         ledger: b"as of the child".to_vec(),
+                        decision: None,
                     },
                 )
                 .expect("prepare the child");
@@ -6319,6 +6398,7 @@ mod tests {
         let commit = |ledger: &str| BlockCommit {
             header: BlockHeader::default(),
             ledger: ledger.as_bytes().to_vec(),
+            decision: None,
         };
 
         let mut parent = None;

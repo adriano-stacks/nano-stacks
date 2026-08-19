@@ -127,6 +127,7 @@ fn chain_with_a_block_open() -> Vm {
                     ..BlockHeader::default()
                 },
                 ledger: Vec::new(),
+                decision: None,
             },
         )
         .expect("seal it");

@@ -2657,6 +2657,7 @@ mod tests {
                     &nano_vm::BlockCommit {
                         header: nano_vm::BlockHeader::default(),
                         ledger: b"committed".to_vec(),
+                        decision: None,
                     },
                 )
                 .expect("commit");

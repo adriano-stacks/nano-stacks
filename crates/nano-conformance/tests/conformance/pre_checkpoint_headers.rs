@@ -367,6 +367,7 @@ fn a_header_never_carried_is_not_a_block_that_does_not_exist() {
                 ..nano_vm::BlockHeader::default()
             },
             ledger: Vec::new(),
+            decision: None,
         },
     )
     .expect("seal it");
