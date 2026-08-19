@@ -10,7 +10,7 @@ use tokio::{task::JoinHandle, time::sleep};
 use crate::{
     CatchUpBudget, CheckpointExecutor,
     archive::Archive,
-    burnchain::{BurnchainSource, bitcoin_context},
+    burnchain::{self, BurnchainSource, bitcoin_context},
     config::Config,
     network::OutboundNetwork,
     observation::{Observation, Snapshot},
@@ -121,7 +121,10 @@ impl Follower {
             self.peer = selected;
         }
         if let Ok(current) = self.peer.pox_info().await {
-            self.pox = current;
+            match burnchain::verified_pox(config, current) {
+                Ok(current) => self.pox = current,
+                Err(reason) => eprintln!("keeping the pinned PoX constants: {reason}"),
+            }
         }
         let from = self.executor.tip().header.chain_length;
         let outcome = self
@@ -235,7 +238,10 @@ async fn await_peer(
                 continue;
             };
             if let (Ok(info), Ok(pox)) = (client.node_info().await, client.pox_info().await) {
-                return Ok((client, info.network_id, pox));
+                match burnchain::verified_pox(config, pox) {
+                    Ok(pox) => return Ok((client, info.network_id, pox)),
+                    Err(reason) => eprintln!("refusing bootstrap peer {endpoint}: {reason}"),
+                }
             }
         }
         if began.elapsed() >= deadline {
