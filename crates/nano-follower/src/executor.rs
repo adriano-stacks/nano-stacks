@@ -655,6 +655,15 @@ impl CatchUpRound {
     }
 }
 
+/// What authenticating a staged block's representations concluded.
+///
+/// Distinct from a burnchain fetch failure, which is an ordinary error and
+/// must not cost the staged branch the way a rejection does.
+enum RepresentationOutcome {
+    Accepted(Box<(NakamotoBlock, AuthenticatedBlock)>),
+    Rejected(CheckpointExecutionError),
+}
+
 #[derive(Debug)]
 pub enum NodeExecutionError {
     Sync(SyncError),
@@ -971,6 +980,39 @@ where
         let authenticated =
             self.authenticate_with_operations(block, bitcoin_context, operations)?;
         self.apply_authenticated(authenticated)
+    }
+
+    /// Authenticate the first representation the chainstate accepts.
+    ///
+    /// One Bitcoin fetch for every representation of the block: the decision
+    /// half takes decoded operations, never the burnchain itself, and sibling
+    /// representations share the burn block anyway. A fetch failure is the
+    /// outer error — it must not cost the staged branch, unlike a rejection.
+    fn authenticate_representations(
+        &mut self,
+        representations: Vec<NakamotoBlock>,
+        bitcoin_context: BitcoinBlockContext,
+    ) -> Result<RepresentationOutcome, CheckpointExecutionError> {
+        let operations = self
+            .bitcoin
+            .block_at(bitcoin_context.height)
+            .map_err(|error| CheckpointExecutionError::Bitcoin(error.to_string()))?;
+        let mut rejected = None;
+        for block in representations {
+            match self.authenticate_with_operations(&block, bitcoin_context, &operations.operations)
+            {
+                Ok(authenticated) => {
+                    return Ok(RepresentationOutcome::Accepted(Box::new((
+                        block,
+                        authenticated,
+                    ))));
+                }
+                Err(error) => rejected = Some(error),
+            }
+        }
+        Ok(RepresentationOutcome::Rejected(
+            rejected.expect("a non-empty set of representations was rejected"),
+        ))
     }
 
     /// Authenticate one direct descendant with decoded Bitcoin operations.
@@ -2740,25 +2782,17 @@ where
                 }
             };
             let phase = std::time::Instant::now();
-            let mut rejected = None;
-            let mut accepted = None;
-            for block in representations {
-                match self.authenticate(&block, bitcoin_context) {
-                    Ok(authenticated) => {
-                        accepted = Some((block, authenticated));
-                        break;
+            let (block, authenticated) =
+                match self.authenticate_representations(representations, bitcoin_context)? {
+                    RepresentationOutcome::Accepted(accepted) => *accepted,
+                    RepresentationOutcome::Rejected(rejected) => {
+                        // Signer signatures are absent from the block ID. Keeping
+                        // only rejected bytes would make descent hide a later
+                        // finalized form.
+                        staging.remove_branch(selected_id)?;
+                        return Err(rejected.into());
                     }
-                    Err(error) => rejected = Some(error),
-                }
-            }
-            let Some((block, authenticated)) = accepted else {
-                // Signer signatures are absent from the block ID. Keeping only
-                // rejected bytes would make descent hide a later finalized form.
-                staging.remove_branch(selected_id)?;
-                return Err(rejected
-                    .expect("a non-empty set of representations was rejected")
-                    .into());
-            };
+                };
             staging.put(&authenticated)?;
             let applied = self.apply_authenticated(authenticated)?;
             #[cfg(not(feature = "node-adapters"))]
