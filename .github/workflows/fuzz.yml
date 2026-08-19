@@ -102,12 +102,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TARGET: ${{ matrix.target }}
           BRANCH: ${{ steps.retain.outputs.branch }}
+        # The pushed branch is what makes a finding durable; the pull request
+        # only makes it easy to find. A repository that forbids Actions from
+        # opening one must not read as a retention failure, so that refusal is
+        # named and tolerated while every other error still fails the step.
         run: |
-          gh pr create \
+          if ! output=$(gh pr create \
             --base main \
             --head "$BRANCH" \
             --title "test(fuzz): retain $TARGET finding" \
-            --body "Automated reproducible input from workflow run $GITHUB_RUN_ID."
+            --body "Automated reproducible input from workflow run $GITHUB_RUN_ID." 2>&1); then
+            printf '%s\n' "$output"
+            case $output in
+              *"not permitted to create or approve pull requests"*)
+                echo "this repository forbids Actions from opening pull requests;" \
+                     "the finding is retained on branch $BRANCH"
+                ;;
+              *)
+                exit 1
+                ;;
+            esac
+          fi
 
       - name: upload a convenience copy
         if: failure()
