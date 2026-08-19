@@ -15,6 +15,7 @@ members = [
     "crates/nano-wasm-cache",
     "crates/nano-oracle",
     "crates/nano-chainstate",
+    "crates/epoch4-consensus",
     "crates/nano-p2p",
     "crates/nano-sync",
     "crates/nano-follower",
