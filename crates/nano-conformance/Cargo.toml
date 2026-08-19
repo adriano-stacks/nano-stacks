@@ -9,6 +9,7 @@ publish = false
 marf-profile = ["nano-marf/marf-profile"]
 
 [dependencies]
+epoch4-consensus = { path = "../epoch4-consensus" }
 nano-address = { path = "../nano-address" }
 nano-bitcoin = { path = "../nano-bitcoin" }
 nano-codec = { path = "../nano-codec" }

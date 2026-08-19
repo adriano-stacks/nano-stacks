@@ -14,6 +14,7 @@
 //! be compared across processes, revisions and implementations, where a
 //! `Display` string cannot.
 
+pub mod host;
 mod request;
 
 pub use request::{ContextWire, DecisionRequest, OpenedRequest, REQUEST_SCHEMA};
