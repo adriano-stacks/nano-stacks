@@ -24,7 +24,7 @@ impl fmt::Display for AddressError {
 
 impl std::error::Error for AddressError {}
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct StacksAddress {
     version: u8,
     hash160: Hash160,
@@ -121,7 +121,7 @@ impl FromStr for StacksAddress {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 #[repr(u8)]
 pub enum AddressHashMode {
     P2pkh = 0,
@@ -148,20 +148,20 @@ impl AddressHashMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 #[repr(u8)]
 pub enum PoxAddressType20 {
     P2wpkh = 4,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 #[repr(u8)]
 pub enum PoxAddressType32 {
     P2wsh = 5,
     P2tr = 6,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum PoxAddress {
     Standard {
         address: StacksAddress,

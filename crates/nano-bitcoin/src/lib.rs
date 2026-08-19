@@ -474,7 +474,7 @@ impl BitcoinSource for BitcoinRpcSource {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct BitcoinOperation {
     pub txid: [u8; 32],
     pub transaction_index: u32,
@@ -483,13 +483,13 @@ pub struct BitcoinOperation {
     pub kind: BitcoinOperationKind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct BitcoinInput {
     pub txid: [u8; 32],
     pub output_index: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct BitcoinOutput {
     pub amount_sats: u64,
     pub recipient: PoxAddress,
@@ -725,7 +725,54 @@ pub fn build_leader_commitment_transaction(
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Hexadecimal (de)serialization for 33-byte compressed keys, which serde's
+/// derive does not cover: its array support stops at 32.
+mod serde_key33 {
+    pub fn serialize<S: serde::Serializer>(
+        key: &[u8; 33],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(key))
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<[u8; 33], D::Error> {
+        let text: &str = serde::Deserialize::deserialize(deserializer)?;
+        let mut bytes = [0u8; 33];
+        hex::decode_to_slice(text, &mut bytes).map_err(serde::de::Error::custom)?;
+        Ok(bytes)
+    }
+}
+
+/// The optional form of [`serde_key33`].
+mod serde_key33_option {
+    // serde's `with` contract fixes this signature; the reference is serde's.
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S: serde::Serializer>(
+        key: &Option<[u8; 33]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match key {
+            Some(key) => serializer.serialize_some(&hex::encode(key)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<[u8; 33]>, D::Error> {
+        let text: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+        text.map(|text| {
+            let mut bytes = [0u8; 33];
+            hex::decode_to_slice(&text, &mut bytes).map_err(serde::de::Error::custom)?;
+            Ok(bytes)
+        })
+        .transpose()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum BitcoinOperationKind {
     LeaderBlockCommit {
         block_header_hash: [u8; 32],
@@ -751,6 +798,7 @@ pub enum BitcoinOperationKind {
         reward_address: PoxAddress,
         amount: u128,
         cycles: u8,
+        #[serde(with = "serde_key33_option")]
         signer_key: Option<[u8; 33]>,
         max_amount: Option<u128>,
         authorization_id: Option<u32>,
@@ -772,6 +820,7 @@ pub enum BitcoinOperationKind {
     VoteForAggregateKey {
         sender: nano_address::StacksAddress,
         signer_index: u16,
+        #[serde(with = "serde_key33")]
         aggregate_key: [u8; 33],
         round: u32,
         reward_cycle: u64,

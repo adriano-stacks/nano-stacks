@@ -9,6 +9,7 @@ bitcoin = "0.32.8"
 bs58 = { version = "0.5.1", features = ["check"] }
 c32 = { version = "0.6.1", features = ["alloc", "check"] }
 nano-primitives = { path = "../nano-primitives" }
+serde = { version = "1.0.229", features = ["derive"] }
 
 [lints]
 workspace = true

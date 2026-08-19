@@ -14,6 +14,10 @@
 //! be compared across processes, revisions and implementations, where a
 //! `Display` string cannot.
 
+mod request;
+
+pub use request::{ContextWire, DecisionRequest, OpenedRequest, REQUEST_SCHEMA};
+
 use nano_chainstate::{
     AppliedBlock, AuthenticatedBlock, BitcoinBlockContext, ChainState, ChainStateError,
     ConsensusError, NakamotoBlock, ReceiptCommitment, receipt_commitment,

@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+hex = "0.4.3"
 primitive-types = "0.14.0"
+serde = "1.0.229"
 ripemd = "0.1.3"
 sha2 = "0.10.9"
 

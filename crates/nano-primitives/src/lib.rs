@@ -53,6 +53,21 @@ macro_rules! hash_type {
                 Ok(())
             }
         }
+
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(&self.to_string())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let text: &str = serde::Deserialize::deserialize(deserializer)?;
+                let mut bytes = [0u8; $length];
+                hex::decode_to_slice(text, &mut bytes).map_err(serde::de::Error::custom)?;
+                Ok(Self(bytes))
+            }
+        }
     };
 }
 

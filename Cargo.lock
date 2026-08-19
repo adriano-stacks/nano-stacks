@@ -2500,6 +2500,7 @@ dependencies = [
  "bs58",
  "c32",
  "nano-primitives",
+ "serde",
 ]
 
 [[package]]
@@ -2536,6 +2537,7 @@ dependencies = [
  "nano-address",
  "nano-crypto",
  "nano-primitives",
+ "serde",
  "sha2 0.10.9",
  "ureq 3.3.0",
 ]
@@ -2785,9 +2787,11 @@ dependencies = [
 name = "nano-primitives"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "primitive-types",
  "proptest",
  "ripemd",
+ "serde",
  "sha2 0.10.9",
 ]
 
