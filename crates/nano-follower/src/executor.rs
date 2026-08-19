@@ -91,6 +91,14 @@ pub struct CheckpointExecutor<S> {
     /// block was executed rather than downloaded, and it is the executed ones a
     /// node answers `/v3/blocks` and `/v3/tenures` with.
     archive: Option<std::sync::Arc<crate::archive::Archive>>,
+    /// Where each executed block's height is reported as it lands.
+    ///
+    /// Beside the observers and archive for the same reason. A round publishes
+    /// its observation snapshot only when it ends, and a checkpoint catch-up is
+    /// one round hours long — health frozen at the anchor with `ready: true`
+    /// reads exactly like a stalled node, to an operator and to the restart
+    /// qualification alike.
+    executed_height: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// Where execution is measured: block cost against the block limit and the
     /// wall time a block took. Beside the observers for the same reason they
     /// are here — only the executor knows a block was executed.
@@ -880,6 +888,7 @@ where
             #[cfg(feature = "node-adapters")]
             observers: None,
             archive: None,
+            executed_height: None,
             #[cfg(feature = "node-adapters")]
             metrics: None,
             waterfall_registry,
@@ -907,6 +916,7 @@ where
             #[cfg(feature = "node-adapters")]
             observers: None,
             archive: None,
+            executed_height: None,
             #[cfg(feature = "node-adapters")]
             metrics: None,
             waterfall_registry: None,
@@ -1675,6 +1685,12 @@ where
     }
 
     fn keep_executed_block(&self, block: &NakamotoBlock, applied: &AppliedBlock) {
+        if let Some(height) = self.executed_height.as_ref() {
+            height.store(
+                block.header.chain_length,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         if let Some(archive) = self.archive.as_ref()
             && let Err(error) = archive.keep_applied(block, applied)
         {
@@ -1768,6 +1784,17 @@ where
     /// has just told it about.
     pub fn keep_executed_blocks(&mut self, archive: std::sync::Arc<crate::archive::Archive>) {
         self.archive = Some(archive);
+    }
+
+    /// Report each executed block's height here, as it lands.
+    ///
+    /// The observation snapshot is published per round, and one round can be a
+    /// whole checkpoint catch-up; this is the per-block signal beside it.
+    pub fn publish_executed_height_to(
+        &mut self,
+        sink: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.executed_height = Some(sink);
     }
 
     /// Give back sealed states above a height. See `ChainState::discard_above`.

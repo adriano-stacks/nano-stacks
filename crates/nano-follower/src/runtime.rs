@@ -95,6 +95,7 @@ impl Follower {
         executor.keep_executed_blocks(Arc::new(Archive::open(
             &config.chainstate_dir().join("executed.sqlite"),
         )?));
+        executor.publish_executed_height_to(observation.executed_height_sink());
         let staging = Staging::open(&config.chainstate_dir().join("staging.sqlite"))?;
         transport.publish_cycle(executor.cycle_start_consensus_hash(&pox));
         observation

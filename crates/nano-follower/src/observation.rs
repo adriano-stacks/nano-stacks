@@ -1,6 +1,13 @@
 //! The follower's two loopback-only observation routes.
 
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -32,6 +39,14 @@ pub struct Snapshot {
 #[derive(Clone, Debug, Default)]
 pub struct Observation {
     snapshot: Arc<RwLock<Snapshot>>,
+    /// The executed tip as the executor stores it, block by block.
+    ///
+    /// A snapshot is published once per round, and a round's execute budget can
+    /// be a whole checkpoint catch-up — hours during which health and metrics
+    /// would otherwise keep naming the height the round started from, which
+    /// reads exactly like a stalled node. Zero means no block was executed
+    /// since the last snapshot, so the snapshot's own height stands.
+    executed: Arc<AtomicU64>,
 }
 
 impl Observation {
@@ -41,7 +56,17 @@ impl Observation {
     }
 
     pub async fn publish(&self, snapshot: Snapshot) {
+        // The round's snapshot is authoritative — it can also move a tip
+        // backwards across a retraction, which the per-block signal never does.
+        self.executed
+            .store(snapshot.stacks_height.unwrap_or(0), Ordering::Relaxed);
         *self.snapshot.write().await = snapshot;
+    }
+
+    /// Where the executor reports each executed block's height, synchronously.
+    #[must_use]
+    pub fn executed_height_sink(&self) -> Arc<AtomicU64> {
+        self.executed.clone()
     }
 
     #[must_use]
@@ -100,7 +125,11 @@ async fn answer(mut stream: TcpStream, route: Route, observation: Observation) -
     if !matches {
         return write_response(&mut stream, 404, "text/plain", b"not found\n").await;
     }
-    let snapshot = observation.snapshot.read().await.clone();
+    let mut snapshot = observation.snapshot.read().await.clone();
+    let executed = observation.executed.load(Ordering::Relaxed);
+    if executed != 0 {
+        snapshot.stacks_height = Some(executed);
+    }
     match route {
         Route::Health => {
             let code = if snapshot.ready { 200 } else { 503 };
@@ -233,6 +262,63 @@ mod tests {
             request(metrics, "/v2/transactions")
                 .await
                 .starts_with("HTTP/1.1 404")
+        );
+    }
+
+    /// A round's snapshot is published when the round ends, and one round can
+    /// be a whole checkpoint catch-up — the per-block height must show through
+    /// in between, and the next snapshot must remain authoritative over it,
+    /// including across a retraction that moves the tip backwards.
+    #[tokio::test]
+    async fn executed_blocks_move_health_between_snapshots() {
+        let observation = Observation::new();
+        let sink = observation.executed_height_sink();
+        observation
+            .publish(Snapshot {
+                ready: true,
+                stacks_height: Some(8_665_601),
+                bitcoin_height: Some(960_231),
+                state_root: Some("ab".repeat(32)),
+                p2p_connected: 4,
+                p2p_known: 81,
+                last_error: None,
+            })
+            .await;
+        let health = listener(Route::Health, observation.clone()).await;
+        let metrics = listener(Route::Metrics, observation.clone()).await;
+        assert!(
+            request(health, "/health")
+                .await
+                .contains("\"stacks_height\":8665601")
+        );
+
+        sink.store(8_700_000, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            request(health, "/health")
+                .await
+                .contains("\"stacks_height\":8700000")
+        );
+        assert!(
+            request(metrics, "/metrics")
+                .await
+                .contains("nano_follower_stacks_height 8700000")
+        );
+
+        observation
+            .publish(Snapshot {
+                ready: true,
+                stacks_height: Some(8_699_998),
+                bitcoin_height: Some(960_400),
+                state_root: Some("cd".repeat(32)),
+                p2p_connected: 4,
+                p2p_known: 81,
+                last_error: None,
+            })
+            .await;
+        assert!(
+            request(health, "/health")
+                .await
+                .contains("\"stacks_height\":8699998")
         );
     }
 }
