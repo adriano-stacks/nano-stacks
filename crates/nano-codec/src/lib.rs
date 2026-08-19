@@ -987,13 +987,13 @@ fn read_payload(reader: &mut Reader<'_>) -> Result<TransactionPayloadData, Codec
             memo: reader.take(34)?.try_into().expect("fixed slice"),
         }),
         TransactionPayloadType::SmartContract => Ok(TransactionPayloadData::SmartContract {
-            contract_name: read_name(reader)?,
+            contract_name: read_contract_name(reader, 40)?,
             source: read_stacks_string(reader)?,
         }),
         TransactionPayloadType::ContractCall => {
             let address = read_address(reader)?;
-            let contract_name = read_name(reader)?;
-            let function_name = read_name(reader)?;
+            let contract_name = read_contract_name(reader, 40)?;
+            let function_name = read_clarity_name(reader)?;
             let count = usize::try_from(reader.u32()?).map_err(|_| CodecError::InvalidLength)?;
             if count > reader.remaining() {
                 return Err(CodecError::InvalidLength);
@@ -1032,7 +1032,7 @@ fn read_payload(reader: &mut Reader<'_>) -> Result<TransactionPayloadData, Codec
         TransactionPayloadType::VersionedSmartContract => {
             Ok(TransactionPayloadData::VersionedSmartContract {
                 clarity_version: ClarityVersion::parse(reader.byte()?)?,
-                contract_name: read_name(reader)?,
+                contract_name: read_contract_name(reader, 40)?,
                 source: read_stacks_string(reader)?,
             })
         }
@@ -1124,7 +1124,7 @@ fn read_post_condition_principal(
         2 => Ok(PostConditionPrincipal::Standard(read_address(reader)?)),
         3 => Ok(PostConditionPrincipal::Contract {
             address: read_address(reader)?,
-            contract_name: read_name(reader)?,
+            contract_name: read_contract_name(reader, 40)?,
         }),
         _ => Err(CodecError::InvalidPostCondition),
     }
@@ -1133,8 +1133,8 @@ fn read_post_condition_principal(
 fn read_asset_info(reader: &mut Reader<'_>) -> Result<AssetInfo, CodecError> {
     Ok(AssetInfo {
         address: read_address(reader)?,
-        contract_name: read_name(reader)?,
-        asset_name: read_name(reader)?,
+        contract_name: read_contract_name(reader, 40)?,
+        asset_name: read_clarity_name(reader)?,
     })
 }
 
@@ -1152,9 +1152,11 @@ fn read_fungible_condition(reader: &mut Reader<'_>) -> Result<FungibleCondition,
 fn read_principal(reader: &mut Reader<'_>) -> Result<Principal, CodecError> {
     match reader.byte()? {
         5 => Ok(Principal::Standard(read_address(reader)?)),
+        // A principal travels as a Clarity value here, which keeps the longer
+        // legacy contract-name bound rather than the transaction codec's.
         6 => Ok(Principal::Contract {
             address: read_address(reader)?,
-            contract_name: read_name(reader)?,
+            contract_name: read_contract_name(reader, 128)?,
         }),
         _ => Err(CodecError::InvalidPrincipal),
     }
@@ -1178,10 +1180,59 @@ fn read_block_id(reader: &mut Reader<'_>) -> Result<StacksBlockId, CodecError> {
     ))
 }
 
-fn read_name(reader: &mut Reader<'_>) -> Result<String, CodecError> {
+/// Read a contract name matching Clarity's contract-name grammar, or the
+/// reserved `__transient`.
+///
+/// The transaction codec caps a contract name at 40 bytes, while a contract
+/// principal inside a Clarity value still admits the 128 bytes earlier nodes
+/// accepted, so the bound is the caller's to state.
+fn read_contract_name(reader: &mut Reader<'_>, maximum: usize) -> Result<String, CodecError> {
+    let name = read_name(reader, maximum)?;
+    let grammatical = name == "__transient"
+        || name
+            .strip_prefix(|first: char| first.is_ascii_alphabetic())
+            .is_some_and(|rest| {
+                rest.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+            });
+    if !grammatical {
+        return Err(CodecError::InvalidName);
+    }
+    Ok(name)
+}
+
+/// Read a Clarity name: up to 128 bytes matching Clarity's identifier
+/// grammar, including its standalone operator spellings.
+fn read_clarity_name(reader: &mut Reader<'_>) -> Result<String, CodecError> {
+    let name = read_name(reader, 128)?;
+    let grammatical = matches!(
+        name.as_str(),
+        "-" | "+" | "=" | "/" | "*" | "<" | ">" | "<=" | ">="
+    ) || name
+        .strip_prefix(|first: char| first.is_ascii_alphabetic())
+        .is_some_and(|rest| {
+            rest.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(
+                        character,
+                        '-' | '_' | '!' | '?' | '+' | '<' | '>' | '=' | '/' | '*'
+                    )
+            })
+        });
+    if !grammatical {
+        return Err(CodecError::InvalidName);
+    }
+    Ok(name)
+}
+
+fn read_name(reader: &mut Reader<'_>, maximum: usize) -> Result<String, CodecError> {
     let length = usize::from(reader.byte()?);
+    if length == 0 || length > maximum {
+        return Err(CodecError::InvalidName);
+    }
     let bytes = reader.take(length)?;
-    if length == 0 || length > 128 || !bytes.iter().all(u8::is_ascii) {
+    if !bytes.iter().all(u8::is_ascii) {
         return Err(CodecError::InvalidName);
     }
     Ok(String::from_utf8(bytes.to_vec()).expect("ASCII is valid UTF-8"))
@@ -1228,7 +1279,7 @@ fn scan_clarity_value(reader: &mut Reader<'_>, depth: u8) -> Result<(), CodecErr
         }
         6 => {
             read_address(reader)?;
-            read_name(reader)?;
+            read_contract_name(reader, 128)?;
         }
         7 | 8 | 10 => scan_clarity_value(reader, depth + 1)?,
         11 => {
@@ -1246,7 +1297,7 @@ fn scan_clarity_value(reader: &mut Reader<'_>, depth: u8) -> Result<(), CodecErr
                 return Err(CodecError::InvalidClarityValue);
             }
             for _ in 0..length {
-                read_name(reader)?;
+                read_clarity_name(reader)?;
                 scan_clarity_value(reader, depth + 1)?;
             }
         }
@@ -2076,7 +2127,8 @@ impl Writer {
 mod tests {
     use super::{
         AnchorMode, CodecError, NonFungibleCondition, PostConditionData, PostConditionMode, Reader,
-        Transaction, TransactionPayloadData, TransactionVersion, read_stacks_string,
+        Transaction, TransactionPayloadData, TransactionVersion, read_clarity_name,
+        read_contract_name, read_stacks_string,
     };
     use nano_crypto::StacksPrivateKey;
     use nano_primitives::sha512_256;
@@ -2212,6 +2264,42 @@ mod tests {
                 "coinbase anchored {anchor_mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn names_follow_the_clarity_grammars_they_are_declared_with() {
+        for (name, contract, clarity) in [
+            ("token", true, true),
+            ("a-b_1", true, true),
+            ("__transient", true, false),
+            (",", false, false),
+            ("1token", false, false),
+            ("-", false, true),
+            (">=", false, true),
+            ("has!", false, true),
+            ("has.dot", false, false),
+        ] {
+            let mut encoded = vec![u8::try_from(name.len()).expect("short name")];
+            encoded.extend_from_slice(name.as_bytes());
+            assert_eq!(
+                read_contract_name(&mut Reader::new(&encoded), 40).is_ok(),
+                contract,
+                "contract name {name:?}"
+            );
+            assert_eq!(
+                read_clarity_name(&mut Reader::new(&encoded)).is_ok(),
+                clarity,
+                "clarity name {name:?}"
+            );
+        }
+
+        // A transaction caps a contract name at 40 bytes; a contract principal
+        // inside a Clarity value still admits 128.
+        let long = format!("c{}", "a".repeat(50));
+        let mut encoded = vec![u8::try_from(long.len()).expect("short name")];
+        encoded.extend_from_slice(long.as_bytes());
+        assert!(read_contract_name(&mut Reader::new(&encoded), 40).is_err());
+        assert!(read_contract_name(&mut Reader::new(&encoded), 128).is_ok());
     }
 
     fn encoded_post_condition_transaction(mode: u8, nft_tag: u8) -> Vec<u8> {
