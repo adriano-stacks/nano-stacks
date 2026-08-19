@@ -99,6 +99,44 @@ pub const EPOCH_4_BLOCK_LIMIT: ExecutionCost = ExecutionCost {
     runtime: 5_000_000_000,
 };
 
+/// Diagnostic trace switches, each read from the environment once per process.
+///
+/// The block decision path may not read the environment: a per-write `getenv`
+/// is both an impurity the consensus firewall forbids and a measurable cost on
+/// the hot path. One read at first use pins the whole run's behavior.
+macro_rules! trace_switch {
+    ($(#[$doc:meta])* $name:ident, $variable:literal) => {
+        $(#[$doc])*
+        #[must_use]
+        pub fn $name() -> bool {
+            static ON: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| std::env::var_os($variable).is_some());
+            *ON
+        }
+    };
+}
+
+trace_switch!(
+    /// Whether `NANO_TRACE_WRITES` asked every Clarity write to be printed.
+    trace_writes,
+    "NANO_TRACE_WRITES"
+);
+trace_switch!(
+    /// Whether `NANO_TRACE_READS` asked every Clarity read to be printed.
+    trace_reads,
+    "NANO_TRACE_READS"
+);
+trace_switch!(
+    /// Whether `NANO_TRACE_BURN_HEADERS` asked burn-header answers to be printed.
+    trace_burn_headers,
+    "NANO_TRACE_BURN_HEADERS"
+);
+trace_switch!(
+    /// Whether `NANO_TRACE_MISSING_CONTRACTS` asked absent contracts to be named.
+    trace_missing_contracts,
+    "NANO_TRACE_MISSING_CONTRACTS"
+);
+
 /// The MARF root a block sealed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionResult {
@@ -887,7 +925,7 @@ impl BitcoinContext {
                 // backfill would either fail or write down a block from another
                 // chain. Whatever resolved a height to this identifier is the
                 // fault, and the `Expect` this produces is where it surfaces.
-                if std::env::var_os("NANO_TRACE_WRITES").is_some() {
+                if trace_writes() {
                     println!(
                         "block {id} is not on this fork, so it has no {}",
                         field.name()
@@ -910,7 +948,7 @@ impl BitcoinContext {
         {
             missing.push(*id.as_bytes());
         }
-        if std::env::var_os("NANO_TRACE_WRITES").is_some() {
+        if trace_writes() {
             println!("block {id} {why}");
         }
     }
@@ -1158,7 +1196,7 @@ impl BurnStateDB for BitcoinContext {
         // rejects and the network accepted, so it is worth being able to see
         // what every lookup answered.
         let found = self.burn_header(height);
-        if std::env::var_os("NANO_TRACE_BURN_HEADERS").is_some() {
+        if trace_burn_headers() {
             println!(
                 "burn header {height} -> {}",
                 found.map_or_else(|| "<none>".to_owned(), hex::encode)
@@ -2858,7 +2896,7 @@ impl MarfStore {
         // or MARF fault, and the only way to narrow it is to see the writes
         // themselves — in the order they were made, which is what the trie
         // packs pointers in.
-        if std::env::var_os("NANO_TRACE_WRITES").is_some() {
+        if trace_writes() {
             println!("write {key} = {}", marf_value_key(value_hash));
         }
         self.marf.insert(key.as_bytes(), value_hash)?;
@@ -3959,7 +3997,7 @@ impl ClarityBackingStore for MarfStore {
         ));
         // A value that is wrong rather than missing is only visible by reading
         // it, so this says what every read answered.
-        if std::env::var_os("NANO_TRACE_READS").is_some() {
+        if trace_reads() {
             match &found {
                 Ok(Some(value)) => println!("read {key} = {value}"),
                 Ok(None) => println!("read {key} = <none>"),
@@ -4026,7 +4064,7 @@ impl ClarityBackingStore for MarfStore {
                 panic!("MARF storage failed while resolving block height {height}: {error}")
             })
             .map(StacksBlockId);
-        if found.is_none() && std::env::var_os("NANO_TRACE_WRITES").is_some() {
+        if found.is_none() && trace_writes() {
             println!("no block at height {height}");
         }
         found
@@ -4083,7 +4121,7 @@ impl ClarityBackingStore for MarfStore {
                 // analysis pass, and a replay that retries a block emits it
                 // thousands of times — which buries the divergence the log is
                 // being read for.
-                if std::env::var_os("NANO_TRACE_MISSING_CONTRACTS").is_some() {
+                if trace_missing_contracts() {
                     eprintln!(
                         "no contract commitment for {contract} at key {}",
                         make_contract_hash_key(contract)
