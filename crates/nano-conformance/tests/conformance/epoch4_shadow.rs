@@ -414,17 +414,37 @@ fn the_mainnet_capture_decides_identically_in_and_out_of_process() {
         return;
     };
 
-    let in_process = tempfile::tempdir().expect("a directory");
-    let out_of_process = tempfile::tempdir().expect("a directory");
-    let (mut chainstate, anchor) =
-        nano_conformance::shadow_capture_chainstate(&root, in_process.path())
-            .expect("the mainnet checkpoint opens");
+    // A persistent workdir keeps both multi-hour imports (and the state a
+    // failure stops at) for diagnosis and resume; without it, temporaries.
+    let workdir = std::env::var_os("NANO_SHADOW_WORKDIR").map(std::path::PathBuf::from);
+    let temporary = workdir.is_none().then(|| {
+        (
+            tempfile::tempdir().expect("a directory"),
+            tempfile::tempdir().expect("a directory"),
+        )
+    });
+    let (in_process, out_of_process) = match (&workdir, &temporary) {
+        (Some(workdir), _) => {
+            let in_process = workdir.join("in-process");
+            let out_of_process = workdir.join("executor");
+            std::fs::create_dir_all(&in_process).expect("the workdir is writable");
+            std::fs::create_dir_all(&out_of_process).expect("the workdir is writable");
+            (in_process, out_of_process)
+        }
+        (None, Some((in_process, out_of_process))) => (
+            in_process.path().to_path_buf(),
+            out_of_process.path().to_path_buf(),
+        ),
+        (None, None) => unreachable!("one of the two directory sources exists"),
+    };
+    let (mut chainstate, anchor) = nano_conformance::shadow_capture_chainstate(&root, &in_process)
+        .expect("the mainnet checkpoint opens");
     let inputs = MainnetInputs::read(&root);
     let blocks = capture_blocks(&root);
     assert!(!blocks.is_empty(), "the capture holds blocks");
 
     let mut tip = anchor.clone();
-    let mut shadow = Shadow::spawn_capture(&root, out_of_process.path(), &anchor);
+    let mut shadow = Shadow::spawn_capture(&root, &out_of_process, &anchor);
 
     let mut bitcoin_view = String::new();
     let mut accepted = 0_usize;
