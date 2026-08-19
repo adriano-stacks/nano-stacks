@@ -46,18 +46,9 @@ pub fn serve(
     network: Network,
     registry: Option<&str>,
     mut lines: impl BufRead,
-    mut out: impl Write,
+    out: impl Write,
 ) -> Result<(), String> {
-    let stand = read_line(&mut lines)?.ok_or("the parent closed before standing")?;
-    let stand: serde_json::Value =
-        serde_json::from_str(&stand).map_err(|error| format!("the stand line: {error}"))?;
-    if stand["schema"] != STAND_SCHEMA {
-        return Err(format!("unknown stand schema {}", stand["schema"]));
-    }
-    let bytes = hex::decode(stand["block"].as_str().unwrap_or_default())
-        .map_err(|error| format!("the stand block: {error}"))?;
-    let mut tip = NakamotoBlock::decode(&bytes)
-        .map_err(|error| format!("the stand block does not decode: {error:?}"))?;
+    let tip = read_stand(&mut lines)?;
 
     let mut chainstate = ChainState::open(network, directory).map_err(|error| error.to_string())?;
     let durable = chainstate
@@ -80,7 +71,21 @@ pub fn serve(
             tip.block_id()
         ));
     }
+    serve_over(chainstate, tip, registry, lines, out)
+}
 
+/// Serve decisions over an already opened and adopted chainstate.
+///
+/// The state-directory door above is one way in; a conformance harness opens a
+/// captured checkpoint its own way and serves the identical protocol through
+/// this one. The ready line and every decision line are the same either way.
+pub fn serve_over(
+    mut chainstate: ChainState,
+    mut tip: NakamotoBlock,
+    registry: Option<&str>,
+    mut lines: impl BufRead,
+    mut out: impl Write,
+) -> Result<(), String> {
     writeln!(
         out,
         "{}",
@@ -135,6 +140,20 @@ pub fn serve(
         out.flush().map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+/// The parent's opening line: the block the executor is asked to stand on.
+pub fn read_stand(mut lines: impl BufRead) -> Result<NakamotoBlock, String> {
+    let stand = read_line(&mut lines)?.ok_or("the parent closed before standing")?;
+    let stand: serde_json::Value =
+        serde_json::from_str(&stand).map_err(|error| format!("the stand line: {error}"))?;
+    if stand["schema"] != STAND_SCHEMA {
+        return Err(format!("unknown stand schema {}", stand["schema"]));
+    }
+    let bytes = hex::decode(stand["block"].as_str().unwrap_or_default())
+        .map_err(|error| format!("the stand block: {error}"))?;
+    NakamotoBlock::decode(&bytes)
+        .map_err(|error| format!("the stand block does not decode: {error:?}"))
 }
 
 fn protocol_error(out: &mut impl Write, error: &str) -> Result<(), String> {

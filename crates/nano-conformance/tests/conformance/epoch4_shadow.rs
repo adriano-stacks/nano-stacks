@@ -150,9 +150,31 @@ struct Shadow {
 impl Shadow {
     fn spawn(directory: &Path, stand: &NakamotoBlock) -> Self {
         let network = nano_conformance::captured_network(&fixtures());
+        Self::spawn_with(
+            &[
+                directory.to_string_lossy().to_string(),
+                format!("chain-id:{}", network.chain_id()),
+            ],
+            stand,
+        )
+    }
+
+    /// The `--capture` door: the checkpoint imported durably inside the
+    /// child, through the same helper the in-process side uses.
+    fn spawn_capture(root: &Path, directory: &Path, stand: &NakamotoBlock) -> Self {
+        Self::spawn_with(
+            &[
+                "--capture".to_owned(),
+                root.to_string_lossy().to_string(),
+                directory.to_string_lossy().to_string(),
+            ],
+            stand,
+        )
+    }
+
+    fn spawn_with(arguments: &[String], stand: &NakamotoBlock) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_epoch4-shadow-executor"))
-            .arg(directory)
-            .arg(format!("chain-id:{}", network.chain_id()))
+            .args(arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -295,5 +317,137 @@ fn the_decision_boundary_answers_identically_in_and_out_of_process() {
         "every captured block above the boundary was decided"
     );
 
+    shadow.finish();
+}
+
+/// The per-block execution context of a captured chain, as the replay derives
+/// it: the view snapshot, the tenure's own burn height moved in beside it, and
+/// the chain's unlock constants from its provenance.
+struct MainnetInputs {
+    snapshots: BTreeMap<String, BitcoinBlockContext>,
+    operations: BTreeMap<String, Vec<nano_bitcoin::BitcoinOperation>>,
+    unlocks: [u32; 4],
+}
+
+impl MainnetInputs {
+    fn read(root: &Path) -> Self {
+        let field = |name: &str| {
+            nano_conformance::provenance_field(root, name)
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .unwrap_or_else(|| panic!("the capture provenance names {name}"))
+        };
+        Self {
+            snapshots: nano_conformance::captured_bitcoin_snapshots(root)
+                .expect("the captured snapshots read, winners resolved"),
+            operations: nano_conformance::captured_bitcoin_operations(root)
+                .expect("the captured operations read"),
+            unlocks: [
+                field("pox_v1_unlock_height"),
+                field("pox_v2_unlock_height"),
+                field("pox_v3_unlock_height"),
+                field("pox_v4_unlock_height"),
+            ],
+        }
+    }
+
+    fn request(
+        &self,
+        block: &NakamotoBlock,
+        bitcoin_view: &mut String,
+        parent: [u8; 32],
+    ) -> DecisionRequest {
+        if let Some(view) = block.bitcoin_view_consensus_hash() {
+            *bitcoin_view = view.to_string();
+        } else if bitcoin_view.is_empty() {
+            *bitcoin_view = block.header.consensus_hash.to_string();
+        }
+        let mut context = *self
+            .snapshots
+            .get(bitcoin_view.as_str())
+            .expect("the block's burn view is captured");
+        let tenure_hash = block.header.consensus_hash.to_string();
+        if let Some(tenure) = self.snapshots.get(&tenure_hash) {
+            let view = context.height;
+            context.move_to_burn_block(tenure.height);
+            context.extend_view_to(view);
+        }
+        let [v1, v2, v3, v4] = self.unlocks;
+        context.v1_unlock_height = v1;
+        context.v2_unlock_height = v2;
+        context.v3_unlock_height = v3;
+        context.pox_5_activation_height = v4;
+        let operations = self
+            .operations
+            .get(&tenure_hash)
+            .expect("the tenure's Bitcoin operations are captured")
+            .clone();
+        DecisionRequest::new(block, context, operations, Some(parent))
+    }
+}
+
+/// The captured blocks of a capture root, lowest first.
+fn capture_blocks(root: &Path) -> Vec<NakamotoBlock> {
+    let mut blocks: Vec<NakamotoBlock> = nano_conformance::captured_block_paths(root)
+        .into_iter()
+        .map(|path| {
+            NakamotoBlock::decode(&std::fs::read(&path).expect("read a captured block"))
+                .expect("a captured block decodes")
+        })
+        .collect();
+    blocks.sort_by_key(|block| block.header.chain_length);
+    blocks
+}
+
+/// The mainnet corpus decides identically in and out of process.
+///
+/// The same claim the offline gate proves on the captured Hacknet chain, made
+/// on the captured mainnet window: both sides open the mainnet checkpoint
+/// through the same in-memory door, and every captured block is judged from
+/// one serialized request through the in-process path and the spawned
+/// executor. Requires `NANO_MAINNET_CAPTURE`; under `NANO_REQUIRE_MAINNET` a
+/// missing capture is a failure rather than a skip, so a release run cannot
+/// report this green without running it.
+#[test]
+fn the_mainnet_capture_decides_identically_in_and_out_of_process() {
+    let Some(root) = std::env::var_os("NANO_MAINNET_CAPTURE").map(std::path::PathBuf::from) else {
+        nano_conformance::skip_gate("NANO_MAINNET_CAPTURE must name a capture directory");
+        return;
+    };
+
+    let in_process = tempfile::tempdir().expect("a directory");
+    let out_of_process = tempfile::tempdir().expect("a directory");
+    let (mut chainstate, anchor) =
+        nano_conformance::shadow_capture_chainstate(&root, in_process.path())
+            .expect("the mainnet checkpoint opens");
+    let inputs = MainnetInputs::read(&root);
+    let blocks = capture_blocks(&root);
+    assert!(!blocks.is_empty(), "the capture holds blocks");
+
+    let mut tip = anchor.clone();
+    let mut shadow = Shadow::spawn_capture(&root, out_of_process.path(), &anchor);
+
+    let mut bitcoin_view = String::new();
+    let mut accepted = 0_usize;
+    for block in &blocks {
+        let parent = *tip.block_id().as_bytes();
+        let request = inputs.request(block, &mut bitcoin_view, parent);
+        let opened = request.open().expect("the request opens");
+        let ours = judge(&mut chainstate, &opened, &tip, None);
+        let theirs = shadow.decide(&request);
+        assert_eq!(
+            ours.record, theirs,
+            "the decision records part at height {}",
+            block.header.chain_length
+        );
+        assert!(
+            matches!(ours.record.verdict, Verdict::Accepted),
+            "the captured mainnet block at height {} was refused: {:?}",
+            block.header.chain_length,
+            ours.record.verdict
+        );
+        tip = block.clone();
+        accepted += 1;
+    }
+    assert_eq!(accepted, blocks.len(), "every captured block was decided");
     shadow.finish();
 }

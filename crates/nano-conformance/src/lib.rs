@@ -12,7 +12,7 @@ use nano_chainstate::{
     BitcoinBlockContext, CHECKPOINT_HISTORY_LIMIT, ChainState, NakamotoBlock, TenureAccounting,
 };
 use nano_codec::{TenureChangeCause, TransactionPayloadData};
-use nano_primitives::{Network, TrieHash};
+use nano_primitives::{Network, StacksBlockId, TrieHash};
 use serde::Deserialize;
 
 /// The minimum metadata needed to make replay depth visible before fixture
@@ -1238,6 +1238,66 @@ pub fn replay_chainstate(root: &Path) -> Result<(ChainState, [u8; 32]), &'static
     Ok((chainstate, source))
 }
 
+/// Open a captured chain's checkpoint for the epoch4 shadow comparison.
+///
+/// The in-memory checkpoint state with its accounting, continuity seeded from
+/// the recorded parent header, and the anchor block the first captured block
+/// extends — read from the checkpoint's own authentication history, which is
+/// where a following node reads it. Both sides of the shadow gate open through
+/// this one door, in and out of process, so what the comparison measures is
+/// the decision path and not the opening.
+pub fn shadow_capture_chainstate(
+    root: &Path,
+    directory: &Path,
+) -> Result<(ChainState, NakamotoBlock), String> {
+    let (source, state_root) =
+        checkpoint_state(root).ok_or("checkpoint metadata is unavailable")?;
+    let checkpoint = root.join("chainstate/checkpoint-H/marf.sqlite");
+    // Durable rather than in memory: a mainnet checkpoint is tens of
+    // gigabytes, and holding two of it in RAM (each side of the shadow) is
+    // how the first attempt at this gate exhausted the host. The import is
+    // hours once; a directory that already holds the imported state resumes.
+    let mut chainstate = ChainState::open_from_checkpoint(
+        captured_network(root),
+        directory,
+        &checkpoint,
+        source,
+        state_root,
+    )
+    .map_err(|error| format!("the checkpoint cannot be opened: {error}"))?;
+    let accounting = fs::read(root.join("chainstate/checkpoint-H/native-effects.json"))
+        .ok()
+        .and_then(|contents| TenureAccounting::from_json(&contents).ok())
+        .ok_or("native accounting fixture cannot be loaded")?;
+    *chainstate.accounting_mut() = accounting;
+    chainstate
+        .seed_unauthenticated_fixture_extension_from_parent_header(StacksBlockId::from_bytes(
+            source,
+        ))
+        .map_err(|error| format!("seed checkpoint extension continuity: {error}"))?;
+    let blocks = root.join("chainstate/checkpoint-H/authentication-history/blocks");
+    let suffix = format!("-{}.bin", hex::encode(source));
+    let anchor = fs::read_dir(&blocks)
+        .map_err(|error| format!("{}: {error}", blocks.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(&suffix))
+        })
+        .ok_or_else(|| {
+            format!(
+                "the checkpoint authentication history holds no block named {}",
+                hex::encode(source)
+            )
+        })?;
+    let anchor = NakamotoBlock::decode(
+        &fs::read(&anchor).map_err(|error| format!("{}: {error}", anchor.display()))?,
+    )
+    .map_err(|error| format!("the anchor block does not decode: {error:?}"))?;
+    Ok((chainstate, anchor))
+}
+
 /// A durable chainstate over the captured checkpoint, resuming what `directory`
 /// already holds.
 ///
@@ -2031,7 +2091,8 @@ impl std::fmt::Display for ReplayDivergence {
 }
 
 /// Read a scalar field from the capture's provenance record.
-fn provenance_field(root: &Path, name: &str) -> Option<String> {
+#[must_use]
+pub fn provenance_field(root: &Path, name: &str) -> Option<String> {
     let provenance = fs::read_to_string(root.join("provenance.toml")).ok()?;
     provenance
         .lines()
@@ -2224,16 +2285,26 @@ pub fn captured_bitcoin_snapshots(root: &Path) -> Option<BTreeMap<String, Bitcoi
     let prepare_phase_length = u32::try_from(field("pox_prepare_phase_length")?).ok()?;
     let reward_phase_length = u32::try_from(field("pox_reward_phase_length")?).ok()?;
     let operations = captured_bitcoin_operations(root)?;
-    let mut registrations = nano_node::sortition::read_leader_keys(&root.join("sortition"))
-        .ok()?
-        .entries()
-        .map(|(height, index, registration)| {
-            (
-                (height, index),
-                (registration.vrf_public_key, registration.signing_key_hash),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    // A winning commitment usually names a leader key registered long before
+    // the burn window a capture covers; the checkpoint's authentication
+    // history is where those live, exactly as a following node reads them.
+    let mut registrations = [
+        root.join("sortition"),
+        root.join("chainstate/checkpoint-H/authentication-history"),
+    ]
+    .iter()
+    .filter_map(|directory| nano_node::sortition::read_leader_keys(directory).ok())
+    .flat_map(|keys| {
+        keys.entries()
+            .map(|(height, index, registration)| {
+                (
+                    (height, index),
+                    (registration.vrf_public_key, registration.signing_key_hash),
+                )
+            })
+            .collect::<Vec<_>>()
+    })
+    .collect::<BTreeMap<_, _>>();
     registrations.extend(snapshots.iter().flat_map(|snapshot| {
         operations
             .get(&snapshot.consensus_hash)
