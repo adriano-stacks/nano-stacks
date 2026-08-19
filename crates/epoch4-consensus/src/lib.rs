@@ -145,6 +145,43 @@ pub fn decide(
     }
 }
 
+/// Judge one wire request end to end: linkage, authentication, execution.
+///
+/// The child process's whole loop is this call. The tip is the child's own —
+/// adopted at start and advanced only by its own accepted decisions — so a
+/// parent process cannot make it stand somewhere it never executed.
+pub fn judge(
+    chainstate: &mut ChainState,
+    request: &OpenedRequest,
+    tip: &NakamotoBlock,
+    waterfall_registry: Option<&str>,
+) -> Decision {
+    if let Err(error) = request.block.validate_successor(&tip.header) {
+        let mut record = record_scaffold(&request.block, request.context);
+        record.verdict = Verdict::Refused {
+            kind: RefusalKind::ParentMismatch,
+            detail: format!("{error:?}: the candidate does not extend this executor's tip"),
+        };
+        return Decision {
+            record,
+            applied: None,
+        };
+    }
+    let parent = request.parent.unwrap_or_else(|| *tip.block_id().as_bytes());
+    match chainstate.authenticate_nakamoto_block_with_bitcoin_operations(
+        request.context,
+        &request.operations,
+        Some(parent),
+        request.block.clone(),
+    ) {
+        Ok(authenticated) => decide(chainstate, authenticated, waterfall_registry),
+        Err(error) => Decision {
+            record: refused_record(&request.block, request.context, &error),
+            applied: None,
+        },
+    }
+}
+
 fn record_scaffold(block: &NakamotoBlock, context: BitcoinBlockContext) -> DecisionRecord {
     DecisionRecord {
         schema: DECISION_SCHEMA.to_owned(),
