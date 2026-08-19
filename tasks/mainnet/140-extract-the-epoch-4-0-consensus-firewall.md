@@ -1,7 +1,7 @@
 ---
 id: "140"
 title: "Extract the Epoch 4.0 consensus firewall"
-status: pending
+status: in-progress
 priority: high
 effort: large
 dependencies: ["135", "136", "138"]
@@ -21,7 +21,7 @@ consensus rules in place.
 
 ## Tasks
 
-- [ ] Write an architecture decision describing the process/crate boundary,
+- [x] Write an architecture decision describing the process/crate boundary,
       deterministic inputs and outputs, failure semantics and migration plan.
 - [ ] Extract an `epoch4-consensus` API with no Tokio, HTTP, sockets, wall clock,
       environment reads or arbitrary filesystem access in its decision path.
