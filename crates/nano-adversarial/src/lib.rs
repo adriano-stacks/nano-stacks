@@ -246,7 +246,11 @@ pub fn transaction_and_block_codecs(input: &[u8]) -> u8 {
     if let Ok((transaction, consumed)) = Transaction::decode(input) {
         assert!(consumed <= input.len());
         let encoded = transaction.encode();
-        assert_eq!(encoded, input[..consumed]);
+        // Re-encoding canonicalizes the version byte from network bit 7 and
+        // must reproduce every other wire byte exactly.
+        let mut canonical = input[..consumed].to_vec();
+        canonical[0] &= 0x80;
+        assert_eq!(encoded, canonical);
         let (decoded, decoded_len) = Transaction::decode(&encoded).expect("encoded transaction");
         assert_eq!(decoded_len, encoded.len());
         assert_eq!(decoded, transaction);
@@ -255,11 +259,17 @@ pub fn transaction_and_block_codecs(input: &[u8]) -> u8 {
 
     if let Ok(block) = NakamotoBlock::decode(input) {
         let encoded = block.encode();
-        assert_eq!(encoded, input);
-        assert_eq!(
-            NakamotoBlock::decode(&encoded).expect("encoded block"),
-            block
-        );
+        // Embedded transaction version bytes canonicalize on re-encode; any
+        // byte that changed must be exactly such a canonicalization.
+        assert_eq!(encoded.len(), input.len());
+        for (rewritten, wire) in encoded.iter().zip(input) {
+            if rewritten != wire {
+                assert_eq!(*rewritten, wire & 0x80);
+            }
+        }
+        let decoded = NakamotoBlock::decode(&encoded).expect("encoded block");
+        assert_eq!(decoded, block);
+        assert_eq!(decoded.encode(), encoded);
         coverage |= 2;
     }
     coverage

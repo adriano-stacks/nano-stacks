@@ -756,9 +756,14 @@ impl Transaction {
         };
 
         let length = reader.position();
+        let mut canonical = bytes[..length].to_vec();
+        // The version byte is the one field decoding canonicalizes, and the
+        // cached bytes back `txid` and `as_bytes`, which are computed from
+        // the canonical serialization rather than the wire bytes.
+        canonical[0] = version.byte();
         Ok((
             Self {
-                bytes: bytes[..length].to_vec(),
+                bytes: canonical,
                 version,
                 chain_id,
                 auth,
@@ -2143,6 +2148,31 @@ mod tests {
         decoded
             .verify_authorization()
             .expect("verify decoded transaction");
+    }
+
+    #[test]
+    fn non_canonical_version_bytes_keep_the_canonical_transaction_id() {
+        let transaction = Transaction::sign_standard(
+            TransactionVersion::Testnet,
+            0x8000_0000,
+            AnchorMode::OnChainOnly,
+            &StacksPrivateKey::from_seed(b"transaction-id"),
+            0,
+            0,
+            TransactionPayloadData::Coinbase { payload: [0; 32] },
+        )
+        .expect("sign transaction");
+        let canonical = transaction.encode();
+        for version_byte in [0x81, 0xd4, 0xff] {
+            let mut wire = canonical.clone();
+            wire[0] = version_byte;
+            let (decoded, consumed) = Transaction::decode(&wire).expect("decode transaction");
+            assert_eq!(consumed, wire.len());
+            assert_eq!(decoded.version(), TransactionVersion::Testnet);
+            assert_eq!(decoded.encode(), canonical);
+            assert_eq!(decoded.as_bytes(), canonical);
+            assert_eq!(decoded.txid(), sha512_256(&canonical));
+        }
     }
 
     fn encoded_post_condition_transaction(mode: u8, nft_tag: u8) -> Vec<u8> {
