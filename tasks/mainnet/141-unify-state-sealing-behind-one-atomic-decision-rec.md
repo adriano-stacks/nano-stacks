@@ -1,7 +1,7 @@
 ---
 id: "141"
 title: "Unify state sealing behind one atomic decision record"
-status: pending
+status: in-progress
 priority: high
 effort: large
 dependencies: ["079", "140"]
@@ -20,10 +20,10 @@ plus side-store durability protocol without sacrificing checkpoint compatibility
 
 ## Tasks
 
-- [ ] Specify a content-addressed decision record binding parent, authenticated
+- [x] Specify a content-addressed decision record binding parent, authenticated
       consensus inputs, writes, ledger/header metadata, state root, receipts,
       costs, events and compiler/epoch identity.
-- [ ] Evaluate one database/transaction first; compare it with a rigorously
+- [x] Evaluate one database/transaction first; compare it with a rigorously
       proven multi-file atomic transaction or append-only seal protocol. Document
       filesystem, SQLite journal-mode and power-loss assumptions.
 - [ ] Prototype and benchmark the simplest design against mainnet catch-up,
