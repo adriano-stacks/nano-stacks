@@ -14,15 +14,17 @@
 #  - for every block the follower executes during the hold it byte-compares
 #    the archived block against both independent stock oracles (byte equality
 #    covers the header state root the follower already refused to seal
-#    without) and compares the archived receipt commitment with the digest of
-#    an independently executing witness node's new_block payload;
-#  - each verified payload is then compared field by field against the
-#    receipt oracle by verify-mainnet-observer.py, whose unavailability is a
-#    retry and never a liveness input, exactly as the release plan requires.
+#    without) and records the archived receipt commitment beside it;
+#  - the receipt commitments are verified after the interval by
+#    scripts/verify-hold-receipts.sh against an independently executing
+#    same-revision witness node's new_block payloads and the receipt oracle.
+#    Deferred rather than inline because the first hold attempt proved the
+#    inline witness was load-bearing: a stale-revision witness failed the run
+#    over a compiler cost fix the witness lacked, not over the follower.
 #
-# Any process change, health failure, byte difference, digest difference or
-# oracle mismatch appends a terminal failure record and exits nonzero: a hold
-# with a defect restarts from zero. Every record lands in one JSONL output.
+# Any process change, health failure, byte difference or missing archive row
+# appends a terminal failure record and exits nonzero: a hold with a defect
+# restarts from zero. Every record lands in one JSONL output.
 set -euo pipefail
 
 usage() {
@@ -35,20 +37,17 @@ usage: hold-follower-mainnet.sh, configured by environment:
   HOLD_CONFIG            the follower's configuration file
   HOLD_PID               the follower's process id
   HOLD_EXE_SHA256        required sha256 of /proc/PID/exe
-  HOLD_WITNESS_EVENTS    witness observer directory holding new_block/
   HOLD_ORACLE_A          stock node base URL
   HOLD_ORACLE_B          stock node base URL
-  HOLD_RECEIPT_ORACLE    receipt oracle base URL (extended API)
   HOLD_BITCOIN_TIP_URL   URL answering the Bitcoin tip height as decimal
-  HOLD_RECEIPT_DIGEST    path to the receipt-digest binary
   HOLD_DURATION_SECONDS  optional, default 86400
 EOF
     exit 2
 }
 
 for name in HOLD_OUTPUT HOLD_HEALTH_URL HOLD_METRICS_URL HOLD_STATE_DIR \
-    HOLD_CONFIG HOLD_PID HOLD_EXE_SHA256 HOLD_WITNESS_EVENTS HOLD_ORACLE_A \
-    HOLD_ORACLE_B HOLD_RECEIPT_ORACLE HOLD_BITCOIN_TIP_URL HOLD_RECEIPT_DIGEST; do
+    HOLD_CONFIG HOLD_PID HOLD_EXE_SHA256 HOLD_ORACLE_A \
+    HOLD_ORACLE_B HOLD_BITCOIN_TIP_URL; do
     [ -n "${!name:-}" ] || { echo "$name is not set" >&2; usage; }
 done
 
@@ -59,19 +58,12 @@ readonly state_dir="$HOLD_STATE_DIR"
 readonly config="$HOLD_CONFIG"
 readonly pid="$HOLD_PID"
 readonly expected_exe_sha256="$HOLD_EXE_SHA256"
-readonly witness_events="$HOLD_WITNESS_EVENTS"
 readonly oracle_a="${HOLD_ORACLE_A%/}"
 readonly oracle_b="${HOLD_ORACLE_B%/}"
-readonly receipt_oracle="${HOLD_RECEIPT_ORACLE%/}"
 readonly bitcoin_tip_url="$HOLD_BITCOIN_TIP_URL"
-readonly receipt_digest_bin="$HOLD_RECEIPT_DIGEST"
 readonly duration_seconds="${HOLD_DURATION_SECONDS:-86400}"
 readonly interval_seconds=60
-# Witness lag beyond this is missing evidence, which fails the hold.
-readonly witness_grace_seconds=1800
 readonly executed_db="$state_dir/chainstate/executed.sqlite"
-verifier="$(dirname "$0")/verify-mainnet-observer.py"
-readonly verifier
 
 work="$(mktemp -d)"
 readonly work
@@ -112,9 +104,8 @@ check_process() {
         fail "the follower executable changed: $sha"
 }
 
-# Byte-compare one archived block against both stock oracles and its receipt
-# commitment against the witness digest. Failures are terminal; an absent
-# witness payload inside the grace window is a retry.
+# Byte-compare one archived block against both stock oracles and record its
+# receipt commitment for the deferred verification. Failures are terminal.
 verify_block() {
     local height="$1" block_id="$2"
     local follower_block="$work/follower.bin"
@@ -131,29 +122,10 @@ verify_block() {
             fail "block $height differs from $oracle"
     done
 
-    local summary block_hash
+    local summary
     summary="$(executed_query "SELECT cast(summary AS text) FROM receipts
                                WHERE block_id = x'$block_id'")"
     [ -n "$summary" ] || fail "block $height has no archived receipt commitment"
-    block_hash="$(jq -er .block <<< "$summary")"
-
-    local payload
-    payload="$(printf '%s/new_block/%08d-%s.json' "$witness_events" "$height" "$block_hash")"
-    if [ ! -f "$payload" ]; then
-        local waited=0
-        while [ ! -f "$payload" ]; do
-            [ "$waited" -lt "$witness_grace_seconds" ] || \
-                fail "the witness produced no payload for block $height"
-            sleep 10
-            waited=$((waited + 10))
-            check_process
-        done
-    fi
-    local witness_digest
-    witness_digest="$("$receipt_digest_bin" "$payload")" || \
-        fail "the witness payload for block $height did not digest"
-    [ "$(jq -cS . <<< "$summary")" = "$(jq -cS . <<< "$witness_digest")" ] || \
-        fail "block $height receipts differ: follower $summary, witness $witness_digest"
 
     local root
     root="$(dd if="$follower_block" bs=1 skip=101 count=32 status=none | \
@@ -166,50 +138,15 @@ verify_block() {
         --argjson receipts "$summary" \
         '{type: "block", timestamp: $timestamp, height: $height,
           block_id: $block_id, state_index_root: $state_index_root,
-          receipts: $receipts, oracles: 2, witness: true}' >> "$output"
-    printf '%s %s %s\n' "$height" "$block_hash" "$root" >> "$receipt_queue"
-}
-
-# Compare queued witness payloads with the receipt oracle. Unavailability
-# (exit 75) stops the drain for this round; a mismatch is terminal.
-drain_receipt_queue() {
-    while [ -s "$receipt_queue" ]; do
-        local height block_hash root payload result status
-        read -r height block_hash root < <(head -n 1 "$receipt_queue")
-        payload="$(printf '%s/new_block/%08d-%s.json' "$witness_events" "$height" "$block_hash")"
-        set +e
-        result="$("$verifier" "$payload" "$receipt_oracle" "$root" 2> "$work/oracle-error")"
-        status="$?"
-        set -e
-        case "$status" in
-            0)
-                printf '%s\n' "$result" >> "$output"
-                sed -i 1d "$receipt_queue"
-                ;;
-            75)
-                return 0
-                ;;
-            *)
-                fail "$(cat "$work/oracle-error")"
-                ;;
-        esac
-    done
+          receipts: $receipts, oracles: 2}' >> "$output"
 }
 
 test -d "$state_dir" || { echo "state directory is absent: $state_dir" >&2; exit 1; }
 test -r "$config" || { echo "config is unreadable: $config" >&2; exit 1; }
 test -r "$executed_db" || { echo "executed archive is unreadable: $executed_db" >&2; exit 1; }
-test -d "$witness_events/new_block" || \
-    { echo "witness observer directory is absent: $witness_events" >&2; exit 1; }
-test -x "$verifier" || { echo "oracle verifier is not executable: $verifier" >&2; exit 1; }
-test -x "$receipt_digest_bin" || \
-    { echo "receipt-digest is not executable: $receipt_digest_bin" >&2; exit 1; }
 test ! -s "$output" || { echo "output already contains a run: $output" >&2; exit 1; }
 mkdir -p "$(dirname "$output")"
 : > "$output"
-receipt_queue="$work/receipt-queue"
-readonly receipt_queue
-: > "$receipt_queue"
 
 if grep -Eqi 'api\.(mainnet\.)?hiro\.so' "$config"; then
     fail "the follower config names a hosted Stacks API"
@@ -242,10 +179,8 @@ jq -cn \
     --arg config "$config" \
     --arg config_sha256 "$config_sha256" \
     --arg state_dir "$state_dir" \
-    --arg witness_events "$witness_events" \
     --arg oracle_a "$oracle_a" \
     --arg oracle_b "$oracle_b" \
-    --arg receipt_oracle "$receipt_oracle" \
     --arg bitcoin_tip_url "$bitcoin_tip_url" \
     --argjson bitcoin_tip "$initial_bitcoin_tip" \
     --argjson initial_height "$initial_height" \
@@ -253,8 +188,8 @@ jq -cn \
     --argjson duration_seconds "$duration_seconds" \
     '{type: "start", timestamp: $timestamp, pid: $pid,
       exe_sha256: $exe_sha256, config: $config, config_sha256: $config_sha256,
-      state_dir: $state_dir, witness_events: $witness_events,
-      oracle_a: $oracle_a, oracle_b: $oracle_b, receipt_oracle: $receipt_oracle,
+      state_dir: $state_dir,
+      oracle_a: $oracle_a, oracle_b: $oracle_b,
       bitcoin_tip_url: $bitcoin_tip_url, bitcoin_tip: $bitcoin_tip,
       initial_height: $initial_height, health: $health,
       duration_seconds: $duration_seconds}' >> "$output"
@@ -313,7 +248,6 @@ while [ "$SECONDS" -lt "$duration_seconds" ]; do
         verify_block "$next" "$block_id"
         last_verified_height="$next"
     done
-    drain_receipt_queue
 
     jq -cn \
         --arg timestamp "$(date -u +%FT%TZ)" \
@@ -323,7 +257,6 @@ while [ "$SECONDS" -lt "$duration_seconds" ]; do
         --argjson info_b "$info_b" \
         --argjson bitcoin_tip "$bitcoin_tip" \
         --argjson verified_height "$last_verified_height" \
-        --argjson receipt_backlog "$(wc -l < "$receipt_queue")" \
         --argjson rss_kb "$rss_kb" \
         --argjson peak_kb "$peak_kb" \
         --argjson open_files "$open_files" \
@@ -338,7 +271,6 @@ while [ "$SECONDS" -lt "$duration_seconds" ]; do
               {stacks: $info_b.stacks_tip_height, burn: $info_b.burn_block_height} end)},
           bitcoin_tip: $bitcoin_tip,
           verified_height: $verified_height,
-          receipt_backlog: $receipt_backlog,
           resources: {rss_kb: $rss_kb, peak_kb: $peak_kb, open_files: $open_files,
             disk_available: $disk_available, database_bytes: $db_sizes},
           metrics: ($metrics | split("\n") | map(select(length > 0)))}' >> "$output"
@@ -346,18 +278,10 @@ while [ "$SECONDS" -lt "$duration_seconds" ]; do
     sleep "$interval_seconds"
 done
 
-# The interval is over; the evidence is complete only when every executed
-# block also passed the receipt oracle. Unavailability is worth waiting out,
-# for at most another hour.
-drain_deadline=$((SECONDS + 3600))
-while [ -s "$receipt_queue" ]; do
-    [ "$SECONDS" -lt "$drain_deadline" ] || \
-        fail "receipt oracle verification remains pending for $(wc -l < "$receipt_queue") blocks"
-    sleep 30
-    check_process
-    drain_receipt_queue
-done
-
+# The interval is over. Receipt commitments recorded per block remain to be
+# verified by scripts/verify-hold-receipts.sh against the same-revision
+# witness and the receipt oracle; the hold is not release evidence until that
+# verification also passes.
 jq -cn \
     --arg timestamp "$(date -u +%FT%TZ)" \
     --argjson elapsed_seconds "$SECONDS" \
