@@ -1,0 +1,14 @@
+schema = "nano-stacks/checkpoint-builder-policy/v1"
+required_signatures = 2
+
+[[builders]]
+name = "aldur-host-primary"
+public_key = "020ed29fef9157ebf390d5ec2345b973b6a98b3a04d6974b4719e32487746e20e1"
+valid_from_height = 8665600
+valid_through_height = 8665600
+
+[[builders]]
+name = "aldur-host-recovery"
+public_key = "020e3bc4efdd7fc0785e0ce41972ad2d3a80e9e56beef19a762b4a2f36b0dcd2be"
+valid_from_height = 8665600
+valid_through_height = 8665600

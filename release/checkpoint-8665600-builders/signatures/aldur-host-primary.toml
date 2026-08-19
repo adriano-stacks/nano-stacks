@@ -1,0 +1,4 @@
+schema = "nano-stacks/checkpoint-builder-signature/v1"
+builder = "aldur-host-primary"
+content_root = "146ade17681fa62e508dca2325a6dd356f8adcdacc8afba06b03bcda0e6b307d"
+signature = "00c53d7a636b0e712f68b72ec60afd4878bd8202bf653046617c4dc356f8584f0313617f33e123a6b1d0cc5c7dfb6d4e4eaafa8caff202901930b781cff27d8730"

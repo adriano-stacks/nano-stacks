@@ -1,0 +1,4 @@
+schema = "nano-stacks/checkpoint-builder-signature/v1"
+builder = "aldur-host-recovery"
+content_root = "146ade17681fa62e508dca2325a6dd356f8adcdacc8afba06b03bcda0e6b307d"
+signature = "0102e3fbdea3581fec847af1a10fc868590adb6b6717250c7b7ed6ebb4c3fd423222f68af041b73107270aeac85b6d3d5c4de259895ec25385ebedce6d2507f3c2"
