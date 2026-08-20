@@ -747,4 +747,12 @@ job = "release-qualification"
 requires = "NANO_MAINNET_MARF, NANO_MAINNET_BLOCK, NANO_MAINNET_ROOT and NANO_MAINNET_JOURNAL as used by the test"
 policy = "required"
 
-# 86 call sites inventoried.
+[[conditional]]
+site = "epoch4_shadow::the_mainnet_capture_decides_identically_in_and_out_of_process#1"
+class = "infrastructure"
+owner = "140"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE, and NANO_SHADOW_WORKDIR to keep the two checkpoint imports"
+policy = "required"
+
+# 87 call sites inventoried.
