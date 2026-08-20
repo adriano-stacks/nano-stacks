@@ -214,8 +214,18 @@ hole_rounds=0
 while [ "$SECONDS" -lt "$duration_seconds" ]; do
     check_process
 
-    health="$(curl -fsS --max-time 10 "$health_url/health")" || \
-        fail "the follower health endpoint failed"
+    # Three attempts before a verdict: one missed 10-second probe under a
+    # heavy I/O moment is a measurement artifact — the first interval died on
+    # exactly that while the follower answered again seconds later — but a
+    # follower that stays unresponsive across half a minute has failed.
+    health=""
+    for _ in 1 2 3; do
+        health="$(curl -fsS --max-time 10 "$health_url/health")" && break
+        health=""
+        sleep 5
+        check_process
+    done
+    [ -n "$health" ] || fail "the follower health endpoint failed three probes"
     jq -e '.last_error == null' <<< "$health" > /dev/null || \
         fail "the follower reports an error: $health"
     metrics="$(curl -fsS --max-time 10 "$metrics_url/metrics")" || \
