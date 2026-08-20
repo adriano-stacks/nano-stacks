@@ -12,7 +12,7 @@ use nano_chainstate::{
     BitcoinBlockContext, CHECKPOINT_HISTORY_LIMIT, ChainState, NakamotoBlock, TenureAccounting,
 };
 use nano_codec::{TenureChangeCause, TransactionPayloadData};
-use nano_primitives::{Network, StacksBlockId, TrieHash};
+use nano_primitives::{Network, TrieHash};
 use serde::Deserialize;
 
 /// The minimum metadata needed to make replay depth visible before fixture
@@ -1240,62 +1240,62 @@ pub fn replay_chainstate(root: &Path) -> Result<(ChainState, [u8; 32]), &'static
 
 /// Open a captured chain's checkpoint for the epoch4 shadow comparison.
 ///
-/// The in-memory checkpoint state with its accounting, continuity seeded from
-/// the recorded parent header, and the anchor block the first captured block
-/// extends — read from the checkpoint's own authentication history, which is
-/// where a following node reads it. Both sides of the shadow gate open through
-/// this one door, in and out of process, so what the comparison measures is
-/// the decision path and not the opening.
+/// A durable import (a mainnet checkpoint is tens of gigabytes; the first
+/// attempt held two of it in memory and exhausted the host), anchored the way
+/// a following node anchors: the first captured block is applied as the
+/// checkpoint anchor when the directory still stands at the source, and a
+/// directory that already decided captured blocks resumes at the last one it
+/// sealed. Both sides of the shadow gate open through this one door, in and
+/// out of process, so what the comparison measures is the decision path and
+/// not the opening. Returns the chainstate, the block it stands on, and how
+/// many captured blocks are already sealed (the caller's resume offset).
 pub fn shadow_capture_chainstate(
     root: &Path,
     directory: &Path,
-) -> Result<(ChainState, NakamotoBlock), String> {
-    let (source, state_root) =
-        checkpoint_state(root).ok_or("checkpoint metadata is unavailable")?;
-    let checkpoint = root.join("chainstate/checkpoint-H/marf.sqlite");
-    // Durable rather than in memory: a mainnet checkpoint is tens of
-    // gigabytes, and holding two of it in RAM (each side of the shadow) is
-    // how the first attempt at this gate exhausted the host. The import is
-    // hours once; a directory that already holds the imported state resumes.
-    let mut chainstate = ChainState::open_from_checkpoint(
-        captured_network(root),
-        directory,
-        &checkpoint,
-        source,
-        state_root,
-    )
-    .map_err(|error| format!("the checkpoint cannot be opened: {error}"))?;
-    let accounting = fs::read(root.join("chainstate/checkpoint-H/native-effects.json"))
-        .ok()
-        .and_then(|contents| TenureAccounting::from_json(&contents).ok())
-        .ok_or("native accounting fixture cannot be loaded")?;
-    *chainstate.accounting_mut() = accounting;
-    chainstate
-        .seed_unauthenticated_fixture_extension_from_parent_header(StacksBlockId::from_bytes(
+) -> Result<(ChainState, NakamotoBlock, usize), String> {
+    let (mut chainstate, source) = durable_replay_chainstate(root, directory)?;
+    let mut sealed = captured_blocks_sealed(root, &chainstate)?;
+    if sealed == 0 {
+        let has_receipts = fs::read_dir(root.join("events/new_block"))
+            .is_ok_and(|mut entries| entries.next().is_some());
+        let depth = replay_into(
+            &mut chainstate,
             source,
-        ))
-        .map_err(|error| format!("seed checkpoint extension continuity: {error}"))?;
-    let blocks = root.join("chainstate/checkpoint-H/authentication-history/blocks");
-    let suffix = format!("-{}.bin", hex::encode(source));
-    let anchor = fs::read_dir(&blocks)
-        .map_err(|error| format!("{}: {error}", blocks.display()))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().ends_with(&suffix))
-        })
-        .ok_or_else(|| {
-            format!(
-                "the checkpoint authentication history holds no block named {}",
-                hex::encode(source)
-            )
-        })?;
-    let anchor = NakamotoBlock::decode(
-        &fs::read(&anchor).map_err(|error| format!("{}: {error}", anchor.display()))?,
+            root,
+            FixtureManifest {
+                mode: FixtureMode::Captured,
+                replay_blocks: 1,
+                receipts: has_receipts,
+            },
+            0,
+            &mut |_, _| {},
+        );
+        if depth.completed != 1 {
+            return Err(format!(
+                "the checkpoint anchor did not apply: failure {:?}, divergence {:?}",
+                depth.first_failure, depth.first_divergence
+            ));
+        }
+        sealed = 1;
+    }
+    let paths = captured_block_paths(root);
+    let stand = paths
+        .get(sealed - 1)
+        .ok_or("the sealed count exceeds the captured blocks")?;
+    let stand = NakamotoBlock::decode(
+        &fs::read(stand).map_err(|error| format!("{}: {error}", stand.display()))?,
     )
-    .map_err(|error| format!("the anchor block does not decode: {error:?}"))?;
-    Ok((chainstate, anchor))
+    .map_err(|error| format!("the standing block does not decode: {error:?}"))?;
+    if !chainstate
+        .recover_ledger_at(*stand.block_id().as_bytes())
+        .map_err(|error| error.to_string())?
+    {
+        return Err(format!(
+            "block {} has no committed ledger to stand on",
+            stand.block_id()
+        ));
+    }
+    Ok((chainstate, stand, sealed))
 }
 
 /// A durable chainstate over the captured checkpoint, resuming what `directory`

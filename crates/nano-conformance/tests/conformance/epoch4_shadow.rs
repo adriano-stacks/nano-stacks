@@ -437,18 +437,23 @@ fn the_mainnet_capture_decides_identically_in_and_out_of_process() {
         ),
         (None, None) => unreachable!("one of the two directory sources exists"),
     };
-    let (mut chainstate, anchor) = nano_conformance::shadow_capture_chainstate(&root, &in_process)
-        .expect("the mainnet checkpoint opens");
+    let (mut chainstate, standing, decided) =
+        nano_conformance::shadow_capture_chainstate(&root, &in_process)
+            .expect("the mainnet checkpoint opens");
     let inputs = MainnetInputs::read(&root);
     let blocks = capture_blocks(&root);
     assert!(!blocks.is_empty(), "the capture holds blocks");
+    assert!(
+        decided <= blocks.len(),
+        "a resumed workdir stands past the capture; wipe it for a fresh run"
+    );
 
-    let mut tip = anchor.clone();
-    let mut shadow = Shadow::spawn_capture(&root, &out_of_process, &anchor);
+    let mut tip = standing.clone();
+    let mut shadow = Shadow::spawn_capture(&root, &out_of_process, &standing);
 
     let mut bitcoin_view = String::new();
-    let mut accepted = 0_usize;
-    for block in &blocks {
+    let mut accepted = decided;
+    for block in &blocks[decided..] {
         let parent = *tip.block_id().as_bytes();
         let request = inputs.request(block, &mut bitcoin_view, parent);
         let opened = request.open().expect("the request opens");

@@ -49,18 +49,18 @@ fn main() -> ExitCode {
 
 /// Serve decisions over a captured chain's checkpoint, imported durably.
 fn serve_capture(root: &str, directory: &str) -> Result<(), String> {
-    let (chainstate, anchor) = nano_conformance::shadow_capture_chainstate(
+    let (chainstate, standing, _) = nano_conformance::shadow_capture_chainstate(
         std::path::Path::new(root),
         std::path::Path::new(directory),
     )?;
     let mut lines = std::io::stdin().lock();
     let stand = host::read_stand(&mut lines)?;
-    if stand.block_id() != anchor.block_id() {
+    if stand.block_id() != standing.block_id() {
         return Err(format!(
-            "the parent stands on {} but the capture's anchor is {}",
+            "the parent stands on {} but this capture state stands on {}",
             stand.block_id(),
-            anchor.block_id()
+            standing.block_id()
         ));
     }
-    host::serve_over(chainstate, anchor, None, lines, std::io::stdout().lock())
+    host::serve_over(chainstate, standing, None, lines, std::io::stdout().lock())
 }
