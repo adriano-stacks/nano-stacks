@@ -1,7 +1,7 @@
 ---
 id: "053"
 title: "Pass the mainnet node release gate"
-status: in-progress
+status: blocked
 priority: critical
 effort: medium
 type: improvement
