@@ -58,6 +58,26 @@ struct Fingerprint {
     executed: Vec<[u8; 32]>,
     parent_tenure_proof: Option<[u8; 80]>,
     tenure_start: Option<u32>,
+    /// The content hash of the decision record the surviving tip committed
+    /// under. A block is meant to be absent or fully visible *with its record*,
+    /// so every scenario in this file compares this too: a tip that reopens with
+    /// its root and accounting intact but no record is a partially visible
+    /// block, which is the shape this file exists to refuse.
+    decision: Option<[u8; 32]>,
+}
+
+/// The clean reference, which every injected run is compared against.
+///
+/// Asserting the record is present here is what keeps the comparison from being
+/// vacuous: without it, a decision record that never landed on either side
+/// would compare equal as `None` and the criterion would look satisfied.
+fn reference_fingerprint(directory: &Path) -> Fingerprint {
+    let clean = fingerprint(directory);
+    assert!(
+        clean.decision.is_some(),
+        "the clean replay's tip must carry a decision record, or comparing it proves nothing"
+    );
+    clean
 }
 
 fn fingerprint(directory: &Path) -> Fingerprint {
@@ -82,6 +102,10 @@ fn fingerprint(directory: &Path) -> Fingerprint {
         executed: chainstate.executed_blocks(),
         parent_tenure_proof: chainstate.parent_tenure_proof(),
         tenure_start,
+        decision: chainstate
+            .decision_record(tip)
+            .expect("read the surviving decision record")
+            .map(|sealed| sealed.content_hash),
     }
 }
 
@@ -338,7 +362,7 @@ fn storage_failures_leave_only_a_complete_replay_prefix() {
         replay(reference.path(), TARGET_BLOCKS).success(),
         "the uninterrupted reference reaches {TARGET_BLOCKS} blocks"
     );
-    let expected = fingerprint(reference.path());
+    let expected = reference_fingerprint(reference.path());
 
     let faults = [
         Fault {
@@ -423,7 +447,7 @@ fn mismatched_store_generations_expose_only_a_complete_state() {
     }
 
     let reference = prepare_state(TARGET_BLOCKS);
-    let expected = fingerprint(reference.path());
+    let expected = reference_fingerprint(reference.path());
 
     let parent = prepare_state(2);
     let parent_before = fingerprint(parent.path());
@@ -486,7 +510,7 @@ fn every_durable_commit_boundary_exposes_only_a_complete_state() {
     }
 
     let reference = prepare_state(TARGET_BLOCKS);
-    let expected = fingerprint(reference.path());
+    let expected = reference_fingerprint(reference.path());
     let fsyncs = sweep_durability_point(&expected, "posix/io/sync/fsync");
     let fdatasyncs = sweep_durability_point(&expected, "posix/io/sync/fdatasync");
     let renames = sweep_durability_point(&expected, "posix/io/dir/rename");
