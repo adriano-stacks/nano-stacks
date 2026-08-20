@@ -117,7 +117,7 @@
             pname = "nano-stacks";
             version = "0.1.0-${builtins.substring 0 12 sourceRevision}";
             src = self;
-            cargoHash = "sha256-pkxjTPNn33TKGDJV9w47xrbIAM6EaldyGbD0iYNCU50=";
+            cargoHash = "sha256-BaK4c5yN1jekLfvdgMZOOyP9tHwk049o7SjZRde4kLA=";
             cargoBuildFlags = [ "-p" "nano-node" "--bin" "stacks-node" ];
             doCheck = false;
 
@@ -179,7 +179,7 @@
             pname = "nano-stacks-follower";
             version = "0.1.0-${builtins.substring 0 12 sourceRevision}";
             src = self;
-            cargoHash = "sha256-pkxjTPNn33TKGDJV9w47xrbIAM6EaldyGbD0iYNCU50=";
+            cargoHash = "sha256-BaK4c5yN1jekLfvdgMZOOyP9tHwk049o7SjZRde4kLA=";
             cargoBuildFlags = [ "-p" "nano-follower" "--bin" "stacks-follower" ];
             doCheck = false;
 
