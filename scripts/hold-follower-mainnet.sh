@@ -126,11 +126,31 @@ verify_block() {
     [ "$(jq -er .block_id <<< "$follower_identity")" = "$block_id" ] || \
         fail "the archived block at height $height is not the block the archive names"
 
-    local oracle oracle_identity
+    # An oracle that does not answer is retried across minutes and recorded,
+    # never treated as the subject's failure: unavailability is a property of
+    # the oracle, and the fifth interval died on exactly that. An oracle that
+    # answers with a *different* block is terminal, as ever.
+    local oracle oracle_identity served
     for oracle in "$oracle_a" "$oracle_b"; do
-        curl -fsS --max-time 20 --retry 5 --retry-all-errors \
-            "$oracle/v3/blocks/$block_id" > "$work/oracle.bin" || \
-            fail "block $height is not served by $oracle"
+        served=""
+        for _ in 1 2 3 4 5 6; do
+            if curl -fsS --max-time 20 --retry 3 --retry-all-errors \
+                "$oracle/v3/blocks/$block_id" > "$work/oracle.bin" 2>/dev/null; then
+                served=yes
+                break
+            fi
+            sleep 20
+            check_process
+        done
+        if [ -z "$served" ]; then
+            jq -cn \
+                --arg timestamp "$(date -u +%FT%TZ)" \
+                --argjson height "$height" \
+                --arg oracle "$oracle" \
+                '{type: "oracle-unavailable", timestamp: $timestamp,
+                  height: $height, oracle: $oracle}' >> "$output"
+            continue
+        fi
         oracle_identity="$("$block_identity_bin" "$work/oracle.bin")" || \
             fail "block $height from $oracle does not decode"
         [ "$(jq -c 'del(.signer_signatures)' <<< "$follower_identity")" = \
