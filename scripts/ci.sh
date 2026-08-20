@@ -49,6 +49,15 @@ run_gate() {
     fixtures)
       cargo run --profile ci -p xtask -- validate-fixtures
       ;;
+    executor-artifact)
+      # The consensus firewall's claim is that the sole chainstate writer cannot
+      # be reached over a network. The follower is the control: it must be
+      # refused by the same check, or the check is inspecting nothing.
+      cargo build --release -p epoch4-consensus --bin epoch4-executor
+      scripts/check-executor-artifact.sh target/release/epoch4-executor
+      cargo build --release -p nano-follower --bin stacks-follower
+      scripts/check-executor-artifact.sh target/release/stacks-follower --expect-network
+      ;;
     checkpoint-sample)
       run_named_test --profile ci -p nano-follower --lib \
         checkpoint_bundle::tests::published_sample_rebuilds_byte_for_byte -- --exact
@@ -137,7 +146,7 @@ run_gate() {
 
 case "$gate" in
   all)
-    for name in toolchain workflow formatting clippy follower-artifact scoreboard fixtures checkpoint-sample adversarial-smoke network-chaos storage-faults fuzz-smoke tests release release-integrity locks; do
+    for name in toolchain workflow formatting clippy follower-artifact executor-artifact scoreboard fixtures checkpoint-sample adversarial-smoke network-chaos storage-faults fuzz-smoke tests release release-integrity locks; do
       run_gate "$name"
     done
     ;;
