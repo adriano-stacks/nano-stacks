@@ -1255,30 +1255,48 @@ pub fn shadow_capture_chainstate(
 ) -> Result<(ChainState, NakamotoBlock, usize), String> {
     let (mut chainstate, source) = durable_replay_chainstate(root, directory)?;
     let mut sealed = captured_blocks_sealed(root, &chainstate)?;
-    if sealed == 0 {
+    let paths = captured_block_paths(root);
+    // The fixture prefix ends at the first tenure-start block after the
+    // anchor: its tenure change counts a tenure the checkpoint split, which
+    // only the production follower's checkpoint-history seeding can
+    // authenticate — the packaged follower's live qualification covered that
+    // path on real mainnet. Every tenure boundary after it is fully inside
+    // the executed range and is judged authenticated on both sides.
+    let mut prefix = 1;
+    for path in paths.iter().skip(1) {
+        let block = NakamotoBlock::decode(
+            &fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?,
+        )
+        .map_err(|error| format!("a captured block does not decode: {error:?}"))?;
+        prefix += 1;
+        if nano_chainstate::starts_new_tenure(&block) {
+            break;
+        }
+    }
+    if sealed < prefix {
         let has_receipts = fs::read_dir(root.join("events/new_block"))
             .is_ok_and(|mut entries| entries.next().is_some());
+        let expected = u64::try_from(prefix - sealed).map_err(|error| error.to_string())?;
         let depth = replay_into(
             &mut chainstate,
             source,
             root,
             FixtureManifest {
                 mode: FixtureMode::Captured,
-                replay_blocks: 1,
+                replay_blocks: expected,
                 receipts: has_receipts,
             },
-            0,
+            sealed,
             &mut |_, _| {},
         );
-        if depth.completed != 1 {
+        if depth.completed != expected {
             return Err(format!(
-                "the checkpoint anchor did not apply: failure {:?}, divergence {:?}",
+                "the checkpoint prefix did not apply: failure {:?}, divergence {:?}",
                 depth.first_failure, depth.first_divergence
             ));
         }
-        sealed = 1;
+        sealed = prefix;
     }
-    let paths = captured_block_paths(root);
     let stand = paths
         .get(sealed - 1)
         .ok_or("the sealed count exceeds the captured blocks")?;
