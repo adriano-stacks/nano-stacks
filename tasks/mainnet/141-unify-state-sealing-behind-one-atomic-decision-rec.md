@@ -1,7 +1,7 @@
 ---
 id: "141"
 title: "Unify state sealing behind one atomic decision record"
-status: in-progress
+status: blocked
 priority: high
 effort: large
 dependencies: ["079", "140"]

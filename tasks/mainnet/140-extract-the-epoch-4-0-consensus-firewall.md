@@ -1,7 +1,7 @@
 ---
 id: "140"
 title: "Extract the Epoch 4.0 consensus firewall"
-status: in-progress
+status: blocked
 priority: high
 effort: large
 dependencies: ["135", "136", "138"]
