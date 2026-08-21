@@ -119,6 +119,9 @@ fn main() -> ExitCode {
         Some("probe-root") => probe_root(&env::args().skip(2).collect::<Vec<_>>()),
         Some("call-both") => call_both(&env::args().skip(2).collect::<Vec<_>>()),
         Some("call-both-tx") => call_both_tx(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("cost-both-tx") => cost_both_tx(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("cost-both-batch") => cost_both_batch(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("cost-both") => cost_both(&env::args().skip(2).collect::<Vec<_>>()),
         Some("heal-contracts") => heal_contracts(env::args().nth(2).as_deref()),
         Some("probe-header") => probe_header(&env::args().skip(2).collect::<Vec<_>>()),
         Some("eval") => eval_in_state(&env::args().skip(2).collect::<Vec<_>>()),
@@ -5120,6 +5123,424 @@ fn call_both_tx(arguments: &[String]) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Re-run one sealed transaction against its parent and print what each
+/// engine charged, dimension by dimension.
+///
+/// `call-both-tx` compares the engines' *answers* on the staged block above
+/// the tip, under a free tracker. This one exists because task 146's
+/// differential was in the *charges*: the canonical record disagreed with a
+/// receipt on `read_length`, runtime and `write_length` while every answer and
+/// every root matched, and the block was long sealed. The MARF keeps every
+/// ancestor trie, so the call re-runs against the exact state it ran against,
+/// with the consensus cost tracker. Every block is aborted, so no root moves,
+/// but the state opens writable — recompiling the callees fills the module
+/// cache and interpreting them heals stub definitions, both side stores.
+/// Re-run many sealed contract calls through both engines, one line each.
+///
+/// The manifest is JSONL: `{"parent": "<block-id-hex>", "txs": ["<raw-hex>", …]}`
+/// per block. One state open serves the whole run, which is what makes a
+/// thousand-block cost audit finish in minutes instead of reopening a
+/// hundred-gigabyte state per transaction. Each line of output is
+/// `txid AGREE|DISAGREE compiler(rt,rc,rl,wc,wl) interpreter(rt,rc,rl,wc,wl)`.
+fn cost_both_batch(arguments: &[String]) -> ExitCode {
+    let [state, manifest] = arguments else {
+        eprintln!(
+            "usage: cargo xtask cost-both-batch <state-dir> <manifest.jsonl>\n\
+             writes only side caches, run it on a scratch copy; the node must not be running"
+        );
+        return ExitCode::FAILURE;
+    };
+    let manifest = match std::fs::read_to_string(manifest) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("cannot read {manifest}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut vm = match open_state_vm_for_writing(&Path::new(state).join("chainstate")) {
+        Ok(vm) => vm,
+        Err(error) => {
+            eprintln!("cannot open the state: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut disagreements = 0usize;
+    for line in manifest.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            eprintln!("not a manifest line: {line}");
+            return ExitCode::FAILURE;
+        };
+        let Some(parent) = entry["parent"]
+            .as_str()
+            .map(|hex| hex.trim_start_matches("0x"))
+            .and_then(|hex| hex::decode(hex).ok())
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        else {
+            eprintln!("a manifest line names no 32-byte parent: {line}");
+            return ExitCode::FAILURE;
+        };
+        for raw in entry["txs"].as_array().into_iter().flatten() {
+            let Some(bytes) = raw
+                .as_str()
+                .map(|hex| hex.trim_start_matches("0x"))
+                .and_then(|hex| hex::decode(hex).ok())
+            else {
+                eprintln!("a manifest transaction is not hexadecimal");
+                return ExitCode::FAILURE;
+            };
+            let transaction = match nano_codec::Transaction::decode(&bytes) {
+                Ok((transaction, _)) => transaction,
+                Err(error) => {
+                    eprintln!("cannot decode a transaction: {error:?}");
+                    continue;
+                }
+            };
+            match compare_engine_charges(&mut vm, parent, &transaction) {
+                Ok(Some((compiled, interpreted))) => {
+                    let agree = compiled == interpreted;
+                    disagreements += usize::from(!agree);
+                    println!(
+                        "{} {} {} {}",
+                        hex::encode(transaction.txid().as_bytes()),
+                        if agree { "AGREE" } else { "DISAGREE" },
+                        compact_cost(&compiled),
+                        compact_cost(&interpreted),
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => println!(
+                    "{} ERROR {error}",
+                    hex::encode(transaction.txid().as_bytes())
+                ),
+            }
+        }
+    }
+    println!("{disagreements} calls the engines charge differently");
+    ExitCode::SUCCESS
+}
+
+fn compact_cost(cost: &clarity::vm::costs::ExecutionCost) -> String {
+    format!(
+        "({},{},{},{},{})",
+        cost.runtime, cost.read_count, cost.read_length, cost.write_count, cost.write_length
+    )
+}
+
+/// One transaction's contract call through both engines at `parent`,
+/// answering the two charges without printing. `Ok(None)` when the
+/// transaction is not a contract call.
+fn compare_engine_charges(
+    vm: &mut nano_vm::Vm,
+    parent: [u8; 32],
+    transaction: &nano_codec::Transaction,
+) -> Result<
+    Option<(
+        clarity::vm::costs::ExecutionCost,
+        clarity::vm::costs::ExecutionCost,
+    )>,
+    String,
+> {
+    let nano_codec::TransactionPayloadData::ContractCall {
+        address,
+        contract_name,
+        function_name,
+        arguments,
+    } = transaction.payload().data()
+    else {
+        return Ok(None);
+    };
+    let origin = transaction
+        .origin_address()
+        .ok_or_else(|| "no recognized network".to_owned())?;
+    let sender = clarity::vm::types::PrincipalData::parse(&origin.to_string())
+        .map_err(|error| error.to_string())?;
+    let contract = format!("{address}.{contract_name}");
+    let identifier = clarity::vm::types::QualifiedContractIdentifier::parse(&contract)
+        .map_err(|_| format!("{contract} is not a contract identifier"))?;
+    let encoded = arguments
+        .iter()
+        .map(|argument| argument.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let mut charges = Vec::with_capacity(2);
+    for interpreted in [false, true] {
+        vm.begin_block(Some(parent), [0xcb; 32])
+            .map_err(|error| format!("cannot begin a block on the parent: {error:?}"))?;
+        let tracker = vm
+            .transaction_cost_tracker()
+            .map_err(|error| format!("cannot build the consensus cost tracker: {error:?}"))?;
+        let outcome = if interpreted {
+            nano_oracle::interpret_contract_call(
+                vm,
+                nano_oracle::ContractCall {
+                    sender: sender.clone(),
+                    sponsor: None,
+                    contract: identifier.clone(),
+                    function: function_name,
+                    arguments: &encoded,
+                },
+                tracker,
+            )
+        } else {
+            vm.execute_contract_call_outcome(
+                sender.clone(),
+                None,
+                identifier.clone(),
+                function_name,
+                &encoded,
+                &tracker,
+            )
+        };
+        let cost = match &outcome {
+            Ok(
+                nano_vm::ContractCallOutcome::Success(result)
+                | nano_vm::ContractCallOutcome::AbortedByResponse(result),
+            ) => result.cost.clone(),
+            Ok(nano_vm::ContractCallOutcome::RuntimeFailure { cost, .. }) => cost.clone(),
+            Err(error) => {
+                drop(vm.abort_block());
+                return Err(format!("{error:?}"));
+            }
+        };
+        drop(vm.abort_block());
+        charges.push(cost);
+    }
+    let interpreted = charges.pop().expect("two charges");
+    let compiled = charges.pop().expect("two charges");
+    Ok(Some((compiled, interpreted)))
+}
+
+fn cost_both_tx(arguments: &[String]) -> ExitCode {
+    let [state, parent, raw] = arguments else {
+        eprintln!(
+            "usage: cargo xtask cost-both-tx <state-dir> <parent-block-id> <raw-tx-hex-file>\n\
+             re-runs one sealed contract call against its parent with the consensus cost\n\
+             tracker; writes only side caches, run it on a scratch copy anyway;\n\
+             the node must not be running"
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(parent) = hex::decode(parent)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+    else {
+        eprintln!("{parent} is not a 32-byte block id");
+        return ExitCode::FAILURE;
+    };
+    let raw = match std::fs::read_to_string(raw) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("cannot read {raw}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Ok(bytes) = hex::decode(raw.trim().trim_start_matches("0x")) else {
+        eprintln!("the transaction file is not hexadecimal");
+        return ExitCode::FAILURE;
+    };
+    let transaction = match nano_codec::Transaction::decode(&bytes) {
+        Ok((transaction, _)) => transaction,
+        Err(error) => {
+            eprintln!("cannot decode the transaction: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let chainstate = Path::new(state).join("chainstate");
+    let mut vm = match open_state_vm_for_writing(&chainstate) {
+        Ok(vm) => vm,
+        Err(error) => {
+            eprintln!("cannot open the state: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match ask_both_engines_for_cost(&mut vm, parent, &transaction) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => {
+            eprintln!("not a contract call: only calls have two engines to compare");
+            ExitCode::FAILURE
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run one contract call through both engines at `parent`, printing each
+/// engine's answer and its consensus-tracked cost. `Ok(false)` when the
+/// transaction is not a contract call.
+fn ask_both_engines_for_cost(
+    vm: &mut nano_vm::Vm,
+    parent: [u8; 32],
+    transaction: &nano_codec::Transaction,
+) -> Result<bool, String> {
+    let nano_codec::TransactionPayloadData::ContractCall {
+        address,
+        contract_name,
+        function_name,
+        arguments,
+    } = transaction.payload().data()
+    else {
+        return Ok(false);
+    };
+    let origin = transaction
+        .origin_address()
+        .ok_or_else(|| "no recognized network".to_owned())?;
+    let sender = clarity::vm::types::PrincipalData::parse(&origin.to_string())
+        .map_err(|error| error.to_string())?;
+    let contract = format!("{address}.{contract_name}");
+    let identifier = clarity::vm::types::QualifiedContractIdentifier::parse(&contract)
+        .map_err(|_| format!("{contract} is not a contract identifier"))?;
+    let encoded = arguments
+        .iter()
+        .map(|argument| argument.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    println!(
+        "{} {contract}::{function_name} ({} arguments)",
+        hex::encode(transaction.txid().as_bytes()),
+        encoded.len()
+    );
+    charge_both_engines(vm, parent, &sender, &identifier, function_name, &encoded)?;
+    Ok(true)
+}
+
+/// `cost-both`: one hand-written call, both engines, consensus cost trackers.
+///
+/// The snippet-level companion to `cost-both-tx`, for splitting a sealed
+/// transaction's inflated charge across its callees: call each sub-function
+/// directly at the same parent and see which one carries the difference.
+fn cost_both(arguments: &[String]) -> ExitCode {
+    let (sender, arguments) = match arguments {
+        [flag, principal, rest @ ..] if flag == "--sender" => (Some(principal.clone()), rest),
+        _ => (None, arguments),
+    };
+    let [state, parent, contract, function, rest @ ..] = arguments else {
+        eprintln!(
+            "usage: cargo xtask cost-both [--sender <principal>] <state-dir> <parent-block-id> \
+             <contract-id> <function> [argument...]\n\
+             arguments are uints, contract principals, or consensus-serialized hexadecimal;\n\
+             writes only side caches, run it on a scratch copy; the node must not be running"
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(parent) = hex::decode(parent)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+    else {
+        eprintln!("{parent} is not a 32-byte block id");
+        return ExitCode::FAILURE;
+    };
+    let Ok(identifier) = clarity::vm::types::QualifiedContractIdentifier::parse(contract) else {
+        eprintln!("{contract} is not a contract identifier");
+        return ExitCode::FAILURE;
+    };
+    let mut encoded = Vec::new();
+    for argument in rest {
+        let Some(bytes) = clarity_argument(argument) else {
+            eprintln!("{argument} is not a uint, a contract principal, or hexadecimal");
+            return ExitCode::FAILURE;
+        };
+        encoded.push(bytes);
+    }
+    let sender = sender.unwrap_or_else(|| identifier.issuer.to_string());
+    let Ok(sender) = clarity::vm::types::PrincipalData::parse(&sender) else {
+        eprintln!("{sender} is not a principal");
+        return ExitCode::FAILURE;
+    };
+    let mut vm = match open_state_vm_for_writing(&Path::new(state).join("chainstate")) {
+        Ok(vm) => vm,
+        Err(error) => {
+            eprintln!("cannot open the state: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match charge_both_engines(&mut vm, parent, &sender, &identifier, function, &encoded) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The engine loop shared by `cost-both-tx` and `cost-both`: run the call
+/// through the compiler and then the interpreter at `parent`, printing each
+/// engine's consensus-tracked charge and its answer, aborting both blocks.
+fn charge_both_engines(
+    vm: &mut nano_vm::Vm,
+    parent: [u8; 32],
+    sender: &clarity::vm::types::PrincipalData,
+    identifier: &clarity::vm::types::QualifiedContractIdentifier,
+    function_name: &str,
+    encoded: &[Vec<u8>],
+) -> Result<(), String> {
+    for interpreted in [false, true] {
+        eprintln!(
+            "=== {}",
+            if interpreted {
+                "interpreter"
+            } else {
+                "compiler"
+            }
+        );
+        vm.begin_block(Some(parent), [0xcb; 32])
+            .map_err(|error| format!("cannot begin a block on the parent: {error:?}"))?;
+        let tracker = vm
+            .transaction_cost_tracker()
+            .map_err(|error| format!("cannot build the consensus cost tracker: {error:?}"))?;
+        let outcome = if interpreted {
+            nano_oracle::interpret_contract_call(
+                vm,
+                nano_oracle::ContractCall {
+                    sender: sender.clone(),
+                    sponsor: None,
+                    contract: identifier.clone(),
+                    function: function_name,
+                    arguments: encoded,
+                },
+                tracker,
+            )
+        } else {
+            vm.execute_contract_call_outcome(
+                sender.clone(),
+                None,
+                identifier.clone(),
+                function_name,
+                encoded,
+                &tracker,
+            )
+        };
+        let (answer, cost) = match &outcome {
+            Ok(
+                nano_vm::ContractCallOutcome::Success(result)
+                | nano_vm::ContractCallOutcome::AbortedByResponse(result),
+            ) => (format!("{:?}", result.value), result.cost.clone()),
+            Ok(nano_vm::ContractCallOutcome::RuntimeFailure { error, cost }) => {
+                (format!("failed: {error:?}"), cost.clone())
+            }
+            Err(error) => (
+                format!("error: {error:?}"),
+                clarity::vm::costs::ExecutionCost::ZERO,
+            ),
+        };
+        println!(
+            "{}  runtime {}  read_count {}  read_length {}  write_count {}  write_length {}",
+            if interpreted {
+                "interpreter"
+            } else {
+                "compiler   "
+            },
+            cost.runtime,
+            cost.read_count,
+            cost.read_length,
+            cost.write_count,
+            cost.write_length,
+        );
+        println!("  {answer}");
+        drop(vm.abort_block());
+    }
+    Ok(())
 }
 
 /// Ask both engines one transaction's contract call, if that is what it is.
