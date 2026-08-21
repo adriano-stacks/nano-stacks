@@ -336,6 +336,7 @@ pub fn link_host_functions(
     link_map_set_fn(linker)?;
     link_map_insert_fn(linker)?;
     link_map_delete_fn(linker)?;
+    link_charge_probe_fn(linker)?;
     link_get_stacks_block_info_header_hash_property_fn(linker)?;
     link_get_stacks_block_info_time_property_fn(linker)?;
     link_get_stacks_block_info_identity_header_hash_property_fn(linker)?;
@@ -4297,6 +4298,26 @@ fn link_map_get_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExec
         .map_err(|e| {
             crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
                 "map_get".to_string(),
+                e,
+            ))
+        })
+}
+
+/// Link the diagnostic `charge_probe` host function.
+///
+/// Inert unless a module was compiled with `NANO_TRACE_CHARGES`, which makes
+/// every generated charge report its interned label index and scaling input
+/// before it decrements the meters. A module compiled without the flag never
+/// imports it.
+fn link_charge_probe_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap("clarity", "charge_probe", |index: i32, n: i64| {
+            eprintln!("probe {index} {n}");
+        })
+        .map(|_| ())
+        .map_err(|e| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "charge_probe".to_string(),
                 e,
             ))
         })

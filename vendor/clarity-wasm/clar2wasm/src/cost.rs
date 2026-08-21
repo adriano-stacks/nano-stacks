@@ -267,7 +267,10 @@ pub trait ChargeGenerator {
 
         if let Some((ctx, module)) = self.cost_context() {
             match ctx.word_cost(&word_name) {
-                Some(cost) => ctx.emit(instrs, module, cost, n)?,
+                Some(cost) => {
+                    ctx.emit_probe(instrs, word_name.as_str(), n);
+                    ctx.emit(instrs, module, cost, n)?;
+                }
                 None => {
                     return Err(GeneratorError::InternalError(format!(
                         "'{word_name}' does not exist in costs table for epoch '{}'",
@@ -286,10 +289,13 @@ pub trait ChargeGenerator {
     fn charge_eval(
         &self,
         instrs: &mut InstrSeqBuilder,
+        label: &str,
         cost: impl Fn(&EvalCosts) -> Caf,
         n: impl Into<Scalar>,
     ) -> Result<()> {
         if let Some((ctx, module)) = self.cost_context() {
+            let n = n.into();
+            ctx.emit_probe(instrs, label, n);
             ctx.emit_with_caf(
                 instrs,
                 module,
@@ -304,7 +310,12 @@ pub trait ChargeGenerator {
 
     /// Charge resolving the head of an application to a function.
     fn charge_function_lookup(&self, instrs: &mut InstrSeqBuilder) -> Result<()> {
-        self.charge_eval(instrs, |costs| costs.function_lookup, 0_u32)
+        self.charge_eval(
+            instrs,
+            "eval:function-lookup",
+            |costs| costs.function_lookup,
+            0_u32,
+        )
     }
 
     /// Charge entering a user-defined function with `arguments` parameters.
@@ -313,22 +324,42 @@ pub trait ChargeGenerator {
         instrs: &mut InstrSeqBuilder,
         arguments: u32,
     ) -> Result<()> {
-        self.charge_eval(instrs, |costs| costs.user_function_application, arguments)
+        self.charge_eval(
+            instrs,
+            "eval:application",
+            |costs| costs.user_function_application,
+            arguments,
+        )
     }
 
     /// Charge type-checking one argument of a user-defined function.
     fn charge_inner_type_check(&self, instrs: &mut InstrSeqBuilder, size: LocalId) -> Result<()> {
-        self.charge_eval(instrs, |costs| costs.inner_type_check, size)
+        self.charge_eval(
+            instrs,
+            "eval:type-check",
+            |costs| costs.inner_type_check,
+            size,
+        )
     }
 
     /// Charge searching the binding scopes for a name.
     fn charge_variable_lookup(&self, instrs: &mut InstrSeqBuilder, depth: u32) -> Result<()> {
-        self.charge_eval(instrs, |costs| costs.variable_depth, depth)
+        self.charge_eval(
+            instrs,
+            "eval:variable-depth",
+            |costs| costs.variable_depth,
+            depth,
+        )
     }
 
     /// Charge copying a bound value out of its binding.
     fn charge_variable_copy(&self, instrs: &mut InstrSeqBuilder, size: LocalId) -> Result<()> {
-        self.charge_eval(instrs, |costs| costs.variable_size, size)
+        self.charge_eval(
+            instrs,
+            "eval:variable-size",
+            |costs| costs.variable_size,
+            size,
+        )
     }
 
     /// Charge parsing one analyzed type representation at contract publication.
@@ -339,6 +370,7 @@ pub trait ChargeGenerator {
     ) -> Result<()> {
         self.charge_eval(
             instrs,
+            "eval:type-parse",
             |costs| costs.type_parse_steps,
             type_parse_steps(type_repr)?,
         )
@@ -478,9 +510,30 @@ impl ScalarGet for InstrSeqBuilder<'_> {
 }
 
 /// Context required from a generator to emit cost tracking code.
+/// Diagnostic label registry for `NANO_TRACE_CHARGES` probes. Interning a
+/// label prints a legend line once; the probe host function prints the index.
+fn probe_label_index(label: &str) -> i32 {
+    use std::sync::Mutex;
+    static LEGEND: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut legend = LEGEND.lock().expect("probe legend");
+    if let Some(index) = legend.iter().position(|known| known == label) {
+        return i32::try_from(index).expect("fewer than 2^31 probe labels");
+    }
+    legend.push(label.to_owned());
+    let index = legend.len() - 1;
+    eprintln!("charge-legend {index} {label}");
+    i32::try_from(index).expect("fewer than 2^31 probe labels")
+}
+
 #[derive(Debug)]
 pub struct ChargeContext {
     pub epoch: StacksEpochId,
+    /// Diagnostic: a host function every charge reports to, present only
+    /// when `NANO_TRACE_CHARGES` was set while the module compiled. Never a
+    /// production shape — the emitted call changes the module, so the
+    /// consensus profile fingerprint refuses to mix traced and untraced
+    /// artifacts on one state.
+    pub charge_probe: Option<walrus::FunctionId>,
     pub runtime: GlobalId,
     pub read_count: GlobalId,
     pub read_length: GlobalId,
@@ -551,6 +604,26 @@ pub enum Caf {
 }
 
 impl ChargeContext {
+    /// Emit the diagnostic probe call for one charge, when tracing is on.
+    fn emit_probe(&self, instrs: &mut InstrSeqBuilder, label: &str, n: Scalar) {
+        let Some(probe) = self.charge_probe else {
+            return;
+        };
+        let index = probe_label_index(label);
+        instrs.i32_const(index);
+        match n {
+            Scalar::Compile(n) => {
+                instrs.i64_const(i64::from(n));
+            }
+            Scalar::Run(local) => {
+                instrs
+                    .local_get(local)
+                    .unop(walrus::ir::UnaryOp::I64ExtendUI32);
+            }
+        }
+        instrs.call(probe);
+    }
+
     fn emit(
         &self,
         instrs: &mut InstrSeqBuilder,

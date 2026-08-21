@@ -1275,8 +1275,16 @@ impl WasmGenerator {
         let wc = get_global(module, "cost-write-count")?;
         let wl = get_global(module, "cost-write-length")?;
 
+        let charge_probe = if std::env::var_os("NANO_TRACE_CHARGES").is_some() {
+            let probe_type = module.types.add(&[ValType::I32, ValType::I64], &[]);
+            let (probe, _) = module.add_import_func("clarity", "charge_probe", probe_type);
+            Some(probe)
+        } else {
+            None
+        };
         generator.cost_context = Some(ChargeContext {
             epoch: cost_epoch,
+            charge_probe,
             runtime: r,
             read_count: rc,
             read_length: rl,
