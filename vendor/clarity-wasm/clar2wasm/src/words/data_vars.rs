@@ -1,4 +1,3 @@
-use clarity::types::StacksEpochId;
 use clarity::vm::types::{TypeSignature, TypeSignatureExt};
 use clarity::vm::{ClarityName, SymbolicExpression};
 use walrus::ValType;
@@ -139,7 +138,7 @@ impl ComplexWord for SetDataVar {
 
         // From epoch 2.05 the interpreter charges what the value serializes to,
         // which is only known once the value itself is.
-        let serialized = if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+        let serialized = if generator.charges_serialized_sizes() {
             generator.serialization_size(builder, &ty)?;
             let serialized = generator.borrow_local(ValType::I32);
             builder.local_set(*serialized);
@@ -234,7 +233,7 @@ impl ComplexWord for GetDataVar {
             .clone();
         let (offset, size) = generator.create_call_stack_local(builder, &ty, true, true);
 
-        if generator.contract_analysis.epoch < StacksEpochId::Epoch2_05 {
+        if !generator.charges_serialized_sizes() {
             self.charge(
                 generator,
                 builder,
@@ -268,7 +267,7 @@ impl ComplexWord for GetDataVar {
 
         // From epoch 2.05 the interpreter charges what the stored value
         // serializes to, which is only known once it has been read.
-        if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+        if generator.charges_serialized_sizes() {
             generator.serialization_size(builder, &ty)?;
             let serialized = generator.borrow_local(ValType::I32);
             builder.local_set(*serialized);

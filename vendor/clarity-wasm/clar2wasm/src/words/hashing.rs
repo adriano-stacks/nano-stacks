@@ -1,4 +1,3 @@
-use clarity::types::StacksEpochId;
 use clarity::vm::types::{BufferLength, SequenceSubtype, TypeSignature};
 use clarity::vm::ClarityName;
 use walrus::ValType;
@@ -13,7 +12,7 @@ pub fn compute_cost(
     builder: &mut walrus::InstrSeqBuilder,
     arg_types: &[TypeSignature],
 ) -> Result<(), GeneratorError> {
-    if generator.contract_analysis.epoch < StacksEpochId::Epoch2_05 {
+    if !generator.charges_serialized_sizes() {
         word.charge(generator, builder, arg_types.len() as u32)?
     } else {
         match &arg_types[0] {

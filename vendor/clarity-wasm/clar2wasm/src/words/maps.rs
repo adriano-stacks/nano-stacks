@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use clarity::types::StacksEpochId;
 use clarity::vm::types::{TypeSignature, TypeSignatureExt};
 use clarity::vm::{ClarityName, SymbolicExpression};
 use walrus::ir::{BinaryOp, IfElse};
@@ -127,7 +126,7 @@ impl ComplexWord for MapGet {
         // database actually read. This distinguishes an absent entry from a
         // persisted one-byte deletion marker, even though both answer `none`.
         // In epoch < 2.05, the charge is immediately computed like it is in the interpreter.
-        let post205_cost_local = if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+        let post205_cost_local = if generator.charges_serialized_sizes() {
             Some(generator.borrow_local(ValType::I32))
         } else {
             let (key_ty, value_ty) = get_original_types(&generator.map_types_original, name)?;
@@ -282,7 +281,7 @@ impl ComplexWord for MapSet {
         // In epoch >= 2.05, we generate a local to compute intermediary results used in the
         // cost tracking. In this case, the cost tracking charge is applied after the delete operation.
         // In epoch < 2.05, the charge is immediately computed like it is in the interpreter.
-        let post205_cost_local = if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+        let post205_cost_local = if generator.charges_serialized_sizes() {
             Some(generator.borrow_local(ValType::I32))
         } else {
             let (key_ty, value_ty) = get_original_types(&generator.map_types_original, name)?;
@@ -420,7 +419,7 @@ impl ComplexWord for MapInsert {
         // In epoch >= 2.05, we generate a local to compute intermediary results used in the
         // cost tracking. In this case, the cost tracking charge is applied after the delete operation.
         // In epoch < 2.05, the charge is immediately computed like it is in the interpreter.
-        let post205_cost_local = if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+        let post205_cost_local = if generator.charges_serialized_sizes() {
             Some(generator.borrow_local(ValType::I32))
         } else {
             let (key_ty, value_ty) = get_original_types(&generator.map_types_original, name)?;
@@ -549,7 +548,7 @@ impl ComplexWord for MapDelete {
         // In epoch >= 2.05, we generate a local to compute intermediary results used in the
         // cost tracking. In this case, the cost tracking charge is applied after the delete operation.
         // In epoch < 2.05, the charge is immediately computed like it is in the interpreter.
-        let post205_cost_local = if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+        let post205_cost_local = if generator.charges_serialized_sizes() {
             Some(generator.borrow_local(ValType::I32))
         } else {
             let (key_ty, _) = get_original_types(&generator.map_types_original, name)?;
@@ -939,6 +938,289 @@ mod tests {
             ],
             "f",
             &[user, asset],
+        );
+    }
+}
+
+#[cfg(test)]
+mod recorded_semantics_charges {
+    use clarity::types::StacksEpochId;
+    use clarity::vm::ClarityVersion;
+
+    use crate::tools::crosscheck_cost_recorded_semantics;
+
+    #[test]
+    fn an_old_contracts_unlist_shape_charges_current_epoch_style() {
+        crosscheck_cost_recorded_semantics(
+            &[
+                (
+                    "tradable-trait",
+                    "(define-trait tradables-trait
+                       ((get-owner (uint) (response (optional principal) uint))
+                        (transfer (uint principal principal) (response bool uint))))",
+                ),
+                (
+                    "bulls",
+                    "(define-non-fungible-token bulls uint)
+                     (define-public (setup (escrow principal))
+                       (match (nft-mint? bulls u157 escrow) ok-mint (ok true) err-mint (err u1)))
+                     (define-read-only (get-owner (id uint))
+                       (ok (nft-get-owner? bulls id)))
+                     (define-public (transfer (id uint) (sender principal) (recipient principal))
+                       (if (is-eq tx-sender sender)
+                           (match (nft-transfer? bulls id sender recipient)
+                             success (ok success)
+                             error (err u2))
+                           (err u500)))",
+                ),
+                (
+                    "market",
+                    "(use-trait tradables-trait .tradable-trait.tradables-trait)
+                     (define-map on-sale
+                       {tradables: principal, tradable-id: uint}
+                       {price: uint, commission: uint, owner: principal,
+                        royalty-address: principal, royalty-percent: uint})
+                     (define-public (seed)
+                       (if (map-insert on-sale
+                             {tradables: .bulls, tradable-id: u157}
+                             {price: u25000000, commission: u200, owner: tx-sender,
+                              royalty-address: tx-sender, royalty-percent: u500})
+                           (match (contract-call? .bulls setup (as-contract tx-sender))
+                             minted (ok true)
+                             bad (err u3))
+                           (err u4)))
+                     (define-private (transfer-tradable-from-escrow
+                                       (tradables <tradables-trait>) (tradable-id uint))
+                       (let ((owner tx-sender))
+                         (as-contract
+                           (contract-call? tradables transfer tradable-id
+                                           (as-contract tx-sender) owner))))
+                     (define-public (unlist-asset (tradables <tradables-trait>) (tradable-id uint))
+                       (match (map-get? on-sale
+                                {tradables: (contract-of tradables), tradable-id: tradable-id})
+                         nft-data
+                         (if (is-eq (get owner nft-data) tx-sender)
+                             (match (transfer-tradable-from-escrow tradables tradable-id)
+                               success
+                               (begin
+                                 (map-delete on-sale
+                                   {tradables: (contract-of tradables), tradable-id: tradable-id})
+                                 (ok true))
+                               error (begin (print error) (err u2)))
+                             (err u3))
+                         (err u5)))",
+                ),
+                (
+                    "driver",
+                    "(define-public (probe)
+                       (begin
+                         (try! (contract-call? .market seed))
+                         (contract-call? .market unlist-asset .bulls u157)))",
+                ),
+            ],
+            "probe",
+            &[],
+            StacksEpochId::Epoch20,
+            ClarityVersion::Clarity1,
+        );
+    }
+
+    #[test]
+    fn an_old_contracts_trait_dispatch_charges_like_the_reference() {
+        crosscheck_cost_recorded_semantics(
+            &[
+                (
+                    "tradable-trait",
+                    "(define-trait tradables-trait
+                       ((get-owner (uint) (response (optional principal) uint))))",
+                ),
+                (
+                    "bulls",
+                    "(define-non-fungible-token bulls uint)
+                     (define-read-only (get-owner (id uint))
+                       (ok (nft-get-owner? bulls id)))",
+                ),
+                (
+                    "market",
+                    "(use-trait tradables-trait .tradable-trait.tradables-trait)
+                     (define-public (poke (tradables <tradables-trait>))
+                       (match (contract-call? tradables get-owner u157)
+                         owner (ok true)
+                         bad (err u1)))",
+                ),
+                (
+                    "driver",
+                    "(define-public (probe)
+                       (contract-call? .market poke .bulls))",
+                ),
+            ],
+            "probe",
+            &[],
+            StacksEpochId::Epoch20,
+            ClarityVersion::Clarity1,
+        );
+    }
+
+    #[test]
+    fn an_old_contracts_private_trait_argument_charges_like_the_reference() {
+        crosscheck_cost_recorded_semantics(
+            &[
+                (
+                    "tradable-trait",
+                    "(define-trait tradables-trait
+                       ((get-owner (uint) (response (optional principal) uint))))",
+                ),
+                (
+                    "bulls",
+                    "(define-non-fungible-token bulls uint)
+                     (define-read-only (get-owner (id uint))
+                       (ok (nft-get-owner? bulls id)))",
+                ),
+                (
+                    "market",
+                    "(use-trait tradables-trait .tradable-trait.tradables-trait)
+                     (define-private (inner (tradables <tradables-trait>) (id uint))
+                       (let ((owner tx-sender))
+                         (as-contract
+                           (contract-call? tradables get-owner id))))
+                     (define-public (poke (tradables <tradables-trait>))
+                       (match (inner tradables u157)
+                         owner (ok true)
+                         bad (err u1)))",
+                ),
+                (
+                    "driver",
+                    "(define-public (probe)
+                       (contract-call? .market poke .bulls))",
+                ),
+            ],
+            "probe",
+            &[],
+            StacksEpochId::Epoch20,
+            ClarityVersion::Clarity1,
+        );
+    }
+
+    #[test]
+    fn a_trait_argument_pays_no_copy_and_sizes_as_its_value() {
+        crosscheck_cost_recorded_semantics(
+            &[
+                (
+                    "tradable-trait",
+                    "(define-trait tradables-trait
+                       ((get-owner (uint) (response (optional principal) uint))))",
+                ),
+                (
+                    "bulls",
+                    "(define-non-fungible-token bulls uint)
+                     (define-read-only (get-owner (id uint))
+                       (ok (nft-get-owner? bulls id)))",
+                ),
+                (
+                    "market",
+                    "(use-trait tradables-trait .tradable-trait.tradables-trait)
+                     (define-private (inner (tradables <tradables-trait>) (id uint))
+                       (contract-call? tradables get-owner id))
+                     (define-public (poke (tradables <tradables-trait>))
+                       (match (inner tradables u157)
+                         owner (ok true)
+                         bad (err u1)))",
+                ),
+                (
+                    "driver",
+                    "(define-public (probe)
+                       (contract-call? .market poke .bulls))",
+                ),
+            ],
+            "probe",
+            &[],
+            StacksEpochId::Epoch20,
+            ClarityVersion::Clarity1,
+        );
+    }
+
+    #[test]
+    fn an_old_contracts_is_eq_charges_current_epoch_style() {
+        crosscheck_cost_recorded_semantics(
+            &[(
+                "market",
+                "(define-public (probe (a principal) (b principal))
+                   (ok (is-eq a b)))",
+            )],
+            "probe",
+            &[
+                clarity::vm::Value::Principal(
+                    clarity::vm::types::PrincipalData::parse(
+                        "SPNWZ5V2TPWGQGVDR6T7B6RQ4XMGZ4PXTEE0VQ0S.marketplace-v4",
+                    )
+                    .expect("contract principal"),
+                ),
+                clarity::vm::Value::Principal(
+                    clarity::vm::types::PrincipalData::parse(
+                        "SPNWZ5V2TPWGQGVDR6T7B6RQ4XMGZ4PXTEE0VQ0S.marketplace-v4",
+                    )
+                    .expect("contract principal"),
+                ),
+            ],
+            StacksEpochId::Epoch20,
+            ClarityVersion::Clarity1,
+        );
+    }
+
+    #[test]
+    fn an_old_contracts_nft_transfer_charges_current_epoch_style() {
+        crosscheck_cost_recorded_semantics(
+            &[(
+                "market",
+                "(define-non-fungible-token bulls uint)
+                 (define-public (probe (recipient principal))
+                   (begin
+                     (unwrap-panic (nft-mint? bulls u157 tx-sender))
+                     (nft-transfer? bulls u157 tx-sender recipient)))",
+            )],
+            "probe",
+            &[clarity::vm::Value::Principal(
+                clarity::vm::types::PrincipalData::parse(
+                    "SP2WA4AAQKK4K1FJNEMZB01FHXTZNF8EWEXPX5VC0",
+                )
+                .expect("recipient"),
+            )],
+            StacksEpochId::Epoch20,
+            ClarityVersion::Clarity1,
+        );
+    }
+
+    #[test]
+    fn an_old_contracts_map_ops_charge_current_epoch_style() {
+        crosscheck_cost_recorded_semantics(
+            &[(
+                "market",
+                "(define-map verified-contracts
+                   {tradables: principal}
+                   {royalty-address: principal, royalty-percent: uint})
+                 (define-public (seed (contract principal))
+                   (if (map-set verified-contracts {tradables: contract}
+                        {royalty-address: tx-sender, royalty-percent: u500})
+                       (ok true) (err u1)))
+                 (define-read-only (get-royalty-amount (contract principal))
+                   (match (map-get? verified-contracts {tradables: contract})
+                     royalty-data
+                     (get royalty-percent royalty-data)
+                     u0))
+                 (define-public (probe (contract principal))
+                   (begin
+                     (try! (seed contract))
+                     (ok (get-royalty-amount contract))))",
+            )],
+            "probe",
+            &[clarity::vm::Value::Principal(
+                clarity::vm::types::PrincipalData::parse(
+                    "SP2KAF9RF86PVX3NEE27DFV1CQX0T4WGR41X3S45C.byzantion-bitcoin-bulls",
+                )
+                .expect("contract principal"),
+            )],
+            StacksEpochId::Epoch20,
+            ClarityVersion::Clarity1,
         );
     }
 }

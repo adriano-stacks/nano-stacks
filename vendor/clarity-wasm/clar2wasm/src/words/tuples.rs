@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use clarity::types::StacksEpochId;
 use clarity::vm::types::{TupleTypeSignature, TypeSignature};
 use clarity::vm::{ClarityName, SymbolicExpression};
 use walrus::ir::{BinaryOp, IfElse};
@@ -269,7 +268,7 @@ impl ComplexWord for TupleMerge {
         check_args!(generator, builder, 2, args.len(), ArgumentCountCheck::Exact);
         let serialization_size = generator.borrow_local(ValType::I32);
 
-        if generator.contract_analysis.epoch < StacksEpochId::Epoch2_05 {
+        if !generator.charges_serialized_sizes() {
             self.charge(generator, builder, args.len() as u32)?;
         }
         let lhs_tuple_ty = generator
@@ -337,7 +336,7 @@ impl ComplexWord for TupleMerge {
         // Traverse the LHS tuple argument, leaving it on top of the stack.
         generator.traverse_expr(builder, &args[0])?;
 
-        if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+        if generator.charges_serialized_sizes() {
             generator.serialization_size(builder, &lhs_tuple_ty.clone().into())?;
             // STACK: [LHS, item_serialization_size]
 
@@ -370,7 +369,7 @@ impl ComplexWord for TupleMerge {
         // Traverse the RHS tuple argument, leaving it on top of the stack.
         generator.traverse_expr(builder, &args[1])?;
 
-        if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+        if generator.charges_serialized_sizes() {
             generator.serialization_size(builder, &rhs_tuple_ty.clone().into())?;
             // STACK: [RHS, item_serialization_size]
 

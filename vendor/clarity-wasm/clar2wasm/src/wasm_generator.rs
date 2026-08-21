@@ -515,6 +515,20 @@ impl Bindings {
     }
 }
 
+/// Whether a binding of this type resolves through the callable context.
+///
+/// In a Clarity 1 contract a trait argument lives *only* in the callable
+/// context, and the reference hands it back owned — so reading it never pays
+/// `LookupVariableSize`, only the depth charge. From Clarity 2 the argument
+/// is also inserted as an ordinary variable and pays the copy like any other.
+fn is_trait_reference(ty: &TypeSignature) -> bool {
+    matches!(
+        ty,
+        TypeSignature::CallableType(CallableSubtype::Trait(_))
+            | TypeSignature::TraitReferenceType(_)
+    )
+}
+
 #[derive(Hash, Eq, PartialEq)]
 pub enum LiteralMemoryEntry {
     Ascii(String),
@@ -1271,6 +1285,33 @@ impl WasmGenerator {
             runtime_error: get_function(module, "stdlib.runtime-error")?,
         });
         Ok(generator)
+    }
+
+    /// Whether data words charge the bytes the database actually moved, the
+    /// rule every epoch from 2.05 on uses, rather than 2.0's static type
+    /// sizes.
+    ///
+    /// This is a property of [`Self::executing_epoch`] — the epoch the chain
+    /// is running now — never of the semantic epoch the contract keeps. The
+    /// interpreter decides the same branch from its runtime epoch, so a
+    /// contract written for 2.0 and running in a later epoch pays
+    /// serialized-size charges like everything else. Deciding it from
+    /// `contract_analysis.epoch` froze 2.0 charging into recompiled old
+    /// contracts and inflated three cost dimensions on mainnet (task 146).
+    /// Without a charging epoch no charge code is emitted at all, so the
+    /// fallback to the semantic epoch only picks the shape of the
+    /// (non-charging) generated code.
+    /// Whether an atom of this type resolves through the callable context and
+    /// comes back owned, paying no `LookupVariableSize`. True only for trait
+    /// references in Clarity 1 contracts; see [`is_trait_reference`].
+    fn reads_owned_callable(&self, ty: &TypeSignature) -> bool {
+        is_trait_reference(ty) && self.contract_analysis.clarity_version < ClarityVersion::Clarity2
+    }
+
+    pub(crate) fn charges_serialized_sizes(&self) -> bool {
+        self.executing_epoch()
+            .unwrap_or(self.contract_analysis.epoch)
+            >= clarity::types::StacksEpochId::Epoch2_05
     }
 
     pub fn set_memory_pages(&mut self) -> Result<(), GeneratorError> {
@@ -2496,6 +2537,21 @@ impl WasmGenerator {
                     consequent: host,
                     alternative: inline,
                 });
+            }
+            TypeSignature::CallableType(CallableSubtype::Trait(_))
+            | TypeSignature::TraitReferenceType(_) => {
+                // The value behind a trait reference is a callable. From
+                // Clarity 2 it carries its trait identifier and the reference
+                // sizes it as a trait (276); a Clarity 1 contract's callables
+                // never carry one, so the reference sizes them as bare
+                // contract principals (148), and so must the charge.
+                let value_size =
+                    if self.contract_analysis.clarity_version >= ClarityVersion::Clarity2 {
+                        276
+                    } else {
+                        148
+                    };
+                builder.i32_const(value_size).local_set(size);
             }
             _ => {
                 builder
@@ -3735,7 +3791,7 @@ impl WasmGenerator {
         if let Some(expected) = expected.filter(|expected| *expected != ty) {
             if let Some(actions) = widen_actions(&ty, &expected) {
                 self.charge_variable_lookup(builder, self.bindings.depth())?;
-                if self.charge_local_value_copy {
+                if self.charge_local_value_copy && !self.reads_owned_callable(&ty) {
                     for value in &values {
                         builder.local_get(*value);
                     }
@@ -3777,7 +3833,7 @@ impl WasmGenerator {
             builder.local_get(*value);
         }
         self.charge_variable_lookup(builder, self.bindings.depth())?;
-        if self.charge_local_value_copy {
+        if self.charge_local_value_copy && !self.reads_owned_callable(&ty) {
             self.clarity_value_size_on_stack(builder, &ty)?;
             let size = self.borrow_local(ValType::I32);
             builder.local_set(*size);

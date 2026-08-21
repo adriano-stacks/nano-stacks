@@ -1,4 +1,3 @@
-use clarity::types::StacksEpochId;
 use clarity::vm::types::signatures::CallableSubtype;
 use clarity::vm::types::{SequenceSubtype, TupleTypeSignature, TypeSignature};
 use clarity::vm::{ClarityName, SymbolicExpression};
@@ -36,7 +35,7 @@ impl ComplexWord for IsEq {
         builder.i32_const(0).local_set(serialization_size_sum);
 
         check_args!(generator, builder, 1, args_len, ArgumentCountCheck::AtLeast);
-        if generator.contract_analysis.epoch < StacksEpochId::Epoch2_05 {
+        if !generator.charges_serialized_sizes() {
             self.charge(generator, builder, args_len as u32)?;
         }
 
@@ -77,7 +76,7 @@ impl ComplexWord for IsEq {
         {
             for (operand, ty) in args.iter().zip(&operand_types) {
                 generator.traverse_expr(builder, operand)?;
-                if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+                if generator.charges_serialized_sizes() {
                     generator.serialization_size(builder, ty)?;
                     builder
                         .local_get(serialization_size_sum)
@@ -86,7 +85,7 @@ impl ComplexWord for IsEq {
                 }
                 drop_value(builder, ty);
             }
-            if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+            if generator.charges_serialized_sizes() {
                 self.charge(generator, builder, serialization_size_sum)?;
             }
             builder.i32_const(0);
@@ -103,7 +102,7 @@ impl ComplexWord for IsEq {
         for operand in args.iter() {
             generator.traverse_expr(builder, operand)?;
             // STACK: [operand]
-            if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+            if generator.charges_serialized_sizes() {
                 generator.serialization_size(builder, &ty)?;
                 // STACK: [operand, serialization_size]
                 builder
@@ -115,7 +114,7 @@ impl ComplexWord for IsEq {
         }
         // STACK: [operand1, ..., operandN]
 
-        if generator.contract_analysis.epoch >= StacksEpochId::Epoch2_05 {
+        if generator.charges_serialized_sizes() {
             self.charge(generator, builder, serialization_size_sum)?;
         }
 
