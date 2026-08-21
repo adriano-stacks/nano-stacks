@@ -70,8 +70,12 @@ def main() -> int:
     print(f"retractions       {len(retractions)}")
 
     lag_max = 0
-    backlog_max = 0
+    unobserved = 0
     for sample in samples:
+        health = sample.get("health")
+        if not isinstance(health, dict):
+            unobserved += 1
+            continue
         tips = sample["oracle_tips"]
         heights = [
             tips[key]["stacks"]
@@ -79,11 +83,11 @@ def main() -> int:
             if isinstance(tips.get(key), dict)
         ]
         if heights:
-            lag_max = max(lag_max, max(heights) - sample["health"]["stacks_height"])
-        backlog_max = max(backlog_max, sample.get("receipt_backlog", 0))
+            lag_max = max(lag_max, max(heights) - health["stacks_height"])
     print(f"worst oracle lag  {lag_max} blocks")
-    print(f"worst backlog     {backlog_max} receipt-oracle blocks pending")
+    print(f"unobserved        {unobserved} samples with no health answer")
 
+    samples = [s for s in samples if isinstance(s.get("health"), dict)]
     series = {
         "rss_kb": lambda s: s["resources"]["rss_kb"],
         "open_files": lambda s: s["resources"]["open_files"],
