@@ -356,6 +356,38 @@ requires = "nm and objdump on PATH"
 policy = "required"
 
 [[conditional]]
+site = "mainnet_sortition::the_node_tracker_derives_the_same_window#3"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE whose sortition seed carries the winner VRF registrations — the current capture predates winner_vrf_seed and must be recaptured"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_sortition::a_chain_resumed_at_a_sortitionless_burn_block_names_the_same_winner#4"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE whose sortition seed carries the winner VRF registrations — the current capture predates winner_vrf_seed and must be recaptured"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_sortition::the_carried_registry_names_the_key_that_proved_each_tenure#4"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE whose sortition seed carries the winner VRF registrations — the current capture predates winner_vrf_seed and must be recaptured"
+policy = "required"
+
+[[conditional]]
+site = "mainnet_sortition::the_carried_registry_names_the_key_that_proved_each_tenure#5"
+class = "infrastructure"
+owner = "077"
+job = "release-qualification"
+requires = "NANO_MAINNET_CAPTURE whose sortition seed carries the winner VRF registrations — the current capture predates winner_vrf_seed and must be recaptured"
+policy = "required"
+
+[[conditional]]
 site = "one_engine_in_the_artifact::the_artifact_cannot_enter_the_interpreters_evaluator#1"
 class = "infrastructure"
 owner = "060"
