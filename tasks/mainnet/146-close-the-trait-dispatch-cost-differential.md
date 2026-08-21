@@ -1,7 +1,7 @@
 ---
 id: "146"
 title: "Close the trait-dispatch cost differential against the canonical record"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["097", "098"]
@@ -71,7 +71,7 @@ second block.
 - [ ] Complete the block-level cost sweep over the hold window (in flight at
       creation time: `/home/aldur/mainnet-hold/cost-mismatches.jsonl`) and
       classify every mismatching block by contract and call shape.
-- [ ] Reproduce the differential offline through the dual-engine tooling on a
+- [x] Reproduce the differential offline through the dual-engine tooling on a
       state snapshot, dimension by dimension, and localize the charging site
       (dynamic callee load, trait argument casting, write-length measurement).
 - [ ] Fix the accounting in the nano-owned cost path; the interpreter remains
