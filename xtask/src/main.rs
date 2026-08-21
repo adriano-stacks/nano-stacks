@@ -5265,6 +5265,17 @@ fn compare_engine_charges(
         .collect::<Vec<_>>();
     let mut charges = Vec::with_capacity(2);
     for interpreted in [false, true] {
+        // Stderr markers so a `NANO_TRACE_CHARGES` stream can be split back
+        // into per-transaction, per-engine segments.
+        eprintln!(
+            "=== {} {}",
+            if interpreted {
+                "interpreter"
+            } else {
+                "compiler"
+            },
+            hex::encode(transaction.txid().as_bytes())
+        );
         vm.begin_block(Some(parent), [0xcb; 32])
             .map_err(|error| format!("cannot begin a block on the parent: {error:?}"))?;
         let tracker = vm
