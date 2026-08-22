@@ -3525,7 +3525,24 @@ mod tests {
         })
         .await
         .expect("all abandoned workers finish");
-        let recovered = app.oneshot(request()).await.expect("response");
+        // Every permit is back, but a request can still be refused for a
+        // moment: the refusal above carries `Retry-After: 1`, and whether the
+        // next request lands inside or outside that window depends on how the
+        // machine scheduled two worker threads. The property under test is that
+        // the service recovers, not that it recovers within one scheduling
+        // quantum, so this waits for recovery instead of sampling once. Sampling
+        // once is what made this test fail in CI while passing in isolation.
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let response = app.clone().oneshot(request()).await.expect("response");
+                if response.status() == StatusCode::OK {
+                    return response;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the service accepts a read-only call again");
         assert_eq!(recovered.status(), StatusCode::OK);
     }
 
