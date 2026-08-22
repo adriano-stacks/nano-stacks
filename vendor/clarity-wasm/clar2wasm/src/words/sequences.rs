@@ -778,7 +778,33 @@ impl ComplexWord for Concat {
 
         // we charge after the operation since that's the only time we have the
         // length of the resulting list
-        self.charge(generator, builder, length)?;
+        //
+        // The reference charges for the number of *items* joined — `total_len`
+        // in `special_concat` accumulates `seq.len()` — while `length` here is
+        // the byte span the copies moved. Those are the same number for a
+        // buffer or an ASCII string, where an item is a byte, and differ by the
+        // element stride otherwise: sixteen for a list of `uint`, four for a
+        // UTF-8 string. Charging the byte span priced one mainnet transaction's
+        // hundred and fifty concats at 4,400 where the chain charged 275.
+        let stride = match &ty {
+            TypeSignature::SequenceType(SequenceSubtype::ListType(list)) => {
+                get_type_size(list.get_list_item_type())
+            }
+            TypeSignature::SequenceType(SequenceSubtype::StringType(StringSubtype::UTF8(_))) => 4,
+            _ => 1,
+        };
+        let items = if stride > 1 {
+            let items = generator.alloc_local(ValType::I32);
+            builder
+                .local_get(length)
+                .i32_const(stride)
+                .binop(BinaryOp::I32DivU)
+                .local_set(items);
+            items
+        } else {
+            length
+        };
+        self.charge(generator, builder, items)?;
 
         Ok(())
     }

@@ -269,6 +269,7 @@ pub trait ChargeGenerator {
             match ctx.word_cost(&word_name) {
                 Some(cost) => {
                     ctx.emit_probe(instrs, word_name.as_str(), n);
+                    ctx.emit_meter_probe_before(instrs);
                     ctx.emit(instrs, module, cost, n)?;
                     ctx.emit_meter_probe(instrs);
                 }
@@ -297,6 +298,7 @@ pub trait ChargeGenerator {
         if let Some((ctx, module)) = self.cost_context() {
             let n = n.into();
             ctx.emit_probe(instrs, label, n);
+            ctx.emit_meter_probe_before(instrs);
             ctx.emit_with_caf(
                 instrs,
                 module,
@@ -630,6 +632,20 @@ impl ChargeContext {
             }
         }
         instrs.call(probe);
+    }
+
+    /// Report the runtime meter *before* a charge, under index `-2`.
+    ///
+    /// Reading the meter on both sides of a charge, rather than only after it,
+    /// is what makes a cost recoverable across a `contract-call?`: the meters
+    /// are per-instance globals, so differencing consecutive after-readings
+    /// attributes a whole callee's consumption to the caller's next charge,
+    /// while a before/after pair is always two readings of the same instance.
+    fn emit_meter_probe_before(&self, instrs: &mut InstrSeqBuilder) {
+        let Some(probe) = self.charge_probe else {
+            return;
+        };
+        instrs.i32_const(-2).global_get(self.runtime).call(probe);
     }
 
     /// Report the runtime meter *after* a charge, under index `-1`.
@@ -3553,6 +3569,36 @@ mod borrowed_operand_charges {
         probe(
             "(as-max-len? x u32)",
             Value::buff_from(vec![1, 2, 3]).expect("buff"),
+        );
+    }
+
+    /// `concat` is charged for the number of items it joined, not for the
+    /// bytes the join moved.
+    ///
+    /// The reference accumulates `seq.len()` — items — so a list of `uint`
+    /// charges on its length while nano charged on its 16-bytes-per-element
+    /// memory span. A buffer hides this completely, because there an item *is*
+    /// a byte; it took a list to show it, and it showed as 150 concats priced
+    /// at 4,400 against the chain's 275 on one mainnet transaction.
+    #[test]
+    fn concat_charges_for_items_not_bytes() {
+        crosscheck_cost(
+            "(define-public (poke (x uint))
+               (ok (len (concat (list x x x x) (list x x x)))))",
+            "poke",
+            &[Value::UInt(7)],
+        );
+        crosscheck_cost(
+            "(define-public (poke (x int))
+               (ok (len (concat (list x x x x x) (list x x)))))",
+            "poke",
+            &[Value::Int(7)],
+        );
+        crosscheck_cost(
+            "(define-public (poke (x (string-utf8 8)))
+               (ok (len (concat x u\"ab\"))))",
+            "poke",
+            &[Value::string_utf8_from_bytes("hi".as_bytes().to_vec()).expect("utf8")],
         );
     }
 
