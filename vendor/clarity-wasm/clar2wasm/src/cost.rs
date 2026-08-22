@@ -3756,6 +3756,83 @@ mod borrowed_operand_charges {
         );
     }
 
+    /// The last cost differential the canonical record still shows in the
+    /// audited window, reduced: a `fold` over a list of tuples each carrying
+    /// three trait references, which is what
+    /// `SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD.dlmm-liquidity-router-v-1-2`'s
+    /// `withdraw-liquidity-multi` takes. Nano over-charges runtime there — 1,228
+    /// and 98 units on the two mainnet calls — and the interpreter and the chain
+    /// agree with each other against it, so a trait field inside a folded tuple
+    /// is measured differently by the two engines.
+    ///
+    /// The list arrives as an argument rather than as a literal, which is how
+    /// mainnet delivers it: the contract principals in it are cast to callables
+    /// when the function admits them, and a literal of the same shape is
+    /// rejected by both engines before either charges anything.
+    #[test]
+    fn a_fold_over_tuples_of_traits_charges_like_the_reference() {
+        use clarity::vm::types::{PrincipalData, TupleData};
+        use clarity::vm::ClarityName;
+
+        let contract = |name: &str| {
+            Value::Principal(
+                PrincipalData::parse_qualified_contract_principal(&format!(
+                    "S1G2081040G2081040G2081040G208105NK8PE5.{name}"
+                ))
+                .expect("contract principal"),
+            )
+        };
+        let position = |amount: u128| {
+            Value::Tuple(
+                TupleData::from_data(vec![
+                    (ClarityName::from_literal("amount"), Value::UInt(amount)),
+                    (ClarityName::from_literal("bin-id"), Value::Int(1)),
+                    (ClarityName::from_literal("pool"), contract("pool")),
+                    (ClarityName::from_literal("x"), contract("token")),
+                    (ClarityName::from_literal("y"), contract("token")),
+                ])
+                .expect("position tuple"),
+            )
+        };
+        let positions =
+            Value::cons_list_unsanitized(vec![position(7), position(9)]).expect("positions list");
+        crate::tools::crosscheck_cost_multi_contract(
+            &[
+                (
+                    "token",
+                    "(define-public (transfer (amount uint) (from principal) (to principal)
+                                             (memo (optional (buff 34))))
+                       (ok true))",
+                ),
+                (
+                    "pool",
+                    "(define-public (withdraw (bin int) (amount uint)) (ok amount))",
+                ),
+                (
+                    "router",
+                    "(define-trait pool-trait ((withdraw (int uint) (response uint uint))))
+                     (define-trait ft
+                       ((transfer (uint principal principal (optional (buff 34)))
+                                  (response bool uint))))
+                     (define-private (step
+                           (p { pool: <pool-trait>, x: <ft>, y: <ft>,
+                                bin-id: int, amount: uint })
+                           (acc (response (list 10 uint) uint)))
+                       (match acc
+                         reached (ok (unwrap-panic
+                                       (as-max-len? (append reached (get amount p)) u10)))
+                         failed (err failed)))
+                     (define-public (poke
+                           (positions (list 2 { pool: <pool-trait>, x: <ft>, y: <ft>,
+                                                bin-id: int, amount: uint })))
+                       (fold step positions (ok (list))))",
+                ),
+            ],
+            "poke",
+            &[positions],
+        );
+    }
+
     /// A dynamic trait dispatch whose callee *fails* — the combination the
     /// mainnet `+62` family lands on. `swag.sr` charges identically to the
     /// reference on the slices whose dispatch succeeds and diverges by exactly

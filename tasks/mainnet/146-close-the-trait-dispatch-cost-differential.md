@@ -77,6 +77,18 @@ second block.
 - [x] Fix the length dimensions: charge data words at the executing epoch and
       size trait references as values, closing every `read_length` and
       `write_length` difference in the window.
+- [x] Build a canonical-oracle measurement that does not need a re-attested
+      checkpoint: `xtask replay-window` replays consecutive blocks at their
+      exact prestates with the real transaction prefix and verified roots, and
+      a conformance gate pins block 8,808,752 against the chain's own record.
+      First window: 39 blocks, 66 transactions, 64 matching on all five
+      dimensions.
+- [ ] Close the last chain-level differential: `dlmm-liquidity-router-v-1-2`'s
+      `withdraw-liquidity-multi` over-charges runtime by 2 units per folded
+      position (1,228 and 98 on the two mainnet calls). The interpreter agrees
+      with the chain here, so it is a usable oracle; a one-element call
+      reproduces it at the same prestate, and reduced probes of the shape do
+      not yet.
 - [ ] Re-run the checkpoint builder ceremony for the new compiler identity.
       A node refuses a bundle whose recorded compiler identity is not its own
       and the section is mandatory, so the cost fixes invalidate the attested
