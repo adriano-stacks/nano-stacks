@@ -699,15 +699,18 @@ fn link_admit_function_argument_fn(
                     // no clone at all.
                     if let TypeSignature::TupleType(expected_tuple) = &expected_type {
                         let handle = read_i32(memory, &mut caller, value_offset)?;
-                        if handle != 0
+                        let exact_static_value = representation_type == expected_type
+                            && handle == 0
+                            && expected_tuple.get_type_map().values().all(admit_preserves);
+                        let exact_runtime_value = handle != 0
                             && caller.data().runtime_shapes().is_some_and(|arena| {
                                 matches!(
                                     arena.get(handle),
                                     Ok(Value::Tuple(tuple))
                                         if tuple.type_signature == *expected_tuple
                                 )
-                            })
-                        {
+                            });
+                        if exact_static_value || exact_runtime_value {
                             return Ok(());
                         }
                     }

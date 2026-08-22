@@ -248,6 +248,12 @@ pub trait ChargeGenerator {
     /// The cost tracking context. Only present if charging code should be emitted.
     fn cost_context(&self) -> Option<(&ChargeContext, &Module)>;
 
+    /// Where a charge emitted right now belongs in the source, for the
+    /// `NANO_TRACE_CHARGES` probe. `None` when the implementor cannot say.
+    fn charge_position(&self) -> Option<String> {
+        None
+    }
+
     /// Generate code that charges the appropriate cost for the given word.
     ///
     /// `n` is a scaling factor that depends on the word being charged, but can only be known
@@ -268,6 +274,9 @@ pub trait ChargeGenerator {
         if let Some((ctx, module)) = self.cost_context() {
             match ctx.word_cost(&word_name) {
                 Some(cost) => {
+                    if let Some(position) = self.charge_position() {
+                        ctx.emit_position_probe(instrs, &position);
+                    }
                     ctx.emit_probe(instrs, word_name.as_str(), n);
                     ctx.emit_meter_probe_before(instrs);
                     ctx.emit(instrs, module, cost, n)?;
@@ -297,6 +306,9 @@ pub trait ChargeGenerator {
     ) -> Result<()> {
         if let Some((ctx, module)) = self.cost_context() {
             let n = n.into();
+            if let Some(position) = self.charge_position() {
+                ctx.emit_position_probe(instrs, &position);
+            }
             ctx.emit_probe(instrs, label, n);
             ctx.emit_meter_probe_before(instrs);
             ctx.emit_with_caf(
@@ -458,6 +470,13 @@ const EVAL_COSTS_3: EvalCosts = EvalCosts {
 };
 
 impl ChargeGenerator for WasmGenerator {
+    fn charge_position(&self) -> Option<String> {
+        self.cost_context
+            .as_ref()
+            .and_then(|context| context.charge_probe)
+            .map(|_| self.charging_position())
+    }
+
     fn cost_context(&self) -> Option<(&ChargeContext, &Module)> {
         self.cost_context.as_ref().map(|ctx| (ctx, &self.module))
     }
@@ -632,6 +651,20 @@ impl ChargeContext {
             }
         }
         instrs.call(probe);
+    }
+
+    /// Report *where* a charge belongs, under index `-3`.
+    ///
+    /// The payload is an interned position — contract name and expression
+    /// identifier — so two engines that decompose the same work into different
+    /// charge events can still be compared: group both streams by position and
+    /// the sums are directly comparable even when the event counts are not.
+    fn emit_position_probe(&self, instrs: &mut InstrSeqBuilder, position: &str) {
+        let Some(probe) = self.charge_probe else {
+            return;
+        };
+        let index = probe_label_index(position);
+        instrs.i32_const(-3).i64_const(i64::from(index)).call(probe);
     }
 
     /// Report the runtime meter *before* a charge, under index `-2`.

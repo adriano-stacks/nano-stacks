@@ -88,6 +88,14 @@ pub struct WasmGenerator {
 
     /// Whether reading a bound value copies it, and so pays to do so.
     charge_local_value_copy: bool,
+    /// The `SymbolicExpression` being traversed, for the `NANO_TRACE_CHARGES`
+    /// probe only.
+    ///
+    /// A label says *what* was charged and an amount says how much; neither
+    /// says *where*. Two engines that decompose the same work into different
+    /// charge events can only be compared by position, which is why the probe
+    /// reports this alongside each charge.
+    charging_expression: u64,
 
     /// Emits cost tracking code if set.
     pub(crate) cost_context: Option<ChargeContext>,
@@ -1220,6 +1228,7 @@ impl WasmGenerator {
             constant_contract_principals: HashMap::new(),
             bindings: Bindings::new(),
             charge_local_value_copy: true,
+            charging_expression: 0,
             cost_context: None,
             early_return_block_id: None,
             current_function_type: None,
@@ -1489,6 +1498,7 @@ impl WasmGenerator {
         expr: &SymbolicExpression,
     ) -> Result<(), GeneratorError> {
         self.expression_locals.push(Vec::new());
+        let enclosing = std::mem::replace(&mut self.charging_expression, expr.id);
         let result = match &expr.expr {
             SymbolicExpressionType::Atom(name) => self.visit_atom(builder, expr, name),
             SymbolicExpressionType::List(exprs) => self.traverse_list(builder, expr, exprs),
@@ -1502,7 +1512,19 @@ impl WasmGenerator {
             .pop()
             .expect("an expression local scope was pushed");
         self.release_locals(locals);
+        self.charging_expression = enclosing;
         result
+    }
+
+    /// Where a charge emitted right now belongs, for the charge probe.
+    ///
+    /// The contract disambiguates: expression identifiers restart at one per
+    /// contract, and a single transaction charges across several.
+    pub(crate) fn charging_position(&self) -> String {
+        format!(
+            "{}#{}",
+            self.contract_analysis.contract_identifier.name, self.charging_expression
+        )
     }
 
     /// Traverse an expression whose value the interpreter reads in place, so a
