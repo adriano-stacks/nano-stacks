@@ -3555,7 +3555,7 @@ mod crosscheck {
 mod borrowed_operand_charges {
     use clarity::vm::Value;
 
-    use crate::tools::crosscheck_cost;
+    use crate::tools::{crosscheck_cost, crosscheck_cost_multi_contract};
 
     fn probe(body: &str, argument: Value) {
         let snippet = format!(
@@ -4506,6 +4506,111 @@ mod borrowed_operand_charges {
                (ok (as-contract? ((with-ft current-contract \"tok\" x)) true)))",
             "poke",
             &[Value::UInt(100)],
+        );
+    }
+    /// A tuple's size embeds its *type* size, which the reference takes from
+    /// the value's own type — so a `none` field contributes `NoType`, not the
+    /// declared inner type.
+    ///
+    /// `principal-destruct?` is where mainnet hits it: for a standard
+    /// principal the `name` field is `none`, and reading the result charged
+    /// `LookupVariableSize(101)` against the chain's 97, which `2n + 1` turns
+    /// into the +8 that fourteen transactions of the canonical audit carried.
+    #[test]
+    fn a_tuple_with_a_none_field_sizes_like_the_reference() {
+        const STANDARD: &str = "ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM";
+        crosscheck_cost(
+            "(define-map m (buff 20) bool)
+             (define-public (poke (address principal))
+               (let ((d (unwrap-panic (principal-destruct? address))))
+                 (ok (default-to false (map-get? m (get hash-bytes d))))))",
+            "poke",
+            &[Value::Principal(
+                clarity::vm::types::PrincipalData::parse(STANDARD).expect("principal"),
+            )],
+        );
+        // A present `name` too, so the fix cannot be a constant that happens
+        // to suit `none`; and the error arm of the same destructuring, whose
+        // response wraps the identical tuple.
+        for bound in [
+            format!("(unwrap-panic (principal-destruct? '{STANDARD}.a-contract-with-a-long-name))"),
+            format!("(unwrap-panic (principal-destruct? '{STANDARD}))"),
+            "(unwrap-err-panic (principal-destruct? 'SP2WA4AAQKK4K1FJNEMZB01FHXTZNF8EWEXPX5VC0))"
+                .to_owned(),
+        ] {
+            crosscheck_cost(
+                &format!(
+                    "(define-public (poke)
+                       (let ((d {bound}))
+                         (ok (len (get hash-bytes d)))))"
+                ),
+                "poke",
+                &[],
+            );
+        }
+        // The same shape one level down, where the tuple is a field of a
+        // tuple: that field's dynamic type size is not measurable from the
+        // locals, so the whole tuple has to be materialised rather than
+        // guessed from its declaration.
+        crosscheck_cost(
+            "(define-public (poke (address principal))
+               (let ((d (unwrap-panic (principal-destruct? address)))
+                     (n u1))
+                 (let ((wrapped {n: n, inner: d}))
+                   (ok (get n wrapped)))))",
+            "poke",
+            &[Value::Principal(
+                clarity::vm::types::PrincipalData::parse(STANDARD).expect("principal"),
+            )],
+        );
+    }
+    /// A trait reference inside a sized tuple keeps its trait size.
+    ///
+    /// Its type size is 1 whatever it points at, so the declaration is already
+    /// exact — and measuring it by materialising is worse than useless: a trait
+    /// reference erases to a bare principal on the way through memory and comes
+    /// back sized 148 where the reference says 276. Two `bitflow-dlmm-adapter`
+    /// transactions undercharged by 2,816 and 3,072 on exactly that; block
+    /// 8,808,800's charged 27,510,471 against the chain's 27,513,287 until the
+    /// callable stopped being materialised.
+    ///
+    /// This asserts the agreement but does not by itself reproduce the defect:
+    /// a synthetic trait-bearing tuple always carries a runtime-shape handle,
+    /// which takes the host path either way. The measurement above is the
+    /// evidence; the comment in `type_size_plan` is the guard.
+    #[test]
+    fn a_trait_in_a_tuple_keeps_its_trait_size() {
+        let contract = |name: &str| clarity::vm::types::QualifiedContractIdentifier {
+            issuer: clarity::vm::types::PrincipalData::parse_standard_principal(
+                "S1G2081040G2081040G2081040G208105NK8PE5",
+            )
+            .expect("issuer"),
+            name: clarity::vm::ContractName::try_from(name).expect("contract name"),
+        };
+        let callee = contract("callee");
+        let caller = contract("caller");
+        crosscheck_cost_multi_contract(
+            &[
+                ("callee", "(define-public (f (x uint)) (ok x))"),
+                (
+                    "caller",
+                    "(define-trait t ((f (uint) (response uint uint))))
+                     (define-public (poke (who <t>))
+                       (let ((bundle {who: who, memo: none}))
+                         (ok (default-to u0 (get memo bundle)))))",
+                ),
+            ],
+            "poke",
+            // The callable has to carry its trait identifier: without one the
+            // reference sizes it as a bare contract principal too, and the
+            // difference the erasure makes disappears.
+            &[Value::CallableContract(clarity::vm::types::CallableData {
+                contract_identifier: callee.clone(),
+                trait_identifier: Some(Box::new(clarity::vm::types::TraitIdentifier {
+                    name: clarity::vm::ClarityName::from_literal("t"),
+                    contract_identifier: caller,
+                })),
+            })],
         );
     }
 }

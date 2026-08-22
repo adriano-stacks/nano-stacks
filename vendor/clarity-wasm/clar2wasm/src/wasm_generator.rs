@@ -547,6 +547,88 @@ fn source_form(expr: &SymbolicExpression) -> String {
     }
 }
 
+/// How a value's dynamic type size — the term a tuple's size includes for its
+/// own type — can be obtained.
+///
+/// The reference sizes a value through `type_of`, so a tuple carrying `none`
+/// contributes `NoType` where the declaration says `(optional (string-ascii
+/// 40))`. Reading the declared type there overcharges by the difference.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypeSizePlan {
+    /// The dynamic type is the declared one, so the declared size is exact.
+    Declared,
+    /// An optional or response picks between arms of different type size, and
+    /// the generated code can branch on the discriminant it already holds.
+    Measured,
+    /// Only the host, materializing the value, can answer.
+    Host,
+}
+
+/// Which plan measures this type's dynamic type size *as a tuple field*.
+///
+/// A composite is admitted only as `Declared`: measuring one means reading its
+/// fields' discriminants, and a tuple or list whose runtime-shape handle is set
+/// keeps its value in the arena, where those locals no longer describe it. An
+/// optional or a response is safe because measuring it reads only its own
+/// discriminant and then a constant.
+fn type_size_plan(ty: &TypeSignature) -> TypeSizePlan {
+    match ty {
+        TypeSignature::NoType
+        | TypeSignature::IntType
+        | TypeSignature::UIntType
+        | TypeSignature::BoolType
+        | TypeSignature::PrincipalType
+        | TypeSignature::SequenceType(
+            SequenceSubtype::BufferType(_) | SequenceSubtype::StringType(_),
+        )
+        // A callable's type size is 1 whatever it points at, so the declaration
+        // is exact — and it must not be measured by materialising, because a
+        // trait reference erases to a bare principal on the way through memory
+        // and comes back sized 148 where the reference says 276.
+        | TypeSignature::CallableType(_)
+        | TypeSignature::TraitReferenceType(_)
+        | TypeSignature::ListUnionType(_) => TypeSizePlan::Declared,
+        TypeSignature::OptionalType(inner) => match type_size_plan(inner) {
+            TypeSizePlan::Host => TypeSizePlan::Host,
+            _ => TypeSizePlan::Measured,
+        },
+        TypeSignature::ResponseType(response) => {
+            if type_size_plan(&response.0) == TypeSizePlan::Host
+                || type_size_plan(&response.1) == TypeSizePlan::Host
+            {
+                TypeSizePlan::Host
+            } else {
+                TypeSizePlan::Measured
+            }
+        }
+        TypeSignature::TupleType(tuple) => {
+            if tuple
+                .get_type_map()
+                .values()
+                .all(|field| type_size_plan(field) == TypeSizePlan::Declared)
+            {
+                TypeSizePlan::Declared
+            } else {
+                TypeSizePlan::Host
+            }
+        }
+        // The same element types the inline list measurement admits: each is
+        // its own dynamic type and sizes like `NoType`, which is what makes the
+        // empty list — whose entry type the reference derives as `NoType` —
+        // agree. Any other element needs the least-supertype fold.
+        TypeSignature::SequenceType(SequenceSubtype::ListType(list)) => matches!(
+            list.get_list_item_type(),
+            TypeSignature::IntType
+                | TypeSignature::UIntType
+                | TypeSignature::BoolType
+                | TypeSignature::PrincipalType
+        )
+        .then_some(TypeSizePlan::Declared)
+        .unwrap_or(TypeSizePlan::Host),
+        _ => TypeSizePlan::Host,
+    }
+}
+
 /// Whether a binding of this type resolves through the callable context.
 ///
 /// In a Clarity 1 contract a trait argument lives *only* in the callable
@@ -2547,11 +2629,17 @@ impl WasmGenerator {
                 // the whole value serialized to memory and read back. A set
                 // handle keeps that host path, which sizes the arena value
                 // the handle names.
-                let overhead = u32::try_from(tuple.get_type_map().len())
+                //
+                // A tuple's size counts `2 * fields + names` twice, once in
+                // its own right and once inside the type size it embeds. Only
+                // that embedded term depends on the *dynamic* field types, so
+                // it is the declared one exactly when every field's is.
+                let plans: Vec<_> = tuple.get_type_map().values().map(type_size_plan).collect();
+                let measured = !plans.iter().all(|plan| *plan == TypeSizePlan::Declared);
+                let unmeasurable = plans.contains(&TypeSizePlan::Host);
+                let names = u32::try_from(tuple.get_type_map().len())
                     .ok()
                     .and_then(|fields| fields.checked_mul(2))
-                    .zip(tuple.type_size())
-                    .and_then(|(map, ty)| map.checked_add(ty))
                     .and_then(|base| {
                         tuple
                             .get_type_map()
@@ -2561,40 +2649,76 @@ impl WasmGenerator {
                     .ok_or_else(|| {
                         GeneratorError::TypeError(format!("tuple overhead overflows: {ty}"))
                     })?;
+                let overhead = if measured {
+                    names.checked_mul(2)
+                } else {
+                    tuple.type_size().and_then(|ty| names.checked_add(ty))
+                }
+                .ok_or_else(|| {
+                    GeneratorError::TypeError(format!("tuple overhead overflows: {ty}"))
+                })?;
                 let field_size = self.borrow_local(ValType::I32);
-                let inline = {
+                // A field whose dynamic type size only the host can give makes
+                // the whole tuple the host's to size, handle or not.
+                let unhandled = if unmeasurable {
+                    let mut materialize = builder.dangling_instr_seq(None);
+                    for local in locals {
+                        materialize.local_get(*local);
+                    }
+                    let (value_offset, _) =
+                        self.create_call_stack_local(&mut materialize, ty, true, false);
+                    self.write_to_memory(&mut materialize, value_offset, 0, ty)?;
+                    let (type_offset, type_length) = self.serialized_type(ty)?;
+                    materialize
+                        .local_get(value_offset)
+                        .i32_const(type_offset)
+                        .i32_const(type_length)
+                        .call(self.func_by_name("stdlib.runtime_value_size"))
+                        .local_set(size);
+                    materialize.id()
+                } else {
                     let mut inline = builder.dangling_instr_seq(None);
                     inline.i32_const(overhead as i32).local_set(size);
                     let mut cursor = 1;
                     for field_ty in tuple.get_type_map().values() {
                         let width = clar2wasm_ty(field_ty).len();
-                        self.runtime_size(
-                            &mut inline,
-                            field_ty,
-                            &locals[cursor..cursor + width],
-                            *field_size,
-                        )?;
+                        let field_locals = &locals[cursor..cursor + width];
+                        self.runtime_size(&mut inline, field_ty, field_locals, *field_size)?;
                         inline
                             .local_get(size)
                             .local_get(*field_size)
                             .binop(BinaryOp::I32Add)
                             .local_set(size);
+                        if measured {
+                            self.runtime_type_size(
+                                &mut inline,
+                                field_ty,
+                                field_locals,
+                                *field_size,
+                            )?;
+                            inline
+                                .local_get(size)
+                                .local_get(*field_size)
+                                .binop(BinaryOp::I32Add)
+                                .local_set(size);
+                        }
                         cursor += width;
                     }
                     inline.id()
                 };
-                let host = {
+                let handled = {
                     // The handle names the arena value the host would size
                     // anyway; passing it is the whole message.
-                    let mut host = builder.dangling_instr_seq(None);
-                    host.local_get(locals[0])
+                    let mut handled = builder.dangling_instr_seq(None);
+                    handled
+                        .local_get(locals[0])
                         .call(self.func_by_name("stdlib.runtime_shape_size"))
                         .local_set(size);
-                    host.id()
+                    handled.id()
                 };
                 builder.local_get(locals[0]).instr(IfElse {
-                    consequent: host,
-                    alternative: inline,
+                    consequent: handled,
+                    alternative: unhandled,
                 });
             }
             TypeSignature::CallableType(CallableSubtype::Trait(_))
@@ -2616,6 +2740,82 @@ impl WasmGenerator {
                 builder
                     .i32_const(self.clarity_value_size(ty)? as i32)
                     .local_set(size);
+            }
+        }
+        Ok(())
+    }
+
+    /// Measure a value's dynamic type size into `out`.
+    ///
+    /// Only reached for types [`type_size_plan`] admits, so the composite arms
+    /// are constants and the recursion never reads through a shape handle.
+    fn runtime_type_size(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        ty: &TypeSignature,
+        locals: &[LocalId],
+        out: LocalId,
+    ) -> Result<(), GeneratorError> {
+        // `(optional t)` is `t + 1`, and `none` is `(optional NoType)`; a
+        // response is `ok + err + 1` with `NoType` standing in for the arm the
+        // value did not take, so either arm is its own size plus two.
+        match ty {
+            TypeSignature::OptionalType(inner) => {
+                let some = {
+                    let mut some = builder.dangling_instr_seq(None);
+                    self.runtime_type_size(&mut some, inner, &locals[1..], out)?;
+                    some.local_get(out)
+                        .i32_const(1)
+                        .binop(BinaryOp::I32Add)
+                        .local_set(out);
+                    some.id()
+                };
+                let none = {
+                    let mut none = builder.dangling_instr_seq(None);
+                    none.i32_const(2).local_set(out);
+                    none.id()
+                };
+                builder.local_get(locals[0]).instr(IfElse {
+                    consequent: some,
+                    alternative: none,
+                });
+            }
+            TypeSignature::ResponseType(response) => {
+                let ok_locals = clar2wasm_ty(&response.0).len();
+                let err_locals = clar2wasm_ty(&response.1).len();
+                let ok = {
+                    let mut ok = builder.dangling_instr_seq(None);
+                    self.runtime_type_size(&mut ok, &response.0, &locals[1..=ok_locals], out)?;
+                    ok.local_get(out)
+                        .i32_const(2)
+                        .binop(BinaryOp::I32Add)
+                        .local_set(out);
+                    ok.id()
+                };
+                let err = {
+                    let mut err = builder.dangling_instr_seq(None);
+                    self.runtime_type_size(
+                        &mut err,
+                        &response.1,
+                        &locals[1 + ok_locals..1 + ok_locals + err_locals],
+                        out,
+                    )?;
+                    err.local_get(out)
+                        .i32_const(2)
+                        .binop(BinaryOp::I32Add)
+                        .local_set(out);
+                    err.id()
+                };
+                builder.local_get(locals[0]).instr(IfElse {
+                    consequent: ok,
+                    alternative: err,
+                });
+            }
+            _ => {
+                let declared = ty.type_size().map_err(|error| {
+                    GeneratorError::TypeError(format!("cannot size the type of {ty}: {error}"))
+                })?;
+                builder.i32_const(declared as i32).local_set(out);
             }
         }
         Ok(())
