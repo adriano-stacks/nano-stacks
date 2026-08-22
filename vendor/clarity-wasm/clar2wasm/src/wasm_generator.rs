@@ -616,16 +616,19 @@ fn type_size_plan(ty: &TypeSignature) -> TypeSizePlan {
         // its own dynamic type and sizes like `NoType`, which is what makes the
         // empty list — whose entry type the reference derives as `NoType` —
         // agree. Any other element needs the least-supertype fold.
-        TypeSignature::SequenceType(SequenceSubtype::ListType(list)) => matches!(
-            list.get_list_item_type(),
-            TypeSignature::IntType
-                | TypeSignature::UIntType
-                | TypeSignature::BoolType
-                | TypeSignature::PrincipalType
-        )
-        .then_some(TypeSizePlan::Declared)
-        .unwrap_or(TypeSizePlan::Host),
-        _ => TypeSizePlan::Host,
+        TypeSignature::SequenceType(SequenceSubtype::ListType(list)) => {
+            if matches!(
+                list.get_list_item_type(),
+                TypeSignature::IntType
+                    | TypeSignature::UIntType
+                    | TypeSignature::BoolType
+                    | TypeSignature::PrincipalType
+            ) {
+                TypeSizePlan::Declared
+            } else {
+                TypeSizePlan::Host
+            }
+        }
     }
 }
 
