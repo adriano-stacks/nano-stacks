@@ -3696,6 +3696,89 @@ mod borrowed_operand_charges {
         );
     }
 
+    /// `SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-vault-stx`'s
+    /// `iter-unpack-u16`, verbatim in shape: a fold whose accumulator is a
+    /// tuple holding a list, where each step binds the appended item from a
+    /// function call and appends it under `as-max-len?`. A trace of that
+    /// contract's `redeem` puts nano 33 units — one 16-byte copy charge — above
+    /// the canonical record, at the expression that reads the bound item.
+    #[test]
+    fn appending_a_bound_call_result_charges_like_the_reference() {
+        crosscheck_cost(
+            "(define-private (unpack-u16-at (word uint) (pos uint))
+               (mod (/ word (pow u2 pos)) u65536))
+             (define-private (iter (pos uint) (acc {word: uint, fields: (list 8 uint)}))
+               (let ((word (get word acc))
+                     (fields (get fields acc))
+                     (unpack (unpack-u16-at word pos))
+                     (new (as-max-len? (append fields unpack) u8)))
+                 { word: word, fields: (unwrap-panic new) }))
+             (define-public (poke (w uint))
+               (ok (get fields (fold iter (list u0 u1 u2) { word: w, fields: (list) }))))",
+            "poke",
+            &[Value::UInt(123_456)],
+        );
+        // The contract was published at height 6,162,060, so it carries an
+        // older epoch's recorded analysis and is charged at the current rate —
+        // the combination that produced this task's first defect.
+        for (epoch, version) in [
+            (
+                clarity::types::StacksEpochId::Epoch21,
+                clarity::vm::ClarityVersion::Clarity1,
+            ),
+            (
+                clarity::types::StacksEpochId::Epoch24,
+                clarity::vm::ClarityVersion::Clarity2,
+            ),
+        ] {
+            crate::tools::crosscheck_cost_recorded_semantics(
+                &[(
+                    "vault",
+                    "(define-private (unpack-u16-at (word uint) (pos uint))
+                       (mod (/ word (pow u2 pos)) u65536))
+                     (define-private (iter (pos uint) (acc {word: uint, fields: (list 8 uint)}))
+                       (let ((word (get word acc))
+                             (fields (get fields acc))
+                             (unpack (unpack-u16-at word pos))
+                             (new (as-max-len? (append fields unpack) u8)))
+                         { word: word, fields: (unwrap-panic new) }))
+                     (define-public (poke (w uint))
+                       (ok (get fields
+                                (fold iter (list u0 u1 u2) { word: w, fields: (list) }))))",
+                )],
+                "poke",
+                &[Value::UInt(123_456)],
+                epoch,
+                version,
+            );
+        }
+    }
+
+    /// `append`'s operands where both are `let`-bound and the result is
+    /// wrapped in `as-max-len?`, which is the shape
+    /// `SP2H674PRTZV6YW56K0FMR7GDGZE4ZC5HMYZ3CDEV.v0-vault-stx` uses and where
+    /// a trace shows nano charging a copy for the appended item that the
+    /// reference does not.
+    #[test]
+    fn append_of_bound_operands_charges_like_the_reference() {
+        crosscheck_cost(
+            "(define-public (poke (x uint))
+               (let ((items (list x x))
+                     (item x))
+                 (ok (unwrap-panic (as-max-len? (append items item) u8)))))",
+            "poke",
+            &[Value::UInt(7)],
+        );
+        crosscheck_cost(
+            "(define-private (grow (acc (list 8 uint)) (item uint))
+               (unwrap-panic (as-max-len? (append acc item) u8)))
+             (define-public (poke (x uint))
+               (ok (grow (list x) x)))",
+            "poke",
+            &[Value::UInt(7)],
+        );
+    }
+
     #[test]
     fn append_borrows_its_list() {
         probe("(append (list u1) x)", Value::UInt(7));
