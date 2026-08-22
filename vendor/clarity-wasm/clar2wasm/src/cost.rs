@@ -3754,6 +3754,34 @@ mod borrowed_operand_charges {
         }
     }
 
+    /// The `v0-vault-stx` shape with its fold driven by a **constant** list,
+    /// which is how the contract actually calls it:
+    /// `(fold iter-unpack-u16 ITER-UINT-8 init)`. A constant is read through
+    /// `lookup_constant_variable`, a different path from a list literal, and
+    /// the literal is what every earlier reduction used.
+    #[test]
+    fn folding_a_constant_list_charges_like_the_reference() {
+        crosscheck_cost(
+            "(define-constant ITER-UINT-8 (list u0 u1 u2 u3 u4 u5 u6 u7))
+             (define-private (unpack-u16-at (word uint) (pos uint))
+               (mod (/ word (pow u2 (* pos u16))) u65536))
+             (define-private (iter (pos uint) (acc {word: uint, fields: (list 8 uint)}))
+               (let ((word (get word acc))
+                     (fields (get fields acc))
+                     (unpack (unpack-u16-at word pos))
+                     (new (as-max-len? (append fields unpack) u8)))
+                 { word: word, fields: (unwrap-panic new) }))
+             (define-private (unpack-u16 (word uint))
+               (let ((init { word: word, fields: (list) })
+                     (out (fold iter ITER-UINT-8 init)))
+                 (get fields out)))
+             (define-public (poke (w uint))
+               (ok (unpack-u16 w)))",
+            "poke",
+            &[Value::UInt(123_456_789)],
+        );
+    }
+
     /// `append`'s operands where both are `let`-bound and the result is
     /// wrapped in `as-max-len?`, which is the shape
     /// `SP2H674PRTZV6YW56K0FMR7GDGZE4ZC5HMYZ3CDEV.v0-vault-stx` uses and where
