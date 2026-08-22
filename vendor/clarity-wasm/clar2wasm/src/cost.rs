@@ -3894,7 +3894,7 @@ mod borrowed_operand_charges {
                 ),
             ],
             "poke",
-            &[positions.clone()],
+            std::slice::from_ref(&positions),
         );
     }
 
@@ -4010,7 +4010,7 @@ mod borrowed_operand_charges {
                     ),
                 ],
                 "poke",
-                &[positions.clone()],
+                std::slice::from_ref(&positions),
                 epoch,
                 version,
             );

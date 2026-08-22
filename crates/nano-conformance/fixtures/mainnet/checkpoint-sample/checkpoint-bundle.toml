@@ -1,6 +1,6 @@
 schema = "nano-stacks/checkpoint-bundle/v1"
 chunk_bytes = 4194304
-content_root = "273c59d46b6810399c63f1b074512b71f427d3c5202b8d3f3e4ae8505b0ca9e7"
+content_root = "67db17746652d35efb212d1a240cd60be817e48bf4f3b1e8d23c9282f0803fb3"
 
 [checkpoint]
 state_format = "stacks-core-marf-sqlite-v2"
@@ -13,8 +13,8 @@ attesting_block_id = "a87338900f279efc1b1df130004238cac8e09a2a4244fea39436fc66af
 signer_weight = 2708
 approval_threshold = 2599
 semantic_epoch = "Epoch40"
-compiler_identity = "sha256:0cb0e36f171e559733d4bed7b71acadb414a5cc01b909235222a3334f4985253"
-profile_fingerprint = "f952cd2fcec74b113c8167957e0481e5d91452460415c6c8d9c0123cfae3fb26"
+compiler_identity = "sha256:bd764b4ddabaef018aca641786716290b2e704541382e9803d14434463e45bd9"
+profile_fingerprint = "1934c51250a03b3143c679e8df1c0653d2ef3aaf7a04043eaecf776b31aeb5d5"
 
 [[files]]
 path = "block.bin"
@@ -25,8 +25,8 @@ chunks = ["756bcf0028c5bd76bf69bfa049167c761031232fba52bb22a649df81eeddd84f"]
 [[files]]
 path = "checkpoint.toml"
 size = 373
-sha256 = "2710ff1517e05525fcc1bb615e2f01ca7c4554e3147726a5779de9557e4cbca3"
-chunks = ["2710ff1517e05525fcc1bb615e2f01ca7c4554e3147726a5779de9557e4cbca3"]
+sha256 = "b833d0e579df8cc1ed3676f22d0630838e94ba82bde89dac84093bda4d8229e0"
+chunks = ["b833d0e579df8cc1ed3676f22d0630838e94ba82bde89dac84093bda4d8229e0"]
 
 [[files]]
 path = "marf.sqlite"
