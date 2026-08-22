@@ -947,7 +947,7 @@ mod recorded_semantics_charges {
     use clarity::types::StacksEpochId;
     use clarity::vm::ClarityVersion;
 
-    use crate::tools::crosscheck_cost_recorded_semantics;
+    use crate::tools::{crosscheck_cost, crosscheck_cost_recorded_semantics};
 
     #[test]
     fn an_old_contracts_unlist_shape_charges_current_epoch_style() {
@@ -1022,6 +1022,21 @@ mod recorded_semantics_charges {
             &[],
             StacksEpochId::Epoch20,
             ClarityVersion::Clarity1,
+        );
+    }
+
+    /// A binding read that a borrowing special function consumes pays the
+    /// reference no `LookupVariableSize`: the reference evaluates such an
+    /// operand itself and reads it through `as_ref`, never cloning it.
+    #[test]
+    fn a_parameter_a_special_function_borrows_pays_no_copy() {
+        crosscheck_cost(
+            "(define-read-only (header (height uint))
+               (get-burn-block-info? header-hash height))
+             (define-public (poke (height uint))
+               (ok (header height)))",
+            "poke",
+            &[clarity::vm::Value::UInt(1)],
         );
     }
 

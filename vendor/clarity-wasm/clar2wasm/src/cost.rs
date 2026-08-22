@@ -3470,3 +3470,143 @@ mod crosscheck {
         );
     }
 }
+
+/// What a binding read costs depends on its *consumer*.
+///
+/// The reference charges `LookupVariableSize` when a value is materialized out
+/// of its binding, which `apply` does for every argument of a native or
+/// user-defined function. A special function receives unevaluated expressions,
+/// evaluates them itself, and — where it only needs to look at the result —
+/// reads it through `as_ref`, cloning nothing and charging nothing. So the same
+/// `(word x)` is priced two different ways depending on which kind of word it
+/// is, and the compiler has to model that per word rather than per read.
+///
+/// Each test below reads a *parameter* as one word's operand and asks both
+/// engines what it cost. A failure names a word whose generated code charges a
+/// copy the reference does not make (or the reverse); mainnet's cost census is
+/// where the ones that matter were found.
+#[cfg(test)]
+mod borrowed_operand_charges {
+    use clarity::vm::Value;
+
+    use crate::tools::crosscheck_cost;
+
+    fn probe(body: &str, argument: Value) {
+        let snippet = format!(
+            "(define-read-only (inner (x {}))
+               {body})
+             (define-public (poke (x {}))
+               (ok (inner x)))",
+            declared(&argument),
+            declared(&argument)
+        );
+        crosscheck_cost(&snippet, "poke", &[argument]);
+    }
+
+    fn declared(argument: &Value) -> &'static str {
+        match argument {
+            Value::UInt(_) => "uint",
+            Value::Int(_) => "int",
+            Value::Principal(_) => "principal",
+            Value::Sequence(_) => "(buff 32)",
+            _ => "bool",
+        }
+    }
+
+    #[test]
+    fn is_standard_borrows_its_principal() {
+        probe(
+            "(is-standard x)",
+            Value::Principal(
+                clarity::vm::types::PrincipalData::parse(
+                    "SP2WA4AAQKK4K1FJNEMZB01FHXTZNF8EWEXPX5VC0",
+                )
+                .expect("principal"),
+            ),
+        );
+    }
+
+    #[test]
+    fn print_borrows_its_operand() {
+        probe("(print x)", Value::UInt(7));
+    }
+
+    #[test]
+    fn as_max_len_borrows_its_sequence() {
+        probe(
+            "(as-max-len? x u32)",
+            Value::buff_from(vec![1, 2, 3]).expect("buff"),
+        );
+    }
+
+    #[test]
+    fn concat_borrows_its_sequences() {
+        probe(
+            "(concat x 0x00)",
+            Value::buff_from(vec![1, 2, 3]).expect("buff"),
+        );
+    }
+
+    #[test]
+    fn comparison_borrows_its_operands() {
+        probe("(>= x u1)", Value::UInt(7));
+    }
+
+    #[test]
+    fn stx_balance_borrows_its_principal() {
+        probe(
+            "(stx-get-balance x)",
+            Value::Principal(
+                clarity::vm::types::PrincipalData::parse(
+                    "SP2WA4AAQKK4K1FJNEMZB01FHXTZNF8EWEXPX5VC0",
+                )
+                .expect("principal"),
+            ),
+        );
+    }
+
+    #[test]
+    fn principal_of_borrows_its_key() {
+        probe(
+            "(principal-of? 0x0390a5cac7c33fda49f70bc1b0866fa0ba7a9440d9de647fecb8132ceb76a94dfa)",
+            Value::UInt(1),
+        );
+    }
+
+    #[test]
+    fn asserts_borrows_its_condition() {
+        // `asserts!` returns from the *enclosing* function on failure, so its
+        // probe cannot use the read-only wrapper the others share.
+        crosscheck_cost(
+            "(define-public (poke (x uint))
+               (begin
+                 (asserts! (> x u0) (err u1))
+                 (ok true)))",
+            "poke",
+            &[Value::UInt(7)],
+        );
+    }
+
+    #[test]
+    fn if_borrows_its_condition() {
+        probe("(if (> x u0) u1 u2)", Value::UInt(7));
+    }
+
+    #[test]
+    fn slice_borrows_its_sequence() {
+        probe(
+            "(slice? x u0 u1)",
+            Value::buff_from(vec![1, 2, 3]).expect("buff"),
+        );
+    }
+
+    #[test]
+    fn append_borrows_its_list() {
+        probe("(append (list u1) x)", Value::UInt(7));
+    }
+
+    #[test]
+    fn to_ascii_borrows_its_operand() {
+        probe("(to-ascii? x)", Value::UInt(7));
+    }
+}

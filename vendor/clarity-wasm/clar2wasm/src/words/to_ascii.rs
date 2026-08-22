@@ -39,7 +39,10 @@ impl ComplexWord for ToAscii {
                 GeneratorError::TypeError("to-ascii? 's argument should be typed".to_owned())
             })?
             .clone();
-        generator.traverse_expr(builder, arg)?;
+        // The reference evaluates this operand itself and reads it through
+        // `as_ref`, so a binding read here is never cloned and never pays
+        // `LookupVariableSize`.
+        generator.traverse_expr_as_borrowed_value(builder, arg)?;
         let arg_locals = generator.save_to_locals(builder, &arg_ty, true);
         let arg_size = generator.borrow_local(walrus::ValType::I32);
         generator.runtime_size(builder, &arg_ty, &arg_locals, *arg_size)?;

@@ -34,7 +34,10 @@ impl ComplexWord for GetBlockInfo {
         let block = args.get_expr(1)?;
 
         // Push the block number onto the stack
-        generator.traverse_expr(builder, block)?;
+        // The reference evaluates this operand itself and reads it through
+        // `as_ref`, so a binding read here is never cloned and never pays
+        // `LookupVariableSize`.
+        generator.traverse_expr_as_borrowed_value(builder, block)?;
 
         // Reserve space on the stack for the return value
         let return_ty = generator
@@ -125,7 +128,10 @@ impl ComplexWord for GetBurnBlockInfo {
         let block = args.get_expr(1)?;
 
         // Push the block number onto the stack
-        generator.traverse_expr(builder, block)?;
+        // The reference evaluates this operand itself and reads it through
+        // `as_ref`, so a binding read here is never cloned and never pays
+        // `LookupVariableSize`.
+        generator.traverse_expr_as_borrowed_value(builder, block)?;
 
         // Reserve space on the stack for the return value
         let return_ty = generator
@@ -349,7 +355,10 @@ impl ComplexWord for GetStacksBlockInfo {
         let block = args.get_expr(1)?;
 
         // Push the block number onto the stack
-        generator.traverse_expr(builder, block)?;
+        // The reference evaluates this operand itself and reads it through
+        // `as_ref`, so a binding read here is never cloned and never pays
+        // `LookupVariableSize`.
+        generator.traverse_expr_as_borrowed_value(builder, block)?;
 
         // Reserve space on the stack for the return value
         let return_ty = generator
@@ -420,7 +429,10 @@ impl ComplexWord for GetTenureInfo {
         let block = args.get_expr(1)?;
 
         // Push the block number onto the stack
-        generator.traverse_expr(builder, block)?;
+        // The reference evaluates this operand itself and reads it through
+        // `as_ref`, so a binding read here is never cloned and never pays
+        // `LookupVariableSize`.
+        generator.traverse_expr_as_borrowed_value(builder, block)?;
 
         // Reserve space on the stack for the return value
         let return_ty = generator
