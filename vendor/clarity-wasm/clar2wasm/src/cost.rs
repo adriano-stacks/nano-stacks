@@ -3756,6 +3756,291 @@ mod borrowed_operand_charges {
         );
     }
 
+    /// An execution that *aborts* after a word has been charged.
+    ///
+    /// This is the shape every earlier reduction missed by succeeding. Tracing
+    /// `pox-5.stake-update` at its real prestate showed the compiler charging
+    /// one `unwrap!` (31 units) that the reference never charges, with all
+    /// fourteen other labels matching to the unit — and that execution ends in
+    /// an arithmetic underflow. If the two engines charge a word at different
+    /// points relative to performing it, then an abort in between leaves the
+    /// eager one having charged something the other never reached, which would
+    /// explain a residual that only ever appears on failing transactions.
+    #[test]
+    fn an_abort_after_a_charged_word_charges_like_the_reference() {
+        crosscheck_cost(
+            "(define-public (poke (x uint))
+               (let ((v (unwrap! (some x) (err u1))))
+                 (ok (- v u999999))))",
+            "poke",
+            &[Value::UInt(1)],
+        );
+        // `stake-update` aborts in a *later binding of the same `let`*, after an
+        // `unwrap!` whose argument is a user-defined call, which is not the
+        // same shape as aborting in the body.
+        crosscheck_cost(
+            "(define-read-only (info (x uint)) (some x))
+             (define-public (poke (x uint))
+               (let ((v (unwrap! (info x) (err u1)))
+                     (w (- v u999999)))
+                 (ok w)))",
+            "poke",
+            &[Value::UInt(1)],
+        );
+    }
+
+    /// The whole router shape at once, since no ingredient diverges alone: a
+    /// seven-field position tuple carrying three trait references, folded into
+    /// a response-wrapped `(list 326 {x-amount, y-amount})`, with the bin-id
+    /// assertion and a static call that takes the three traits as arguments.
+    /// This is `fold-withdraw-liquidity-multi` with the real callee replaced by
+    /// a stub, which is sound because calling the real callee at the real
+    /// prestate is exact.
+    #[test]
+    fn the_whole_router_fold_shape_charges_like_the_reference() {
+        use clarity::vm::types::{PrincipalData, TupleData};
+        use clarity::vm::ClarityName;
+
+        let contract = |name: &str| {
+            Value::Principal(
+                PrincipalData::parse_qualified_contract_principal(&format!(
+                    "S1G2081040G2081040G2081040G208105NK8PE5.{name}"
+                ))
+                .expect("contract principal"),
+            )
+        };
+        let position = || {
+            Value::Tuple(
+                TupleData::from_data(vec![
+                    (ClarityName::from_literal("amount"), Value::UInt(1_636_569)),
+                    (ClarityName::from_literal("bin-id"), Value::Int(88)),
+                    (
+                        ClarityName::from_literal("min-x-amount"),
+                        Value::UInt(144_875_423),
+                    ),
+                    (ClarityName::from_literal("min-y-amount"), Value::UInt(0)),
+                    (ClarityName::from_literal("pool-trait"), contract("pool")),
+                    (
+                        ClarityName::from_literal("x-token-trait"),
+                        contract("token"),
+                    ),
+                    (
+                        ClarityName::from_literal("y-token-trait"),
+                        contract("token"),
+                    ),
+                ])
+                .expect("position tuple"),
+            )
+        };
+        let positions = Value::cons_list_unsanitized(vec![position(), position(), position()])
+            .expect("positions list");
+        crate::tools::crosscheck_cost_multi_contract(
+            &[
+                (
+                    "token",
+                    "(define-public (transfer (amount uint) (from principal) (to principal)
+                                             (memo (optional (buff 34))))
+                       (ok true))",
+                ),
+                (
+                    "pool",
+                    "(define-public (withdraw (bin int) (amount uint)) (ok amount))",
+                ),
+                (
+                    "core",
+                    "(define-trait pool-trait ((withdraw (int uint) (response uint uint))))
+                     (define-trait ft
+                       ((transfer (uint principal principal (optional (buff 34)))
+                                  (response bool uint))))
+                     (define-public (withdraw-liquidity
+                           (pool <pool-trait>) (x <ft>) (y <ft>) (bin int)
+                           (amount uint) (min-x uint) (min-y uint))
+                       (if (> amount u0)
+                           (ok { x-amount: amount, y-amount: min-y })
+                           (err u9)))",
+                ),
+                (
+                    "router",
+                    "(use-trait pool-trait .core.pool-trait)
+                     (use-trait ft .core.ft)
+                     (define-constant MIN_BIN_ID 0)
+                     (define-constant MAX_BIN_ID 1000)
+                     (define-private (step
+                           (position { pool-trait: <pool-trait>, x-token-trait: <ft>,
+                                       y-token-trait: <ft>, bin-id: int, amount: uint,
+                                       min-x-amount: uint, min-y-amount: uint })
+                           (result (response (list 326 {x-amount: uint, y-amount: uint}) uint)))
+                       (let ((result-data (unwrap! result (err u1)))
+                             (bin-id (get bin-id position))
+                             (bin-id-check (asserts!
+                                             (and (>= bin-id MIN_BIN_ID) (<= bin-id MAX_BIN_ID))
+                                             (err u2)))
+                             (withdrawn (try! (contract-call? .core withdraw-liquidity
+                                                              (get pool-trait position)
+                                                              (get x-token-trait position)
+                                                              (get y-token-trait position)
+                                                              bin-id
+                                                              (get amount position)
+                                                              (get min-x-amount position)
+                                                              (get min-y-amount position))))
+                             (grown (unwrap! (as-max-len? (append result-data withdrawn) u326)
+                                             (err u3))))
+                         (ok grown)))
+                     (define-public (poke
+                           (positions (list 3 { pool-trait: <pool-trait>, x-token-trait: <ft>,
+                                                y-token-trait: <ft>, bin-id: int, amount: uint,
+                                                min-x-amount: uint, min-y-amount: uint })))
+                       (fold step positions (ok (list))))",
+                ),
+            ],
+            "poke",
+            &[positions.clone()],
+        );
+    }
+
+    /// The same shape under the semantics the real router was *deployed* under.
+    ///
+    /// `dlmm-liquidity-router-v-1-2` was published at height 6,979,620, so it
+    /// carries an older epoch's recorded analysis and is charged at the current
+    /// epoch's rate — the combination that produced this task's first defect.
+    #[test]
+    fn the_router_fold_shape_under_recorded_semantics_charges_like_the_reference() {
+        use clarity::types::StacksEpochId;
+        use clarity::vm::types::{PrincipalData, TupleData};
+        use clarity::vm::{ClarityName, ClarityVersion};
+
+        let contract = |name: &str| {
+            Value::Principal(
+                PrincipalData::parse_qualified_contract_principal(&format!(
+                    "S1G2081040G2081040G2081040G208105NK8PE5.{name}"
+                ))
+                .expect("contract principal"),
+            )
+        };
+        let position = || {
+            Value::Tuple(
+                TupleData::from_data(vec![
+                    (ClarityName::from_literal("amount"), Value::UInt(1_636_569)),
+                    (ClarityName::from_literal("bin-id"), Value::Int(88)),
+                    (
+                        ClarityName::from_literal("min-x-amount"),
+                        Value::UInt(144_875_423),
+                    ),
+                    (ClarityName::from_literal("min-y-amount"), Value::UInt(0)),
+                    (ClarityName::from_literal("pool-trait"), contract("pool")),
+                    (
+                        ClarityName::from_literal("x-token-trait"),
+                        contract("token"),
+                    ),
+                    (
+                        ClarityName::from_literal("y-token-trait"),
+                        contract("token"),
+                    ),
+                ])
+                .expect("position tuple"),
+            )
+        };
+        let positions = Value::cons_list_unsanitized(vec![position(), position(), position()])
+            .expect("positions list");
+        for (epoch, version) in [
+            (StacksEpochId::Epoch25, ClarityVersion::Clarity2),
+            (StacksEpochId::Epoch30, ClarityVersion::Clarity3),
+        ] {
+            crate::tools::crosscheck_cost_recorded_semantics(
+                &[
+                    (
+                        "token",
+                        "(define-public (transfer (amount uint) (from principal) (to principal)
+                                                 (memo (optional (buff 34))))
+                           (ok true))",
+                    ),
+                    (
+                        "pool",
+                        "(define-public (withdraw (bin int) (amount uint)) (ok amount))",
+                    ),
+                    (
+                        "core",
+                        "(define-trait pool-trait ((withdraw (int uint) (response uint uint))))
+                         (define-trait ft
+                           ((transfer (uint principal principal (optional (buff 34)))
+                                      (response bool uint))))
+                         (define-public (withdraw-liquidity
+                               (pool <pool-trait>) (x <ft>) (y <ft>) (bin int)
+                               (amount uint) (min-x uint) (min-y uint))
+                           (if (> amount u0)
+                               (ok { x-amount: amount, y-amount: min-y })
+                               (err u9)))",
+                    ),
+                    (
+                        "router",
+                        "(use-trait pool-trait .core.pool-trait)
+                         (use-trait ft .core.ft)
+                         (define-constant MIN_BIN_ID 0)
+                         (define-constant MAX_BIN_ID 1000)
+                         (define-private (step
+                               (position { pool-trait: <pool-trait>, x-token-trait: <ft>,
+                                           y-token-trait: <ft>, bin-id: int, amount: uint,
+                                           min-x-amount: uint, min-y-amount: uint })
+                               (result (response (list 326 {x-amount: uint, y-amount: uint})
+                                                 uint)))
+                           (let ((result-data (unwrap! result (err u1)))
+                                 (bin-id (get bin-id position))
+                                 (bin-id-check (asserts!
+                                                 (and (>= bin-id MIN_BIN_ID)
+                                                      (<= bin-id MAX_BIN_ID))
+                                                 (err u2)))
+                                 (withdrawn (try! (contract-call? .core withdraw-liquidity
+                                                                  (get pool-trait position)
+                                                                  (get x-token-trait position)
+                                                                  (get y-token-trait position)
+                                                                  bin-id
+                                                                  (get amount position)
+                                                                  (get min-x-amount position)
+                                                                  (get min-y-amount position))))
+                                 (grown (unwrap! (as-max-len? (append result-data withdrawn) u326)
+                                                 (err u3))))
+                             (ok grown)))
+                         (define-public (poke
+                               (positions (list 3 { pool-trait: <pool-trait>,
+                                                    x-token-trait: <ft>,
+                                                    y-token-trait: <ft>, bin-id: int,
+                                                    amount: uint, min-x-amount: uint,
+                                                    min-y-amount: uint })))
+                           (fold step positions (ok (list))))",
+                    ),
+                ],
+                "poke",
+                &[positions.clone()],
+                epoch,
+                version,
+            );
+        }
+    }
+
+    /// The router's own wrapper, without any of the traits: a `fold` whose
+    /// accumulator is a response around a `(list 326 {x-amount, y-amount})`,
+    /// grown one tuple per position through `unwrap!`, `append` and
+    /// `as-max-len?`. Calling the contract the real router calls is exact at
+    /// the same prestate, so what is left is this shape.
+    #[test]
+    fn a_fold_growing_a_response_wrapped_tuple_list_charges_like_the_reference() {
+        crosscheck_cost(
+            "(define-private (step (amount uint)
+                                   (result (response (list 326 {x-amount: uint,
+                                                                y-amount: uint}) uint)))
+               (let ((reached (unwrap! result (err u1)))
+                     (grown (unwrap! (as-max-len?
+                                       (append reached { x-amount: amount, y-amount: amount })
+                                       u326)
+                                     (err u2))))
+                 (ok grown)))
+             (define-public (poke (amount uint))
+               (fold step (list amount amount amount amount) (ok (list))))",
+            "poke",
+            &[Value::UInt(7)],
+        );
+    }
+
     /// The last cost differential the canonical record still shows in the
     /// audited window, reduced: a `fold` over a list of tuples each carrying
     /// three trait references, which is what
@@ -3809,6 +4094,16 @@ mod borrowed_operand_charges {
                     "(define-public (withdraw (bin int) (amount uint)) (ok amount))",
                 ),
                 (
+                    "core",
+                    "(define-trait pool-trait ((withdraw (int uint) (response uint uint))))
+                     (define-trait ft
+                       ((transfer (uint principal principal (optional (buff 34)))
+                                  (response bool uint))))
+                     (define-public (withdraw (pool <pool-trait>) (x <ft>) (y <ft>)
+                                              (bin int) (amount uint))
+                       (contract-call? pool withdraw bin amount))",
+                ),
+                (
                     "router",
                     "(define-trait pool-trait ((withdraw (int uint) (response uint uint))))
                      (define-trait ft
@@ -3818,10 +4113,15 @@ mod borrowed_operand_charges {
                            (p { pool: <pool-trait>, x: <ft>, y: <ft>,
                                 bin-id: int, amount: uint })
                            (acc (response (list 10 uint) uint)))
-                       (match acc
-                         reached (ok (unwrap-panic
-                                       (as-max-len? (append reached (get amount p)) u10)))
-                         failed (err failed)))
+                       (let ((reached (unwrap! acc (err u1)))
+                             (withdrawn (try! (contract-call? .core withdraw
+                                                              (get pool p)
+                                                              (get x p)
+                                                              (get y p)
+                                                              (get bin-id p)
+                                                              (get amount p)))))
+                         (ok (unwrap-panic
+                               (as-max-len? (append reached withdrawn) u10)))))
                      (define-public (poke
                            (positions (list 2 { pool: <pool-trait>, x: <ft>, y: <ft>,
                                                 bin-id: int, amount: uint })))
