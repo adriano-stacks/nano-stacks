@@ -163,6 +163,12 @@ mod tests {
             root.path(),
             &["config", "user.email", "release@example.invalid"],
         );
+        // A throwaway repository must not inherit the operator's signing
+        // configuration: a developer who signs commits with an SSH key has a
+        // global `commit.gpgsign`, and these commits would then fail for a
+        // reason that has nothing to do with what the test asserts.
+        git(root.path(), &["config", "commit.gpgsign", "false"]);
+        git(root.path(), &["config", "tag.gpgsign", "false"]);
         fs::create_dir(root.path().join("crates")).expect("create source directory");
         fs::write(root.path().join("Cargo.toml"), "[workspace]\n").expect("write manifest");
         fs::write(root.path().join("crates/lib.rs"), "pub fn clean() {}\n").expect("write source");
