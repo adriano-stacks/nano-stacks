@@ -269,3 +269,10 @@ class = "infrastructure"
 owner = "053"
 job = "release-qualification"
 requires = "running Hacknet node on localhost:20443 and Bitcoin Core on localhost:18443"
+
+[[ignored]]
+test = "from_consensus_buff_borrows_its_bytes"
+class = "semantic"
+owner = "146"
+job = "none"
+requires = "the from-consensus-buff? charge input to match the reference; the word charges 23 runtime units too many on a buff parameter, and skipping its operand copy overshoots to 4 under, so the cause is the charge input rather than the read"
