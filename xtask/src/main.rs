@@ -5145,6 +5145,33 @@ fn call_both_tx(arguments: &[String]) -> ExitCode {
 /// thousand-block cost audit finish in minutes instead of reopening a
 /// hundred-gigabyte state per transaction. Each line of output is
 /// `txid AGREE|DISAGREE compiler(rt,rc,rl,wc,wl) interpreter(rt,rc,rl,wc,wl)`.
+/// The recorded headers a window replay needs: the first block's parent, then
+/// every block in order. A replay cannot invent a burn view, so a missing
+/// header is refused rather than guessed.
+fn recorded_window_headers(
+    source: &nano_chainstate::ChainState,
+    parent: [u8; 32],
+    blocks: &[nano_chainstate::NakamotoBlock],
+) -> Result<Vec<nano_vm::BlockHeader>, String> {
+    let mut headers = Vec::with_capacity(blocks.len() + 1);
+    headers.push(source.recorded_header(parent).ok_or_else(|| {
+        "the source state holds no complete header for the first parent".to_owned()
+    })?);
+    for block in blocks {
+        headers.push(
+            source
+                .recorded_header(*block.block_id().as_bytes())
+                .ok_or_else(|| {
+                    format!(
+                        "the source state holds no complete header for block {}",
+                        block.header.chain_length
+                    )
+                })?,
+        );
+    }
+    Ok(headers)
+}
+
 /// Replay a window of mainnet blocks at their exact prestates and print what
 /// each transaction cost, so the numbers can be compared with the chain's own
 /// record.
@@ -5210,23 +5237,14 @@ fn replay_window(arguments: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-    let mut headers = Vec::with_capacity(blocks.len() + 1);
     let parent_id = *first.header.parent_block_id.as_bytes();
-    let Some(parent_header) = source.recorded_header(parent_id) else {
-        eprintln!("the source state holds no complete header for the first parent");
-        return ExitCode::FAILURE;
-    };
-    headers.push(parent_header);
-    for block in &blocks {
-        let Some(header) = source.recorded_header(*block.block_id().as_bytes()) else {
-            eprintln!(
-                "the source state holds no complete header for block {}",
-                block.header.chain_length
-            );
+    let headers = match recorded_window_headers(&source, parent_id, &blocks) {
+        Ok(headers) => headers,
+        Err(error) => {
+            eprintln!("{error}");
             return ExitCode::FAILURE;
-        };
-        headers.push(header);
-    }
+        }
+    };
     let network = source.network();
     drop(source);
 
@@ -5255,50 +5273,64 @@ fn replay_window(arguments: &[String]) -> ExitCode {
     }
 
     for (index, block) in blocks.iter().enumerate() {
-        let context = fixture_bitcoin_context(&headers[index], &headers[index + 1]);
-        let parent = *block.header.parent_block_id.as_bytes();
-        let applied = match chain.append_unauthenticated_fixture_block_with_bitcoin_operations(
-            context,
-            &[],
-            Some(parent),
-            block,
-        ) {
-            Ok(applied) => applied,
-            Err(error) => {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "height": block.header.chain_length,
-                        "error": format!("{error:?}"),
-                    })
-                );
-                return ExitCode::FAILURE;
-            }
-        };
-        for receipt in &applied.receipts {
-            let cost = &receipt.result.cost;
-            println!(
-                "{}",
-                serde_json::json!({
-                    "height": block.header.chain_length,
-                    "txid": receipt.txid.to_string(),
-                    "committed": receipt.committed,
-                    "cost": {
-                        "read_count": cost.read_count,
-                        "read_length": cost.read_length,
-                        "runtime": cost.runtime,
-                        "write_count": cost.write_count,
-                        "write_length": cost.write_length,
-                    },
-                })
-            );
+        if !replay_one_window_block(&mut chain, block, &headers[index], &headers[index + 1]) {
+            return ExitCode::FAILURE;
         }
     }
     ExitCode::SUCCESS
 }
 
+/// Execute one window block on top of the scratch's tip and print each
+/// receipt's five cost dimensions. Answers whether it executed.
+fn replay_one_window_block(
+    chain: &mut nano_chainstate::ChainState,
+    block: &nano_chainstate::NakamotoBlock,
+    parent_header: &nano_vm::BlockHeader,
+    header: &nano_vm::BlockHeader,
+) -> bool {
+    let context = fixture_bitcoin_context(parent_header, header);
+    let parent = *block.header.parent_block_id.as_bytes();
+    let applied = match chain.append_unauthenticated_fixture_block_with_bitcoin_operations(
+        context,
+        &[],
+        Some(parent),
+        block,
+    ) {
+        Ok(applied) => applied,
+        Err(error) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "height": block.header.chain_length,
+                    "error": format!("{error:?}"),
+                })
+            );
+            return false;
+        }
+    };
+    for receipt in &applied.receipts {
+        let cost = &receipt.result.cost;
+        println!(
+            "{}",
+            serde_json::json!({
+                "height": block.header.chain_length,
+                "txid": receipt.txid.to_string(),
+                "committed": receipt.committed,
+                "cost": {
+                    "read_count": cost.read_count,
+                    "read_length": cost.read_length,
+                    "runtime": cost.runtime,
+                    "write_count": cost.write_count,
+                    "write_length": cost.write_length,
+                },
+            })
+        );
+    }
+    true
+}
+
 /// The Bitcoin view a fixture replay runs a block under, from the recorded
-/// headers of the block and its parent. The PoX constants are mainnet's.
+/// headers of the block and its parent. The `PoX` constants are mainnet's.
 fn fixture_bitcoin_context(
     parent: &nano_vm::BlockHeader,
     child: &nano_vm::BlockHeader,
