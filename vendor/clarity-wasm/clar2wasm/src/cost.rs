@@ -529,10 +529,16 @@ fn probe_label_index(label: &str) -> i32 {
 pub struct ChargeContext {
     pub epoch: StacksEpochId,
     /// Diagnostic: a host function every charge reports to, present only
-    /// when `NANO_TRACE_CHARGES` was set while the module compiled. Never a
-    /// production shape — the emitted call changes the module, so the
-    /// consensus profile fingerprint refuses to mix traced and untraced
-    /// artifacts on one state.
+    /// when `NANO_TRACE_CHARGES` was set while the module compiled.
+    ///
+    /// The probe reports and returns; it charges nothing, so a traced module
+    /// computes the same costs as an untraced one. What it does change is the
+    /// module bytes — and *not* the compiler identity, which hashes the
+    /// compiler's sources and so cannot see a runtime flag. A traced module is
+    /// therefore indistinguishable by profile from an untraced one, which is
+    /// why the node keeps traced modules out of the on-disk cache
+    /// (`nano_vm::native_module_cache`) rather than relying on the fingerprint
+    /// to separate them.
     pub charge_probe: Option<walrus::FunctionId>,
     pub runtime: GlobalId,
     pub read_count: GlobalId,

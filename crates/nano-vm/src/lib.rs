@@ -136,6 +136,15 @@ trace_switch!(
     trace_missing_contracts,
     "NANO_TRACE_MISSING_CONTRACTS"
 );
+trace_switch!(
+    /// Whether `NANO_TRACE_CHARGES` asked clarity-wasm to emit a probe call
+    /// before every charge its generated code makes.
+    ///
+    /// Read here as well as in the compiler because the modules such a build
+    /// produces must not outlive the diagnostic: see [`native_module_cache`].
+    charge_tracing,
+    "NANO_TRACE_CHARGES"
+);
 
 /// The MARF root a block sealed.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5115,6 +5124,15 @@ const fn contract_argument(value: &Value) -> Option<&QualifiedContractIdentifier
 /// checkpoint being read — has nowhere to put it and does without.
 #[cfg(feature = "persistent-native-modules")]
 fn native_module_cache(side_store: Option<&Path>) -> ModuleCache {
+    // A charge-traced build compiles *different modules* — every charge carries
+    // an extra probe call — while its compiler identity, a hash of the compiler
+    // sources, is by construction the same as the untraced build's. So nothing
+    // in the profile fingerprint would stop a traced module from being left in a
+    // state that a production node opens later. Keeping traced modules in memory
+    // is what stops it: the diagnostic leaves no compiled code behind.
+    if charge_tracing() {
+        return ModuleCache::default();
+    }
     side_store
         .and_then(Path::parent)
         .and_then(|directory| nano_wasm_cache::NativeModuleCache::open(directory).ok())
