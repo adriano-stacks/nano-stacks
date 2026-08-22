@@ -6213,28 +6213,14 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                         sponsor,
                     };
                     let result = if short_circuit_cost {
-                        // A free callee still decrements this module's cost
-                        // globals — generated code always does — while the
-                        // tracker is never charged. A charge trace that could
-                        // not see the boundary counted work the transaction did
-                        // not pay for, so the boundary is announced.
-                        let traced = std::env::var_os("NANO_TRACE_CHARGES").is_some();
-                        if traced {
-                            eprintln!("free-enter");
-                        }
-                        let free =
-                            exec_state.run_free(&invoke_ctx, |exec_state, free_invoke_ctx| {
-                                exec_state.execute_contract_from_wasm(
-                                    free_invoke_ctx,
-                                    contract_id,
-                                    &function_name,
-                                    &args,
-                                )
-                            });
-                        if traced {
-                            eprintln!("free-exit");
-                        }
-                        free
+                        exec_state.run_free(&invoke_ctx, |exec_state, free_invoke_ctx| {
+                            exec_state.execute_contract_from_wasm(
+                                free_invoke_ctx,
+                                contract_id,
+                                &function_name,
+                                &args,
+                            )
+                        })
                     } else {
                         exec_state.execute_contract_from_wasm(
                             &invoke_ctx,
