@@ -77,6 +77,12 @@ second block.
 - [x] Fix the length dimensions: charge data words at the executing epoch and
       size trait references as values, closing every `read_length` and
       `write_length` difference in the window.
+- [ ] Re-run the checkpoint builder ceremony for the new compiler identity.
+      A node refuses a bundle whose recorded compiler identity is not its own
+      and the section is mandatory, so the cost fixes invalidate the attested
+      bundle (`sha256:1f78d344`, profile `5561d364`) and no fixed-compiler
+      replay can start until an attested bundle exists for the new identity.
+      Hand-editing a copied bundle would forge the builders' binding.
 - [ ] Re-execute the hold window's blocks with the fixed compiler and compare
       every receipt to the canonical record. This is the measurement that
       decides the task: the compiler-versus-interpreter census cannot, because
