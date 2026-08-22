@@ -96,6 +96,10 @@ pub struct WasmGenerator {
     /// charge events can only be compared by position, which is why the probe
     /// reports this alongside each charge.
     charging_expression: u64,
+    /// A short source form for [`Self::charging_expression`], so a trace names
+    /// the expression instead of a number whose identifier walk has to be
+    /// guessed at. Empty when nothing is being traversed.
+    charging_form: String,
 
     /// Emits cost tracking code if set.
     pub(crate) cost_context: Option<ChargeContext>,
@@ -520,6 +524,26 @@ impl Bindings {
             TypeSignature::CallableType(CallableSubtype::Trait(t)) => Some(t),
             _ => None,
         })
+    }
+}
+
+/// A one-line source form for an expression, for the charge probe's positions.
+///
+/// Enough to recognise which expression a charge belongs to without counting
+/// identifiers by hand: a name for an atom, the head and arity for a call, and
+/// the kind for anything else.
+fn source_form(expr: &SymbolicExpression) -> String {
+    match &expr.expr {
+        SymbolicExpressionType::Atom(name) => name.to_string(),
+        SymbolicExpressionType::LiteralValue(_) => "<literal>".to_owned(),
+        SymbolicExpressionType::List(items) => items
+            .first()
+            .and_then(|head| head.match_atom())
+            .map_or_else(
+                || format!("(list of {})", items.len()),
+                |head| format!("({head} /{})", items.len().saturating_sub(1)),
+            ),
+        _ => "<other>".to_owned(),
     }
 }
 
@@ -1229,6 +1253,7 @@ impl WasmGenerator {
             bindings: Bindings::new(),
             charge_local_value_copy: true,
             charging_expression: 0,
+            charging_form: String::new(),
             cost_context: None,
             early_return_block_id: None,
             current_function_type: None,
@@ -1499,6 +1524,7 @@ impl WasmGenerator {
     ) -> Result<(), GeneratorError> {
         self.expression_locals.push(Vec::new());
         let enclosing = std::mem::replace(&mut self.charging_expression, expr.id);
+        let enclosing_form = std::mem::replace(&mut self.charging_form, source_form(expr));
         let result = match &expr.expr {
             SymbolicExpressionType::Atom(name) => self.visit_atom(builder, expr, name),
             SymbolicExpressionType::List(exprs) => self.traverse_list(builder, expr, exprs),
@@ -1513,6 +1539,7 @@ impl WasmGenerator {
             .expect("an expression local scope was pushed");
         self.release_locals(locals);
         self.charging_expression = enclosing;
+        self.charging_form = enclosing_form;
         result
     }
 
@@ -1522,8 +1549,10 @@ impl WasmGenerator {
     /// contract, and a single transaction charges across several.
     pub(crate) fn charging_position(&self) -> String {
         format!(
-            "{}#{}",
-            self.contract_analysis.contract_identifier.name, self.charging_expression
+            "{}#{} {}",
+            self.contract_analysis.contract_identifier.name,
+            self.charging_expression,
+            self.charging_form
         )
     }
 
