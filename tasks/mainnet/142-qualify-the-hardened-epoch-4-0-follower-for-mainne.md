@@ -4,7 +4,7 @@ title: "Qualify the hardened Epoch 4.0 follower for mainnet"
 status: pending
 priority: critical
 effort: small
-dependencies: ["138"]
+dependencies: ["106", "082"]
 tags: ["mainnet", "release", "consensus", "qualification"]
 created_at: 2026-08-14
 parent: 053
@@ -25,8 +25,17 @@ are finished.
 - [ ] Confirm taskmd reports every dependency complete and no critical/high
       release task, blocking semantic ignore, declared differential, advisory
       exception past expiry or unowned qualification input remains.
+- [ ] Hold one continuous interval that starts before a reward-cycle prepare
+      phase and runs through the rollover and the complete following cycle,
+      inherited from the cancelled
+      [[138-run-a-multi-operator-full-reward-cycle-qualificati]]: 106 proves
+      twenty-four hours and 082 crosses one boundary, and neither is a full
+      cycle held without interruption.
+- [ ] Exercise loss of one peer, one Bitcoin backend and one optional edge
+      service without changing the canonical result or requiring hosted HTTP,
+      also inherited from 138.
 - [ ] Run the qualifying release report against the signed artifact, checkpoint,
-      mainnet capture and state from [[138-run-a-multi-operator-full-reward-cycle-qualificati]].
+      mainnet capture and the state that interval produced.
 - [ ] Verify that the report binds the clean source, reproducible artifact,
       Epoch 4.0 profile, engine/SBOM, checkpoint builders and raw operator
       evidence.
@@ -44,7 +53,9 @@ are finished.
   with artifact-bound evidence; no waiver converts missing evidence into a pass.
 - `cargo xtask release-report` succeeds from the published clean source and
   rejects any substituted artifact, checkpoint, profile or evidence bundle.
-- The published checksum is identical to the artifact run by all qualification
-  operators.
+- The published checksum is identical to the artifact that produced the
+  qualification evidence. Single-operator only: 138 was cancelled because this
+  project has one operator, so the go/no-go record must name that as a residual
+  operational assumption rather than imply independent corroboration.
 - The go/no-go record is signed and independently reproducible.
 - Only after these conditions hold may tasks 142 and 053 be completed.
