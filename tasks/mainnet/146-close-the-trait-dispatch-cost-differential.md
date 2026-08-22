@@ -83,7 +83,18 @@ second block.
       a conformance gate pins block 8,808,752 against the chain's own record.
       First window: 39 blocks, 66 transactions, 64 matching on all five
       dimensions.
-- [ ] Close the last chain-level differential: `dlmm-liquidity-router-v-1-2`'s
+- [x] Close the largest chain-level differential: `concat` was charged for the
+      bytes its copies moved rather than the items it joined, sixteen times too
+      much for a list of `uint`. Found through a single-transaction block where
+      the canonical comparison is exact; closed 29 of the 55 differing
+      transactions, taking the ten-window audit from 793/848 to **822/848**.
+- [ ] Close the remaining 26 (3.1%), all runtime-only: `+8` on fourteen, then
+      `-184` on three, `+1002` on two and eight singletons. A label-level diff
+      cannot localize these — the engines decompose the same work into
+      different charge events whose costs nearly cancel — so this needs a
+      comparison that aligns charges to source positions rather than to labels.
+- [ ] Close the earlier per-call findings, now known not to be chain
+      divergences on their own: `dlmm-liquidity-router-v-1-2`'s
       `withdraw-liquidity-multi` over-charges runtime by 2 units per folded
       position (1,228 and 98 on the two mainnet calls). The interpreter agrees
       with the chain here, so it is a usable oracle; a one-element call
