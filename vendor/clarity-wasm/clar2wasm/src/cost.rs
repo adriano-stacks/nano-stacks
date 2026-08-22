@@ -270,6 +270,7 @@ pub trait ChargeGenerator {
                 Some(cost) => {
                     ctx.emit_probe(instrs, word_name.as_str(), n);
                     ctx.emit(instrs, module, cost, n)?;
+                    ctx.emit_meter_probe(instrs);
                 }
                 None => {
                     return Err(GeneratorError::InternalError(format!(
@@ -304,6 +305,7 @@ pub trait ChargeGenerator {
                 ErrorMap::CostOverrunRuntime as _,
                 n,
             )?;
+            ctx.emit_meter_probe(instrs);
         }
         Ok(())
     }
@@ -628,6 +630,21 @@ impl ChargeContext {
             }
         }
         instrs.call(probe);
+    }
+
+    /// Report the runtime meter *after* a charge, under index `-1`.
+    ///
+    /// The label and scaling input alone cannot say what a charge cost — the
+    /// arithmetic happens in the generated code — so a stream of them cannot be
+    /// compared with the reference's costs. Reading the meter after each charge
+    /// turns the probe stream into a running total, which is directly
+    /// comparable and is what localizes a divergence of a few units inside
+    /// millions.
+    fn emit_meter_probe(&self, instrs: &mut InstrSeqBuilder) {
+        let Some(probe) = self.charge_probe else {
+            return;
+        };
+        instrs.i32_const(-1).global_get(self.runtime).call(probe);
     }
 
     fn emit(
@@ -3736,6 +3753,149 @@ mod borrowed_operand_charges {
                (ok (map-set m u1 x)))",
             "poke",
             &[Value::UInt(7)],
+        );
+    }
+
+    /// A dynamic trait dispatch whose callee *fails* — the combination the
+    /// mainnet `+62` family lands on. `swag.sr` charges identically to the
+    /// reference on the slices whose dispatch succeeds and diverges by exactly
+    /// 62 on the ones whose dispatch aborts, so the two engines disagree about
+    /// what a failing dispatch costs, not about the dispatch itself.
+    #[test]
+    fn a_failing_dynamic_dispatch_charges_like_the_reference() {
+        for (label, callee) in [
+            (
+                "err",
+                "(define-public (transfer (amount uint) (sender principal)
+                                         (recipient principal) (memo (optional (buff 34))))
+                   (begin (asserts! (> amount u0) (err u1)) (ok true)))",
+            ),
+            (
+                "runtime-error",
+                "(define-public (transfer (amount uint) (sender principal)
+                                         (recipient principal) (memo (optional (buff 34))))
+                   (ok (> (- amount u1) u0)))",
+            ),
+        ] {
+            let _ = label;
+            crate::tools::crosscheck_cost_multi_contract(
+                &[
+                    ("callee", callee),
+                    (
+                        "caller",
+                        "(define-trait ft
+                           ((transfer (uint principal principal (optional (buff 34)))
+                                      (response bool uint))))
+                         (define-public (poke (amount uint))
+                           (contract-call? .callee transfer amount tx-sender tx-sender none))",
+                    ),
+                ],
+                "poke",
+                &[Value::UInt(0)],
+            );
+        }
+    }
+
+    /// The `+62` family is charged on the *abort* path. Calling
+    /// `swag.ss` on real mainnet state charges identically for one and two
+    /// list elements and diverges by exactly 62 units from three on, which is
+    /// where execution starts failing with an arithmetic underflow — so what
+    /// differs is what each engine charges for a runtime error, not for work.
+    #[test]
+    fn an_arithmetic_underflow_charges_like_the_reference() {
+        crosscheck_cost(
+            "(define-public (poke (x uint))
+               (ok (- x u1)))",
+            "poke",
+            &[Value::UInt(0)],
+        );
+    }
+
+    #[test]
+    fn an_underflow_inside_a_called_function_charges_like_the_reference() {
+        crosscheck_cost(
+            "(define-private (inner (x uint)) (- x u1))
+             (define-public (poke (x uint))
+               (ok (inner x)))",
+            "poke",
+            &[Value::UInt(0)],
+        );
+    }
+
+    #[test]
+    fn an_underflow_inside_a_fold_charges_like_the_reference() {
+        crosscheck_cost(
+            "(define-private (step (item uint) (acc uint)) (- acc item))
+             (define-public (poke (x uint))
+               (ok (fold step (list u1 u1 u1) x)))",
+            "poke",
+            &[Value::UInt(2)],
+        );
+    }
+
+    /// The `+62` family's real shape, reduced from
+    /// `SP2H674PRTZV6YW56K0FMR7GDGZE4ZC5HMYZ3CDEV.swag`'s `ss`: a `fold` over a
+    /// list of *trait references* whose accumulator is a tuple carrying a
+    /// buffer, where the folded function never even reads its trait argument.
+    #[test]
+    fn a_fold_over_a_trait_list_charges_like_the_reference() {
+        crate::tools::crosscheck_cost_multi_contract(
+            &[
+                (
+                    "token",
+                    "(define-public (transfer (amount uint) (from principal) (to principal)
+                                             (memo (optional (buff 34))))
+                       (ok true))",
+                ),
+                (
+                    "swap",
+                    "(define-trait ft
+                       ((transfer (uint principal principal (optional (buff 34)))
+                                  (response bool uint))))
+                     (define-read-only (tft (fts (list 8 <ft>))) fts)
+                     (define-constant kft (tft (list .token .token)))
+                     (define-private (sl (ai <ft>)
+                                         (it { b: (buff 400), s: (list 20 (buff 20)) }))
+                       (let ((v0 (get b it))
+                             (v1 (unwrap-panic (as-max-len? (unwrap-panic (slice? v0 u0 u20)) u20)))
+                             (v2 (default-to 0x (slice? v0 u20 (len v0))))
+                             (v3 (unwrap-panic (as-max-len? (append (get s it) v1) u20))))
+                         { b: v2, s: v3 }))
+                     (define-public (poke (b (buff 400)))
+                       (ok (get s (fold sl
+                                        (unwrap-panic (slice? kft u0 (/ (len b) u20)))
+                                        { b: b, s: (list) }))))",
+                ),
+            ],
+            "poke",
+            &[Value::buff_from(vec![7; 40]).expect("buff")],
+        );
+    }
+
+    /// The mainnet `+62` family: a router forwarding a `(buff 400)` parameter
+    /// through a trait dispatch, which is what every contract in that family
+    /// is (`SP2H674PRTZV6YW56K0FMR7GDGZE4ZC5HMYZ3CDEV.psis` and its siblings).
+    #[test]
+    fn a_router_forwarding_a_buffer_through_a_trait_charges_like_the_reference() {
+        crate::tools::crosscheck_cost_multi_contract(
+            &[
+                (
+                    "callee",
+                    "(define-public (ss (b (buff 400)))
+                       (ok (list (ok u1))))",
+                ),
+                (
+                    "router",
+                    "(define-trait z
+                       ((ss ((buff 400)) (response (list 20 (response uint uint)) uint))))
+                     (define-public (r (b (buff 400)) (t <z>))
+                       (if (> (len b) u0) (contract-call? t ss b) (ok (list))))
+                     (define-public (poke (b (buff 400)))
+                       (r b .callee))",
+                ),
+            ],
+            "poke",
+            &[Value::buff_from(vec![7; 120]).expect("buff")],
         );
     }
 

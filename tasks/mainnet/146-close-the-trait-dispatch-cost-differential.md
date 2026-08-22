@@ -77,6 +77,14 @@ second block.
 - [x] Fix the length dimensions: charge data words at the executing epoch and
       size trait references as values, closing every `read_length` and
       `write_length` difference in the window.
+- [ ] Re-execute the hold window's blocks with the fixed compiler and compare
+      every receipt to the canonical record. This is the measurement that
+      decides the task: the compiler-versus-interpreter census cannot, because
+      on at least one mainnet shape (`swag`/`psis`) nano's sealed runtime is
+      362 *below* canonical while the compiler is 62 *above* the interpreter,
+      putting the interpreter further from the chain than the engine under
+      test. `cost-both-tx` is not a substitute — it runs one call without the
+      block's transaction prefix.
 - [ ] Close the runtime-only residual. Confirmed so far, each with a probe in
       `clar2wasm`'s `borrowed_operand_charges`: the block-info words,
       `to-ascii?` and `secp256k1-verify` charged a copy for an operand the
@@ -96,6 +104,7 @@ second block.
 ## Acceptance Criteria
 
 - Every cost dimension of every transaction in a verified mainnet window
-  matches the canonical record exactly.
+  matches the canonical record exactly. The canonical record is the oracle
+  here, not the interpreter: where the two disagree, the chain decides.
 - The differential's call shape is a permanent regression test.
 - No production path consults the interpreter to compute or repair costs.
