@@ -276,3 +276,10 @@ class = "semantic"
 owner = "146"
 job = "none"
 requires = "the from-consensus-buff? charge input to match the reference; the word charges 23 runtime units too many on a buff parameter, and skipping its operand copy overshoots to 4 under, so the cause is the charge input rather than the read"
+
+[[ignored]]
+test = "the_block_8808752_receipt_matches_the_canonical_record"
+class = "infrastructure"
+owner = "146"
+job = "release-qualification"
+requires = "NANO_146_SOURCE naming an immutable mainnet state that holds block 8,808,752 and its parent, and NANO_146_SCRATCH naming a fresh writable copy of it"

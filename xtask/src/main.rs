@@ -121,6 +121,7 @@ fn main() -> ExitCode {
         Some("call-both-tx") => call_both_tx(&env::args().skip(2).collect::<Vec<_>>()),
         Some("cost-both-tx") => cost_both_tx(&env::args().skip(2).collect::<Vec<_>>()),
         Some("cost-both-batch") => cost_both_batch(&env::args().skip(2).collect::<Vec<_>>()),
+        Some("replay-window") => replay_window(&env::args().skip(2).collect::<Vec<_>>()),
         Some("cost-both") => cost_both(&env::args().skip(2).collect::<Vec<_>>()),
         Some("heal-contracts") => heal_contracts(env::args().nth(2).as_deref()),
         Some("probe-header") => probe_header(&env::args().skip(2).collect::<Vec<_>>()),
@@ -5144,6 +5145,183 @@ fn call_both_tx(arguments: &[String]) -> ExitCode {
 /// thousand-block cost audit finish in minutes instead of reopening a
 /// hundred-gigabyte state per transaction. Each line of output is
 /// `txid AGREE|DISAGREE compiler(rt,rc,rl,wc,wl) interpreter(rt,rc,rl,wc,wl)`.
+/// Replay a window of mainnet blocks at their exact prestates and print what
+/// each transaction cost, so the numbers can be compared with the chain's own
+/// record.
+///
+/// The manifest is JSONL, one `{"height": h, "block": "<hex>"}` per line in
+/// ascending height. The first block is replayed against a scratch discarded to
+/// its parent; the rest continue from the block before them, which is what
+/// makes the transaction prefix — fees, nonces, cumulative cost — the real one.
+/// The append verifies each committed root, so a wrong execution cannot pass
+/// silently; what this adds is the receipt.
+///
+/// Output is JSONL: one object per transaction with its height, txid, status
+/// and five cost dimensions. Comparing that with the canonical record is the
+/// caller's job, deliberately: the oracle is an external service, and mixing
+/// its rate limits into a replay is how a cost audit turns into a flaky test.
+fn replay_window(arguments: &[String]) -> ExitCode {
+    let [state, scratch, manifest] = arguments else {
+        eprintln!(
+            "usage: cargo xtask replay-window <source-state-dir> <scratch-state-dir> \
+             <manifest.jsonl>\n\
+             the source is opened read-only for its headers; only the scratch is written"
+        );
+        return ExitCode::FAILURE;
+    };
+    let manifest_text = match std::fs::read_to_string(manifest) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("cannot read {manifest}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut blocks = Vec::new();
+    for line in manifest_text.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            eprintln!("not a manifest line: {line}");
+            return ExitCode::FAILURE;
+        };
+        let Some(bytes) = entry["block"]
+            .as_str()
+            .and_then(|hex| hex::decode(hex).ok())
+        else {
+            eprintln!("a manifest entry carries no hexadecimal block");
+            return ExitCode::FAILURE;
+        };
+        match nano_chainstate::NakamotoBlock::decode(&bytes) {
+            Ok(block) => blocks.push(block),
+            Err(error) => {
+                eprintln!("cannot decode a manifest block: {error:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let Some(first) = blocks.first() else {
+        eprintln!("the manifest names no blocks");
+        return ExitCode::FAILURE;
+    };
+
+    let source =
+        match nano_chainstate::ChainState::open_existing(Path::new(state).join("chainstate")) {
+            Ok(source) => source,
+            Err(error) => {
+                eprintln!("cannot open the source state: {error:?}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let mut headers = Vec::with_capacity(blocks.len() + 1);
+    let parent_id = *first.header.parent_block_id.as_bytes();
+    let Some(parent_header) = source.recorded_header(parent_id) else {
+        eprintln!("the source state holds no complete header for the first parent");
+        return ExitCode::FAILURE;
+    };
+    headers.push(parent_header);
+    for block in &blocks {
+        let Some(header) = source.recorded_header(*block.block_id().as_bytes()) else {
+            eprintln!(
+                "the source state holds no complete header for block {}",
+                block.header.chain_length
+            );
+            return ExitCode::FAILURE;
+        };
+        headers.push(header);
+    }
+    let network = source.network();
+    drop(source);
+
+    let mut chain =
+        match nano_chainstate::ChainState::open(network, Path::new(scratch).join("chainstate")) {
+            Ok(chain) => chain,
+            Err(error) => {
+                eprintln!("cannot open the scratch state: {error:?}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let parent_height = u32::try_from(first.header.chain_length.saturating_sub(1)).unwrap_or(0);
+    if let Err(error) = chain.discard_above(parent_height) {
+        eprintln!("cannot discard the scratch above {parent_height}: {error:?}");
+        return ExitCode::FAILURE;
+    }
+    if chain.tip().ok().flatten() != Some(parent_id) {
+        eprintln!("the scratch does not stand on the first block's parent");
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = chain
+        .seed_unauthenticated_fixture_extension_from_parent_header(first.header.parent_block_id)
+    {
+        eprintln!("cannot seed continuity from the parent header: {error:?}");
+        return ExitCode::FAILURE;
+    }
+
+    for (index, block) in blocks.iter().enumerate() {
+        let context = fixture_bitcoin_context(&headers[index], &headers[index + 1]);
+        let parent = *block.header.parent_block_id.as_bytes();
+        let applied = match chain.append_unauthenticated_fixture_block_with_bitcoin_operations(
+            context,
+            &[],
+            Some(parent),
+            block,
+        ) {
+            Ok(applied) => applied,
+            Err(error) => {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "height": block.header.chain_length,
+                        "error": format!("{error:?}"),
+                    })
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        for receipt in &applied.receipts {
+            let cost = &receipt.result.cost;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "height": block.header.chain_length,
+                    "txid": receipt.txid.to_string(),
+                    "committed": receipt.committed,
+                    "cost": {
+                        "read_count": cost.read_count,
+                        "read_length": cost.read_length,
+                        "runtime": cost.runtime,
+                        "write_count": cost.write_count,
+                        "write_length": cost.write_length,
+                    },
+                })
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// The Bitcoin view a fixture replay runs a block under, from the recorded
+/// headers of the block and its parent. The PoX constants are mainnet's.
+fn fixture_bitcoin_context(
+    parent: &nano_vm::BlockHeader,
+    child: &nano_vm::BlockHeader,
+) -> nano_chainstate::BitcoinBlockContext {
+    let mut context =
+        nano_chainstate::BitcoinBlockContext::at_height(u64::from(parent.burn_block_height));
+    context.extend_view_to(u64::from(child.burn_block_height));
+    context.first_height = 666_050;
+    context.prepare_phase_length = 100;
+    context.reward_phase_length = 2_000;
+    context.rejection_fraction = 25;
+    context.v1_unlock_height = 781_552;
+    context.v2_unlock_height = 787_652;
+    context.v3_unlock_height = 840_361;
+    context.pox_5_activation_height = 960_230;
+    context.burn_header_hash = child.burn_header_hash;
+    context.burn_block_time = child.burn_block_time;
+    context.vrf_seed = child.vrf_seed;
+    context.burn_spend_total = child.burn_spend_total;
+    context.burn_spend_winner = child.burn_spend_winner;
+    context
+}
+
 fn cost_both_batch(arguments: &[String]) -> ExitCode {
     let [state, manifest] = arguments else {
         eprintln!(

@@ -1,0 +1,42 @@
+{
+  "source": "https://api.hiro.so/extended/v1/tx/0xfc71c88fb7e897c39f9b755db1e47dd716ab80f3af9a7eca3dc049884ed8d604?event_limit=100",
+  "retrieved_at": "2026-08-22T15:55:00Z",
+  "txid": "fc71c88fb7e897c39f9b755db1e47dd716ab80f3af9a7eca3dc049884ed8d604",
+  "block_height": 8808752,
+  "block_hash": "71557a0e6b3950c1850fedddb5b7808e634784f42d5776ef80a11c5472788a35",
+  "index_block_hash": "839bb4d8b49c266c14437fe696605b75aac8e0514036d06e7d48a05a552623ae",
+  "parent_index_block_hash": "b03dad794089d456d2a03b69d6b27543ada35b83bacf34b691e48d5d554f4a37",
+  "burn_block_height": 963326,
+  "tx_index": 0,
+  "canonical": true,
+  "status": "success",
+  "result": {
+    "hex": "0703",
+    "repr": "(ok true)"
+  },
+  "cost": {
+    "read_count": 30,
+    "read_length": 76653,
+    "runtime": 161448,
+    "write_count": 4,
+    "write_length": 341
+  },
+  "events": [
+    {
+      "kind": "non_fungible_token",
+      "operation": "transfer",
+      "asset": "SP2KAF9RF86PVX3NEE27DFV1CQX0T4WGR41X3S45C.byzantion-bitcoin-bulls::bitcoin-bulls",
+      "sender": "SPNWZ5V2TPWGQGVDR6T7B6RQ4XMGZ4PXTEE0VQ0S.marketplace-v4",
+      "recipient": "SP293M874EPBS7H5EFF1DYAR3P5V1CNKVPK78GXG3",
+      "value_hex": "0x010000000000000000000000000000009d"
+    },
+    {
+      "kind": "non_fungible_token",
+      "operation": "transfer",
+      "asset": "SP2KAF9RF86PVX3NEE27DFV1CQX0T4WGR41X3S45C.byzantion-bitcoin-bulls::bitcoin-bulls",
+      "sender": "SP293M874EPBS7H5EFF1DYAR3P5V1CNKVPK78GXG3",
+      "recipient": "SPNWZ5V2TPWGQGVDR6T7B6RQ4XMGZ4PXTEE0VQ0S.marketplace-v4",
+      "value_hex": "0x010000000000000000000000000000009d"
+    }
+  ]
+}

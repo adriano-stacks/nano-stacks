@@ -48,6 +48,7 @@ mod inventory_schedule;
 mod kill_during_import;
 mod kill_during_replay;
 mod mainnet_accounting;
+mod mainnet_canonical_cost;
 mod mainnet_checkpoint;
 mod mainnet_codec;
 mod mainnet_codegen;
