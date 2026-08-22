@@ -893,6 +893,12 @@ pub(crate) fn call_function_with_argument_sizes(
             .remaining_costs(&mut store)
             .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
         let cost = CostMeter::used_from_remaining(remaining);
+        if std::env::var_os("NANO_TRACE_CHARGES").is_some() {
+            // What one instance reports it used, which is the only amount the
+            // tracker is told about. A charge trace that sums to more than the
+            // sum of these is counting something twice.
+            eprintln!("instance-used {}", cost.runtime);
+        }
         store
             .data_mut()
             .global_context
