@@ -3609,4 +3609,143 @@ mod borrowed_operand_charges {
     fn to_ascii_borrows_its_operand() {
         probe("(to-ascii? x)", Value::UInt(7));
     }
+
+    #[test]
+    fn tuple_get_borrows_its_tuple() {
+        probe("(get a { a: x })", Value::UInt(7));
+    }
+
+    #[test]
+    fn match_borrows_its_subject() {
+        probe("(match (some x) found found u0)", Value::UInt(7));
+    }
+
+    #[test]
+    fn let_borrows_its_binding() {
+        probe("(let ((y x)) y)", Value::UInt(7));
+    }
+
+    #[test]
+    fn and_borrows_its_operands() {
+        probe("(and (> x u0) true)", Value::UInt(7));
+    }
+
+    #[test]
+    fn or_borrows_its_operands() {
+        probe("(or (> x u0) false)", Value::UInt(7));
+    }
+
+    #[test]
+    fn try_borrows_its_subject() {
+        probe("(default-to u0 (some x))", Value::UInt(7));
+    }
+
+    #[test]
+    fn unwrap_borrows_its_subject() {
+        probe("(unwrap! (some x) u0)", Value::UInt(7));
+    }
+
+    #[test]
+    fn element_at_borrows_its_sequence() {
+        probe("(element-at? (list x) u0)", Value::UInt(7));
+    }
+
+    #[test]
+    fn index_of_borrows_its_sequence() {
+        probe("(index-of? (list u1) x)", Value::UInt(7));
+    }
+
+    #[test]
+    fn fold_borrows_its_initial_value() {
+        probe("(fold + (list u1 u2) x)", Value::UInt(7));
+    }
+
+    #[test]
+    fn replace_at_borrows_its_sequence() {
+        probe(
+            "(replace-at? x u0 0x00)",
+            Value::buff_from(vec![1, 2, 3]).expect("buff"),
+        );
+    }
+
+    /// Open finding, not a borrow: `from-consensus-buff?` charges 23 runtime
+    /// units more than the reference on a buff parameter, and skipping the
+    /// operand copy overshoots to 4 units *under*, so the difference is in
+    /// what the word itself is charged rather than in how its operand is read.
+    /// Recorded as ignored with its measurement rather than deleted: task 146
+    /// owns closing it.
+    #[test]
+    #[ignore = "task 146: from-consensus-buff? charge input, not the operand read"]
+    fn from_consensus_buff_borrows_its_bytes() {
+        probe(
+            "(from-consensus-buff? uint x)",
+            Value::buff_from(vec![1, 0, 0, 0, 0, 0, 0, 0, 0]).expect("buff"),
+        );
+    }
+
+    #[test]
+    fn principal_destruct_borrows_its_principal() {
+        probe(
+            "(principal-destruct? x)",
+            Value::Principal(
+                clarity::vm::types::PrincipalData::parse(
+                    "SP2WA4AAQKK4K1FJNEMZB01FHXTZNF8EWEXPX5VC0",
+                )
+                .expect("principal"),
+            ),
+        );
+    }
+
+    #[test]
+    fn secp256k1_verify_borrows_its_hash() {
+        probe(
+            "(secp256k1-verify x \n               0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\n               0x0390a5cac7c33fda49f70bc1b0866fa0ba7a9440d9de647fecb8132ceb76a94dfa)",
+            Value::buff_from(vec![7; 32]).expect("buff"),
+        );
+    }
+
+    #[test]
+    fn stx_balance_of_a_let_binding_borrows() {
+        probe(
+            "(let ((who x)) (stx-get-balance who))",
+            Value::Principal(
+                clarity::vm::types::PrincipalData::parse(
+                    "SP2WA4AAQKK4K1FJNEMZB01FHXTZNF8EWEXPX5VC0",
+                )
+                .expect("principal"),
+            ),
+        );
+    }
+
+    #[test]
+    fn var_set_borrows_its_value() {
+        crosscheck_cost(
+            "(define-data-var v uint u0)
+             (define-public (poke (x uint))
+               (ok (var-set v x)))",
+            "poke",
+            &[Value::UInt(7)],
+        );
+    }
+
+    #[test]
+    fn map_set_borrows_its_value() {
+        crosscheck_cost(
+            "(define-map m uint uint)
+             (define-public (poke (x uint))
+               (ok (map-set m u1 x)))",
+            "poke",
+            &[Value::UInt(7)],
+        );
+    }
+
+    #[test]
+    fn stx_transfer_borrows_its_amount() {
+        crosscheck_cost(
+            "(define-public (poke (x uint))
+               (stx-transfer? x tx-sender 'SP2WA4AAQKK4K1FJNEMZB01FHXTZNF8EWEXPX5VC0))",
+            "poke",
+            &[Value::UInt(1)],
+        );
+    }
 }

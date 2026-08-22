@@ -142,9 +142,12 @@ impl ComplexWord for Verify {
 
         self.charge(generator, builder, 0)?;
 
-        generator.traverse_expr(builder, args.get_expr(0)?)?;
-        generator.traverse_expr(builder, args.get_expr(1)?)?;
-        generator.traverse_expr(builder, args.get_expr(2)?)?;
+        // The reference evaluates these operands itself and reads them through
+        // `as_ref`, so a binding read here is never cloned and never pays
+        // `LookupVariableSize`.
+        generator.traverse_expr_as_borrowed_value(builder, args.get_expr(0)?)?;
+        generator.traverse_expr_as_borrowed_value(builder, args.get_expr(1)?)?;
+        generator.traverse_expr_as_borrowed_value(builder, args.get_expr(2)?)?;
 
         // Call the host interface function, `secp256k1_verify`
         builder.call(

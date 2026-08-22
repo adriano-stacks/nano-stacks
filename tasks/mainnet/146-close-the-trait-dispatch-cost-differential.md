@@ -74,8 +74,19 @@ second block.
 - [x] Reproduce the differential offline through the dual-engine tooling on a
       state snapshot, dimension by dimension, and localize the charging site
       (dynamic callee load, trait argument casting, write-length measurement).
-- [ ] Fix the accounting in the nano-owned cost path; the interpreter remains
-      a dev-only oracle.
+- [x] Fix the length dimensions: charge data words at the executing epoch and
+      size trait references as values, closing every `read_length` and
+      `write_length` difference in the window.
+- [ ] Close the runtime-only residual. Confirmed so far, each with a probe in
+      `clar2wasm`'s `borrowed_operand_charges`: the block-info words,
+      `to-ascii?` and `secp256k1-verify` charged a copy for an operand the
+      reference borrows. Still open: `from-consensus-buff?` charges 23 units
+      too many on a buff parameter, and skipping the operand copy overshoots
+      to 4 under, so the cause is the word's charge input rather than the read
+      (recorded as an ignored probe naming this task); the `+62`, `+8` and
+      `+1281` families are unattributed; and `BNS-V2::name-claim-fast`
+      performs one extra charged read and write, which is operational rather
+      than pricing.
 - [ ] Add the reproduced call shape to the conformance corpus so the gate
       that catches it cannot skip itself, and re-run the mainnet cost sweep
       to zero mismatches.
