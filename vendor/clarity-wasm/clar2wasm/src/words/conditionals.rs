@@ -446,6 +446,13 @@ impl ComplexWord for Match {
                 .0
         });
         generator.bindings.enter_scope()?;
+        // Both arms of a response match bind a name, so both are evaluated one
+        // scope deeper. Restoring between them has to put back the names the
+        // first arm bound without also putting back the scope, or the error
+        // arm is charged its lookups as if the `match` were not there — one
+        // unit short per read. An optional's `none` arm binds nothing and is
+        // evaluated in the enclosing context, so it restores all the way out.
+        let scoped_bindings = generator.bindings.clone();
 
         match generator.get_expr_type(match_on).cloned() {
             Some(TypeSignature::OptionalType(inner_type)) => {
@@ -484,7 +491,10 @@ impl ComplexWord for Match {
                     )?
                 };
 
-                // we can restore early, since the none branch does not bind anything
+                // We can restore early, and all the way out of the match's
+                // scope: the reference evaluates a `none` branch in the
+                // context the match was called in, because that branch binds
+                // no name for it to extend with.
                 generator.bindings = saved_bindings;
 
                 let none_block = if let Some(result_offset) = result_offset {
@@ -551,8 +561,8 @@ impl ComplexWord for Match {
                     )?
                 };
 
-                // restore named locals
-                generator.bindings.clone_from(&saved_bindings);
+                // restore named locals, inside the match's own scope
+                generator.bindings.clone_from(&scoped_bindings);
 
                 // bind err branch local
                 generator.bindings.insert_spilled(

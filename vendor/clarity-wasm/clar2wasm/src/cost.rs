@@ -4564,6 +4564,42 @@ mod borrowed_operand_charges {
             )],
         );
     }
+    /// A `match` arm reads from inside the scope the `match` opened.
+    ///
+    /// Nano restored the binding table between arms from a snapshot taken
+    /// *before* entering that scope, so every arm after the first was charged
+    /// its lookups one level too shallow: `LookupVariableDepth` is `n + 1`, so
+    /// one unit per read, on the error arm of a response match and on the
+    /// `none` arm of an optional one.
+    #[test]
+    fn a_later_match_arm_looks_up_at_its_own_depth() {
+        // The error arm binds and reads a tuple.
+        crosscheck_cost(
+            "(define-public (poke)
+               (let ((d (match (principal-destruct? 'SP2WA4AAQKK4K1FJNEMZB01FHXTZNF8EWEXPX5VC0)
+                          ok-d ok-d err-d err-d)))
+                 (ok (get version d))))",
+            "poke",
+            &[],
+        );
+        // The `none` arm binds nothing but still reads an outer binding.
+        crosscheck_cost(
+            "(define-public (poke (o (optional uint)))
+               (let ((fallback u7))
+                 (ok (match o v v fallback))))",
+            "poke",
+            &[Value::none()],
+        );
+        // And the error arm reading an outer binding rather than its own.
+        crosscheck_cost(
+            "(define-public (poke (r (response uint uint)))
+               (let ((fallback u7))
+                 (ok (match r v v e fallback))))",
+            "poke",
+            &[Value::error(Value::UInt(1)).expect("response")],
+        );
+    }
+
     /// A trait reference inside a sized tuple keeps its trait size.
     ///
     /// Its type size is 1 whatever it points at, so the declaration is already
