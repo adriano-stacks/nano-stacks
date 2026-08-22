@@ -4475,4 +4475,37 @@ mod borrowed_operand_charges {
             &[Value::UInt(1)],
         );
     }
+
+    /// `with-stx` reads its amount borrowed; its sibling allowances clone.
+    ///
+    /// `eval_allowance` reads the `with-stx` operand through `as_ref` and takes
+    /// every `with-ft`, `with-nft` and `with-staking` operand through
+    /// `clone_with_cost`. Nano charged a copy for all of them, so every mainnet
+    /// `(as-contract? ((with-stx amt)) …)` over a bound `uint` paid one extra
+    /// `LookupVariableSize(16)` — 33 units. Both spellings are pinned here so a
+    /// future change cannot make the asymmetry uniform in either direction.
+    #[test]
+    fn allowance_amounts_charge_like_the_reference() {
+        crosscheck_cost(
+            "(define-private (send (amt uint))
+               (as-contract? ((with-stx amt)) true))
+             (define-public (poke (x uint))
+               (ok (send x)))",
+            "poke",
+            &[Value::UInt(100)],
+        );
+        crosscheck_cost(
+            "(define-public (poke (x uint))
+               (ok (as-contract? ((with-staking x)) true)))",
+            "poke",
+            &[Value::UInt(100)],
+        );
+        crosscheck_cost(
+            "(define-fungible-token tok)
+             (define-public (poke (x uint))
+               (ok (as-contract? ((with-ft current-contract \"tok\" x)) true)))",
+            "poke",
+            &[Value::UInt(100)],
+        );
+    }
 }

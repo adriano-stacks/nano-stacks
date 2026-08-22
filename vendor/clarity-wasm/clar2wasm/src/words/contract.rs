@@ -732,8 +732,12 @@ impl ComplexWord for WithStx {
             // Load the externref allowance context (first param)
             builder.local_get(allowance_context);
 
-            // Traverse the allowance amount (uint)
-            generator.traverse_expr(builder, allowance)?;
+            // Traverse the allowance amount (uint). Alone among the allowances,
+            // the reference reads `with-stx`'s amount through `as_ref`, so a
+            // binding read here is never cloned and never pays
+            // `LookupVariableSize`; `with-ft`, `with-nft` and `with-staking`
+            // do clone theirs.
+            generator.traverse_expr_as_borrowed_value(builder, allowance)?;
 
             // Call the host interface function, `with_stx`
             builder.call(generator.func_by_name("stdlib.with_stx"));
