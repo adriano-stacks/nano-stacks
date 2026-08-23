@@ -275,7 +275,7 @@ test = "from_consensus_buff_keeps_declared_widths"
 class = "semantic"
 owner = "146"
 job = "none"
-requires = "nano to size a deserialized value by its declared sequence widths; `try_deserialize_bytes_exact` builds the value against the type it was given, so the same bytes size 164 constructed and 176 deserialized, and nano charges the 164 -- 72 units on xverse-signer-manager-3's stake-update. A map or variable read deserializes against its declared type too, so closing it needs provenance nano does not track today"
+requires = "a field extracted from a deserialized value to keep its parent's declared width, and to narrow again when it crosses into a user function. The value itself now keeps its widths through the runtime-shape arena, which closed 48 of the 72 units on xverse-signer-manager-3; the remaining 24 is the argument type-check of `(get pox-addr pox-addr)`. Deriving the field's entry without the narrowing half was measured moving that transaction from 72 under to 72 over"
 
 [[ignored]]
 test = "the_block_8808752_receipt_matches_the_canonical_record"

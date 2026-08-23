@@ -1293,6 +1293,13 @@ impl WasmGenerator {
         let (merge_shape, _) =
             module.add_import_func("clarity", "merge_runtime_shape", merge_shape_ty);
         module.funcs.get_mut(merge_shape).name = Some("stdlib.merge_runtime_shape".to_owned());
+        let (deserialize_shape, _) =
+            module.add_import_func("clarity", "deserialize_runtime_shape", merge_shape_ty);
+        module.funcs.get_mut(deserialize_shape).name =
+            Some("stdlib.deserialize_runtime_shape".to_owned());
+        let (field_shape, _) =
+            module.add_import_func("clarity", "field_runtime_shape", save_shape_ty);
+        module.funcs.get_mut(field_shape).name = Some("stdlib.field_runtime_shape".to_owned());
         let (handle_size, _) =
             module.add_import_func("clarity", "runtime_shape_size", shape_size_ty);
         module.funcs.get_mut(handle_size).name = Some("stdlib.runtime_shape_size".to_owned());

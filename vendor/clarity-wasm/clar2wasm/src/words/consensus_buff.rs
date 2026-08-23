@@ -138,6 +138,18 @@ impl ComplexWord for ToConsensusBuff {
     }
 }
 
+/// Whether a value of this type has a runtime-shape handle to carry.
+///
+/// Only the composites do: a tuple's or list's representation begins with one,
+/// and everything else is measured from what it holds.
+fn carries_runtime_shape(ty: &TypeSignature) -> bool {
+    matches!(
+        ty,
+        TypeSignature::TupleType(_)
+            | TypeSignature::SequenceType(clarity::vm::types::SequenceSubtype::ListType(_))
+    )
+}
+
 #[derive(Debug)]
 pub struct FromConsensusBuff;
 
@@ -287,6 +299,27 @@ impl ComplexWord for FromConsensusBuff {
         let offset = generator.alloc_local(ValType::I32);
         builder.local_set(offset);
 
+        // Taken here, before the decode scratch can overwrite the input: the
+        // value clarity would have deserialized keeps the declared widths of
+        // its sequences, which nano's representation cannot record. The arena
+        // keeps that value and the handle is how a measurement finds it.
+        let shape_handle = match &ty {
+            TypeSignature::OptionalType(inner) if carries_runtime_shape(inner) => {
+                let (inner_ty_offset, inner_ty_length) =
+                    generator.serialized_type(inner.as_ref())?;
+                let handle = generator.alloc_local(ValType::I32);
+                builder
+                    .local_get(offset)
+                    .local_get(length)
+                    .i32_const(inner_ty_offset)
+                    .i32_const(inner_ty_length)
+                    .call(generator.func_by_name("stdlib.deserialize_runtime_shape"))
+                    .local_set(handle);
+                Some(handle)
+            }
+            _ => None,
+        };
+
         if uses_packed_value(&ty) {
             let result_offset = generator
                 .create_call_stack_local(builder, &ty, true, false)
@@ -317,9 +350,34 @@ impl ComplexWord for FromConsensusBuff {
                 .local_get(length)
                 .local_get(result_offset)
                 .call(helper);
+            // The inner value's handle slot is the first word of its image,
+            // which sits right after the optional's own indicator.
+            if let Some(handle) = shape_handle {
+                let memory = generator.get_memory()?;
+                builder.local_get(result_offset).local_get(handle).store(
+                    memory,
+                    walrus::ir::StoreKind::I32 { atomic: false },
+                    walrus::ir::MemArg {
+                        align: 4,
+                        offset: 4,
+                    },
+                );
+            }
             generator.read_from_memory(builder, result_offset, 0, &ty)?;
         } else {
             self.deserialize_value(generator, builder, &ty, offset, length, None)?;
+            // The unpacked value is on the stack: the optional's indicator,
+            // then the inner value with its handle first. Setting the handle
+            // means going through locals.
+            if let Some(handle) = shape_handle {
+                let locals = generator.save_to_locals(builder, &ty, true);
+                if let Some(slot) = locals.get(1).copied() {
+                    builder.local_get(handle).local_set(slot);
+                }
+                for local in &locals {
+                    builder.local_get(*local);
+                }
+            }
         }
 
         Ok(())

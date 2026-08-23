@@ -282,6 +282,8 @@ pub fn link_host_functions(
     link_admit_function_argument_fn(linker)?;
     link_runtime_shape_is_equal_fn(linker)?;
     link_merge_runtime_shape_fn(linker)?;
+    link_deserialize_runtime_shape_fn(linker)?;
+    link_field_runtime_shape_fn(linker)?;
     link_define_function_fn(linker)?;
     link_define_variable_fn(linker)?;
     link_define_ft_fn(linker)?;
@@ -925,6 +927,115 @@ fn read_runtime_value(
 ///
 /// Returns 0 when the base carries no arena value, which is when nano's own
 /// measurement is already the right one.
+/// Link `deserialize_runtime_shape`: the arena value `from-consensus-buff?`
+/// produces.
+///
+/// `Value::try_deserialize_bytes_exact` builds the value against the type it
+/// was given, so a `(buff 32)` field holding twenty bytes still says 32 — the
+/// same bytes size 164 built from data and 176 deserialized. Nano's own
+/// representation records what it holds, so measuring it charges the 164. The
+/// arena keeps the value the reference would have, and the handle is how a
+/// measurement finds it.
+///
+/// Returns 0 when the bytes do not deserialize to the type, which is the
+/// `none` result, and nothing then reads the value.
+/// Link `field_runtime_shape`: the arena value a tuple field of an arena value
+/// is.
+///
+/// A tuple keeps the type signature it was built with, so the field pulled out
+/// of it keeps the width that signature gave it. Nano's representation of the
+/// extracted field carries no handle of its own, so without this the field
+/// falls back to being measured, which narrows it.
+///
+/// Returns 0 when the parent carries no arena value or the field is absent.
+fn link_field_runtime_shape_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "field_runtime_shape",
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             base_handle: i32,
+             name_offset: i32,
+             name_length: i32| {
+                crate::phases::time(crate::phases::Phase::ShapeSave, || {
+                    if base_handle == 0 {
+                        return Ok(0i32);
+                    }
+                    let memory = caller
+                        .data()
+                        .memory
+                        .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                    let name =
+                        read_identifier_from_wasm(memory, &mut caller, name_offset, name_length)?;
+                    let base = match caller.data().load_runtime_shape(base_handle)? {
+                        Value::Tuple(base) => base,
+                        _ => Err(crate::error::wasm_error(WasmError::ValueTypeMismatch))?,
+                    };
+                    let Some(field) = base.data_map.get(name.as_str()) else {
+                        return Ok(0i32);
+                    };
+                    let field = field.clone();
+                    Ok(caller.data_mut().save_runtime_shape(field)?)
+                })
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "field_runtime_shape".to_owned(),
+                error,
+            ))
+        })
+}
+
+fn link_deserialize_runtime_shape_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "deserialize_runtime_shape",
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             bytes_offset: i32,
+             bytes_length: i32,
+             serialized_ty_offset: i32,
+             serialized_ty_length: i32| {
+                crate::phases::time(crate::phases::Phase::ShapeSave, || {
+                    let (memory, value_ty) = runtime_value_type(
+                        &mut caller,
+                        serialized_ty_offset,
+                        serialized_ty_length,
+                    )?;
+                    let mut bytes = vec![0u8; usize::try_from(bytes_length).unwrap_or(0)];
+                    memory
+                        .read(
+                            &mut caller,
+                            usize::try_from(bytes_offset).unwrap_or(0),
+                            &mut bytes,
+                        )
+                        .map_err(|error| {
+                            crate::error::wasm_error(WasmError::UnableToReadMemory(error.into()))
+                        })?;
+                    let sanitize = caller.data().global_context.epoch_id.value_sanitizing();
+                    let Ok(value) = Value::try_deserialize_bytes_exact(&bytes, &value_ty, sanitize)
+                    else {
+                        return Ok(0i32);
+                    };
+                    Ok(caller.data_mut().save_runtime_shape(value)?)
+                })
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "deserialize_runtime_shape".to_owned(),
+                error,
+            ))
+        })
+}
+
 fn link_merge_runtime_shape_fn(
     linker: &mut Linker<ClarityWasmContext>,
 ) -> Result<(), VmExecutionError> {
@@ -7920,6 +8031,18 @@ pub fn dummy_linker<T: 'static>(engine: &Engine) -> Result<Linker<T>, wasmtime::
         "clarity",
         "merge_runtime_shape",
         |_base_handle: i32, _updates_offset: i32, _type_offset: i32, _type_length: i32| Ok(0i32),
+    )?;
+
+    linker.func_wrap(
+        "clarity",
+        "deserialize_runtime_shape",
+        |_bytes_offset: i32, _bytes_length: i32, _type_offset: i32, _type_length: i32| Ok(0i32),
+    )?;
+
+    linker.func_wrap(
+        "clarity",
+        "field_runtime_shape",
+        |_base_handle: i32, _name_offset: i32, _name_length: i32| Ok(0i32),
     )?;
 
     link_skip_list(&mut linker)?;

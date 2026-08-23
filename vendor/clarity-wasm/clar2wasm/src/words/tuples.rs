@@ -207,6 +207,13 @@ impl ComplexWord for TupleGet {
         }
         // Drop the tuple's root runtime-shape handle. The extracted field's
         // own handle, if composite, remains part of that field's slots.
+        //
+        // Deriving an arena entry for the field here is tempting and wrong on
+        // its own: the reference does keep the parent's width at the extraction
+        // itself, but sanitises the value back to what its data says on the way
+        // into a user function, so a field that is immediately passed on must
+        // narrow again. Measured on `xverse-signer-manager-3`, deriving without
+        // that second half moves the transaction from 72 under to 72 over.
         builder.drop();
 
         if tuple_is_optional {

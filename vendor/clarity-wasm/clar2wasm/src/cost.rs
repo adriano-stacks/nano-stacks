@@ -4706,12 +4706,22 @@ mod borrowed_operand_charges {
     /// left of that transaction's difference from the chain: with the two
     /// fixes above it charges 6,374,811 against the chain's 6,374,883.
     ///
-    /// Recorded as ignored with its measurement rather than deleted, because
-    /// closing it needs provenance nano does not track today: a map or
-    /// variable read deserializes against its declared type too, so the rule
-    /// is not local to this word.
+    /// Half closed: the value itself now keeps its widths, a field pulled out
+    /// of it does not.
+    ///
+    /// The deserialized value is kept in the runtime-shape arena, so reading
+    /// *it* finds the widths rather than the bytes — 48 of the 72 units this
+    /// once cost on `xverse-signer-manager-3`. What is left is the argument
+    /// type-check of `(get pox-addr pox-addr)`, which the reference charges at
+    /// the parent's width and nano at the field's own.
+    ///
+    /// Deriving an arena entry for the field is not enough on its own, and was
+    /// measured making things worse: the reference sanitises a value back to
+    /// what its data says on the way into a user function, so the same field
+    /// has to narrow again one call later. Doing the extraction half without
+    /// the narrowing half moves this transaction from 72 under to 72 over.
     #[test]
-    #[ignore = "task 146: deserialized values keep their declared sequence widths"]
+    #[ignore = "task 146: a field of a deserialized value narrows at the extraction"]
     fn from_consensus_buff_keeps_declared_widths() {
         let name = clarity::vm::ClarityName::from_literal;
         let inner = Value::Tuple(
