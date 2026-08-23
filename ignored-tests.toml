@@ -271,11 +271,11 @@ job = "release-qualification"
 requires = "running Hacknet node on localhost:20443 and Bitcoin Core on localhost:18443"
 
 [[ignored]]
-test = "from_consensus_buff_borrows_its_bytes"
+test = "from_consensus_buff_keeps_declared_widths"
 class = "semantic"
 owner = "146"
 job = "none"
-requires = "the from-consensus-buff? charge input to match the reference; the word charges 23 runtime units too many on a buff parameter, and skipping its operand copy overshoots to 4 under, so the cause is the charge input rather than the read"
+requires = "nano to size a deserialized value by its declared sequence widths; `try_deserialize_bytes_exact` builds the value against the type it was given, so the same bytes size 164 constructed and 176 deserialized, and nano charges the 164 -- 72 units on xverse-signer-manager-3's stake-update. A map or variable read deserializes against its declared type too, so closing it needs provenance nano does not track today"
 
 [[ignored]]
 test = "the_block_8808752_receipt_matches_the_canonical_record"

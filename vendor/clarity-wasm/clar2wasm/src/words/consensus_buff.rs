@@ -5,7 +5,7 @@ use walrus::{FunctionBuilder, InstrSeqBuilder, LocalId, ValType};
 
 use super::{ComplexWord, Word};
 use crate::check_args;
-use crate::cost::WordCharge;
+use crate::cost::{ChargeGenerator, WordCharge};
 use crate::wasm_generator::{
     add_placeholder_for_clarity_type, clar2wasm_ty, drop_value, uses_packed_value, ArgumentsExt,
     GeneratorError, WasmGenerator, MAX_WASM_TYPE_ARITY,
@@ -268,8 +268,17 @@ impl ComplexWord for FromConsensusBuff {
                 )
             })?
             .clone();
+        // The reference parses the type argument before it evaluates the
+        // buffer, and `parse_type_repr` charges a step per type node it
+        // recurses through: five for
+        // `{pox-addr: {version: (buff 1), hashbytes: (buff 32)}, max-fee: uint}`.
+        generator.charge_type_parse(builder, args.get_expr(0)?)?;
+
         // Traverse the input buffer, leaving the offset and length on the stack.
-        generator.traverse_expr(builder, args.get_expr(1)?)?;
+        // The reference reads it through `as_ref` to borrow the bytes it
+        // deserializes, so a binding read here is never cloned and never pays
+        // `LookupVariableSize`.
+        generator.traverse_expr_as_borrowed_value(builder, args.get_expr(1)?)?;
 
         let length = generator.alloc_local(ValType::I32);
         builder.local_tee(length);

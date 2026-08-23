@@ -1750,8 +1750,11 @@ mod word {
         2 => CostMeter { runtime: 549,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
         3 => CostMeter { runtime: 479,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
+    // 409, not 405: the type argument costs a `TypeParseStep` the word did
+    // not used to charge, which is one node here and five on mainnet's
+    // `{pox-addr: {version, hashbytes}, max-fee}`.
     decl_tests!("from_consensus_buff", "(from-consensus-buff? int 0x0000000000000000000000000000000001)", {
-        3 => CostMeter { runtime: 405,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
+        3 => CostMeter { runtime: 409,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
     });
     decl_tests!("to_consensus_buff", "(to-consensus-buff? 1)", {
         3 => CostMeter { runtime: 266,  read_count: 0, read_length: 0, write_count: 0, write_length: 0 },
@@ -3875,14 +3878,14 @@ mod borrowed_operand_charges {
         );
     }
 
-    /// Open finding, not a borrow: `from-consensus-buff?` charges 23 runtime
-    /// units more than the reference on a buff parameter, and skipping the
-    /// operand copy overshoots to 4 units *under*, so the difference is in
-    /// what the word itself is charged rather than in how its operand is read.
-    /// Recorded as ignored with its measurement rather than deleted: task 146
-    /// owns closing it.
+    /// `from-consensus-buff?` borrows its bytes and pays for its type.
+    ///
+    /// Both halves were needed, which is why closing this took two goes: the
+    /// reference reads the buffer through `as_ref`, and it parses the type
+    /// argument first, charging a `TypeParseStep` per node it recurses
+    /// through. Dropping only the operand copy left it 4 units under — one
+    /// unparsed `uint` — which is what the earlier measurement recorded.
     #[test]
-    #[ignore = "task 146: from-consensus-buff? charge input, not the operand read"]
     fn from_consensus_buff_borrows_its_bytes() {
         probe(
             "(from-consensus-buff? uint x)",
@@ -4647,6 +4650,105 @@ mod borrowed_operand_charges {
                     contract_identifier: caller,
                 })),
             })],
+        );
+    }
+
+    /// The mainnet shape: a nested type argument and a bound buffer.
+    ///
+    /// `xverse-signer-manager-3` deserializes
+    /// `{pox-addr: {version: (buff 1), hashbytes: (buff 32)}, max-fee: uint}`
+    /// out of a `signer-calldata` binding, which is five type nodes and a
+    /// borrowed read. Nano charged the read and none of the nodes: +199 on
+    /// this snippet, and +103 on the transaction.
+    #[test]
+    fn from_consensus_buff_charges_a_nested_type_argument() {
+        let name = clarity::vm::ClarityName::from_literal;
+        let inner = Value::Tuple(
+            clarity::vm::types::TupleData::from_data(vec![
+                (name("version"), Value::buff_from(vec![4]).expect("buff")),
+                (
+                    name("hashbytes"),
+                    Value::buff_from(vec![7; 32]).expect("buff"),
+                ),
+            ])
+            .expect("inner"),
+        );
+        let outer = Value::Tuple(
+            clarity::vm::types::TupleData::from_data(vec![
+                (name("pox-addr"), inner),
+                (name("max-fee"), Value::UInt(1)),
+            ])
+            .expect("outer"),
+        );
+        let encoded = outer.serialize_to_vec().expect("serialized");
+        crosscheck_cost(
+            "(define-public (poke (calldata (buff 500)))
+               (let ((pox-addr (unwrap-panic (from-consensus-buff?
+                       {pox-addr: {version: (buff 1), hashbytes: (buff 32)}, max-fee: uint}
+                       calldata))))
+                 (ok (len (get hashbytes (get pox-addr pox-addr))))))",
+            "poke",
+            &[Value::buff_from(encoded).expect("calldata")],
+        );
+    }
+
+    /// Open finding: a value `from-consensus-buff?` produced keeps the
+    /// *declared* widths of its sequences, and its size follows them.
+    ///
+    /// `try_deserialize_bytes_exact` builds the value against the type it was
+    /// given, so the tuple's stored signature says `(buff 32)` even when the
+    /// bytes are 20 long — measured directly, the same bytes size 164
+    /// constructed and 176 deserialized, either way sanitized or not. Nano
+    /// measures the representation it holds, so it charges the 164.
+    ///
+    /// On `xverse-signer-manager-3`'s `stake-update` that is 72 units across
+    /// two reads and one argument type-check, and it is the whole of what is
+    /// left of that transaction's difference from the chain: with the two
+    /// fixes above it charges 6,374,811 against the chain's 6,374,883.
+    ///
+    /// Recorded as ignored with its measurement rather than deleted, because
+    /// closing it needs provenance nano does not track today: a map or
+    /// variable read deserializes against its declared type too, so the rule
+    /// is not local to this word.
+    #[test]
+    #[ignore = "task 146: deserialized values keep their declared sequence widths"]
+    fn from_consensus_buff_keeps_declared_widths() {
+        let name = clarity::vm::ClarityName::from_literal;
+        let inner = Value::Tuple(
+            clarity::vm::types::TupleData::from_data(vec![
+                (name("version"), Value::buff_from(vec![4]).expect("buff")),
+                (
+                    name("hashbytes"),
+                    Value::buff_from(vec![7; 20]).expect("buff"),
+                ),
+            ])
+            .expect("inner"),
+        );
+        let outer = Value::Tuple(
+            clarity::vm::types::TupleData::from_data(vec![
+                (name("pox-addr"), inner),
+                (name("max-fee"), Value::UInt(1)),
+            ])
+            .expect("outer"),
+        );
+        let encoded = outer.serialize_to_vec().expect("serialized");
+        crosscheck_cost(
+            "(define-map pox-addrs principal
+               {pox-addr: {version: (buff 1), hashbytes: (buff 32)}, max-fee: uint})
+             (define-private (check-pox-addr (a {version: (buff 1), hashbytes: (buff 32)}))
+               (ok true))
+             (define-public (poke (signer-calldata (optional (buff 500))))
+               (ok (match signer-calldata
+                     calldata
+                     (let ((pox-addr (unwrap-panic (from-consensus-buff?
+                             {pox-addr: {version: (buff 1), hashbytes: (buff 32)}, max-fee: uint}
+                             calldata))))
+                       (unwrap-panic (check-pox-addr (get pox-addr pox-addr)))
+                       (map-set pox-addrs tx-sender pox-addr)
+                       true)
+                     false)))",
+            "poke",
+            &[Value::some(Value::buff_from(encoded).expect("calldata")).expect("optional")],
         );
     }
 }
