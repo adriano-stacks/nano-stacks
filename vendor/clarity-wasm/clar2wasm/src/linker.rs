@@ -281,6 +281,7 @@ pub fn link_host_functions(
     link_runtime_sequence_element_size_fn(linker)?;
     link_admit_function_argument_fn(linker)?;
     link_runtime_shape_is_equal_fn(linker)?;
+    link_merge_runtime_shape_fn(linker)?;
     link_define_function_fn(linker)?;
     link_define_variable_fn(linker)?;
     link_define_ft_fn(linker)?;
@@ -911,6 +912,58 @@ fn read_runtime_value(
              {value_ty} could not be read: {error}"
         )))
     })
+}
+
+/// Link `merge_runtime_shape`: the arena value a `merge` of an arena value is.
+///
+/// `TupleData::shallow_merge` keeps the *base's* type signature and overrides
+/// only the updated fields' types, so a merge of a value that came out of the
+/// database keeps that value's declared widths — `(string-ascii 32)` stays 32
+/// wide however short the string in it is. Rebuilding the merged value from
+/// nano's representation instead measures the string, which is how
+/// `arkadiko-swap-v2-1` charged 623 for a pair the chain charges 646.
+///
+/// Returns 0 when the base carries no arena value, which is when nano's own
+/// measurement is already the right one.
+fn link_merge_runtime_shape_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "merge_runtime_shape",
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             base_handle: i32,
+             updates_offset: i32,
+             serialized_ty_offset: i32,
+             serialized_ty_length: i32| {
+                if base_handle == 0 {
+                    return Ok(0i32);
+                }
+                let base = match caller.data().load_runtime_shape(base_handle)? {
+                    Value::Tuple(base) => base,
+                    _ => Err(crate::error::wasm_error(WasmError::ValueTypeMismatch))?,
+                };
+                let updates = match read_runtime_value(
+                    &mut caller,
+                    updates_offset,
+                    serialized_ty_offset,
+                    serialized_ty_length,
+                )? {
+                    Value::Tuple(updates) => updates,
+                    _ => Err(crate::error::wasm_error(WasmError::ValueTypeMismatch))?,
+                };
+                let merged = clarity::vm::types::TupleData::shallow_merge(base, updates);
+                Ok(caller.data_mut().save_runtime_shape(Value::Tuple(merged))?)
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "merge_runtime_shape".to_owned(),
+                error,
+            ))
+        })
 }
 
 fn link_runtime_shape_is_equal_fn(
@@ -7861,6 +7914,12 @@ pub fn dummy_linker<T: 'static>(engine: &Engine) -> Result<Linker<T>, wasmtime::
         "clarity",
         "runtime_shape_is_equal",
         |_first_offset: i32, _second_offset: i32, _type_offset: i32, _type_length: i32| Ok(0i32),
+    )?;
+
+    linker.func_wrap(
+        "clarity",
+        "merge_runtime_shape",
+        |_base_handle: i32, _updates_offset: i32, _type_offset: i32, _type_length: i32| Ok(0i32),
     )?;
 
     link_skip_list(&mut linker)?;

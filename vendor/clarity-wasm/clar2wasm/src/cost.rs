@@ -4792,4 +4792,54 @@ mod borrowed_operand_charges {
             &[],
         );
     }
+    /// A `merge` of a stored value keeps that value's declared widths.
+    ///
+    /// `TupleData::shallow_merge` keeps the *base's* type signature and
+    /// overrides only the updated fields' types, so a merge of a value that
+    /// came out of the database still says `(string-ascii 32)` however short
+    /// the string in it is. Nano rebuilt the merged value from its own
+    /// representation and measured the string, which is how
+    /// `arkadiko-swap-v2-1` charged 623 for a pair the chain charges 646 — 92
+    /// units a swap, and the `-184`, `-92` and `-88` of five transactions.
+    #[test]
+    fn a_merge_of_a_stored_value_keeps_its_declared_widths() {
+        crosscheck_cost(
+            "(define-map m uint {n: (string-ascii 32), b: uint})
+             (define-public (poke)
+               (begin
+                 (map-set m u1 {n: \"ab\", b: u2})
+                 (let ((v (unwrap-panic (map-get? m u1)))
+                       (w (merge v {b: u3})))
+                   (map-set m u2 w)
+                   (print w)
+                   (ok u0))))",
+            "poke",
+            &[],
+        );
+        // A merge of a value that was *not* stored keeps measuring what it
+        // holds, so the fix cannot be "always use the declaration"; and a
+        // merge that overrides the wide field itself takes the override's own
+        // width, not the base's.
+        crosscheck_cost(
+            "(define-public (poke)
+               (let ((v {n: \"ab\", b: u2})
+                     (w (merge v {b: u3})))
+                 (print w)
+                 (ok u0)))",
+            "poke",
+            &[],
+        );
+        crosscheck_cost(
+            "(define-map m uint {n: (string-ascii 32), b: uint})
+             (define-public (poke)
+               (begin
+                 (map-set m u1 {n: \"abcdefgh\", b: u2})
+                 (let ((v (unwrap-panic (map-get? m u1)))
+                       (w (merge v {n: \"z\"})))
+                   (print w)
+                   (ok u0))))",
+            "poke",
+            &[],
+        );
+    }
 }

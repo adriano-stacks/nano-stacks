@@ -364,10 +364,22 @@ impl ComplexWord for TupleMerge {
                 drop_value(builder, ty_);
             }
         }
-        builder.drop();
+        // The base's runtime-shape handle, kept rather than dropped: a merge of
+        // an arena value is itself one, and `TupleData::shallow_merge` keeps the
+        // base's type signature. Measuring the merged representation instead
+        // narrows every declared width the base was carrying.
+        let base_handle = generator.alloc_local(ValType::I32);
+        builder.local_set(base_handle);
 
         // Traverse the RHS tuple argument, leaving it on top of the stack.
         generator.traverse_expr(builder, &args[1])?;
+
+        // Round-trip the overrides through memory so the host can read them
+        // back as a value; the stack is left exactly as it was found.
+        let rhs_ty = TypeSignature::TupleType(rhs_tuple_ty.clone());
+        let (rhs_image, _) = generator.create_call_stack_local(builder, &rhs_ty, true, false);
+        generator.write_to_memory(builder, rhs_image, 0, &rhs_ty)?;
+        generator.read_from_memory(builder, rhs_image, 0, &rhs_ty)?;
 
         if generator.charges_serialized_sizes() {
             generator.serialization_size(builder, &rhs_tuple_ty.clone().into())?;
@@ -400,8 +412,16 @@ impl ComplexWord for TupleMerge {
         }
         builder.drop();
 
-        // Now we load the result locals onto the stack
-        builder.i32_const(0);
+        // Now we load the result locals onto the stack, under the handle of
+        // the arena value this merge is. The host answers 0 when the base
+        // carried none, which is when nano's own measurement is already right.
+        let (rhs_ty_offset, rhs_ty_length) = generator.serialized_type(&rhs_ty)?;
+        builder
+            .local_get(base_handle)
+            .local_get(rhs_image)
+            .i32_const(rhs_ty_offset)
+            .i32_const(rhs_ty_length)
+            .call(generator.func_by_name("stdlib.merge_runtime_shape"));
         result_locals.into_values().flatten().for_each(|local| {
             builder.local_get(local);
         });

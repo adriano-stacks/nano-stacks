@@ -1286,6 +1286,13 @@ impl WasmGenerator {
             module.add_import_func("clarity", "runtime_sequence_element_size", save_shape_ty);
         module.funcs.get_mut(element_size).name =
             Some("stdlib.runtime_sequence_element_size".to_owned());
+        let merge_shape_ty = module.types.add(
+            &[ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            &[ValType::I32],
+        );
+        let (merge_shape, _) =
+            module.add_import_func("clarity", "merge_runtime_shape", merge_shape_ty);
+        module.funcs.get_mut(merge_shape).name = Some("stdlib.merge_runtime_shape".to_owned());
         let (handle_size, _) =
             module.add_import_func("clarity", "runtime_shape_size", shape_size_ty);
         module.funcs.get_mut(handle_size).name = Some("stdlib.runtime_shape_size".to_owned());
