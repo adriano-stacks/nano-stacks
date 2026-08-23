@@ -133,6 +133,15 @@ impl ComplexWord for TupleCons {
     }
 }
 
+/// Whether a value of this type has a runtime-shape handle in its first slot.
+fn carries_runtime_shape(ty: &TypeSignature) -> bool {
+    matches!(
+        ty,
+        TypeSignature::TupleType(_)
+            | TypeSignature::SequenceType(clarity::vm::types::SequenceSubtype::ListType(_))
+    )
+}
+
 #[derive(Debug)]
 pub struct TupleGet;
 
@@ -205,16 +214,30 @@ impl ComplexWord for TupleGet {
                 drop_value(builder, field_ty);
             }
         }
-        // Drop the tuple's root runtime-shape handle. The extracted field's
-        // own handle, if composite, remains part of that field's slots.
+        // A tuple keeps the type signature it was built with, so the field
+        // pulled out of it keeps the width that signature gave it, and the
+        // field's own slots carry no handle unless something puts one there.
         //
-        // Deriving an arena entry for the field here is tempting and wrong on
-        // its own: the reference does keep the parent's width at the extraction
-        // itself, but sanitises the value back to what its data says on the way
-        // into a user function, so a field that is immediately passed on must
-        // narrow again. Measured on `xverse-signer-manager-3`, deriving without
-        // that second half moves the transaction from 72 under to 72 over.
-        builder.drop();
+        // The other half of this lives at the callee's parameter admission,
+        // which clears the handle again: the reference keeps the parent's width
+        // at the extraction and then sanitises back to what the data says on
+        // the way into a user function. Either half alone is wrong — deriving
+        // without clearing moved `xverse-signer-manager-3` from 72 under to 72
+        // over.
+        let root_handle = generator.alloc_local(ValType::I32);
+        builder.local_set(root_handle);
+        if carries_runtime_shape(&field_ty) {
+            let (name_offset, name_length) =
+                generator.add_string_literal(target_field_name.as_str())?;
+            if let Some(slot) = val_locals.last().copied() {
+                builder
+                    .local_get(root_handle)
+                    .i32_const(name_offset as i32)
+                    .i32_const(name_length as i32)
+                    .call(generator.func_by_name("stdlib.field_runtime_shape"))
+                    .local_set(slot);
+            }
+        }
 
         if tuple_is_optional {
             // The interpreter passes `none` through without charging

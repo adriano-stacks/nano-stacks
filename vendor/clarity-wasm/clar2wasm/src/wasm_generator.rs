@@ -632,6 +632,14 @@ fn type_size_plan(ty: &TypeSignature) -> TypeSizePlan {
     }
 }
 
+/// Whether a value of this type has a runtime-shape handle in its first slot.
+fn carries_runtime_shape(ty: &TypeSignature) -> bool {
+    matches!(
+        ty,
+        TypeSignature::TupleType(_) | TypeSignature::SequenceType(SequenceSubtype::ListType(_))
+    )
+}
+
 /// Whether a binding of this type resolves through the callable context.
 ///
 /// In a Clarity 1 contract a trait argument lives *only* in the callable
@@ -4580,6 +4588,33 @@ impl WasmGenerator {
             }
             BindingStorage::Memory { base, delta } => {
                 self.write_to_memory(builder, *base, *delta, ty)?;
+            }
+        }
+
+        // The admitted value is the sanitised one, and the reference sanitises
+        // back to what the data says: a field that arrived carrying its
+        // parent's declared width is read inside the callee at its own. The
+        // representation now holds that value whole, so the arena entry it came
+        // with is both redundant and wrong to keep — measuring through it would
+        // answer the caller's width for the callee's binding.
+        if carries_runtime_shape(ty) {
+            match storage {
+                BindingStorage::Locals(locals) => {
+                    if let Some(handle) = locals.first() {
+                        builder.i32_const(0).local_set(*handle);
+                    }
+                }
+                BindingStorage::Memory { base, delta } => {
+                    let memory = self.get_memory()?;
+                    builder.local_get(*base).i32_const(0).store(
+                        memory,
+                        walrus::ir::StoreKind::I32 { atomic: false },
+                        walrus::ir::MemArg {
+                            align: 4,
+                            offset: *delta,
+                        },
+                    );
+                }
             }
         }
         Ok(())

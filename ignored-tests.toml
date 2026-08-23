@@ -271,13 +271,6 @@ job = "release-qualification"
 requires = "running Hacknet node on localhost:20443 and Bitcoin Core on localhost:18443"
 
 [[ignored]]
-test = "from_consensus_buff_keeps_declared_widths"
-class = "semantic"
-owner = "146"
-job = "none"
-requires = "a field extracted from a deserialized value to keep its parent's declared width, and to narrow again when it crosses into a user function. The value itself now keeps its widths through the runtime-shape arena, which closed 48 of the 72 units on xverse-signer-manager-3; the remaining 24 is the argument type-check of `(get pox-addr pox-addr)`. Deriving the field's entry without the narrowing half was measured moving that transaction from 72 under to 72 over"
-
-[[ignored]]
 test = "the_block_8808752_receipt_matches_the_canonical_record"
 class = "infrastructure"
 owner = "146"

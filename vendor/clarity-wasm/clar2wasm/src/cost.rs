@@ -4706,22 +4706,21 @@ mod borrowed_operand_charges {
     /// left of that transaction's difference from the chain: with the two
     /// fixes above it charges 6,374,811 against the chain's 6,374,883.
     ///
-    /// Half closed: the value itself now keeps its widths, a field pulled out
-    /// of it does not.
+    /// A deserialized value keeps its declared widths, and a field of it keeps
+    /// them until it crosses into a callee.
     ///
-    /// The deserialized value is kept in the runtime-shape arena, so reading
-    /// *it* finds the widths rather than the bytes — 48 of the 72 units this
-    /// once cost on `xverse-signer-manager-3`. What is left is the argument
-    /// type-check of `(get pox-addr pox-addr)`, which the reference charges at
-    /// the parent's width and nano at the field's own.
+    /// `try_deserialize_bytes_exact` builds the value against the type it was
+    /// given, so a `(buff 32)` field holding twenty bytes still says 32 — the
+    /// same bytes size 164 built from data and 176 deserialized. Three things
+    /// had to line up: the value is kept in the runtime-shape arena, a field
+    /// pulled out of it derives its own entry, and the callee's parameter
+    /// admission clears that entry again, because the reference sanitises back
+    /// to what the data says on the way in.
     ///
-    /// Deriving an arena entry for the field is not enough on its own, and was
-    /// measured making things worse: the reference sanitises a value back to
-    /// what its data says on the way into a user function, so the same field
-    /// has to narrow again one call later. Doing the extraction half without
-    /// the narrowing half moves this transaction from 72 under to 72 over.
+    /// Either of the last two alone is wrong in a measurable way: with the
+    /// extraction and without the clearing, `xverse-signer-manager-3` goes from
+    /// 72 units under the chain to 72 over.
     #[test]
-    #[ignore = "task 146: a field of a deserialized value narrows at the extraction"]
     fn from_consensus_buff_keeps_declared_widths() {
         let name = clarity::vm::ClarityName::from_literal;
         let inner = Value::Tuple(
