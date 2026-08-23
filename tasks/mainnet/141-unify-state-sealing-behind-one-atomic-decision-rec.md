@@ -37,6 +37,35 @@ plus side-store durability protocol without sacrificing checkpoint compatibility
 - [ ] Remove the old two-store commit path after a complete shadow replay and
       recovery qualification; do not retain a runtime fallback.
 
+## Measured status, 2026-08-23
+
+As with [[140-extract-the-epoch-4-0-consensus-firewall]], the checkboxes
+understate the tree, so this records what is in it.
+
+**The sealed record is durable already.** `crates/nano-chainstate/src/decision.rs`
+holds it and commit `290abcc6` made it durable beside the ledger, with the type
+also reached from `nano-vm` and `epoch4-consensus`.
+
+**Fault injection is largely built, for the current protocol.**
+`nano-conformance/tests/conformance/storage_faults.rs` carries seven tests
+covering `ENOSPC`, `EIO`, corruption, `fsync`, rename, truncation and interrupted
+writes, and `kill_during_replay.rs` six more. What the task asks for beyond that
+is power-loss simulation and an *interrupted migration*, and the latter cannot be
+tested before the migration in the fifth box exists.
+
+**What is genuinely absent is the visibility switch.** Nothing in
+`nano-node/src/runtime.rs` reads a decision record, so it is not yet the only
+committed-block visibility point for chain reads, RPC, events, restart and fork
+switching. Until it is, the streaming migration, the benchmark set against
+mainnet catch-up and pruning, and the removal of the two-store commit path all
+stay ahead rather than behind.
+
+The nearest real-world datum arrived today from the release import rather than
+from a test: a checkpoint import is *not* resumable, because journalling is off
+while it runs and a partial trie cannot be told apart from a complete one by
+reading it. That is exactly the class of torn intermediate state this task exists
+to abolish, and it is worth carrying into the design as a worked example.
+
 ## Acceptance Criteria
 
 - A block is either absent or fully visible with its exact decision record after
