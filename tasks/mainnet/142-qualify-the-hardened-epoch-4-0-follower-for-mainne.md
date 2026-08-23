@@ -76,7 +76,37 @@ using it as a shortcut:
 
 A run from a clean worktree at the same revision is the way to see what else is
 outstanding once the tree settles, since a worktree at HEAD satisfies the
-reproducible-input rule without disturbing anyone's working copy.
+reproducible-input rule without disturbing anyone's working copy. Done from
+`/home/aldur/release-build-88920833`, the report clears the revision section
+(`branch HEAD (clean)`) and stops one step later:
+
+```text
+release candidate
+  FAIL: qualification requires --candidate and --public-key
+```
+
+**That candidate cannot be produced on this host, by design.**
+`release-candidate prepare` requires `--secret-key <minisign.key>` and
+`--public-key <minisign.pub>` alongside the checkpoint, its builder policy and
+signatures, a provenance file or state directory, a Bitcoin RPC and a RustSec
+advisory database. Everything but the keys is here — the advisory DB is at
+`~/.cargo/advisory-db`, and the re-attested bundle, `builder-policy.toml` and
+`signatures-ee7af998` are in place. No minisign key exists anywhere on the host,
+and `release/README.md` writes the public one as
+`/path/from/a/trusted/channel/minisign.pub`, so the release signing material is
+meant to arrive from outside this machine. Generating a release identity here
+would fabricate the very thing the trusted channel exists to establish.
+
+So this gate has three distinct prerequisites, and only one is a clock: a tree with
+no build-relevant changes (task 147), the operator's minisign key material, and
+the full-cycle interval above.
+
+The precedent artifact says the same thing about what freezing a build does and
+does not achieve — `/home/aldur/release-candidate-3018ac4a/ARTIFACT.md`: *"This
+freezes the candidate artifact. It is not live qualification evidence until it
+imports the independently signed checkpoint and completes the required tip hold
+and full-cycle runs."* Importing the independently signed checkpoint is what the
+subject started doing on 2026-08-23; the tip hold and full cycle follow it.
 
 ## Acceptance Criteria
 
