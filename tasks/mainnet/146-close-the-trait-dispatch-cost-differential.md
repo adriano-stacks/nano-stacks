@@ -131,6 +131,18 @@ second block.
       and `+24`, `-88`, `-92` singletons. `BNS-V2::name-claim-fast` performs
       one extra charged read and write, which is operational rather than
       pricing.
+- [ ] Size a charge from the type signature the *value* carries, which is the
+      one class most of the ten remaining transactions belong to. The reference
+      always uses it, and it differs from anything nano holds: a value built in
+      Clarity carries the data's own widths, while one
+      `try_deserialize_bytes_exact` produced carries the declared widths it was
+      deserialized against. Nano measures its representation in one place and
+      reads the analysis type in another, so it lands on either side — 72 under
+      on `xverse-signer-manager-3`, and 24 over on `pyth-lazer-decoder-v1`,
+      where `append`'s `max(entry type, element type)` is 658 against the
+      chain's 538. One change, not several, and a large one: it wants the value's
+      own signature available where a charge asks for its size.
+
 - [ ] Add the reproduced call shape to the conformance corpus so the gate
       that catches it cannot skip itself, and re-run the mainnet cost sweep
       to zero mismatches.
