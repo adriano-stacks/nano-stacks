@@ -37,6 +37,37 @@ consensus rules in place.
 - [ ] Measure throughput, catch-up latency and restart behavior; retain no
       fallback to the old executor after migration.
 
+## Measured status, 2026-08-23
+
+The checkboxes above understated what exists, so this records what is in the tree
+rather than what was planned. `crates/epoch4-consensus` is 758 lines across
+`lib.rs`, `request.rs`, `host.rs` and `src/bin/epoch4-executor.rs`.
+
+**The executor process and its protocol exist.** `epoch4-executor` is a 48-line
+shell over `host::serve` that takes a state directory and a network and hands over
+stdin and stdout: "one process, one state directory, no listener and no client
+capability." The protocol is versioned by schema strings (`STAND_SCHEMA`,
+`READY_SCHEMA`, `PROTOCOL_ERROR_SCHEMA`), bounded by `MAX_LINE_BYTES` with a
+`Line::TooLong` refusal answered as `a protocol line exceeds the bounded
+maximum`, and authenticated by construction rather than by a token, since a pipe
+has exactly one writer and the process opens no socket. Commit `35dad1cd` proves
+the decision boundary equal in and out of process.
+
+**Authority has not moved, which is why the fourth box stays unticked.** Nothing
+in `nano-node` spawns `epoch4-executor`; the only caller is
+`nano-conformance/src/bin/epoch4-shadow-executor.rs`. The production node is still
+its own chainstate writer, so "the sole chainstate writer" describes the binary's
+design and not the deployment. What remains is unchanged: move write authority
+behind the boundary, run P2P/RPC/optional roles without write permission, compare
+every decision in shadow mode first, and measure throughput, catch-up latency and
+restart behaviour before removing the in-process path.
+
+**A dependency that can never be satisfied.** This task lists `138`, which is
+cancelled, so taskmd will hold it blocked indefinitely no matter how much of the
+work lands. The full-cycle shadow comparison this task needs is the same interval
+task 142 inherited from 138, so 142 is the honest gate; re-pointing the dependency
+is a plan decision and has been left alone rather than edited quietly.
+
 ## Acceptance Criteria
 
 - The consensus decision API is deterministic from serialized inputs and passes
