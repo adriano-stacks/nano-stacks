@@ -128,9 +128,12 @@ second block.
       interpreter but whose one-sided read cannot be the whole difference; the
       `+1536` pair, which is 12 x 128 and so the mirror of the trait erasure,
       needing a callable's trait identifier that nano's representation erases;
-      and `+24`, `-88`, `-92` singletons. `BNS-V2::name-claim-fast` performs
-      one extra charged read and write, which is operational rather than
-      pricing.
+      and `+24`, `-88`, `-92` singletons — all closed except the `+1536` pair,
+      which a trace confirms is a callable carrying no trait identifier being
+      sized as a trait (276 where the chain says 148). Nano's representation
+      erases the identifier, so that one belongs to task 147's direct-trait
+      argument ABI rather than here. `BNS-V2::name-claim-fast` performs one
+      extra charged read and write, which is operational rather than pricing.
 - [ ] Size a charge from the type signature the *value* carries, which is the
       one class most of the ten remaining transactions belong to. The reference
       always uses it, and it differs from anything nano holds: a value built in
@@ -143,7 +146,12 @@ second block.
       chain's 538. `append` is closed — its element half the generated code can
       measure and its entry half the host can — so what is left of the class is
       the deserialized-value direction, which needs provenance nano does not
-      track. Ten transactions became eight.
+      track. `append` and `merge` are closed, and `from-consensus-buff?`'s own
+      value is; what is left is a field *extracted* from a deserialized value,
+      which the reference keeps at the parent's width and then narrows again on
+      the way into a user function. Both halves or neither: doing the
+      extraction alone was measured moving `xverse-signer-manager-3` from 72
+      under to 72 over. Twenty-six transactions became three.
 
 - [ ] Add the reproduced call shape to the conformance corpus so the gate
       that catches it cannot skip itself, and re-run the mainnet cost sweep
