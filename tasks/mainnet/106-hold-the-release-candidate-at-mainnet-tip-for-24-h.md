@@ -154,10 +154,26 @@ rootful but receiptless hold and forced the whole interval to be repeated. A
 third sink (`nano-release-sink`, the same `hacknet/event-sink.py` the hold and
 witness sinks run, on `127.0.0.1:20472` writing to
 `/home/aldur/release-hold-receipts`) was started and the follower restarted onto
-it twenty minutes into the import rather than two days into it. The restart also
-demonstrated that the attestation survives one: it logged `reauthenticated by
-aldur-host-primary, aldur-host-recovery from persisted provenance` instead of
-re-reading the 359 GB payload.
+it twenty minutes into the import rather than two days into it.
+
+**That restart also established that an import cannot be interrupted at all**,
+which is worth more than the config change that provoked it. The node refused to
+start and said why:
+
+> the checkpoint import … did not finish … Journalling is off during an import,
+> so what it left cannot be rolled back and cannot be told apart from a complete
+> state by reading it — the trie is missing nodes, and every state root computed
+> on it would be wrong. Remove … and start again; an import is not resumed, and a
+> mainnet checkpoint takes about four and a half hours.
+
+So the `checkpoint-import-unfinished.toml` marker is a refusal, not a resume
+point, and the earlier note that the attestation was "reauthenticated from
+persisted provenance" on restart describes a start that then failed — the
+reauthentication line is real, the successful restart it implied was not. The
+partial state was removed and the import restarted once, with the observer
+already configured so nothing needs to interrupt it again. It also corrects the
+import estimate: **about four and a half hours**, not the thirty-one implied by
+extrapolating its first hour's 3.2 GB/h.
 
 Catch-up is measurable rather than open: the witness went 8,665,600 to 8,815,849
 between 2026-08-21 16:21 and 2026-08-23 11:00, 150,249 blocks in about 43 hours
