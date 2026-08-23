@@ -130,12 +130,26 @@ every reference to a shared set returns its ~100 GB. The ceremony's two 359 GB
 workspaces are genuinely near-free at 11.92 MiB exclusive, because nothing
 rewrites the payload.
 
-**So the hold needs about 100 GB freed, which means retiring a whole family of
-state directories.** That is the operator's call, not an unattended step. After
-that, catch-up is measurable rather than open: the witness went 8,665,600 to
-8,815,849 between 2026-08-21 16:21 and 2026-08-23 11:00, 150,249 blocks in about
-43 hours or ~3,500 an hour, so roughly two days to a tip of 8,825,301, and the
-24-hour hold follows it.
+**The space was then found without touching anyone's evidence, and the import is
+running.** Task 146's 57 `task146-*` diagnostic clones were this session's own
+scratch for a closed task; retiring all of them, two of which were registered
+worktrees needing `git worktree remove`, took free space from 109 GiB to
+**141 GiB**. That is the whole shared family, which is why it freed 27 GiB where
+deleting any single clone would have freed megabytes.
+
+The follower was restarted at 2026-08-23 11:59 UTC and authenticated the bundle
+again under both builders. It runs behind `release-hold-ee7af998/disk-guard.sh`,
+a watchdog that samples free space every minute, records a chainstate-growth line
+every ten, and sends SIGTERM if free space falls below a 20 GiB floor — the node
+honoured SIGTERM in five seconds when stopped by hand, leaving a resumable
+unfinished-import marker rather than a torn state. So the import can run
+unattended for two days without the possibility of starving Bitcoin Core or the
+three other writing nodes.
+
+Catch-up is measurable rather than open: the witness went 8,665,600 to 8,815,849
+between 2026-08-21 16:21 and 2026-08-23 11:00, 150,249 blocks in about 43 hours
+or ~3,500 an hour, so roughly two days to a tip of 8,825,301, and the 24-hour
+hold follows it.
 
 The live follower is separately stuck at 8,815,025 on the defect task 147 fixed,
 10,276 blocks behind tip, and cannot be restarted onto the fix: `check_profile`
