@@ -29,7 +29,7 @@ Hold the same release binary at the public mainnet tip for one continuous
       binding. Moved here from task 146, which closed its differential and left
       this needing the builders rather than a compiler fix.
       Re-issued 2026-08-23, recorded below.
-- [ ] Import under the real 2-of-2 builder policy, not the functional one. The
+- [x] Import under the real 2-of-2 builder policy, not the functional one. The
       witness and follower that produced earlier evidence imported under
       `follower-import-final-16e0928a/functional-builders.toml`, a
       single-signature policy whose builder public key is
@@ -93,24 +93,41 @@ keys belong to this host's single operator, so the 2-of-2 threshold separates ke
 custody, not parties. It is not independent corroboration, and task 138 was
 cancelled precisely because this project has one operator.
 
-## Why the hold has not started
+## The release follower is importing, 2026-08-23
 
-The ceremony cleared the attestation blocker, and one thing now stands between it
-and a start: **free disk**. A fresh import replays from 8,665,600 to the network
-tip, which was 8,825,301 on 2026-08-23 — roughly 160,000 blocks. A comparable
-state directory (`witness-16e0928a/state`) measures 102 GB against 109 GB free on
-a filesystem already at 95%, shared with Bitcoin Core and three running nodes. The
-import reflinks the 143 GB MARF so most of that 102 GB is shared extents rather
-than new blocks, but replay divergence consumes real space, and filling this
-filesystem would take down the burnchain source and the live followers with it.
-Freeing space means deleting another run's state, which is the operator's call,
-not a step to take unattended.
+`/home/aldur/release-hold-ee7af998/` runs the re-attested bundle under the real
+policy, with `peers = []` and no `p2p_seeds`, so every block, tenure and
+sortition input arrives from peers discovered over the binary P2P transport and
+the only configured HTTP is this operator's own Bitcoin Core on loopback. It read
+the whole 359 GB payload at ~575 MB/s before accepting anything, and logged:
 
-The live follower is meanwhile stuck at 8,815,025 on the defect task 147 fixed,
+```text
+checkpoint bundle 943ecf7b…0580e authenticated by aldur-host-primary, aldur-host-recovery
+checkpoint a87338900f…e932d attested by 2708 of 2599 signer weight
+```
+
+So the re-issued attestation is not merely self-consistent: a production node
+authenticates it under the unchanged 2-of-2 policy and takes the state.
+
+**A disk objection was raised and then measured away.** `du` reports 102 GB for a
+comparable state directory (`witness-16e0928a/state`) against 109 GB free at 95%
+full, which looked fatal. `btrfs filesystem du` shows that same directory holds
+**809 MiB exclusive** — the rest is extents shared with the bundle. The ceremony's
+two 359 GB workspaces likewise cost 11.92 MiB exclusive between them, and the 57
+`task146-*` diagnostic scratch states cost single-digit MiB each. `du` cannot see
+reflinks and overstates every one of these by two orders of magnitude. Measured
+during the import: 8.6 MB written and free space unchanged.
+
+**What remains is time.** The witness imported at 8,665,600 on 2026-08-21 16:21
+and reached 8,815,849 by 2026-08-23 11:00 — 150,249 blocks in about 43 hours, or
+roughly 3,500 blocks an hour. Tip was 8,825,301, so catch-up is about two days,
+and the 24-hour hold follows it. Nothing about the path is unresolved.
+
+The live follower is separately stuck at 8,815,025 on the defect task 147 fixed,
 10,276 blocks behind tip, and cannot be restarted onto the fix: `check_profile`
 compares the state's recorded profile with the running binary's and there is
-deliberately no subcommand to repin an imported state, so a compiler change means
-re-import. That is the same fresh import above, not a separate blocker.
+deliberately no subcommand to repin an imported state. This import is that
+restart, not a separate blocker.
 
 ## Acceptance criteria
 
