@@ -229,10 +229,38 @@ reproducibly built, signed `stacks-follower`, driven by that harness with
 `target/release/stacks-node` copy and not from the sampler above, which duplicates
 a subset of a vetted harness because it was written before that harness was found.
 
-**Building the right subject is blocked on a clean checkout.**
-`scripts/reproducible-release.sh` exits unless `git status` is completely empty,
-and the tree carries another session's in-progress task-147 files. That is a real
-blocker, not an inconvenience to work around by stashing someone else's work.
+**The subject now exists.** `reproducible-release.sh` refuses unless `git status`
+is completely empty, and the tree carries another session's task-147 files — but a
+git worktree at HEAD is a clean checkout of committed code, which is exactly what
+a reproducible build should bind to, and it leaves their files untouched. Built
+from `/home/aldur/release-build-88920833` at revision `88920833`:
+
+```text
+nix build .#stacks-follower
+  → /nix/store/9nyaq74i43j2ng4mbckrdgj9rbj171n8-nano-stacks-follower-0.1.0-88920833e521
+scripts/check-follower-artifact.sh  → exit 0
+  symbol_table_inspected true, forbidden_symbol_matches 0
+```
+
+Both `stacks-node` and `stacks-follower` are flake packages, so the earlier note
+that the node "cannot" be a release subject overstated it; what is true is that
+the committed hold harness and task 142's label both name the follower artifact.
+
+**The artifact omits the event role, and that dictates the whole topology.** Its
+policy reports `omitted_optional_roles` including `event`, so the follower cannot
+emit `new_block` at all. That is why `hold-follower-mainnet.sh` defers receipts to
+`verify-hold-receipts.sh` "against an independently executing same-revision
+witness node's `new_block` payloads" — receipts come from a *separate* witness,
+not from the subject. Pointing a sink at the subject, as was set up above, cannot
+work on the real artifact.
+
+**So the hold needs two states, and there is room for one.** The subject and a
+same-revision witness each cost about 100 GB, roughly 200 GB together, against
+141 GiB free. The existing `nano-witness` cannot stand in: it runs revision
+`16e0928a`, and the harness header records that a stale-revision witness already
+failed one hold over a compiler cost fix the witness lacked. Retiring an old state
+family to make room is the operator's call, and it is now the binding constraint
+on this task rather than attestation, tooling or the subject.
 
 **The full-node run was left going anyway, for two things it does prove.** It
 rehearses the import path end to end from the re-attested bundle, and its
