@@ -93,9 +93,9 @@ keys belong to this host's single operator, so the 2-of-2 threshold separates ke
 custody, not parties. It is not independent corroboration, and task 138 was
 cancelled precisely because this project has one operator.
 
-## The release follower is importing, 2026-08-23
+## The release follower accepted the attestation, 2026-08-23
 
-`/home/aldur/release-hold-ee7af998/` runs the re-attested bundle under the real
+`/home/aldur/release-hold-ee7af998/` ran the re-attested bundle under the real
 policy, with `peers = []` and no `p2p_seeds`, so every block, tenure and
 sortition input arrives from peers discovered over the binary P2P transport and
 the only configured HTTP is this operator's own Bitcoin Core on loopback. It read
@@ -109,19 +109,33 @@ checkpoint a87338900f…e932d attested by 2708 of 2599 signer weight
 So the re-issued attestation is not merely self-consistent: a production node
 authenticates it under the unchanged 2-of-2 policy and takes the state.
 
-**A disk objection was raised and then measured away.** `du` reports 102 GB for a
-comparable state directory (`witness-16e0928a/state`) against 109 GB free at 95%
-full, which looked fatal. `btrfs filesystem du` shows that same directory holds
-**809 MiB exclusive** — the rest is extents shared with the bundle. The ceremony's
-two 359 GB workspaces likewise cost 11.92 MiB exclusive between them, and the 57
-`task146-*` diagnostic scratch states cost single-digit MiB each. `du` cannot see
-reflinks and overstates every one of these by two orders of magnitude. Measured
-during the import: 8.6 MB written and free space unchanged.
+**It was then stopped, at about 6% of the space it needed.** The import has to
+build its own `marf.sqlite` and `clarity.sqlite`; it does not reflink them from
+the bundle. Measured while it ran: 6.4 GB written in 1 h 45 m, a steady 3.2 GB of
+real disk per hour, against 104 GiB free on a filesystem at 95% shared with
+Bitcoin Core and three writing nodes. The finished size is not a guess —
+`witness-16e0928a/state/chainstate` is `marf.sqlite` 65 GB plus `clarity.sqlite`
+35 GB, so a fresh import needs about **100 GB**. It was stopped with SIGTERM,
+which it honoured in five seconds, leaving
+`chainstate/checkpoint-import-unfinished.toml`; the partial state was removed and
+its provenance record kept as `accepted-attestation-provenance.toml`.
 
-**What remains is time.** The witness imported at 8,665,600 on 2026-08-21 16:21
-and reached 8,815,849 by 2026-08-23 11:00 — 150,249 blocks in about 43 hours, or
-roughly 3,500 blocks an hour. Tip was 8,825,301, so catch-up is about two days,
-and the 24-hour hold follows it. Nothing about the path is unresolved.
+**A reflink measurement was misread first, and this corrects it.** `btrfs
+filesystem du` reports 809 MiB *exclusive* for the witness state, which is true
+and does not mean the state was cheap to create: those blocks are shared with the
+57 `task146-*` diagnostic clones, so exclusivity measures how many copies exist,
+not what the first one cost. The consequence for reclaiming space is the opposite
+of intuition — deleting any one clone frees almost nothing, and only removing
+every reference to a shared set returns its ~100 GB. The ceremony's two 359 GB
+workspaces are genuinely near-free at 11.92 MiB exclusive, because nothing
+rewrites the payload.
+
+**So the hold needs about 100 GB freed, which means retiring a whole family of
+state directories.** That is the operator's call, not an unattended step. After
+that, catch-up is measurable rather than open: the witness went 8,665,600 to
+8,815,849 between 2026-08-21 16:21 and 2026-08-23 11:00, 150,249 blocks in about
+43 hours or ~3,500 an hour, so roughly two days to a tip of 8,825,301, and the
+24-hour hold follows it.
 
 The live follower is separately stuck at 8,815,025 on the defect task 147 fixed,
 10,276 blocks behind tip, and cannot be restarted onto the fix: `check_profile`
