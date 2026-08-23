@@ -47,6 +47,37 @@ are finished.
 - [ ] Tag and publish exactly the qualified artifact without rebuilding or
       changing any input.
 
+## The qualifying gate, run 2026-08-23
+
+`cargo xtask release-report` was run rather than reasoned about, and it refuses
+before reaching any evidence:
+
+```text
+revision  9636879558c43871af1aba450d5db266a2d7ded4
+branch    main (BUILD-RELEVANT CHANGES)
+FAIL      tracked crates/nano-conformance/tests/conformance/mainnet_divergence.rs
+FAIL      tracked crates/nano-conformance/tests/conformance/trait_equality.rs
+release qualification stopped: build-relevant source changes are not a
+reproducible release input
+```
+
+So this task's second acceptance criterion cannot even be attempted while any
+build-relevant file is uncommitted. Those two files are another session's
+in-progress task-147 work, which makes 147 a hard predecessor of this gate and
+not merely a parallel task. `cargo xtask release-tree-status` reports the same two
+files and is the cheap way to check before attempting a run.
+
+The report also states its own limits, which is worth quoting because it forecloses
+using it as a shortcut:
+
+> It is not evidence for holding mainnet tip for 24 hours, a live Bitcoin
+> reorganization, or a stock stacks-signer run against this binary. Those require
+> the named task-053 qualification runs.
+
+A run from a clean worktree at the same revision is the way to see what else is
+outstanding once the tree settles, since a worktree at HEAD satisfies the
+reproducible-input rule without disturbing anyone's working copy.
+
 ## Acceptance Criteria
 
 - Every formal dependency and every task 053 acceptance criterion is complete
