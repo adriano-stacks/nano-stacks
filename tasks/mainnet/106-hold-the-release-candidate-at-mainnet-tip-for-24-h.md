@@ -21,6 +21,16 @@ Hold the same release binary at the public mainnet tip for one continuous
 
 ## Tasks
 
+- [ ] Re-run the checkpoint builder ceremony for the compiler identity the hold
+      will run: a node refuses a bundle whose recorded compiler identity is not
+      its own and the section is mandatory, so a compiler change invalidates the
+      attested bundle and no fixed-compiler replay can start until an attested
+      one exists. Hand-editing a copied bundle would forge the builders'
+      binding. Moved here from task 146, which closed its differential and left
+      this needing the builders rather than a compiler fix.
+- [ ] Re-run this window's deferred receipt verification end to end green, which
+      is the check task 146 built the canonical-record oracle for and which
+      cannot run before the bundle above exists.
 - [ ] Start the hold only after the clean replay in task 037 and the no-hosted
       P2P qualification in task 054 pass for the same release binary.
 - [ ] Run with no hosted data service for 24 continuous hours.

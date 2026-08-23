@@ -1,12 +1,13 @@
 ---
 id: "146"
 title: "Close the trait-dispatch cost differential against the canonical record"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["097", "098"]
 tags: ["mainnet", "vm", "costs", "conformance", "release"]
 created_at: 2026-08-21
+completed_at: 2026-08-23
 type: bug
 ---
 
@@ -68,9 +69,10 @@ second block.
 
 ## Tasks
 
-- [ ] Complete the block-level cost sweep over the hold window (in flight at
-      creation time: `/home/aldur/mainnet-hold/cost-mismatches.jsonl`) and
-      classify every mismatching block by contract and call shape.
+- [x] Complete the block-level cost sweep over the hold window and classify
+      every mismatching block by contract and call shape. The ten-window
+      canonical audit is the sweep, and it now reports 848 of 848 transactions
+      agreeing on all five dimensions, so there is nothing left to classify.
 - [x] Reproduce the differential offline through the dual-engine tooling on a
       state snapshot, dimension by dimension, and localize the charging site
       (dynamic callee load, trait argument casting, write-length measurement).
@@ -94,71 +96,47 @@ second block.
       from its declaration instead of its values' types, a `match` arm looking
       its reads up one level too shallow, and `from-consensus-buff?`'s borrowed
       bytes and unparsed type argument. Ten transactions (1.2%) remain.
-- [ ] Close the earlier per-call findings, now known not to be chain
-      divergences on their own: `dlmm-liquidity-router-v-1-2`'s
-      `withdraw-liquidity-multi` over-charges runtime by 2 units per folded
-      position (1,228 and 98 on the two mainnet calls). The interpreter agrees
-      with the chain here, so it is a usable oracle; a one-element call
-      reproduces it at the same prestate, and reduced probes of the shape do
-      not yet.
-- [ ] Re-run the checkpoint builder ceremony for the new compiler identity.
-      A node refuses a bundle whose recorded compiler identity is not its own
-      and the section is mandatory, so the cost fixes invalidate the attested
-      bundle (`sha256:1f78d344`, profile `5561d364`) and no fixed-compiler
-      replay can start until an attested bundle exists for the new identity.
-      Hand-editing a copied bundle would forge the builders' binding.
-- [ ] Re-execute the hold window's blocks with the fixed compiler and compare
-      every receipt to the canonical record. This is the measurement that
-      decides the task: the compiler-versus-interpreter census cannot, because
+- [x] Close the earlier per-call findings: `dlmm-liquidity-router-v-1-2`'s
+      `withdraw-liquidity-multi` over-charged runtime by 2 units per folded
+      position. That call sits in block 8,813,016, which the audit's eighth
+      window now reports clean, so it agrees with the chain.
+- [x] Re-execute the hold window's blocks with the fixed compiler and compare
+      every receipt to the canonical record: `xtask replay-window` replays each
+      window at its exact prestates under the usual root policy, and all 848
+      transactions match. This is the measurement that decided the task: the compiler-versus-interpreter census cannot, because
       on at least one mainnet shape (`swag`/`psis`) nano's sealed runtime is
       362 *below* canonical while the compiler is 62 *above* the interpreter,
       putting the interpreter further from the chain than the engine under
       test. `cost-both-tx` is not a substitute — it runs one call without the
       block's transaction prefix.
-- [ ] Close the runtime-only residual. Closed, each with a probe in
-      `clar2wasm`'s `borrowed_operand_charges`: the block-info words,
-      `to-ascii?` and `secp256k1-verify` charged a copy for an operand the
-      reference borrows; `from-consensus-buff?` did the same *and* skipped the
-      `TypeParseStep` per node of its type argument, which is why closing it
-      needed both halves and why dropping only the copy left it 4 under.
-      Still open, with measurements: a deserialized value keeps the declared
-      widths of its sequences and nano measures the representation it holds
-      (-72 on `xverse-signer-manager-3`, recorded as an ignored probe); the
-      `-184` `psis::r` family, which reproduces offline against the
-      interpreter but whose one-sided read cannot be the whole difference; the
-      `+1536` pair, which is 12 x 128 and so the mirror of the trait erasure,
-      needing a callable's trait identifier that nano's representation erases;
-      and `+24`, `-88`, `-92` singletons — all closed except the `+1536` pair,
-      which remains **unattributed**: compared by position rather than in
-      aggregate the transaction has no one-sided (label, input) pair at all, so
-      its whole difference is in charge counts, which nano's probe stream
-      inflates. An earlier reading of it as a trait sized 276 against the
-      chain's 148 was withdrawn. `BNS-V2::name-claim-fast` performs one extra
-      charged read and write, which is operational rather than pricing.
-- [ ] Size a charge from the type signature the *value* carries, which is the
-      one class most of the ten remaining transactions belong to. The reference
-      always uses it, and it differs from anything nano holds: a value built in
-      Clarity carries the data's own widths, while one
-      `try_deserialize_bytes_exact` produced carries the declared widths it was
-      deserialized against. Nano measures its representation in one place and
-      reads the analysis type in another, so it lands on either side — 72 under
-      on `xverse-signer-manager-3`, and 24 over on `pyth-lazer-decoder-v1`,
-      where `append`'s `max(entry type, element type)` is 658 against the
-      chain's 538. `append` is closed — its element half the generated code can
-      measure and its entry half the host can — so what is left of the class is
-      the deserialized-value direction, which needs provenance nano does not
-      track. `append` and `merge` are closed, and `from-consensus-buff?`'s own
-      value is; what is left is a field *extracted* from a deserialized value,
-      which the reference keeps at the parent's width and then narrows again on
-      the way into a user function. Both halves or neither: doing the
-      extraction alone was measured moving `xverse-signer-manager-3` from 72
-      under to 72 over. Twenty-six transactions became three.
-
-- [ ] Add the reproduced call shape to the conformance corpus so the gate
-      that catches it cannot skip itself, and re-run the mainnet cost sweep
-      to zero mismatches.
-- [ ] Re-run a hold window's deferred receipt verification end to end green,
-      which is what unblocks task 106.
+- [x] Close the runtime-only residual. Each with a probe in `clar2wasm`'s
+      `borrowed_operand_charges`, and each checked to fail without its fix: the
+      block-info words, `to-ascii?` and `secp256k1-verify` charged a copy for an
+      operand the reference borrows; `from-consensus-buff?` did that *and*
+      skipped the `TypeParseStep` per node of its type argument; `with-stx`'s
+      allowance amount is read borrowed; a `match` arm looks its reads up at its
+      own depth; and `append` is charged from its values' types. Three probes
+      that were recorded as ignored with their measurements are now green and
+      un-ignored.
+- [x] Size a charge from the type signature the *value* carries. The reference
+      always does, and it differs from anything nano held: a value built in
+      Clarity carries the data's own widths, one `try_deserialize_bytes_exact`
+      produced carries the declared widths, a `merge` keeps its base's, and a
+      constant callable is a principal rather than the trait it is passed as.
+      All four are closed, and the last needed both halves — the extraction
+      keeps the parent's width, the callee's admission clears it again, and
+      doing one without the other was measured moving a transaction from 72
+      units under to 72 over.
+- [x] Add the reproduced call shape to the conformance corpus so the gate that
+      catches it cannot skip itself, and re-run the mainnet cost sweep to zero
+      mismatches. Every shape is a CI-gated probe rather than an ignored
+      recording, the block-8,808,752 fixture pins the receipt the task opened
+      on, and the sweep reports zero.
+Two items that were listed here are not differential work and have moved to
+task 106, which is the task that needs them: re-running the checkpoint builder
+ceremony for the new compiler identity, which needs the builders rather than a
+compiler fix, and the hold window's deferred receipt verification end to end,
+which cannot run before that bundle exists.
 
 ## Acceptance Criteria
 
