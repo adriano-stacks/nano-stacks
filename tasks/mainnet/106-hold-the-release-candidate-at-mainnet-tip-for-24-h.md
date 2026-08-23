@@ -164,6 +164,38 @@ between 2026-08-21 16:21 and 2026-08-23 11:00, 150,249 blocks in about 43 hours
 or ~3,500 an hour, so roughly two days to a tip of 8,825,301, and the 24-hour
 hold follows it.
 
+## The hold runs itself, 2026-08-23
+
+`release-hold-ee7af998/hold-sampler.sh` is armed and waiting. It polls until the
+node reports `blocks_behind <= 3`, then samples once a minute for 24 hours into
+`hold-samples.jsonl` and writes `hold-summary.json`.
+
+It measures rather than reimplements: **every sample this task asks for is already
+served by the node at `/nano/sync_status`** — the three tips it insists on
+distinguishing (`followed_stacks_height`, `selected_stacks_height`,
+`executed_stacks_height`), `p2p_sessions` and `p2p_known_peers`, the four queue
+depths, `staged_blocks`, per-observer `undelivered`/`queued_bytes`/`oldest_age_ms`
+for the backlog, `executed_state_index_root` and `blocks_behind`. The sampler adds
+only what the node cannot know about itself: the Bitcoin tip, its own RSS and open
+file count, free disk, chainstate size, captured `new_block` count and running
+totals of the peer-loss, refusal, execution-failure and fork lines in its log.
+
+Continuity is enforced rather than assumed: the sampler records the follower's
+pid with every sample, and if it changes or disappears the interval is declared
+void and the 24 hours restart, which is what "restart the complete measurement
+after a node defect or process stop" requires. `hold-window.log` keeps every
+start and restart, and the summary reports `continuous_pid` and the largest gap
+between consecutive samples, so a stall cannot be mistaken for a clean run.
+
+The summary's two jq programs were exercised against synthetic samples before
+being trusted with a 24-hour run; doing so caught a real bug, an `all(.[]; .pid
+== .[0].pid)` whose `.[0]` bound to the element rather than the array.
+
+What this harness does **not** do is the per-block root and receipt comparison
+against the oracle. It counts the receipts captured so the input exists, but the
+comparison itself belongs to the conformance tooling task 146 built, and it is
+still an open item above.
+
 The live follower is separately stuck at 8,815,025 on the defect task 147 fixed,
 10,276 blocks behind tip, and cannot be restarted onto the fix: `check_profile`
 compares the state's recorded profile with the running binary's and there is
