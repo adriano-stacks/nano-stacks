@@ -4751,4 +4751,45 @@ mod borrowed_operand_charges {
             &[Value::some(Value::buff_from(encoded).expect("calldata")).expect("optional")],
         );
     }
+    /// `append` is charged from the values' types, not the declaration.
+    ///
+    /// `special_append` charges `max(entry_type.size(), element_type.size())`
+    /// and takes both from the values: the entry type is the list's own, which
+    /// is `NoType` while the list is empty and the running supertype after
+    /// that, and the element type is `type_of(element)`. Reading the declared
+    /// types instead overcharges every absent optional by the difference
+    /// between `(optional NoType)` and what was declared — 15 units each, and
+    /// `pyth-lazer-decoder-v1` appends a tuple with eight of them, which is
+    /// 120 per append against the chain's 538 and the `+24` this closed.
+    #[test]
+    fn append_is_charged_from_its_values_types() {
+        crosscheck_cost(
+            "(define-private (step (i uint) (acc (list 10 {a: (optional uint), b: uint})))
+               (unwrap-panic (as-max-len? (append acc {a: none, b: i}) u10)))
+             (define-public (poke)
+               (ok (len (fold step (list u1 u2 u3) (list)))))",
+            "poke",
+            &[],
+        );
+        // A present optional, so the fix cannot be a constant that suits
+        // `none`; and a list whose entry type is *wider* than the element being
+        // appended, which is the case the entry-type half of the maximum is
+        // there for.
+        crosscheck_cost(
+            "(define-private (step (i uint) (acc (list 10 {a: (optional uint), b: uint})))
+               (unwrap-panic (as-max-len? (append acc {a: (some i), b: i}) u10)))
+             (define-public (poke)
+               (ok (len (fold step (list u1 u2 u3) (list)))))",
+            "poke",
+            &[],
+        );
+        crosscheck_cost(
+            "(define-public (poke)
+               (let ((wide (list {a: (some u1), b: u2})))
+                 (ok (len (unwrap-panic (as-max-len?
+                       (append wide {a: none, b: u3}) u4))))))",
+            "poke",
+            &[],
+        );
+    }
 }

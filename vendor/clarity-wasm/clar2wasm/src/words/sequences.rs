@@ -516,10 +516,16 @@ impl ComplexWord for Append {
         // derives a new list shape, so the result starts with handle zero.
         let src_length = generator.alloc_local(ValType::I32);
         let src_offset = generator.alloc_local(ValType::I32);
+        let src_handle = generator.alloc_local(ValType::I32);
+        // `src_length` is reused below for the *result* length, so the source
+        // list's own length is kept aside for the charge's list image.
+        let src_length_before_growth = generator.alloc_local(ValType::I32);
         builder
             .local_set(src_length)
             .local_set(src_offset)
-            .drop()
+            .local_set(src_handle)
+            .local_get(src_length)
+            .local_set(src_length_before_growth)
             .local_get(src_offset)
             .local_get(src_length);
 
@@ -546,23 +552,55 @@ impl ComplexWord for Append {
         // We use the values on the stack to copy the list to its destination
         builder.memory_copy(memory, memory);
 
+        // `special_append` charges `max(entry_type.size(), element_type.size())`
+        // where both come from the *values*: the entry type is the list's own,
+        // which is `NoType` while the list is empty and the running supertype
+        // after that, and the element type is `type_of(element)`. Reading the
+        // declared types instead overcharges every absent optional by the
+        // difference between `(optional NoType)` and what was declared —
+        // 15 units each, and `pyth-lazer-decoder-v1` appends a tuple with
+        // eight of them.
+        //
+        // The entry type is the one part the generated code cannot derive: a
+        // supertype fold has no inline form, and nano's list representation
+        // does not carry the type its elements agreed on. The host has the
+        // value, and `SequenceData::element_size` is that size exactly.
+        let list_ty = generator
+            .get_expr_type(list)
+            .ok_or_else(|| GeneratorError::TypeError("append list must be typed".to_owned()))?
+            .clone();
+        let entry_size = generator.borrow_local(ValType::I32);
+        let (list_image, _) = generator.create_call_stack_local(builder, &list_ty, true, false);
+        builder
+            .local_get(src_handle)
+            .local_get(src_offset)
+            .local_get(src_length_before_growth);
+        generator.write_to_memory(builder, list_image, 0, &list_ty)?;
+        let (list_ty_offset, list_ty_length) = generator.serialized_type(&list_ty)?;
+        builder
+            .local_get(list_image)
+            .i32_const(list_ty_offset)
+            .i32_const(list_ty_length)
+            .call(generator.func_by_name("stdlib.runtime_sequence_element_size"))
+            .local_set(*entry_size);
+
         // Traverse the element that we're appending to the list.
         generator.traverse_expr(builder, elem)?;
         // Charged after both operands, as `dispatch_args` does; see `ok`.
-        // The interpreter charges the size of an entry, not how many entries
-        // the result has (`vm/functions/sequences.rs`, `special_append`).
-        self.charge(
-            generator,
-            builder,
-            elem_ty
-                .size()
-                .map_err(|error| GeneratorError::TypeError(error.to_string()))?
-                .max(
-                    original_elem_ty
-                        .size()
-                        .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
-                ),
-        )?;
+        let charged = generator.borrow_local(ValType::I32);
+        generator.clarity_value_size_on_stack(builder, &original_elem_ty)?;
+        builder
+            .local_tee(*charged)
+            .local_get(*entry_size)
+            .binop(BinaryOp::I32LtU)
+            .if_else(
+                None,
+                |then| {
+                    then.local_get(*entry_size).local_set(*charged);
+                },
+                |_| {},
+            );
+        self.charge(generator, builder, *charged)?;
 
         // `append` evaluates the element at its own type, then sanitizes it to
         // the list's entry type. Rewriting the expression's type is not enough:
