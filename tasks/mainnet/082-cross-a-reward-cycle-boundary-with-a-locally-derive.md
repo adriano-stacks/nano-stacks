@@ -286,3 +286,36 @@ This is a real rollover, but only 186 of cycle 141's 2,100 burn blocks have
 elapsed. The task stays open until the watcher covers the entire following cycle
 and the earlier no-sortition gaps are reconciled against nano's persisted local
 consensus history.
+
+## Cycle 141 covered to burn 963,704, 2026-08-23
+
+The derived record now spans **1,555 contiguous burn blocks**, 962,150 through
+963,704, and every one of them agrees with two independent stock nodes on every
+core sortition field. Extended from the 1,001-block record of 2026-08-19 with the
+same pinned rederiver (`mainnet-cycle141-rederive-3018ac4a`,
+sha256 `ae0b52bd…`), so the comparison is homogeneous across the whole range:
+
+```text
+cycle141-local-rederived-962150-963704.jsonl     1555 rows, 962150..963704 contiguous
+cycle141-derived-comparison-962150-963704.jsonl  1555 rows
+  all_local_match  true      every derived row equals both oracles' /v3/sortitions
+  all_oracles_agree true     the two oracles never disagree with each other
+  sortitions       1077      heights that elected a miner
+```
+
+Asserted with `jq` over the written record rather than taken from the comparison
+script's exit status, since the script writes a row only on a match and fails the
+run on any mismatch or unanswerable height.
+
+**The rederivation is deterministic across four days and a changed input.** Its
+first 1,001 rows are byte-identical to the 2026-08-19 record, even though
+`waterfall-payouts.json` has been rewritten by the live follower since. So the
+extension is a longer measurement of the same derivation, not a re-derivation
+under different inputs.
+
+**Still open, and only the tail.** Cycle 141 runs 2,100 burn blocks from 962,150,
+so the following-cycle comparison completes at burn **964,250**. Bitcoin stood at
+963,704 when this ran, leaving **546 blocks**, which is roughly 3.8 days. Nothing
+about the approach is unresolved: rerun the same rederiver with target 964,250 and
+the same comparison over the remainder. The task stays blocked on burn height
+alone.
