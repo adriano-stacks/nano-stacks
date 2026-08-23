@@ -140,8 +140,10 @@ second block.
       reads the analysis type in another, so it lands on either side — 72 under
       on `xverse-signer-manager-3`, and 24 over on `pyth-lazer-decoder-v1`,
       where `append`'s `max(entry type, element type)` is 658 against the
-      chain's 538. One change, not several, and a large one: it wants the value's
-      own signature available where a charge asks for its size.
+      chain's 538. `append` is closed — its element half the generated code can
+      measure and its entry half the host can — so what is left of the class is
+      the deserialized-value direction, which needs provenance nano does not
+      track. Ten transactions became eight.
 
 - [ ] Add the reproduced call shape to the conformance corpus so the gate
       that catches it cannot skip itself, and re-run the mainnet cost sweep
