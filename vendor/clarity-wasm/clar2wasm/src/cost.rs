@@ -4916,4 +4916,61 @@ mod borrowed_operand_charges {
             &[Value::UInt(7)],
         );
     }
+    /// An absent optional's payload has no shape to remember.
+    ///
+    /// Duck-typing an optional has to project its payload's slots to the
+    /// target's shape on both branches, so the `none` branch offers a tuple
+    /// whose principals are the unmaterialised `(0, 0)`. Nano tried to
+    /// materialise it and refused the whole transaction — "principal
+    /// representation for PrincipalType ... points to offset 0 with invalid
+    /// length 0" — where the reference returns the value.
+    ///
+    /// Mainnet 8,815,026 is the case, and this is the smallest shape that
+    /// reaches it: a `map-set` whose value holds an absent optional of a tuple
+    /// of principals. No trait is needed, which is what took a while to see.
+    #[test]
+    fn an_absent_optionals_payload_has_no_shape_to_remember() {
+        use clarity::vm::types::PrincipalData;
+        let staker = || {
+            Value::Principal(
+                PrincipalData::parse("S1G2081040G2081040G2081040G208105NK8PE5").expect("s"),
+            )
+        };
+        crate::tools::cost_crosscheck(
+            &[(
+                "m",
+                "(define-data-var tail (optional {a: principal, b: principal}) none)
+                 (define-map links {a: principal, b: principal}
+                   {prev: (optional {a: principal, b: principal}),
+                    next: (optional {a: principal, b: principal})})
+                 (define-public (poke (s principal))
+                   (let ((key {a: s, b: s})
+                         (old (var-get tail)))
+                     (map-set links key {prev: old, next: none})
+                     (var-set tail (some key))
+                     (ok u2)))",
+            )],
+            "poke",
+            &[staker()],
+        );
+        // And the same map written a second time, where the optional is now
+        // *present*, so the fix cannot be "never remember a payload's shape".
+        crate::tools::cost_crosscheck(
+            &[(
+                "m",
+                "(define-data-var tail (optional {a: principal, b: principal}) none)
+                 (define-map links {a: principal, b: principal}
+                   {prev: (optional {a: principal, b: principal}),
+                    next: (optional {a: principal, b: principal})})
+                 (define-public (poke (s principal))
+                   (let ((key {a: s, b: s}))
+                     (var-set tail (some key))
+                     (map-set links key {prev: (var-get tail), next: none})
+                     (ok (get a (unwrap-panic (get prev
+                        (unwrap-panic (map-get? links key)))))))) ",
+            )],
+            "poke",
+            &[staker()],
+        );
+    }
 }

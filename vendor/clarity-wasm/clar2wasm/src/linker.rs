@@ -437,13 +437,29 @@ fn link_save_runtime_shape_fn(
                         parsed
                     };
                     let epoch = caller.data().global_context.epoch_id;
-                    let value = read_from_wasm_indirect(
+                    // A shape this cannot read is a shape it cannot preserve, and
+                    // the only representation that cannot be read is a
+                    // placeholder: duck-typing an optional or a response has to
+                    // project the payload's slots to the target's shape on both
+                    // branches, so the `none` branch offers a tuple whose
+                    // principals are the unmaterialised `(0, 0)`. There is no
+                    // value there to remember, and the answer for "no shape" is
+                    // the same zero handle a value that never crossed the host
+                    // carries.
+                    //
+                    // Mainnet 8,815,026 is the case: a `map-set` whose value
+                    // holds `(optional {staker: principal, signer-manager:
+                    // principal})` as `none` made nano refuse a transaction the
+                    // chain executed.
+                    let Ok(value) = read_from_wasm_indirect(
                         memory,
                         &mut caller,
                         &value_ty,
                         value_offset,
                         epoch,
-                    )?;
+                    ) else {
+                        return Ok(0i32);
+                    };
                     let handle = caller.data_mut().save_runtime_shape(value)?;
                     Ok(handle)
                 })
