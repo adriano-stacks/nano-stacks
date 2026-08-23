@@ -88,11 +88,12 @@ second block.
       much for a list of `uint`. Found through a single-transaction block where
       the canonical comparison is exact; closed 29 of the 55 differing
       transactions, taking the ten-window audit from 793/848 to **822/848**.
-- [ ] Close the remaining 26 (3.1%), all runtime-only: `+8` on fourteen, then
-      `-184` on three, `+1002` on two and eight singletons. A label-level diff
-      cannot localize these — the engines decompose the same work into
-      different charge events whose costs nearly cancel — so this needs a
-      comparison that aligns charges to source positions rather than to labels.
+- [x] Close the remaining 26 (3.1%), all runtime-only, with a comparison that
+      aligns charges to source positions rather than to labels. Five defects
+      closed this way: `with-stx`'s borrowed allowance amount, a tuple sized
+      from its declaration instead of its values' types, a `match` arm looking
+      its reads up one level too shallow, and `from-consensus-buff?`'s borrowed
+      bytes and unparsed type argument. Ten transactions (1.2%) remain.
 - [ ] Close the earlier per-call findings, now known not to be chain
       divergences on their own: `dlmm-liquidity-router-v-1-2`'s
       `withdraw-liquidity-multi` over-charges runtime by 2 units per folded
@@ -114,16 +115,22 @@ second block.
       putting the interpreter further from the chain than the engine under
       test. `cost-both-tx` is not a substitute — it runs one call without the
       block's transaction prefix.
-- [ ] Close the runtime-only residual. Confirmed so far, each with a probe in
+- [ ] Close the runtime-only residual. Closed, each with a probe in
       `clar2wasm`'s `borrowed_operand_charges`: the block-info words,
       `to-ascii?` and `secp256k1-verify` charged a copy for an operand the
-      reference borrows. Still open: `from-consensus-buff?` charges 23 units
-      too many on a buff parameter, and skipping the operand copy overshoots
-      to 4 under, so the cause is the word's charge input rather than the read
-      (recorded as an ignored probe naming this task); the `+62`, `+8` and
-      `+1281` families are unattributed; and `BNS-V2::name-claim-fast`
-      performs one extra charged read and write, which is operational rather
-      than pricing.
+      reference borrows; `from-consensus-buff?` did the same *and* skipped the
+      `TypeParseStep` per node of its type argument, which is why closing it
+      needed both halves and why dropping only the copy left it 4 under.
+      Still open, with measurements: a deserialized value keeps the declared
+      widths of its sequences and nano measures the representation it holds
+      (-72 on `xverse-signer-manager-3`, recorded as an ignored probe); the
+      `-184` `psis::r` family, which reproduces offline against the
+      interpreter but whose one-sided read cannot be the whole difference; the
+      `+1536` pair, which is 12 x 128 and so the mirror of the trait erasure,
+      needing a callable's trait identifier that nano's representation erases;
+      and `+24`, `-88`, `-92` singletons. `BNS-V2::name-claim-fast` performs
+      one extra charged read and write, which is operational rather than
+      pricing.
 - [ ] Add the reproduced call shape to the conformance corpus so the gate
       that catches it cannot skip itself, and re-run the mainnet cost sweep
       to zero mismatches.
