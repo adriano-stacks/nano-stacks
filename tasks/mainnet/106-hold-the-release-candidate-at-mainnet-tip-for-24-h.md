@@ -254,13 +254,33 @@ witness node's `new_block` payloads" — receipts come from a *separate* witness
 not from the subject. Pointing a sink at the subject, as was set up above, cannot
 work on the real artifact.
 
-**So the hold needs two states, and there is room for one.** The subject and a
-same-revision witness each cost about 100 GB, roughly 200 GB together, against
-141 GiB free. The existing `nano-witness` cannot stand in: it runs revision
-`16e0928a`, and the harness header records that a stale-revision witness already
-failed one hold over a compiler cost fix the witness lacked. Retiring an old state
-family to make room is the operator's call, and it is now the binding constraint
-on this task rather than attestation, tooling or the subject.
+**The hold needs two states and there is room for one, so they go in order.** The
+subject and a same-revision witness cost about 100 GB each against 141 GiB free.
+The existing `nano-witness` cannot stand in: it runs revision `16e0928a`, and the
+harness header records that a stale-revision witness already failed a hold over a
+compiler cost fix the witness lacked. Sequencing them is what the 2026-08-19 run
+did — its witness was still importing while the hold ran — and
+`verify-hold-receipts.sh` checks receipts *after* the interval, so the witness can
+catch up through the hold window afterwards rather than beside it.
+
+**The subject is therefore importing now** from
+`/home/aldur/release-subject-88920833/`, `stacks-follower check-config` clean,
+`peers = []`, health on 20474 and metrics on 20475, behind the same 20 GiB floor
+guard. The witness-shaped full-node run that occupied that space was stopped and
+its state removed; it was never going to be this task's evidence, and the subject
+has the stronger claim on the one available state.
+
+Retiring an old state family, so subject and witness can run together, remains the
+operator's call. It is no longer the only route: the sequential order above needs
+about 100 GB twice rather than 200 GB at once.
+
+**The sampler armed earlier is retired.** It read `/nano/sync_status`, which the
+artifact does not serve, and it duplicated a subset of `hold-follower-mainnet.sh`.
+That harness is the driver: it wants `HOLD_OUTPUT`, `HOLD_HEALTH_URL`,
+`HOLD_METRICS_URL`, `HOLD_STATE_DIR`, `HOLD_CONFIG`, `HOLD_PID`,
+`HOLD_EXE_SHA256`, two stock oracle URLs, a Bitcoin tip URL and
+`HOLD_BLOCK_IDENTITY`, and it byte-compares every executed block against both
+oracles rather than trusting the node's self-report.
 
 **The full-node run was left going anyway, for two things it does prove.** It
 rehearses the import path end to end from the re-attested bundle, and its
