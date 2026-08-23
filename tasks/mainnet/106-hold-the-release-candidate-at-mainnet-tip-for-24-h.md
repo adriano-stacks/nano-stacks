@@ -146,6 +146,19 @@ unfinished-import marker rather than a torn state. So the import can run
 unattended for two days without the possibility of starving Bitcoin Core or the
 three other writing nodes.
 
+**The receipt criterion needed an observer before the hold, not after it.** This
+task requires comparing each executed state root *and receipt set* with the
+oracle, and receipts only exist where an event observer records them. The
+follower had started with `event_observers = []`, which would have produced a
+rootful but receiptless hold and forced the whole interval to be repeated. A
+third sink (`nano-release-sink`, the same `hacknet/event-sink.py` the hold and
+witness sinks run, on `127.0.0.1:20472` writing to
+`/home/aldur/release-hold-receipts`) was started and the follower restarted onto
+it twenty minutes into the import rather than two days into it. The restart also
+demonstrated that the attestation survives one: it logged `reauthenticated by
+aldur-host-primary, aldur-host-recovery from persisted provenance` instead of
+re-reading the 359 GB payload.
+
 Catch-up is measurable rather than open: the witness went 8,665,600 to 8,815,849
 between 2026-08-21 16:21 and 2026-08-23 11:00, 150,249 blocks in about 43 hours
 or ~3,500 an hour, so roughly two days to a tip of 8,825,301, and the 24-hour
