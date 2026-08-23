@@ -5533,14 +5533,22 @@ fn compare_engine_charges(
 }
 
 fn cost_both_tx(arguments: &[String]) -> ExitCode {
-    let [state, parent, raw] = arguments else {
-        eprintln!(
-            "usage: cargo xtask cost-both-tx <state-dir> <parent-block-id> <raw-tx-hex-file>\n\
-             re-runs one sealed contract call against its parent with the consensus cost\n\
-             tracker; writes only side caches, run it on a scratch copy anyway;\n\
-             the node must not be running"
-        );
-        return ExitCode::FAILURE;
+    let (state, parent, raw, block) = match arguments {
+        [state, parent, raw] => (state, parent, raw, None),
+        [state, parent, raw, block] => (state, parent, raw, Some(block)),
+        _ => {
+            eprintln!(
+                "usage: cargo xtask cost-both-tx <state-dir> <parent-block-id> \
+                 <raw-tx-hex-file> [<block-id>]\n\
+                 re-runs one sealed contract call against its parent with the consensus cost\n\
+                 tracker; writes only side caches, run it on a scratch copy anyway;\n\
+                 the node must not be running.\n\
+                 With <block-id> the call runs under that block's recorded Bitcoin view,\n\
+                 which anything reading the burn height -- `pox-5` above all -- needs to\n\
+                 take the path the chain took rather than aborting."
+            );
+            return ExitCode::FAILURE;
+        }
     };
     let Some(parent) = hex::decode(parent)
         .ok()
@@ -5575,7 +5583,26 @@ fn cost_both_tx(arguments: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match ask_both_engines_for_cost(&mut vm, parent, &transaction) {
+    let context = match block {
+        None => None,
+        Some(block) => {
+            let Some(block) = hex::decode(block)
+                .ok()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+            else {
+                eprintln!("{block} is not a 32-byte block id");
+                return ExitCode::FAILURE;
+            };
+            let (Some(parent_header), Some(header)) =
+                (vm.recorded_header(parent), vm.recorded_header(block))
+            else {
+                eprintln!("the state has no recorded header for the block or its parent");
+                return ExitCode::FAILURE;
+            };
+            Some(fixture_bitcoin_context(&parent_header, &header))
+        }
+    };
+    match ask_both_engines_for_cost(&mut vm, parent, &transaction, context) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => {
             eprintln!("not a contract call: only calls have two engines to compare");
@@ -5595,6 +5622,7 @@ fn ask_both_engines_for_cost(
     vm: &mut nano_vm::Vm,
     parent: [u8; 32],
     transaction: &nano_codec::Transaction,
+    context: Option<nano_vm::BitcoinBlockContext>,
 ) -> Result<bool, String> {
     let nano_codec::TransactionPayloadData::ContractCall {
         address,
@@ -5622,7 +5650,15 @@ fn ask_both_engines_for_cost(
         hex::encode(transaction.txid().as_bytes()),
         encoded.len()
     );
-    charge_both_engines(vm, parent, &sender, &identifier, function_name, &encoded)?;
+    charge_both_engines(
+        vm,
+        parent,
+        &sender,
+        &identifier,
+        function_name,
+        &encoded,
+        context,
+    )?;
     Ok(true)
 }
 
@@ -5676,7 +5712,15 @@ fn cost_both(arguments: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match charge_both_engines(&mut vm, parent, &sender, &identifier, function, &encoded) {
+    match charge_both_engines(
+        &mut vm,
+        parent,
+        &sender,
+        &identifier,
+        function,
+        &encoded,
+        None,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
@@ -5695,6 +5739,7 @@ fn charge_both_engines(
     identifier: &clarity::vm::types::QualifiedContractIdentifier,
     function_name: &str,
     encoded: &[Vec<u8>],
+    context: Option<nano_vm::BitcoinBlockContext>,
 ) -> Result<(), String> {
     for interpreted in [false, true] {
         eprintln!(
@@ -5705,8 +5750,11 @@ fn charge_both_engines(
                 "compiler"
             }
         );
-        vm.begin_block(Some(parent), [0xcb; 32])
-            .map_err(|error| format!("cannot begin a block on the parent: {error:?}"))?;
+        match context {
+            Some(context) => vm.begin_block_with_bitcoin_context(Some(parent), [0xcb; 32], context),
+            None => vm.begin_block(Some(parent), [0xcb; 32]),
+        }
+        .map_err(|error| format!("cannot begin a block on the parent: {error:?}"))?;
         let tracker = vm
             .transaction_cost_tracker()
             .map_err(|error| format!("cannot build the consensus cost tracker: {error:?}"))?;
