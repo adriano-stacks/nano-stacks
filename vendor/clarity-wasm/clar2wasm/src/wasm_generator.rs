@@ -4187,6 +4187,23 @@ impl WasmGenerator {
                     GeneratorError::InternalError("literal argument size exceeds i32".to_owned())
                 })?;
                 builder.i32_const(value_size).local_set(*size);
+            } else if let Some(value_size) = arg
+                .match_atom()
+                .and_then(|name| self.constants.get(name.as_str()))
+                .filter(|ty| {
+                    matches!(
+                        ty,
+                        TypeSignature::CallableType(CallableSubtype::Principal(_))
+                    )
+                })
+                .and_then(|ty| ty.size().ok())
+            {
+                // See `constant_callable_size`: a constant holding a contract
+                // principal is charged as one, not as the trait it is passed as.
+                let value_size = i32::try_from(value_size).map_err(|_| {
+                    GeneratorError::InternalError("constant argument size exceeds i32".to_owned())
+                })?;
+                builder.i32_const(value_size).local_set(*size);
             } else {
                 self.clarity_value_size_on_stack(builder, &value_ty)?;
                 builder.local_set(*size);

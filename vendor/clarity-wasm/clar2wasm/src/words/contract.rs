@@ -111,6 +111,28 @@ where
     Ok(res)
 }
 
+/// The size a *constant* argument is charged at, when it is one and when that
+/// differs from what its declared type says.
+///
+/// From epoch 3.3 the reference charges an argument at the value's own size,
+/// and `type_of` on a contract principal answers `CallableType(Principal(..))`
+/// — 148 — however the callee declares the parameter. A trait's 276 belongs to
+/// a callable that carries a trait identifier, which nothing in nano's
+/// representation records, so a constant's own recorded type is what tells the
+/// two apart. `mia-smart-faktory` reaches Velar's pool through six such
+/// constants and was charged 256 too much for each.
+fn constant_callable_size(generator: &WasmGenerator, arg: &SymbolicExpression) -> Option<u32> {
+    let ty = arg
+        .match_atom()
+        .and_then(|name| generator.constants.get(name.as_str()))?;
+    matches!(
+        ty,
+        TypeSignature::CallableType(CallableSubtype::Principal(_))
+    )
+    .then(|| ty.size().ok())
+    .flatten()
+}
+
 #[derive(Debug)]
 pub struct AsContract;
 
@@ -938,6 +960,13 @@ impl ComplexWord for ContractCall {
                 .map_err(|_| {
                     GeneratorError::InternalError(
                         "literal contract-call? argument size exceeds i32".to_owned(),
+                    )
+                })?;
+                builder.i32_const(value_size).local_set(*argument_size);
+            } else if let Some(value_size) = constant_callable_size(generator, arg) {
+                let value_size = i32::try_from(value_size).map_err(|_| {
+                    GeneratorError::InternalError(
+                        "constant contract-call? argument size exceeds i32".to_owned(),
                     )
                 })?;
                 builder.i32_const(value_size).local_set(*argument_size);

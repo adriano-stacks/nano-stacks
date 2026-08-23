@@ -4852,4 +4852,69 @@ mod borrowed_operand_charges {
             &[],
         );
     }
+    /// A constant holding a contract principal is charged as one, not as the
+    /// trait it is passed as.
+    ///
+    /// From epoch 3.3 the reference charges an argument at the value's own
+    /// size, and `type_of` on a contract principal answers
+    /// `CallableType(Principal(..))` — 148 — however the callee declares the
+    /// parameter. Nano used the declared trait's 276, which `2n + 5` turns into
+    /// 256 an argument. A *literal* was already right, because that branch
+    /// takes `Value::size()`; a constant took the declared type instead.
+    ///
+    /// `mia-smart-faktory` reaches Velar's pool as
+    /// `(contract-call? VELAR-POOL swap WSTX SBTC VELAR-FEES ...)` with every
+    /// one of those a `define-constant`: six such arguments, 1,536 units, and
+    /// the two transactions of the canonical audit that carried it.
+    #[test]
+    fn a_constant_callable_is_charged_as_a_principal() {
+        let contracts: &[(&str, &str)] = &[
+            ("tok", "(define-public (f (x uint)) (ok x))"),
+            (
+                "pool",
+                "(define-trait ft ((f (uint) (response uint uint))))
+                 (define-public (swap (a <ft>) (b <ft>) (amt uint))
+                   (contract-call? a f amt))",
+            ),
+            (
+                "router",
+                "(define-constant TOK .tok)
+                 (define-public (poke (amt uint))
+                   (contract-call? .pool swap TOK TOK amt))",
+            ),
+        ];
+        crosscheck_cost_multi_contract(contracts, "poke", &[Value::UInt(7)]);
+        // The same call with the literals inline, which was already right, so a
+        // fix cannot regress it; and through a user-defined function, which
+        // sizes its arguments on the other of the two paths.
+        crosscheck_cost_multi_contract(
+            &[
+                contracts[0],
+                contracts[1],
+                (
+                    "router",
+                    "(define-public (poke (amt uint))
+                       (contract-call? .pool swap .tok .tok amt))",
+                ),
+            ],
+            "poke",
+            &[Value::UInt(7)],
+        );
+        crosscheck_cost_multi_contract(
+            &[
+                contracts[0],
+                (
+                    "router",
+                    "(define-trait ft ((f (uint) (response uint uint))))
+                     (define-constant TOK .tok)
+                     (define-private (inner (a <ft>) (amt uint))
+                       (contract-call? a f amt))
+                     (define-public (poke (amt uint))
+                       (inner TOK amt))",
+                ),
+            ],
+            "poke",
+            &[Value::UInt(7)],
+        );
+    }
 }
