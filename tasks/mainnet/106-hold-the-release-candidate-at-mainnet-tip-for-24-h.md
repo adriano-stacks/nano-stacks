@@ -271,8 +271,28 @@ its state removed; it was never going to be this task's evidence, and the subjec
 has the stronger claim on the one available state.
 
 Retiring an old state family, so subject and witness can run together, remains the
-operator's call. It is no longer the only route: the sequential order above needs
-about 100 GB twice rather than 200 GB at once.
+operator's call. It is no longer the only route — the sequential order above needs
+about 100 GB twice rather than 200 GB at once — but the margin is thin rather than
+comfortable, which is worth stating precisely.
+
+**Measured while the subject imported**, five minutes apart, so it is a rate and
+not an extrapolation from one sample: chainstate grew 7.16 → 7.48 GB, about
+**3.8 GB/h**, while free space fell about **2.7 GB/h** from 127 GiB. Reaching a
+~100 GB state therefore lands close to the guard's 20 GiB floor rather than
+clearing it easily, and the node's own "about four and a half hours" is an estimate
+this rate does not yet corroborate. The other writers are not the problem: over the
+same interval `mainnet-tip/state` grew 1.9 MB, Bitcoin's datadir 422 bytes, and the
+witness none at all.
+
+An earlier reading of 7 GiB lost in ten minutes looked alarming and was noise —
+btrfs reports free space that fluctuates with WAL churn and with asynchronous
+reclaim of the 57 clones deleted earlier, and the next sample showed it rising
+again. Two samples of the same set are the cheapest way to tell a leak from
+settling.
+
+The three state families that would free real room if retired are
+`mainnet-tip/state` (207 GB), `witness-16e0928a/state` (109 GB) and
+`follower-import-final-16e0928a` (109 GB).
 
 **The sampler armed earlier is retired.** It read `/nano/sync_status`, which the
 artifact does not serve, and it duplicated a subset of `hold-follower-mainnet.sh`.
