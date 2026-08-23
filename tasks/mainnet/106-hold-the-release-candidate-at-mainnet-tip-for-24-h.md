@@ -212,6 +212,35 @@ against the oracle. It counts the receipts captured so the input exists, but the
 comparison itself belongs to the conformance tooling task 146 built, and it is
 still an open item above.
 
+## The running follower is diagnostic, not this task's evidence
+
+Written down because it would otherwise look like the hold is under way.
+
+**The subject of this hold is the packaged follower artifact, not the full node.**
+`scripts/hold-follower-mainnet.sh` — the committed, already-exercised harness —
+drives the artifact's loopback `/health` and `/metrics`, and `/health` is served
+only by `nano-follower` (`observation.rs::LOOPBACK_ROUTES`), never by
+`stacks-node`. Task 142 says the mainnet-ready label applies "only to the minimal
+follower artifact" and that the release report runs "against the signed artifact";
+this task requires the same release binary that tasks 037 and 054 qualified; and
+the 2026-08-19 hold ran that artifact. So the release evidence must come from the
+reproducibly built, signed `stacks-follower`, driven by that harness with
+`scripts/verify-hold-receipts.sh` afterwards — not from an ad-hoc
+`target/release/stacks-node` copy and not from the sampler above, which duplicates
+a subset of a vetted harness because it was written before that harness was found.
+
+**Building the right subject is blocked on a clean checkout.**
+`scripts/reproducible-release.sh` exits unless `git status` is completely empty,
+and the tree carries another session's in-progress task-147 files. That is a real
+blocker, not an inconvenience to work around by stashing someone else's work.
+
+**The full-node run was left going anyway, for two things it does prove.** It
+rehearses the import path end to end from the re-attested bundle, and its
+catch-up passes through 8,815,026 — the block the live follower is stuck on and
+the defect task 147 fixed — so it will show that fix executing against real
+mainnet state. Both are diagnostic value; neither is this task's evidence, and the
+`hold-samples.jsonl` it produces must not be presented as the 24-hour hold.
+
 The live follower is separately stuck at 8,815,025 on the defect task 147 fixed,
 10,276 blocks behind tip, and cannot be restarted onto the fix: `check_profile`
 compares the state's recorded profile with the running binary's and there is
