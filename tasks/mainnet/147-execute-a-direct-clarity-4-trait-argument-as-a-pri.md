@@ -1,11 +1,12 @@
 ---
 title: "Execute a direct Clarity 4 trait argument as a principal"
 id: "147"
-status: in-progress
+status: completed
 priority: critical
 type: bug
 tags: ["mainnet", "vm", "clarity-wasm", "consensus", "liveness", "release"]
 created_at: "2026-08-22"
+completed_at: "2026-08-24"
 ---
 
 # Execute a direct Clarity 4 trait argument as a principal
@@ -55,10 +56,54 @@ for block 8,815,026.
       the runtime-shape arena. A shape that cannot be read cannot be preserved,
       so it answers with the same zero handle a value that never crossed the
       host carries. The smallest reproduction needs no trait at all.
-- [ ] Replay transaction 8b540047…c471e1d and block 8,815,026 to their
-      canonical receipt and state root.
-- [ ] Build and restart the node on port 20492, then prove its executed height
-      advances beyond 8,815,026.
+- [x] Replay transaction 8b540047…c471e1d and block 8,815,026 to their
+      canonical receipt and state root. Executed on mainnet rather than in a
+      fixture: the rebuilt node executed the round 8,813,989 → 8,815,989, which
+      spans the block, with no refusal of that transaction anywhere in its log.
+- [x] Build and restart the node on port 20492, then prove its executed height
+      advances beyond 8,815,026. It reached **8,815,989**, 963 blocks past the
+      height it had been stuck on for days.
+
+## Closed 2026-08-24, against the canonical chain
+
+**A correction to the evidence above first.** This task recorded
+`255c6115d5038ee255afefb26ddaed565417d06e5b17f88a4cd9667e569c476b` as the
+canonical *state root* for 8,815,026. It is the canonical **block hash**. The
+state root is
+`45fff53e2d156f002663ebcc4eef4b12fcb1a079784c384f2545d201c2a16c39`. Anyone
+comparing roots against the old value would have chased a mismatch that was not
+there.
+
+**The node's copy of the block is the canonical one, field for field.** Fetched
+from a stock oracle at `/v3/blocks/height/8815026` and from this node at
+`/v3/blocks/{id}`, both 56,259 bytes, and `block-identity` reports the same
+`block_hash`, `block_id b7781596…`, `consensus_hash d7cf0ff9…`,
+`state_index_root 45fff53e…`, `transaction_merkle_root 5aa0554c…`, 15
+transactions and 13 signer signatures. `append_block` refuses a block whose
+sealed MARF root differs from the header's, so sealing it *is* the root
+comparison — this node computed `45fff53e…`.
+
+**The receipt is the canonical one.** From the node's own event observer,
+`new_block/08815026-255c6115….json`:
+
+```text
+txid    0x8b54004787530e3547a2a9316838375eba701a72d55e7a3a72aef2fe3c471e1d
+status  success
+result  0x070100000000000000000000000000000002        (ok u2)
+cost    runtime 379891, read_count 24, read_length 345596, write_count 4, write_length 519
+```
+
+**The offline gate is unconditional.**
+`trait_equality::a_clarity_four_trait_principal_survives_the_registration_shape`
+crosschecks compiled against interpreted on the reduced shape and asserts
+`UInt(2)`, at four different amounts of preceding static data, with no mainnet
+state. `cargo clippy --workspace --all-targets -D warnings` is clean.
+
+**What remains is not this task.** The exact-prestate replay
+(`the_mainnet_8815026_trait_registration_executes_at_its_exact_prestate`) stays
+ignored and inventoried as infrastructure under this owner: it is a fixture
+convenience, and the live chain has now answered the same question against the
+canonical block.
 
 ## Acceptance Criteria
 
