@@ -87,6 +87,19 @@ chain still names it or says precisely which of the three causes applies.
       unprimed, it simply refuses to answer. The remaining work is the fix.
 - [ ] Make a view the chain has derived nameable for as long as any unexecuted
       staged block can ask for it, or refuse in a way that names the cause.
+      **The reproduction is at the wrong layer to gate this fix, which is worth
+      knowing before anyone tries to make it pass.** `SnapshotChain` has no
+      burnchain source, so once it has dropped a snapshot it cannot get it back;
+      lowering the floor afterwards can never satisfy the test at that layer. The
+      fix therefore has to either stop the drop happening or live in `Tracker`,
+      which does hold a block source and can re-derive. Two candidate shapes:
+      raise the floor only as far as the executor can promise never to go back
+      below — `execution_rollback_floor` subtracts `MINING_COMMITMENT_WINDOW`,
+      which bounds a *Bitcoin* reorganisation and says nothing about how far a
+      *Stacks* fork retraction moves the burn view — or make `keep_from` report
+      that it refused a lower floor instead of silently keeping a higher one, so
+      the caller can rebuild rather than loop. The silent disagreement is the part
+      that turned a recoverable condition into sixteen hours.
 - [ ] Report the condition through `/health` and `/nano/sync_status`. A node that
       cannot advance must not answer `ready: true` with a null error; the hold
       harness and any supervisor read those and both were blind here.
