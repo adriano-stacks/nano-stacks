@@ -260,3 +260,32 @@ closes in them at all. Producing the condition needs one of:
 The second is the pragmatic route and is what the fix should be gated on. Until one
 of them exists, the reproduction committed at the `SnapshotChain` layer is the only
 mechanical evidence, and it cannot cover the executor's behaviour.
+
+## The regression is cheaper than the earlier note said
+
+The note above costed this as needing a capture spanning 144+ burn blocks or a
+test-only narrowing of `SNAPSHOTS_KEPT`, on the reasoning that the retained window
+has to *close* for the stall to appear. That is true of the stall and not of the
+fix, which is what matters for a regression.
+
+`reseed_sortitions_after_retraction` runs on **every** retraction, and its effect
+is directly observable without any window closing: before the fix the tracker keeps
+whatever seed it had walked to; after it, the tracker is replaced by one seeded
+from the saved state at or below the retracted execution's burn view. So the
+assertion is "the tracker's tip is not above what execution now stands on", which
+holds for any retraction at all.
+
+`follow_path::a_branch_that_parts_at_a_block_is_followed_onto_the_fork` already
+drives a real one: it executes a local orphan, serves a heavier byte-exact branch,
+and `catch_up` takes the fork through `switch_to_staged_branch`. Extending it, or
+adding a sibling beside it, needs two things:
+
+- call `keep_sortition_capture` on the test's executor with the fixture's sortition
+  directory. The setter is deliberately optional, so these rigs currently take the
+  early return and exercise nothing — that is why the fix is safe to have landed,
+  and also why no existing test covers it.
+- assert the tracker's tip after the retraction. `derived_sortitions()` is already
+  on the executor; whether it exposes enough, or wants a narrow accessor beside it,
+  is the only open design question left.
+
+No wider capture, no window parameterisation, no new fixture.
