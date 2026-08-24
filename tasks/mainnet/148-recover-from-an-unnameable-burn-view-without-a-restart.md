@@ -103,6 +103,13 @@ chain still names it or says precisely which of the three causes applies.
 - [ ] Report the condition through `/health` and `/nano/sync_status`. A node that
       cannot advance must not answer `ready: true` with a null error; the hold
       harness and any supervisor read those and both were blind here.
+      **Half done (ad250086):** `Tracker::window_closed_below` separates a view
+      this chain derived and dropped from one it has not walked to, and the
+      executor now says which it hit and that a restart clears it. It leans on the
+      consensus-hash history never being front-pruned, so a dropped view is still
+      named there. Behaviour is unchanged; the refusal is still correct and still
+      waits. What remains is surfacing it through the two HTTP surfaces, which is
+      where the supervisor and the hold harness actually look.
 - [ ] Add a regression that fails if executed height is static while staged
       blocks exist and health still reports ready.
 
