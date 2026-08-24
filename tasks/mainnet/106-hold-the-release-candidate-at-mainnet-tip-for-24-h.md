@@ -315,6 +315,46 @@ compares the state's recorded profile with the running binary's and there is
 deliberately no subcommand to repin an imported state. This import is that
 restart, not a separate blocker.
 
+## Catch-up needed a restart, and the witness needs disk, 2026-08-24
+
+**The subject stalled for sixteen hours and a restart cleared it.** It imported,
+executed to 8,743,989, then refused every round because the local sortition chain
+could not name burn view `653ee60a…` while standing on burn 963,817, all while
+`/health` answered `ready: true` with a null error. That view is burn 962,151 by
+both stock oracles and execution stood on 962,149, so the refusal was right and
+the durable state sound; a restart resumed at ~6,400 blocks an hour.
+[[148-recover-from-an-unnameable-burn-view-without-a-restart]] carries the defect.
+
+Two consequences for this task. The catch-up is *not* an uninterrupted run and
+must not be presented as one. And `stall-supervisor.sh` now restarts the subject
+after twelve minutes of static height — which is correct for catch-up and
+**must be stopped before the hold**, since `hold-follower-mainnet.sh` treats a pid
+change as fatal to the interval and is right to.
+
+**The witness binary exists and is exactly the subject's revision.**
+`nix build .#stacks-node` from the clean worktree gave
+`/nix/store/mddc8s7ql9x20k94j94pr96hf3ri0p2m-nano-stacks-0.1.0-88920833e521`,
+reporting `source_revision 88920833e521…` and compiler `sha256:ee7af998…` — the
+same as the subject, which is what `verify-hold-receipts.sh` requires and what
+`nano-witness` (revision `16e0928a`) cannot supply. It can use the idle
+`nano-release-sink` on 20472, since the subject has no `event` role to feed it.
+
+**What it lacks is ~100 GB, and the space is not where `du` says.** The stalled
+dev node on port 20492 was stopped — it is on the task-147 Clarity refusal, not
+this stall, and its provenance from 2026-08-04 records no `profile_fingerprint`
+at all, so `check_profile` refuses it for any current binary and only a re-import
+fixes it. Removing its 194 GiB `chainstate` freed **nothing**: those extents are
+shared with `/home/aldur/mainnet-chainstate`, which holds **508 GiB exclusively**
+and is the original Hiro download — `archive.tar.zst` at 223.8 GB plus its
+extraction, dated 2026-07-31, referenced only by the `fetch-*`/`extract-*` scripts
+that created it and mounted by no container. Retiring it would free the witness's
+room and more, at the cost of re-downloading 223 GB from a single archive provider
+if the checkpoint ever needs rebuilding from source. That is the operator's call,
+not an unattended step. Its small records are backed up at
+`/home/aldur/mainnet-tip-records-backup` (25 MB), and
+`state/waterfall-payouts.json` was deliberately left in place because the running
+task-082 waiter reads that exact path.
+
 ## Acceptance criteria
 
 - One continuous 24-hour interval has no process failure or consensus
