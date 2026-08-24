@@ -839,6 +839,58 @@ fn compare_task_064_engines(
 }
 
 #[test]
+#[ignore = "requires the mainnet 8,815,025 state with its staged child"]
+fn the_mainnet_8815026_trait_registration_executes_at_its_exact_prestate() {
+    const TXID: &str = "8b54004787530e3547a2a9316838375eba701a72d55e7a3a72aef2fe3c471e1d";
+    const HEIGHT: u32 = 8_815_026;
+    const TX_INDEX: usize = 9;
+
+    let directory = env::var_os("NANO_147_SCRATCH")
+        .map(PathBuf::from)
+        .expect("NANO_147_SCRATCH must name a fresh writable chainstate reflink");
+    let mut chain = ChainState::open(Network::MAINNET, &directory).expect("open task 147 scratch");
+    let parent = chain.tip().expect("read task 147 tip").expect("sealed tip");
+    let staging = nano_node::staging::Staging::open(&directory.join("staging.sqlite"))
+        .expect("open task 147 staging");
+    let block = staging
+        .child_of(nano_primitives::StacksBlockId::from_bytes(parent))
+        .expect("read staged child")
+        .expect("task 147 child is staged");
+    assert_eq!(block.header.chain_length, u64::from(HEIGHT));
+    assert_eq!(
+        block.transactions[TX_INDEX].txid().to_string(),
+        TXID,
+        "the reproduced call remains transaction ten"
+    );
+    assert!(!starts_new_tenure(&block));
+
+    let parent_header = complete_header(&chain, parent);
+    let block_context = context(parent_header, parent_header);
+    let result = call_at_exact_fixture_prestate(
+        &mut chain,
+        &block,
+        block_context,
+        TX_INDEX,
+        HEIGHT - 1,
+        false,
+    );
+    assert_eq!(
+        result.value.expect("successful result").to_string(),
+        "(ok u2)"
+    );
+    assert_eq!(
+        result.cost,
+        ExecutionCost {
+            read_count: 24,
+            read_length: 345_596,
+            runtime: 379_891,
+            write_count: 4,
+            write_length: 519,
+        }
+    );
+}
+
+#[test]
 fn the_mainnet_8686666_old_epoch_fixture_is_self_consistent() {
     let (block, oracle) = hex_fixture(TASK_064_BLOCK_FILE, TASK_064_ORACLE_FILE);
     assert_eq!(block.header.chain_length, u64::from(TASK_064_CHILD_HEIGHT));

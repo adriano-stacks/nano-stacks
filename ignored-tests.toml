@@ -302,3 +302,23 @@ by both stock oracles -- while standing on burn 963,817 and reporting
 restart, which re-seeds the chain and its floor together. It would void a 24-hour
 tip hold, so it blocks 106 as well as 148.
 """
+
+[[ignored]]
+test = "the_mainnet_8815026_trait_registration_executes_at_its_exact_prestate"
+class = "infrastructure"
+owner = "147"
+job = "release-qualification"
+requires = "NANO_147_SCRATCH writable state sealed through 8,815,025 with block 8,815,026 staged"
+note = """
+The canonical receipt is `(ok u2)` and the canonical state root is
+255c6115d5038ee255afefb26ddaed565417d06e5b17f88a4cd9667e569c476b. The compiled
+and interpreted engines already agree on the reduced shape without any mainnet
+state, in `trait_equality::a_clarity_four_trait_principal_survives_the_registration_shape`,
+which is the unconditional gate for the defect itself; this one is the exact
+prestate, so it needs the state.
+
+The live equivalent is running rather than pending: the node on RPC 20492 was
+rebuilt on the fix and is catching up through this height, and the sealed root is
+checked against the block header on every block, so passing 8,815,026 at all is
+the canonical-root comparison.
+"""
