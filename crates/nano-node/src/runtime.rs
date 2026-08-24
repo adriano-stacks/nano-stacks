@@ -428,15 +428,20 @@ async fn publish_sealed_tip(
     pox: &PoxInfo,
 ) {
     if let (Some(state), Some(executor)) = (state, executor) {
-        let (sealed, sortitions, cache_usage) = {
+        let (sealed, sortitions, cache_usage, cannot_progress) = {
             let mut executor = executor.lock().await;
             (
                 sealed_tip(executor.tip(), executor.bitcoin_height()),
                 executor.derived_sortitions(),
                 executor.cache_usage(),
+                executor.dropped_view_stall().map(str::to_owned),
             )
         };
         state.metrics().publish_execution_caches(cache_usage);
+        // Published beside the sealed tip because that is the pair a reader needs:
+        // a height, and whether it can still move. Every other field stays healthy
+        // while a node refuses the same block forever.
+        state.publish_cannot_progress(cannot_progress).await;
         state
             .publish_executed(sealed, sortitions, pox.clone())
             .await;

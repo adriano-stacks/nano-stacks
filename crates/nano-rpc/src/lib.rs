@@ -289,6 +289,13 @@ pub struct RpcState {
     peers: Arc<RwLock<Option<PeerReport>>>,
     /// Durable staging and the two bounded p2p relay queues.
     queues: Arc<RwLock<QueueReport>>,
+    /// Why this node can no longer make progress, when that is where it is.
+    ///
+    /// A node refusing the same block every round is dead, and every other field
+    /// here keeps looking healthy while it happens — peers connected, queues
+    /// draining, a followed tip climbing. Sixteen hours of a mainnet catch-up were
+    /// lost to exactly that, so the one fact that matters gets its own field.
+    cannot_progress: Arc<RwLock<Option<String>>>,
     /// What this node executed and sealed, which every Stacks-compatible route
     /// answers from.
     executed: Arc<RwLock<Option<Executed>>>,
@@ -373,6 +380,7 @@ impl RpcState {
             selected: Arc::new(RwLock::new(None)),
             peers: Arc::new(RwLock::new(None)),
             queues: Arc::new(RwLock::new(QueueReport::default())),
+            cannot_progress: Arc::new(RwLock::new(None)),
             executed: Arc::new(RwLock::new(None)),
             events,
             chain: None,
@@ -609,6 +617,12 @@ impl RpcState {
     }
 
     /// Publish queue depths measured by the follow loop.
+    /// Say why this node cannot make progress, or that it can again.
+    pub async fn publish_cannot_progress(&self, reason: Option<String>) {
+        let mut current = self.cannot_progress.write().await;
+        *current = reason;
+    }
+
     pub async fn publish_queues(&self, queues: QueueReport) {
         self.metrics.publish_queues(&queues);
         let mut current = self.queues.write().await;
@@ -1130,6 +1144,7 @@ async fn sync_status(
     let selected = state.selected.read().await.clone();
     let peers = state.peers.read().await.clone();
     let queues = *state.queues.read().await;
+    let cannot_progress = state.cannot_progress.read().await.clone();
     let tip = state
         .executed
         .read()
@@ -1172,6 +1187,7 @@ async fn sync_status(
                 })
                 .collect()
         }),
+        cannot_progress,
         executed_stacks_height: tip.as_ref().map(|tip| tip.stacks_height),
         executed_stacks_tip: tip.as_ref().map(|tip| tip.stacks_tip.to_string()),
         executed_state_index_root: tip.as_ref().map(|tip| tip.state_index_root.to_string()),
@@ -2658,6 +2674,9 @@ struct SyncStatusWire {
     executed_stacks_tip: Option<String>,
     executed_state_index_root: Option<String>,
     blocks_behind: Option<u64>,
+    /// Set when no further round can help, so a reader can tell a node that is
+    /// behind from one that has stopped.
+    cannot_progress: Option<String>,
 }
 
 #[derive(Serialize)]
