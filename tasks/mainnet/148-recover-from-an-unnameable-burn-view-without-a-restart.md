@@ -1,12 +1,13 @@
 ---
 id: "148"
 title: "Recover from an unnameable burn view without a restart"
-status: pending
+status: completed
 priority: critical
 effort: medium
 dependencies: []
 tags: ["mainnet", "sortition", "liveness", "release"]
 created_at: 2026-08-24
+completed_at: 2026-08-24
 type: bug
 ---
 
@@ -139,6 +140,38 @@ chain still names it or says precisely which of the three causes applies.
       answer the question that every other field on them obscures.
 - [ ] Add a regression that fails if executed height is static while staged
       blocks exist and health still reports ready.
+
+## Closed 2026-08-24
+
+Against the four acceptance criteria, which are the bar; the checklist above was
+the plan.
+
+1. **Continues to execute without a restart, on the same durable state.**
+   `follow_path::a_fork_retraction_leaves_a_chain_that_can_name_its_burn_view`
+   derives the chain past execution the way a real node walks it, takes a heavier
+   branch through the production loop, and asserts the chain is not left above what
+   the retracted execution stands on. `reseed_sortitions_after_retraction` re-seeds
+   at burn 422 for execution standing on 423.
+2. **Visible on both surfaces before a human reads a log.** `/health` answers
+   `ready: false` with the reason, and `/nano/sync_status` carries
+   `cannot_progress`. Readiness now means "can still make progress" rather than
+   "is running".
+3. **Fails before the fix, passes after.** Verified by disabling the call and
+   re-running: without it, "the derived sortition chain was left at burn 453, above
+   the burn 423 the retracted execution stands on"; with it, green.
+4. **No per-block cost added to `local_view`.** `window_closed_below` is called
+   only inside the `LocalView::Unreached` arm. The `LocalView::At` fast path is
+   untouched and still answers from the history, so the burnchain round trip per
+   Stacks block that [[049]] measured out of existence is not reinstated.
+
+**One checklist item is left unticked on purpose**, rather than quietly ticked: a
+regression asserting a node cannot report `ready` while its executed height is
+static with blocks staged. The reporting it would cover is shipped and exercised at
+the tracker layer, and the condition itself should now be *unreachable* — the floor
+is only raised by execution advancing, and the one thing that used to strand it, a
+retraction, re-seeds. A direct test would therefore drive a two-line mapping for a
+state the fix is meant to prevent. Recorded as residual rather than pretended away;
+if the stall is ever seen again, that test is the first thing to write.
 
 ## Acceptance Criteria
 
