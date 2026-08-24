@@ -61,6 +61,15 @@ pub struct CheckpointExecutor<S> {
     /// The burn height a reported sortition gap was last complained about, so
     /// the complaint is made once rather than for every block behind it.
     sortition_gap: Option<u64>,
+    /// Set while execution is refused on a burn view this chain derived and then
+    /// dropped, which no further round can clear.
+    ///
+    /// A node in that state is dead and cannot say so: `/health` answered
+    /// `ready: true` with a null error for sixteen hours of a mainnet catch-up,
+    /// and the operator found it by reading a log. Held here so the readiness the
+    /// artifact publishes is about whether it can still make progress rather than
+    /// only about whether it is running.
+    dropped_view_stall: Option<String>,
     tip: NakamotoBlock,
     /// The Bitcoin height the sealed tip was executed under.
     ///
@@ -890,6 +899,7 @@ where
             chainstate,
             sortition: None,
             sortition_state: None,
+            dropped_view_stall: None,
             sortition_gap: None,
             tip: anchor,
             bitcoin_height: bitcoin_context.height,
@@ -918,6 +928,7 @@ where
             chainstate,
             sortition: None,
             sortition_state: None,
+            dropped_view_stall: None,
             sortition_gap: None,
             tip,
             bitcoin_height: 0,
@@ -1059,6 +1070,9 @@ where
     }
 
     fn adopt_executed_tip(&mut self, block: NakamotoBlock, context: BitcoinBlockContext) {
+        // Progress is the only thing that clears the stall, and it clears it
+        // whatever the cause was.
+        self.dropped_view_stall = None;
         self.bitcoin_view = adopted_bitcoin_view(self.bitcoin_view, &block);
         self.tip = block;
         self.bitcoin_height = context.height;
@@ -1093,6 +1107,17 @@ where
         self.chainstate
             .recorded_header(*self.tip.block_id().as_bytes())
             .map_or(0, |header| u64::from(header.burn_block_height))
+    }
+
+    /// Why this node can no longer make progress, if that is where it is.
+    ///
+    /// `None` is a node that is executing or merely waiting for something a later
+    /// round can supply. `Some` is a node that will refuse the same block every
+    /// round until it is restarted, which readiness has to reflect: the operator
+    /// who lost sixteen hours to this had every signal say healthy.
+    #[must_use]
+    pub fn dropped_view_stall(&self) -> Option<&str> {
+        self.dropped_view_stall.as_deref()
     }
 
     /// The consensus hash that names the inventory cycle this node's burn view sits in.
@@ -2640,7 +2665,7 @@ where
                     .as_ref()
                     .and_then(|tracker| tracker.window_closed_below(view))
                 {
-                    eprintln!(
+                    let stall = format!(
                         "the local sortition chain derived burn view {view} at burn \
                          {dropped_at} and no longer holds it: the retained window closed \
                          above it while the chain walked on to burn {standing_on}, and a \
@@ -2648,6 +2673,8 @@ where
                          until this node is restarted",
                         block.header.chain_length
                     );
+                    eprintln!("{stall}");
+                    self.dropped_view_stall = Some(stall);
                 } else {
                     eprintln!(
                         "the local sortition chain cannot name burn view {view}, standing on \

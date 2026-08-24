@@ -325,8 +325,13 @@ fn snapshot(
     ready: bool,
     last_error: Option<String>,
 ) -> Snapshot {
+    // A node refusing a burn view it derived and dropped cannot recover on its
+    // own, so it is not ready however healthy the rest of it looks. Reported here
+    // rather than at each call site because every publisher needs it and none of
+    // them can know it.
+    let stalled = executor.dropped_view_stall().map(str::to_owned);
     Snapshot {
-        ready,
+        ready: ready && stalled.is_none(),
         stacks_height: Some(executor.tip().header.chain_length),
         bitcoin_height: Some(executor.bitcoin_height()),
         state_root: Some(hex::encode(
@@ -334,7 +339,7 @@ fn snapshot(
         )),
         p2p_connected: discovered.connected(),
         p2p_known: discovered.known(),
-        last_error,
+        last_error: last_error.or(stalled),
     }
 }
 
