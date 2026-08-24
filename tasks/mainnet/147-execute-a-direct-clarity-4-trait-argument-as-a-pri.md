@@ -40,8 +40,14 @@ for block 8,815,026.
 
 ## Tasks
 
-- [ ] Reduce the direct Clarity 4 public trait-argument path to an offline
+- [x] Reduce the direct Clarity 4 public trait-argument path to an offline
       compiled/interpreter crosscheck.
+      `trait_equality::a_clarity_four_trait_principal_survives_the_registration_shape`
+      runs the reduced registration shape through both engines, asserts they agree
+      and that the answer is `UInt(2)` — the canonical `(ok u2)`. Unconditional, no
+      mainnet state. Its padding sweep runs 0, 1, 64 and 4,096 bytes of preceding
+      static data, because the mainnet failure named a *value offset* and where a
+      value lands depends on what precedes it; green at all four.
 - [x] Fix the nano-owned clarity-wasm ABI path without an interpreter fallback.
       Closed in 26067420: duck-typing an optional projects its payload's slots
       on both branches, so the `none` branch offered a tuple whose principals
