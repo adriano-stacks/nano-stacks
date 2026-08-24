@@ -288,4 +288,28 @@ adding a sibling beside it, needs two things:
   on the executor; whether it exposes enough, or wants a narrow accessor beside it,
   is the only open design question left.
 
-No wider capture, no window parameterisation, no new fixture.
+No wider capture, no window parameterisation, no new fixture. And
+`derived_bitcoin_height()` already returns the tracker's tip, so no new accessor
+either — that open design question is answered.
+
+**One thing does have to be added, though.** That fork test has no sortition
+tracker at all: neither it nor `execute_fixture_orphan` calls
+`track_sortitions`, so both of the fix's guards return early and there is nothing
+to observe. Sortitions have to be set up in it first, and the pattern to copy is
+the burnchain-reorganisation test in the same file — it builds a tracker against
+`directory.join("capture")`, then asserts
+
+```rust
+tracker.consensus_hash_at(retracted_at) == tenures.first().copied()
+```
+
+before retracting, with the reason stated: "without this the retraction below could
+discard nothing and the test would still pass, because a wrong consensus hash
+matches no tenure." A fork regression that skipped that precondition would pass
+for the wrong reason, which is worse than not having it.
+
+So the remaining work is: give that fork test a tracker under the same
+precondition, call `keep_sortition_capture(directory.join("capture"))`, and assert
+`derived_bitcoin_height() <= bitcoin_height()` after the fork is taken. Pre-fix the
+tracker stays where it walked, which for this fixture is the burnchain tip and
+therefore above execution, so the assertion discriminates.
