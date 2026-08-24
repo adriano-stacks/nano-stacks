@@ -339,7 +339,24 @@ same as the subject, which is what `verify-hold-receipts.sh` requires and what
 `nano-witness` (revision `16e0928a`) cannot supply. It can use the idle
 `nano-release-sink` on 20472, since the subject has no `event` role to feed it.
 
-**What it lacks is ~100 GB, and the space is not where `du` says.** The stalled
+**`btrfs filesystem du`'s "Exclusive" column does not predict what a delete
+frees, and this was learned the hard way twice.** It reported
+`follower-import-final-16e0928a` as 101.21 GiB total with **101.21 GiB exclusive
+and 0 B shared**, so retiring it should have returned ~101 GiB. The directory now
+measures 13.92 MiB, confirming the delete landed — and free space went from
+50 GiB to 43 GiB over the same period, which is exactly the release subject's own
+~3.4 GB/h and nothing else. **The delete freed nothing.** The same thing had
+already happened with the 20492 node's 194 GiB `chainstate`. Without quota groups
+enabled, that column is best-effort and evidently counts extents as exclusive
+that a surviving reflink elsewhere still pins.
+
+The rule to use instead: sample `df` before and after, and treat any
+`btrfs filesystem du` figure as a hypothesis. The only genuinely reclaimable
+block identified so far, `mainnet-chainstate` at a reported 508 GiB exclusive, is
+now also unproven by the same reasoning and must be tested on a small slice
+before anyone deletes 223 GB of archive on the strength of it.
+
+**What the witness lacks is ~100 GB, and no measured way to free it.** The stalled
 dev node on port 20492 was stopped — it is on the task-147 Clarity refusal, not
 this stall, and its provenance from 2026-08-04 records no `profile_fingerprint`
 at all, so `check_profile` refuses it for any current binary and only a re-import
