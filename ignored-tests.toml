@@ -276,3 +276,29 @@ class = "infrastructure"
 owner = "146"
 job = "release-qualification"
 requires = "NANO_146_SOURCE naming an immutable mainnet state that holds block 8,808,752 and its parent, and NANO_146_SCRATCH naming a fresh writable copy of it"
+
+[[ignored]]
+test = "a_rolled_back_executor_can_still_name_its_burn_view"
+class = "semantic"
+owner = "148"
+measured = """
+Blocking, and it should be. `SnapshotChain::keep_from` only ever raises the
+retention floor -- correct while execution moves forward, since a floor that went
+backwards would let the window shrink under a reader standing in it. But
+`Executor::stand_on_known_block` retracts execution to an earlier block, and a
+Stacks fork can reach further back than `MINING_COMMITMENT_WINDOW`. The floor
+cannot follow it down, the snapshots below it were already dropped, and the chain
+walks forward only, so the burn view the retracted execution now stands on is
+unreachable for the life of the process.
+
+This test asserts the consequence and fails on the current code at the second
+assertion: the consensus-hash history still contains the view, so the chain has
+not forgotten deriving it -- it only refuses to answer for it.
+
+Observed on mainnet 2026-08-24: the release subject executed to Stacks 8,743,989
+and then refused every round, unable to name burn view 653ee60a... -- burn 962,151
+by both stock oracles -- while standing on burn 963,817 and reporting
+`ready: true` with a null error. Sixteen hours of catch-up lost, cleared only by a
+restart, which re-seeds the chain and its floor together. It would void a 24-hour
+tip hold, so it blocks 106 as well as 148.
+"""
