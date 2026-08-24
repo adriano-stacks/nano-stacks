@@ -4,7 +4,7 @@ title: "Extract the Epoch 4.0 consensus firewall"
 status: blocked
 priority: high
 effort: large
-dependencies: ["135", "136", "138"]
+dependencies: ["135", "136", "142"]
 tags: ["mainnet", "consensus", "architecture", "isolation"]
 created_at: 2026-08-14
 type: improvement
@@ -37,6 +37,23 @@ consensus rules in place.
 - [ ] Measure throughput, catch-up latency and restart behavior; retain no
       fallback to the old executor after migration.
 
+## Dependency corrected, 2026-08-24
+
+This task depended on **138**, which was cancelled on 2026-08-23 because the
+project has one operator. A dependency on a cancelled task can never be satisfied,
+so taskmd would have held this blocked however much of the work landed — not a
+judgement about readiness, just a broken edge.
+
+Re-pointed to **142**, which is where 138's substance actually went: 142 inherited
+the "one continuous interval spanning a prepare phase, the rollover and the
+complete following cycle" requirement verbatim, and its acceptance criteria name
+the single-operator assumption as a residual rather than pretending to independent
+corroboration. That is the interval this task's shadow-mode comparison needs, so
+the edge now points at the thing that supplies it.
+
+The intent is unchanged: this remains sequenced *after* the follower qualifies, as
+its own objective says.
+
 ## Measured status, 2026-08-23
 
 The checkboxes above understated what exists, so this records what is in the tree
@@ -62,11 +79,10 @@ behind the boundary, run P2P/RPC/optional roles without write permission, compar
 every decision in shadow mode first, and measure throughput, catch-up latency and
 restart behaviour before removing the in-process path.
 
-**A dependency that can never be satisfied.** This task lists `138`, which is
-cancelled, so taskmd will hold it blocked indefinitely no matter how much of the
-work lands. The full-cycle shadow comparison this task needs is the same interval
-task 142 inherited from 138, so 142 is the honest gate; re-pointing the dependency
-is a plan decision and has been left alone rather than edited quietly.
+**A dependency that could never be satisfied**, since corrected above: this task
+listed `138`, which is cancelled, so taskmd would have held it blocked no matter
+how much of the work landed. The full-cycle shadow comparison it needs is the same
+interval 142 inherited from 138, so the edge now points there.
 
 ## Acceptance Criteria
 
