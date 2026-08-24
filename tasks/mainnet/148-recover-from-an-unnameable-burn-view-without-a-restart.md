@@ -210,3 +210,28 @@ What that needs, and all it needs:
   without a restart. The existing reproduction is at the `SnapshotChain` layer and
   cannot cover this; the retraction path is where the regression belongs, and
   writing that fixture is the remaining work.
+
+## Where the regression belongs, and why it is not a quick add
+
+`execution_stall.rs` is the right home for the reporting half. It already runs the
+*shipped binary* against a peer serving a coherent chain and reads all three heights
+back over `/nano/sync_status` — built for exactly the class of bug where "an RPC is
+only trustworthy about a disagreement". Asserting that a node which cannot advance
+stops answering `ready: true` belongs there, beside it.
+
+The obstacle is fixture width, and it is worth stating so the next attempt budgets
+for it. Reaching this stall needs the retained window to have closed *above* the
+burn view execution needs, and the window is `SNAPSHOTS_KEPT = 144` snapshots. The
+captured fixtures these rigs replay span twelve blocks (`fork_retraction.rs`'s
+`BLOCKS = 12`, `execution_stall.rs`'s `SERVED_BLOCKS = 12`), so the window never
+closes in them at all. Producing the condition needs one of:
+
+- a capture spanning more than 144 burn blocks, driven far enough that the tracker
+  runs that far ahead of execution, then retracted; or
+- a test-only way to narrow `SNAPSHOTS_KEPT`, so a twelve-block fixture can close
+  the window. Cheaper, and it changes a constant that is already documented as "what
+  the deepest reader needs plus margin" rather than a consensus rule.
+
+The second is the pragmatic route and is what the fix should be gated on. Until one
+of them exists, the reproduction committed at the `SnapshotChain` layer is the only
+mechanical evidence, and it cannot cover the executor's behaviour.
