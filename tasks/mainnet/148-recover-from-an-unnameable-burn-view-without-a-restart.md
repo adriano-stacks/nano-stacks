@@ -75,10 +75,16 @@ chain still names it or says precisely which of the three causes applies.
 
 ## Tasks
 
-- [ ] Reproduce the stall in a test from the tracker's own API, without a node.
-- [ ] Establish which of the three paths above produces it, by measurement rather
+- [x] Reproduce the stall in a test from the tracker's own API, without a node.
+      `nano_sortition::tests::a_rolled_back_executor_can_still_name_its_burn_view`,
+      ignored and inventoried as `semantic` with owner 148 so it blocks release.
+- [x] Establish which of the three paths above produces it, by measurement rather
       than by reading — the log line alone cannot distinguish "not primed" from
-      "floor too high".
+      "floor too high". **It is the floor.** The test fails at its second
+      assertion: after the floor rises, the window closes, and execution then
+      retracts below it, `snapshot_at` answers `None` while `history()` still
+      contains the view — so the chain has not forgotten deriving it and is not
+      unprimed, it simply refuses to answer. The remaining work is the fix.
 - [ ] Make a view the chain has derived nameable for as long as any unexecuted
       staged block can ask for it, or refuse in a way that names the cause.
 - [ ] Report the condition through `/health` and `/nano/sync_status`. A node that
