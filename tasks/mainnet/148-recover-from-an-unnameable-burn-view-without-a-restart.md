@@ -87,6 +87,17 @@ chain still names it or says precisely which of the three causes applies.
       unprimed, it simply refuses to answer. The remaining work is the fix.
 - [ ] Make a view the chain has derived nameable for as long as any unexecuted
       staged block can ask for it, or refuse in a way that names the cause.
+      **Implemented (bf757a5d), not yet covered end to end.** The refusal names
+      the cause, and `reseed_sortitions_after_retraction` now calls
+      `resume_or_capture_below` at the retraction — adopting the saved chain when
+      it sits below what the retracted execution needs and re-deriving from the
+      capture when it does not, which is what a restart was doing. The capture path
+      is optional and set only by the two production wirings, so rigs that do not
+      set it keep today's behaviour. **The item stays unticked deliberately:** the
+      machinery it calls has its own test, written for the mainnet follower that
+      stopped seeded at burn 961,342, but this call site does not, and the
+      acceptance criteria ask for a test that fails before the fix and passes
+      after.
       **The reproduction is at the wrong layer to gate this fix, which is worth
       knowing before anyone tries to make it pass.** `SnapshotChain` has no
       burnchain source, so once it has dropped a snapshot it cannot get it back;
