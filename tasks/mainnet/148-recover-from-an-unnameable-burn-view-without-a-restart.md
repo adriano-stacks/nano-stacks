@@ -116,3 +116,50 @@ chain still names it or says precisely which of the three causes applies.
 - No regression in the per-Stacks-block cost of `local_view`: the fast path stays
   a history lookup and does not reinstate a burnchain round trip per block, which
   [[049]] measured out of existence.
+
+## Traced further, 2026-08-24: two candidates ruled out
+
+**The retraction path already knows about this.** `resume_from_common_ancestor`
+calls `persist_sortitions_for_restart()` *before* the chainstate write, and that
+writes a seed at `bitcoin_height() - 1` with the reason stated exactly: "A branch
+can replace the first block of the current sortition without a Bitcoin
+reorganization; its common parent then stands one burn block lower. Saving exactly
+at execution made a restart unable to reach that parent because a sortition chain
+only walks forward." Its failure message is "the sortition chain could not retain
+the burn view needed to restart this Stacks fork".
+
+So the durable half of the fix is already there, and that is precisely why a
+restart cures the stall: the next start seeds from that saved point. What is
+missing is the in-process half — after retracting, the executor keeps the same
+in-memory chain, with the floor still raised and the snapshots below it already
+dropped.
+
+**Ruled out, so nobody repeats them:**
+
+- `Tracker::remember_elected_heights` looks like the repair and is not.
+  `track_sortitions` calls it, and its comment does describe this shape of bug
+  ("a staged block standing lower stops execution — mainnet at 8,712,512, asked
+  about burn 961,320 from a chain seeded at 961,342"). But it feeds
+  `seed_sortitions_below_window`, which serves the accumulated-coinbase walk over
+  burn blocks that elected somebody. It does not make
+  `height_of_consensus_hash` answer for a view below the window, which is the
+  symptom here.
+- Lowering the floor after the fact cannot work at the `SnapshotChain` layer, as
+  recorded above: nothing there can re-derive a dropped snapshot.
+
+**So the fix is one of two, both crossing a module boundary:**
+
+1. Re-seed the in-memory tracker from `sortition_state` after a retraction — the
+   same thing startup does. The obstacle is ownership: `Executor::track_sortitions`
+   *receives* a constructed `SortitionTracker`, and the code that builds one from
+   the state path lives in `nano-node`'s runtime wiring, so the executor currently
+   has no way to ask for a fresh one.
+2. Never raise the floor beyond what a retraction can undo, which requires the
+   bound the objective already questions: `execution_rollback_floor` subtracts
+   `MINING_COMMITMENT_WINDOW`, and that bounds a Bitcoin reorganisation, not how
+   far a Stacks fork retraction moves the burn view.
+
+Option 1 is the smaller change and reuses a path that is already exercised on
+every start. It was not attempted here rather than attempted badly: it moves a
+constructor across a crate boundary in consensus-adjacent code, and the release
+subject was mid-catch-up at the time.
