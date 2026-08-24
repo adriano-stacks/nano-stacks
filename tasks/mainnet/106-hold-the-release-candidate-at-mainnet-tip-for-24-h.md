@@ -372,7 +372,32 @@ window's blocks, and both nodes would have imported the same attested checkpoint
 anyway — but `hold-follower-mainnet.sh` says "independently executing" and this is
 weaker than a separate import, so it is recorded as an option rather than adopted.
 
-**Failing that, the witness lacks ~100 GB and no measured way to free it.** The stalled
+**The reflink witness now exists, because the port-20492 node needed the same
+thing.** That node could not be restarted in place — its 2026-08-04 provenance
+records no `profile_fingerprint`, so `check_profile` refuses any current binary —
+and a fresh import needs the ~100 GB this filesystem does not have. So it was
+brought back on a reflink clone of the release subject's imported state, running
+`stacks-node` built from the clean worktree at the subject's own revision
+`88920833e521` (compiler `sha256:ee7af998`), with an event observer into the
+otherwise idle `nano-release-sink`. Cloning 80 GiB cost ~3 GiB of real space.
+
+That makes it the same-revision receipt witness this task needs, with the shared
+prefix caveat recorded above rather than hidden: it agrees with the subject on
+history before the clone by construction, and executes the hold window itself.
+Bring-up: `/home/aldur/bring-up-20492.sh`, config
+`/home/aldur/mainnet-tip/config-88920833.toml`, state
+`/home/aldur/mainnet-tip/state-88920833`.
+
+**Two catch-ups do not both fit, so the floors are tiered.** The subject's guard
+sits at 20 GiB and the 20492 node's at 24 GiB, so under pressure the second node
+stops first and the release evidence keeps its headroom. Both were ~45,000 blocks
+behind with ~34 GiB free, which is tight enough that the 20492 node may pause
+itself before reaching tip and resume once the subject is at tip and its growth
+has slowed. A paused witness is recoverable; a starved subject is not.
+
+The subject's `max_sync_blocks` was also lowered from 20000 to 2000. At 20000 a
+SIGTERM waited a full round — forty minutes of an operator's time on the one
+occasion it mattered — and the parameter is batching, not consensus. The stalled
 dev node on port 20492 was stopped — it is on the task-147 Clarity refusal, not
 this stall, and its provenance from 2026-08-04 records no `profile_fingerprint`
 at all, so `check_profile` refuses it for any current binary and only a re-import
