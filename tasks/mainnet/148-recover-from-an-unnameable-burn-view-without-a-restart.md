@@ -176,3 +176,37 @@ Option 1 is the smaller change and reuses a path that is already exercised on
 every start. It was not attempted here rather than attempted badly: it moves a
 constructor across a crate boundary in consensus-adjacent code, and the release
 subject was mid-catch-up at the time.
+
+## The open question is answered, and it picks the fix
+
+How far can a retraction move the burn view? **It is not bounded by a constant.**
+`switch_to_staged_branch` resumes at whatever ancestor `staging.descent_resumes_at()`
+names, and the comment beside it records a mainnet case with 1,509 blocks staged and
+none executable. So a retraction can give back thousands of Stacks blocks, spanning
+many burn blocks.
+
+That rules out candidate 2. Bounding the floor by the deepest possible retraction
+means retaining the whole staging span, which is the leak the window exists to
+prevent — `SNAPSHOTS_KEPT` is 144 and staging can be an order of magnitude wider.
+`execution_rollback_floor`'s subtraction of `MINING_COMMITMENT_WINDOW` is not
+merely too small; no fixed number is right.
+
+**So candidate 1 is the fix, and the capture fallback is required rather than
+optional.** After a retraction the executor should rebuild its tracker exactly as
+startup does, via `SortitionTracker::resume_or_capture_below(state, capture,
+executed_burn_view)`: that adopts the saved chain when it sits below the retracted
+execution — which the `bitcoin_height() - 1` seed covers for a one-block fork — and
+falls back to re-deriving from the capture when the retraction went deeper, which
+is the case a fixed floor can never cover.
+
+What that needs, and all it needs:
+
+- the executor to hold the capture path beside `sortition_state`. Prefer a small
+  setter over widening `track_sortitions`, whose signature has several callers
+  including tests.
+- the rebuild called from `switch_to_staged_branch` after `stand_on_known_block`,
+  where `persist_sortitions_for_restart` has already run.
+- a test that retracts across a burn boundary and asserts execution continues
+  without a restart. The existing reproduction is at the `SnapshotChain` layer and
+  cannot cover this; the retraction path is where the regression belongs, and
+  writing that fixture is the remaining work.
