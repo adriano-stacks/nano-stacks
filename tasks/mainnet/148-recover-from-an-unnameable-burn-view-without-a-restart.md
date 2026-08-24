@@ -103,13 +103,20 @@ chain still names it or says precisely which of the three causes applies.
 - [ ] Report the condition through `/health` and `/nano/sync_status`. A node that
       cannot advance must not answer `ready: true` with a null error; the hold
       harness and any supervisor read those and both were blind here.
-      **Half done (ad250086):** `Tracker::window_closed_below` separates a view
-      this chain derived and dropped from one it has not walked to, and the
-      executor now says which it hit and that a restart clears it. It leans on the
-      consensus-hash history never being front-pruned, so a dropped view is still
-      named there. Behaviour is unchanged; the refusal is still correct and still
-      waits. What remains is surfacing it through the two HTTP surfaces, which is
-      where the supervisor and the hold harness actually look.
+      **Done for `/health` (ad250086, acb959d6).**
+      `Tracker::window_closed_below` separates a view this chain derived and
+      dropped from one it has not walked to, leaning on the consensus-hash history
+      never being front-pruned. The executor holds why it cannot progress, cleared
+      by any block executing, and the follower's `snapshot()` turns that into
+      `ready: false` with the reason as `last_error` — in `snapshot()` rather than
+      at each call site, because every publisher needs it and none of them can know
+      it. Readiness now means "can still make progress" rather than "is running".
+      Consensus behaviour is untouched.
+
+      **Still open: `/nano/sync_status`**, which is the full node's surface in
+      `nano-rpc` and the one the 20492 witness serves. `SyncStatusWire` already
+      carries `blocks_behind` and the three tips; it needs the same reason field,
+      and the node's runtime has to pass it through the way the follower's does.
 - [ ] Add a regression that fails if executed height is static while staged
       blocks exist and health still reports ready.
 
