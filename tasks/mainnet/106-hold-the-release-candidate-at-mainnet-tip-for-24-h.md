@@ -356,7 +356,23 @@ block identified so far, `mainnet-chainstate` at a reported 508 GiB exclusive, i
 now also unproven by the same reasoning and must be tested on a small slice
 before anyone deletes 223 GB of archive on the strength of it.
 
-**What the witness lacks is ~100 GB, and no measured way to free it.** The stalled
+**An option that removes the 100 GB requirement, for the operator to accept or
+reject.** The witness exists to supply `new_block` payloads for the *hold window*
+— about 17,000 blocks — which `verify-hold-receipts.sh` compares against the
+subject's archived receipt commitments. A second full import re-executes 165,000
+blocks to reach that window. Instead, reflink-clone the subject's state at the
+moment the hold starts, run the clone as the same-revision full node with an event
+observer, and let it execute the window itself. Reflinking is near-free, so the
+blocker disappears.
+
+What that trades away is the shared prefix: the two nodes would agree on all
+history before the hold by construction rather than by independent derivation.
+The receipts actually under comparison are still each node's own execution of the
+window's blocks, and both nodes would have imported the same attested checkpoint
+anyway — but `hold-follower-mainnet.sh` says "independently executing" and this is
+weaker than a separate import, so it is recorded as an option rather than adopted.
+
+**Failing that, the witness lacks ~100 GB and no measured way to free it.** The stalled
 dev node on port 20492 was stopped — it is on the task-147 Clarity refusal, not
 this stall, and its provenance from 2026-08-04 records no `profile_fingerprint`
 at all, so `check_profile` refuses it for any current binary and only a re-import
