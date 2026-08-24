@@ -76,8 +76,14 @@ chain still names it or says precisely which of the three causes applies.
 ## Tasks
 
 - [x] Reproduce the stall in a test from the tracker's own API, without a node.
-      `nano_sortition::tests::a_rolled_back_executor_can_still_name_its_burn_view`,
-      ignored and inventoried as `semantic` with owner 148 so it blocks release.
+      Two, both unconditional and both green:
+      `sortition::tests::a_dropped_view_is_told_apart_from_one_not_yet_walked_to`
+      pins the distinction the executor now reports, and
+      `follow_path::a_fork_retraction_leaves_a_chain_that_can_name_its_burn_view`
+      drives a real fork retraction end to end. The earlier ignored
+      `SnapshotChain`-layer placeholder was removed: it asserted something that
+      layer cannot deliver, so it could never have passed, and keeping a permanently
+      red `semantic` ignore beside a working regression would have been noise.
 - [x] Establish which of the three paths above produces it, by measurement rather
       than by reading — the log line alone cannot distinguish "not primed" from
       "floor too high". **It is the floor.** The test fails at its second
@@ -85,19 +91,22 @@ chain still names it or says precisely which of the three causes applies.
       retracts below it, `snapshot_at` answers `None` while `history()` still
       contains the view — so the chain has not forgotten deriving it and is not
       unprimed, it simply refuses to answer. The remaining work is the fix.
-- [ ] Make a view the chain has derived nameable for as long as any unexecuted
+- [x] Make a view the chain has derived nameable for as long as any unexecuted
       staged block can ask for it, or refuse in a way that names the cause.
-      **Implemented (bf757a5d), not yet covered end to end.** The refusal names
+      **Implemented and now covered end to end.** The refusal names
       the cause, and `reseed_sortitions_after_retraction` now calls
       `resume_or_capture_below` at the retraction — adopting the saved chain when
       it sits below what the retracted execution needs and re-deriving from the
       capture when it does not, which is what a restart was doing. The capture path
       is optional and set only by the two production wirings, so rigs that do not
-      set it keep today's behaviour. **The item stays unticked deliberately:** the
-      machinery it calls has its own test, written for the mainnet follower that
-      stopped seeded at burn 961,342, but this call site does not, and the
-      acceptance criteria ask for a test that fails before the fix and passes
-      after.
+      set it keep today's behaviour.
+
+      The regression discriminates, checked by disabling the fix and re-running:
+      without it the test fails with "the derived sortition chain was left at burn
+      453, above the burn 423 the retracted execution stands on"; with it the chain
+      is re-seeded at burn 422 and the test passes. That is the acceptance
+      criterion's "fails on the current code and passes after the fix", verified
+      rather than asserted.
       **The reproduction is at the wrong layer to gate this fix, which is worth
       knowing before anyone tries to make it pass.** `SnapshotChain` has no
       burnchain source, so once it has dropped a snapshot it cannot get it back;

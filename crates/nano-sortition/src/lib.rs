@@ -2140,69 +2140,6 @@ mod tests {
         assert_eq!(chain.needed_from(), Some(961_480));
     }
 
-    /// Task 148: a rolled-back executor is stranded below the retained window.
-    ///
-    /// `keep_from` only ever raises the floor, which is right while execution
-    /// moves forward — a floor that went backwards would let the window shrink
-    /// under a reader standing in it. But execution does not only move forward:
-    /// `Executor::stand_on_known_block` retracts to an earlier block and resets
-    /// the executor's burn height, and a Stacks fork can reach further back than
-    /// [`MINING_COMMITMENT_WINDOW`]. The floor cannot follow it down, the
-    /// snapshots below were already dropped, and the chain walks forward only —
-    /// so the burn view the retracted execution now stands on is gone for good.
-    ///
-    /// Observed on mainnet 2026-08-24: the release subject executed to Stacks
-    /// 8,743,989 and then refused every round, unable to name burn view
-    /// `653ee60a…` — burn 962,151 by both stock oracles — while standing on burn
-    /// 963,817 and reporting `ready: true`. Sixteen hours, cleared only by a
-    /// restart, which re-seeds the chain and the floor with it.
-    #[test]
-    #[ignore = "task 148: keep_from cannot lower the floor, so a retracted executor is stranded"]
-    fn a_rolled_back_executor_can_still_name_its_burn_view() {
-        let mut chain = SnapshotChain::new(SortitionSnapshot::genesis(
-            961_206,
-            nano_primitives::BitcoinHeaderHash::from_bytes([7; 32]),
-        ));
-        chain.keep_from(961_206);
-        for height in 961_207..=961_500 {
-            chain
-                .append(&bitcoin_block(height, 4), 0, super::PoxId::initial())
-                .expect("append a derived burn block");
-        }
-
-        // A view this chain derived itself, well inside what it was retaining.
-        let stranded = 961_300;
-        let view = chain
-            .snapshot_at(stranded)
-            .expect("the chain retained the view while the floor was low")
-            .consensus_hash;
-        assert!(chain.history().contains(&view));
-
-        // Execution runs ahead — locating one view walks the chain toward
-        // Bitcoin's tip — so the floor rises and the window closes behind it.
-        chain.keep_from(961_490);
-        chain
-            .append(&bitcoin_block(961_501, 5), 0, super::PoxId::initial())
-            .expect("append");
-        assert!(chain.snapshot_at(stranded).is_none());
-
-        // Now execution retracts to a block below the floor, which is what a
-        // Stacks fork does, and says so.
-        chain.keep_from(stranded);
-
-        // The hash history still names it — that list is never front-pruned —
-        // so the chain has not forgotten deriving it, only refuses to answer.
-        assert!(
-            chain.history().contains(&view),
-            "the hash history dropped a view it derived"
-        );
-        assert!(
-            chain.snapshot_at(stranded).is_some(),
-            "the chain cannot name the burn view the retracted execution stands \
-             on, so every later block is refused until the process restarts"
-        );
-    }
-
     /// A chain nothing executes against keeps the fixed window and no more.
     #[test]
     fn a_chain_with_no_execution_keeps_the_fixed_window() {

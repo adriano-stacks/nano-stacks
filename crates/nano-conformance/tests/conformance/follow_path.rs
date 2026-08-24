@@ -1387,6 +1387,103 @@ async fn a_branch_that_parts_at_a_block_is_followed_onto_the_fork() {
     branch_task.abort();
 }
 
+/// Task 148: a fork retraction leaves the sortition chain able to answer for it.
+///
+/// The retained snapshot window only closes upward, so a chain walked ahead of
+/// execution cannot answer for the burn view a *retracted* execution stands on,
+/// and it only walks forward. On mainnet that stranded a follower at Stacks
+/// 8,743,989 for sixteen hours while `/health` said `ready: true`, and only a
+/// restart cleared it — because a restart re-seeds the chain and its floor
+/// together.
+///
+/// So a retraction has to re-seed in process. Asserted as "the derived chain is
+/// not left above what execution now stands on", which holds for any retraction
+/// and needs neither a capture wider than the retained window nor a narrowed
+/// window: before the fix the chain keeps whatever it had walked to, which here is
+/// the burnchain tip.
+#[tokio::test]
+async fn a_fork_retraction_leaves_a_chain_that_can_name_its_burn_view() {
+    let chain = captured_chain();
+    let honest: Vec<_> = chain[..11].to_vec();
+    let (honest_client, honest_task) = serve(Served::honest(honest.clone(), snapshots())).await;
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let burnchain = MovableBurnchain::new(captured_burnchain());
+    let (mut executor, _) = node(directory.path(), burnchain.clone());
+    let staging = Staging::open(&directory.path().join("staging.sqlite")).expect("staging opens");
+    let budget = CatchUpBudget {
+        fetch: 64,
+        execute: 64,
+    };
+    let mut history = TenureSource::only(honest_client.clone());
+    executor
+        .catch_up(&honest_client, &mut history, &pox(), &staging, budget, &[])
+        .await
+        .expect("the captured chain executes");
+    let agreed = *executor.tip().block_id().as_bytes();
+    drop(executor);
+
+    let (mut executor, _) =
+        execute_fixture_orphan(directory.path(), burnchain.clone(), &chain, agreed);
+
+    // Seeded at the second executed tenure, for the reason
+    // `a_bitcoin_reorganization_retracts_the_blocks_it_invalidated` states: the
+    // oldest is the checkpoint's own, and walking below it crosses the burn block
+    // that opens a reward cycle.
+    let tenures = executor.chainstate_mut().executed_tenures();
+    let mut heights = burn_heights(&tenures);
+    heights.sort_unstable();
+    let (seed, upto) = (
+        *heights.get(1).expect("two executed tenures"),
+        *heights.last().expect("an executed tenure"),
+    );
+    // Derived *past* execution, which is what a real node does: locating one burn
+    // view walks the chain toward Bitcoin's tip while execution moves a handful of
+    // burn blocks. A chain that stops exactly at execution can never reproduce this
+    // defect, because the defect is about the gap.
+    let walked_ahead = snapshots()
+        .iter()
+        .map(|snapshot| snapshot.block_height)
+        .max()
+        .expect("the capture has snapshots");
+    assert!(
+        walked_ahead > upto,
+        "the capture does not reach above the executed tenure at burn {upto}, so the \
+         chain cannot be walked ahead of execution"
+    );
+    let tracker = derived_chain(seed, walked_ahead, &burnchain, &directory.path().join("capture"));
+    // The same precondition that test names: a derived consensus hash which does
+    // not match the executed tenure would make the retraction discard nothing, and
+    // this test would then pass without exercising anything.
+    assert_eq!(
+        tracker.consensus_hash_at(upto),
+        tenures.first().copied(),
+        "the derived consensus hash at burn {upto} is not the one the executed \
+         tenure carries"
+    );
+    executor.track_sortitions(tracker, directory.path().join("sortitions"));
+    executor.keep_sortition_capture(directory.path().join("capture"));
+
+    let branch = chain[..16].to_vec();
+    let (branch_client, branch_task) = serve(Served::honest(branch, snapshots())).await;
+    let mut history = TenureSource::only(branch_client.clone());
+    executor
+        .catch_up(&branch_client, &mut history, &pox(), &staging, budget, &[])
+        .await
+        .expect("a heavier branch is not an error");
+
+    let derived = executor.derived_bitcoin_height();
+    let standing_on = executor.bitcoin_height();
+    assert!(
+        derived <= standing_on,
+        "the derived sortition chain was left at burn {derived}, above the burn {standing_on} \
+         the retracted execution stands on, so every later block is refused until a restart"
+    );
+
+    honest_task.abort();
+    branch_task.abort();
+}
+
 /// A peer whose burn view parted from this node's is followed onto the fork.
 ///
 /// The Stacks half of a reorganization, through the production loop: nothing about
