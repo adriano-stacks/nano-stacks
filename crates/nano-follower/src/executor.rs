@@ -61,6 +61,9 @@ pub struct CheckpointExecutor<S> {
     /// The burn height a reported sortition gap was last complained about, so
     /// the complaint is made once rather than for every block behind it.
     sortition_gap: Option<u64>,
+    /// The checkpoint's exported sortition history, so a retraction can rebuild
+    /// the derived chain instead of waiting for a restart to do it.
+    sortition_capture: Option<std::path::PathBuf>,
     /// Set while execution is refused on a burn view this chain derived and then
     /// dropped, which no further round can clear.
     ///
@@ -899,6 +902,7 @@ where
             chainstate,
             sortition: None,
             sortition_state: None,
+            sortition_capture: None,
             dropped_view_stall: None,
             sortition_gap: None,
             tip: anchor,
@@ -928,6 +932,7 @@ where
             chainstate,
             sortition: None,
             sortition_state: None,
+            sortition_capture: None,
             dropped_view_stall: None,
             sortition_gap: None,
             tip,
@@ -1107,6 +1112,54 @@ where
         self.chainstate
             .recorded_header(*self.tip.block_id().as_bytes())
             .map_or(0, |header| u64::from(header.burn_block_height))
+    }
+
+    /// Where the checkpoint's exported sortition history lives.
+    ///
+    /// Optional because only the two production wirings know it; a rig that does
+    /// not set it keeps the old behaviour, where a retraction below the retained
+    /// window waits for a restart.
+    pub fn keep_sortition_capture(&mut self, capture: std::path::PathBuf) {
+        self.sortition_capture = Some(capture);
+    }
+
+    /// Rebuild the derived sortition chain after giving blocks back.
+    ///
+    /// The retained window only closes upward, so a chain walked ahead of
+    /// execution cannot answer for the burn view a *retracted* execution now
+    /// stands on, and it cannot walk backwards to fix that. Startup already solves
+    /// exactly this: `resume_or_capture_below` adopts the saved chain when it sits
+    /// below what execution needs, and re-derives from the capture when it does
+    /// not. This is that, without needing the process to die first.
+    ///
+    /// The re-derivation is slow and correct, and it happens only on a retraction.
+    fn reseed_sortitions_after_retraction(&mut self) {
+        let (Some(state), Some(capture)) =
+            (self.sortition_state.clone(), self.sortition_capture.clone())
+        else {
+            return;
+        };
+        let executed = self.bitcoin_height();
+        match crate::sortition::SortitionTracker::resume_or_capture_below(
+            &state, &capture, executed,
+        ) {
+            Ok(tracker) => {
+                println!(
+                    "the derived sortition chain is re-seeded at burn {} for the retracted \
+                     execution standing on burn {executed}",
+                    tracker.tip().bitcoin_height
+                );
+                self.track_sortitions(tracker, state);
+                self.dropped_view_stall = None;
+            }
+            Err(error) => {
+                eprintln!(
+                    "the derived sortition chain could not be re-seeded after retracting to \
+                     burn {executed}, so this node may refuse the branch it just adopted \
+                     until it is restarted: {error}"
+                );
+            }
+        }
     }
 
     /// Why this node can no longer make progress, if that is where it is.
@@ -2412,6 +2465,7 @@ where
             retraction.discarded.len()
         );
         self.stand_on_known_block(resume_block);
+        self.reseed_sortitions_after_retraction();
         Ok(retraction.resume_from)
     }
 

@@ -2174,6 +2174,9 @@ async fn open_executor_with_sortition_copy(
         executor
     };
     executor.track_sortitions(tracker, config.node.working_dir.clone());
+    if let Some(capture) = config.checkpoint.sortition.clone() {
+        executor.keep_sortition_capture(capture);
+    }
     Ok(executor)
 }
 

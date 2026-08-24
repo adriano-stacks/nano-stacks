@@ -48,6 +48,9 @@ pub async fn open_executor(
         CheckpointExecutor::resume(chainstate, anchor, bitcoin)
     };
     executor.track_sortitions(tracker, config.follower.working_dir.clone());
+    if let Some(capture) = config.checkpoint.sortition.clone() {
+        executor.keep_sortition_capture(capture);
+    }
     Ok(executor)
 }
 
