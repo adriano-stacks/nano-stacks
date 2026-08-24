@@ -150,10 +150,23 @@ dropped.
 **So the fix is one of two, both crossing a module boundary:**
 
 1. Re-seed the in-memory tracker from `sortition_state` after a retraction — the
-   same thing startup does. The obstacle is ownership: `Executor::track_sortitions`
-   *receives* a constructed `SortitionTracker`, and the code that builds one from
-   the state path lives in `nano-node`'s runtime wiring, so the executor currently
-   has no way to ask for a fresh one.
+   same thing startup does. **Correction: this is not blocked on a cross-crate
+   constructor.** `SortitionTracker::resume_or_capture` and
+   `resume_or_capture_below` live in `nano-follower/src/sortition.rs`, the
+   executor's own crate, and the second exists for *exactly* this failure class:
+   "the saved chain is seeded at burn {seeded_at}, above the burn view
+   {executed_burn_view} execution has reached, and a chain only walks forward",
+   recorded against a live mainnet state that no restart could escape (executed tip
+   needing burn 961,447, saved chain ending at 961,450). Startup checks this; a
+   running node has no equivalent check, which is the whole gap.
+
+   What the executor lacks is only the *capture* path — it stores
+   `sortition_state` but not the capture that `resume_or_capture_below` falls back
+   to. For the common case that may not matter: the retraction path saves at
+   `bitcoin_height() - 1`, deliberately below execution, so reloading the saved
+   form alone would already yield a usable chain. The capture fallback is needed
+   only for a retraction deeper than one burn block, which is the same unanswered
+   question as candidate 2.
 2. Never raise the floor beyond what a retraction can undo, which requires the
    bound the objective already questions: `execution_rollback_floor` subtracts
    `MINING_COMMITMENT_WINDOW`, and that bounds a Bitcoin reorganisation, not how
