@@ -2629,12 +2629,33 @@ where
             }
             LocalView::At(bitcoin_height) => bitcoin_height,
             LocalView::Unreached { standing_on } => {
-                eprintln!(
-                    "the local sortition chain cannot name burn view {view}, standing on burn \
-                     {standing_on}: this node will not execute block {} under a burn block a \
-                     peer picked, and the next round walks again",
-                    block.header.chain_length
-                );
+                // Two refusals that read the same and mean opposite things. Not
+                // having walked far enough clears itself on the next round; having
+                // derived the view and dropped its snapshot never does, because the
+                // window closed above it and a chain only walks forward. Saying
+                // which is which is what task 148 cost sixteen hours of a mainnet
+                // catch-up to learn.
+                if let Some(dropped_at) = self
+                    .sortition
+                    .as_ref()
+                    .and_then(|tracker| tracker.window_closed_below(view))
+                {
+                    eprintln!(
+                        "the local sortition chain derived burn view {view} at burn \
+                         {dropped_at} and no longer holds it: the retained window closed \
+                         above it while the chain walked on to burn {standing_on}, and a \
+                         chain only walks forward, so block {} will be refused every round \
+                         until this node is restarted",
+                        block.header.chain_length
+                    );
+                } else {
+                    eprintln!(
+                        "the local sortition chain cannot name burn view {view}, standing on \
+                         burn {standing_on}: this node will not execute block {} under a burn \
+                         block a peer picked, and the next round walks again",
+                        block.header.chain_length
+                    );
+                }
                 return Ok(Err(ContextUnavailable::Wait));
             }
             LocalView::Foreign { standing_on } => {

@@ -420,6 +420,28 @@ impl SortitionTracker {
         self.engine.snapshots().snapshot_at(bitcoin_height)
     }
 
+    /// The height of a view this chain derived and then dropped from its window.
+    ///
+    /// Two refusals are indistinguishable from outside and mean opposite things.
+    /// "I have not walked to that view yet" is ordinary and clears itself: the next
+    /// round walks further. "I derived that view and threw the snapshot away" never
+    /// clears, because the retained window closed above it and a chain only walks
+    /// forward — the node then repeats one round forever while reporting itself
+    /// healthy. Task 148 cost sixteen hours of a mainnet catch-up to exactly that
+    /// conflation, so the two are separated here rather than in a log message.
+    ///
+    /// The consensus-hash history is never front-pruned, so a view this chain
+    /// derived is still named there long after its snapshot is gone. That is what
+    /// makes the second case recognisable at all.
+    #[must_use]
+    pub fn window_closed_below(&self, view: ConsensusHash) -> Option<u64> {
+        let height = self.height_of_consensus_hash(view)?;
+        if self.snapshot_at(height).is_some() {
+            return None;
+        }
+        Some(height)
+    }
+
     /// Return one locally derived snapshot in the shape proposal authentication uses.
     #[must_use]
     pub fn sortition_info_at(&self, bitcoin_height: u64) -> Option<nano_sync::SortitionInfo> {
@@ -2181,6 +2203,41 @@ mod tests {
         };
         let history = vec![behind, seed.consensus_hash];
         SortitionTracker::new(seed, history).expect("the history ends at the seed")
+    }
+
+    /// Task 148: a view this chain dropped is not a view it has not reached.
+    ///
+    /// The stall those two being one answer produced ran sixteen hours on mainnet
+    /// while `/health` said `ready: true`. A chain that has not walked far enough
+    /// clears itself on the next round; a chain whose window closed above the view
+    /// never does, because it only walks forward.
+    #[test]
+    fn a_dropped_view_is_told_apart_from_one_not_yet_walked_to() {
+        let chain = a_chain();
+
+        // The tip's own view is retained, so nothing closed below it.
+        let tip = chain.tip().consensus_hash;
+        assert_eq!(chain.height_of_consensus_hash(tip), Some(100));
+        assert_eq!(chain.window_closed_below(tip), None);
+
+        // The hash behind the seed: named by the history, which is never
+        // front-pruned, and with no snapshot to answer from. This is the stall.
+        let behind = ConsensusHash::from_bytes([0xbe; 20]);
+        assert_eq!(chain.height_of_consensus_hash(behind), Some(99));
+        assert_eq!(chain.snapshot_at(99), None);
+        assert_eq!(
+            chain.window_closed_below(behind),
+            Some(99),
+            "a view the chain derived and dropped has to be recognisable as that"
+        );
+
+        // A view from some other chain of Bitcoin blocks is named by nothing, so
+        // it stays the ordinary case a further walk may still answer.
+        assert_eq!(
+            chain.window_closed_below(ConsensusHash::from_bytes([0x5c; 20])),
+            None,
+            "a view this chain never derived is not a dropped one"
+        );
     }
 
     #[test]
