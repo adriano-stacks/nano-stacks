@@ -100,7 +100,7 @@ chain still names it or says precisely which of the three causes applies.
       that it refused a lower floor instead of silently keeping a higher one, so
       the caller can rebuild rather than loop. The silent disagreement is the part
       that turned a recoverable condition into sixteen hours.
-- [ ] Report the condition through `/health` and `/nano/sync_status`. A node that
+- [x] Report the condition through `/health` and `/nano/sync_status`. A node that
       cannot advance must not answer `ready: true` with a null error; the hold
       harness and any supervisor read those and both were blind here.
       **Done for `/health` (ad250086, acb959d6).**
@@ -113,10 +113,10 @@ chain still names it or says precisely which of the three causes applies.
       it. Readiness now means "can still make progress" rather than "is running".
       Consensus behaviour is untouched.
 
-      **Still open: `/nano/sync_status`**, which is the full node's surface in
-      `nano-rpc` and the one the 20492 witness serves. `SyncStatusWire` already
-      carries `blocks_behind` and the three tips; it needs the same reason field,
-      and the node's runtime has to pass it through the way the follower's does.
+      **Done for `/nano/sync_status` too (8a16559d).** `SyncStatusWire` gained
+      `cannot_progress`, published beside the sealed tip because that is the pair a
+      reader needs — a height, and whether it can still move. Both surfaces now
+      answer the question that every other field on them obscures.
 - [ ] Add a regression that fails if executed height is static while staged
       blocks exist and health still reports ready.
 
