@@ -1,7 +1,7 @@
 ---
 id: "149"
-title: "Close the read-cost differential on values already written this transaction"
-status: pending
+title: "Guard filter over an empty sequence and close the runtime gap it leaves"
+status: in-progress
 priority: critical
 effort: medium
 dependencies: []
@@ -10,25 +10,27 @@ created_at: 2026-08-25
 type: bug
 ---
 
-# Close the read-cost differential on values already written this transaction
+# Guard filter over an empty sequence and close the runtime gap it leaves
 
 ## Objective
 
-A mainnet transaction that mainnet executed for `read_count` **7** is charged
+A mainnet transaction that mainnet executed for `read_count` **7** was charged
 `read_count` **303,863** here — more than ten times the epoch-4.0 block limit of
-30,000 — so it aborts with `CostBalanceExceeded` instead of the
-`abort_by_post_condition` the network recorded. The receipt differs, the block's
-state root differs, and execution stops.
+30,000 — so it aborted with `CostBalanceExceeded` instead of the
+`abort_by_post_condition` the network recorded. The receipt differed, the block's
+state root differed, and execution stopped.
 
-This is a hard consensus differential of exactly the kind the plan's
-**STRENGTHENED — exact receipts and costs** amendment says blocks release, and it
-is currently the wall both live mainnet nodes are stopped against.
+The cause is found and fixed. `read_count`, `read_length` and both write
+dimensions now equal the canonical record; `runtime` does not yet, and that
+remainder is what keeps this task open.
 
 ## What was observed
 
 The release subject (`nano-stacks-follower-0.1.0-88920833e521`,
 `/home/aldur/release-subject-88920833`) has refused Stacks **8,832,029** since
-2026-08-24 20:06, after its stall supervisor gave up at twenty restarts:
+2026-08-24 20:06, after its stall supervisor gave up at twenty restarts. The
+port-20492 node reaches the same block and stops the same way, once its fork is
+retracted:
 
 ```
 state root mismatch at height 8832029: tenure start false, 4 transactions,
@@ -37,112 +39,90 @@ state root mismatch at height 8832029: tenure start false, 4 transactions,
     RuntimeFailure("RuntimeCheck(CostBalanceExceeded(
       ExecutionCost { write_length: 18, write_count: 1,
                       read_length: 5491601, read_count: 303863,
-                      runtime: 56779882 },
-      ExecutionCost { write_length: 15000000, write_count: 15000,
-                      read_length: 200000000, read_count: 30000,
-                      runtime: 5000000000 })))")
-state root mismatch: expected e042574a33b522f5d631822b787a3710bfe192b55a4700c58c6b16a694a574b6,
-                     got      484c331a01dfbe557741ad29bdba409e5fb232a8439940ee9eb617d2da0c1cce
+                      runtime: 56779882 }, ...)))")
 ```
 
-The block limit printed is correct for epoch 4.0 (`read_count` and `read_length`
-doubled from 3.x). The charge is not.
+The block limit printed is correct for epoch 4.0. The charge was not.
 
-### The canonical record
+## Root cause
 
-`8979c764…` is a contract call on
-`SM1793C4R5PZ4NS4VQ4WMP7SKKYVH8JZEWSZ9HCCR.stableswap-staking-stx-ststx-v-1-4`,
-function `unstake-lp-tokens`, in canonical block 8,832,029. What mainnet charged
-it, from the hosted record:
+`clar2wasm`'s `filter` emitted a **do-while**: the loop body always ran once, and
+the end check subtracted an element size from the remaining length and branched
+while the result was non-zero.
 
-| dimension | mainnet | nano | ratio |
+At length **zero** it therefore read an element that was not there, and left the
+length *negative* — so `br_if` kept looping, down through every multiple of the
+element size, 268 million iterations for a `uint` before the counter wraps back
+to zero. `fold` and `map` already guard their loops on a zero length
+(`sequences.rs`); `filter` did not.
+
+It never gets that far, and both endings are consensus outcomes:
+
+- **It traps.** `(filter f <empty stored list>)` fails with an out-of-bounds
+  memory access where the interpreter answers the empty list.
+- **It burns the budget.** Where the garbage it reads happens to fail the
+  predicate, the run returns the *right value* and charges for every iteration
+  until a cost dimension is exhausted. That is mainnet 8,832,029: a filter over
+  an empty `cycles-to-unstake` on
+  `SM1793C4R5PZ4NS4VQ4WMP7SKKYVH8JZEWSZ9HCCR.stableswap-staking-stx-ststx-v-1-4`,
+  whose stored record at 8,832,028 holds `cycles-staked` of 60 and
+  `cycles-to-unstake` of **0**.
+
+The second ending is why this hid: the value and both write dimensions were
+already correct, so nothing but the cost said anything was wrong — exactly the
+case the plan's *cost divergence is invisible until a block nears a limit* note
+is about.
+
+## Measured, before and after
+
+`cargo xtask cost-both-tx` against the real state at 8,832,028, under that
+block's Bitcoin view (burn 963,864):
+
+| dimension | canonical / interpreter | nano before | nano after |
 |---|---|---|---|
-| `runtime` | 3,480,582 | 56,779,882 | 16.3× |
-| `read_count` | **7** | **303,863** | 43,409× |
-| `read_length` | 22,193 | 5,491,601 | 247× |
-| `write_count` | 1 | 1 | — |
-| `write_length` | 18 | 18 | — |
+| `read_count` | 7 | 303,863 | **7** |
+| `read_length` | 22,193 | 5,491,601 | **22,193** |
+| `write_count` | 1 | 1 | **1** |
+| `write_length` | 18 | 18 | **18** |
+| `runtime` | 3,480,582 | 56,779,882 | 3,096,207 |
+| result | `(ok u0)` | `CostBalanceExceeded` | **`(ok u0)`** |
 
-Its real outcome was `abort_by_post_condition`, not a cost failure.
+## What is fixed
 
-Both write dimensions match exactly. Only the read dimensions and runtime
-diverge, which points at how reads are counted rather than at what the function
-does.
+Commit `49ed12fd` guards `filter`'s loop on a zero length, the way `fold` and
+`map` do. Regression tests in `clar2wasm/src/words/conditionals.rs` assert cost
+equality for a filter over an empty stored list and over an empty stored buffer,
+and that a short stored list is unchanged. The whole `clar2wasm` suite is green
+(1,561 unit tests and 1,200-odd integration tests, no failures).
 
-### The shape the contract gives it
+## What is left
 
-`unstake-lp-tokens` iterates lists declared `(list 12000 uint)`:
-
-```clarity
-(define-data-var helper-value uint u0)
-
-(define-map user-data principal {
-  cycles-staked: (list 12000 uint),
-  cycles-to-unstake: (list 12000 uint),
-  lp-staked: uint
-})
-
-(define-public (unstake-lp-tokens)
-  (let (
-    (helper-value-current-cycle (var-set helper-value current-cycle))
-    ...
-    (filtered-user-cycles-to-unstake
-       (filter filter-values-lte-helper-value user-cycles-to-unstake))
-    (unstake-data
-       (fold fold-cycles-to-unstakeable-cycles filtered-user-cycles-to-unstake ...))
-```
-
-The predicate reads `helper-value` per element, and `helper-value` was
-`var-set` **earlier in the same transaction**. Two candidate causes, and they
-are distinguishable by measurement rather than by reading:
-
-1. **A pending write is charged as a store read.** stacks-core's
-   `RollbackWrapper` serves a key already in this transaction's lookup map from
-   memory. If nano charges `read_count`/`read_length` for those, a loop over a
-   just-written variable bills a store read per element where the network bills
-   none. `read_length / read_count` here is 5,491,601 / 303,863 = **18.07
-   bytes**, and 18 is exactly this transaction's `write_length` — the serialized
-   size of the `uint` that was written. That is the stronger candidate.
-2. **A loop runs to the declared capacity.** If `filter`/`fold` iterate the
-   list's declared 12,000 rather than its actual length, the element count is
-   wrong regardless of what each element is charged.
-
-They are not exclusive and the ratios do not cleanly resolve to either alone
-(303,856 / 12,000 = 25.3), so the first step is to measure, not to patch.
-
-## Why it matters
-
-- It is a **receipt and state-root** differential, not a performance question:
-  the network committed a post-condition abort and nano commits a cost failure.
-- It stops both live nodes. The release subject has been dead on it for a day,
-  and the port-20492 node reaches the same block once its fork is retracted
-  ([[148-recover-from-an-unnameable-burn-view-without-a-restart]] and the two
-  fixes below it).
-- Any contract that writes a variable and then loops reading it is exposed, so
-  this is not one transaction's problem.
-
-## Acceptance criteria
-
-- [ ] Reproduce the charge offline for `8979c764…` and state which of the two
-      causes above it is, with the per-dimension numbers.
-- [ ] Crosscheck the reproduction against the interpreter in the rolled-back
-      conformance tooling, per **STRENGTHENED — WASM only**: the production
-      binary must not gain an interpreter path.
-- [ ] Fix the accounting so all five dimensions equal the canonical record for
-      this transaction.
-- [ ] Regress it against the captured receipt, not only against the state root —
-      a root-only check would hide the error identity.
-- [ ] Confirm no other cost dimension moved: the existing cost conformance
-      suites stay green.
-- [ ] Execute canonical block 8,832,029 to the recorded
-      `state_index_root e042574a33b522f5d631822b787a3710bfe192b55a4700c58c6b16a694a574b6`
-      on a live node.
+- [ ] **Close the `runtime` gap.** The compiler now charges 3,096,207 where the
+      interpreter and the canonical record charge 3,480,582 — 384,375 low. It is
+      not `filter`: crosschecks over `print` of a high-capacity empty list, a
+      `fold` with a wide accumulator over an empty list, `get` on a record
+      holding two `(list 12000 uint)` fields, and a big `print` tuple all match
+      on all five dimensions. Suspect the difference is charged at the
+      transaction/contract-call boundary rather than inside the body, since
+      `crosscheck_cost` excludes deployment and invokes the function directly.
+- [ ] **Regress the receipt, not only the root.** The canonical receipt for
+      `8979c764…` should be a fixture, so a wrong error identity cannot pass on a
+      matching root.
+- [ ] **Deploy.** Editing `vendor/clarity-wasm` moved the compatibility
+      fingerprint from `6a83746edc16895eb6886c37474ab7693bc31272b5d350366fc4606663965a35`
+      to `4741d57fb27317c3385ec1de364f92bd10688d315e1419efc77264ce17b30180`, so
+      both live nodes refuse their imported state until the checkpoint is
+      re-attested and re-imported — there is deliberately no repin. See
+      `/home/aldur/checkpoint-builder-keys/run-ceremony-*.sh`. **Until then
+      neither node can execute 8,832,029**, and the measurement above was taken
+      on a scratch reflink clone (`/home/aldur/scratch-149-state`) whose
+      `consensus_profile` row was repinned by hand. That clone is a diagnostic
+      only and must never be presented as release evidence.
+- [ ] **Sweep for the same shape.** `filter` was the only unguarded loop of the
+      three, but confirm nothing else emits a do-while over a sequence length.
 
 ## Notes
 
 - The transaction, its contract and the canonical costs are all fetchable
-  offline; no live node is needed to reproduce.
-- `cargo xtask cost-both-tx` and `cargo xtask replay-window` already exist for
-  this shape of question.
-- Do not raise the block limit to make this pass. The limit printed is right;
-  the charge is wrong.
+  offline; the reproduction needs only the state at 8,832,028.
+- Do not raise the block limit to make this pass. The limit printed is right.
