@@ -579,6 +579,10 @@ fn report_sortition_walk(walk: &crate::sortition::CatchUp, standing_on: u64) {
 struct Stop {
     block_id: StacksBlockId,
     height: u64,
+    /// The deepest height a retraction can still reach, below which a staged
+    /// block is weight no round can use. See
+    /// [`ExecutionNode::forget_overtaken_staging`].
+    floor: u64,
 }
 
 /// How much one round of catching up is allowed to do.
@@ -1399,25 +1403,21 @@ where
         // A descent that overshot leaves blocks below the executed tip, which
         // no round will ever execute and every round would otherwise resume
         // from.
-        //
-        // Below it, and not up to it. A block staged at the executed tip's own
-        // height is either that block — dropped by name just below, having been
-        // executed — or its **sibling**, which is the root of a branch that
-        // parted from this one and the only thing linking what sits above it to
-        // the block both branches descend from. Clearing the whole height threw
-        // that root away on every round, so the branch above it could never be
-        // reached: the mainnet stall at 8724697
-        // ([[096-cross-a-stacks-fork-inside-one-sortition-chain]]).
-        staging.remove_to(executed_height.saturating_sub(1))?;
-        staging.remove(executed_tip)?;
+        self.forget_overtaken_staging(staging, executed_height)?;
         // A peer that will not even say where its tip is does not end the round:
         // everything already staged can still be executed and sealed, and the
         // descent picks up at the next poll. This was the first `?` of the round,
         // so a throttled peer meant a node with twenty thousand blocks on disk
         // executed none of them and reported a failure instead.
+        // The blocks a retraction could still give back, which is how far a descent
+        // may follow a parted branch down and how far staging keeps it.
+        let executed: std::collections::HashSet<[u8; 32]> =
+            self.chainstate.executed_blocks().into_iter().collect();
         let stop = Stop {
             block_id: executed_tip,
             height: executed_height,
+            floor: executed_height
+                .saturating_sub(u64::try_from(executed.len()).unwrap_or(u64::MAX)),
         };
         // A staged branch with an unexecuted parent already says exactly what is
         // missing, and nothing above that gap can run. Close it before asking for
@@ -1425,14 +1425,9 @@ where
         // every peer each round while 66,000 linked blocks waited above a 753-block
         // hole, so the descent was skipped forever.
         let mut fetched = 0;
-        if let Some(resume) = staging
-            .descent_resumes_at()?
-            .filter(|(resume, _)| !self.chainstate.has_executed(*resume.as_bytes()))
-            .map(|(resume, _)| resume)
-        {
-            fetched +=
-                Self::descend(history, staging, resume, stop, budget.fetch, &mut round).await?;
-        }
+        fetched +=
+            Self::close_staged_gap(history, staging, stop, &executed, budget.fetch, &mut round)
+                .await?;
 
         // With no known staged gap, forward first. A backward descent has to reach
         // this node's tip before a single staged block can execute, while the schedule
@@ -1472,6 +1467,7 @@ where
                 staging,
                 peer_tip,
                 stop,
+                &executed,
                 budget.fetch.saturating_sub(fetched),
                 &mut round,
             )
@@ -1501,32 +1497,23 @@ where
             // alone, and a branch that parted points at one it did not and is
             // followed down to where the two agree
             // ([[096-cross-a-stacks-fork-inside-one-sortition-chain]]).
-            if let Some(resume) = staging
-                .descent_resumes_at()?
-                .filter(|_| !round.rate_limited)
-                .filter(|(resume, _)| !self.chainstate.has_executed(*resume.as_bytes()))
-                .map(|(resume, _)| resume)
-            {
-                fetched += Self::descend(
-                    history,
-                    staging,
-                    resume,
-                    stop,
-                    budget.fetch.saturating_sub(fetched),
-                    &mut round,
-                )
-                .await?;
-            }
+            fetched += Self::close_staged_gap(
+                history,
+                staging,
+                stop,
+                &executed,
+                budget.fetch.saturating_sub(fetched),
+                &mut round,
+            )
+            .await?;
             round.fetched = fetched;
         }
         // A tenure response may include blocks below the requested stop. The
         // start-of-round trim cannot remove those because they were fetched
         // afterwards; leaving them here makes branch selection mistake an
         // already-executed ancestor for the sibling branch's root and retract one
-        // block too far. Keep the sibling at `executed_height`, but not anything
-        // below it or the exact executed tip.
-        staging.remove_to(executed_height.saturating_sub(1))?;
-        staging.remove(executed_tip)?;
+        // block too far.
+        self.forget_overtaken_staging(staging, executed_height)?;
         // Before executing anything, ask Bitcoin whether the burn blocks this
         // node's sortitions were derived from still hold. A round is the right
         // place: a sortition is a fact about a Bitcoin block and many Stacks
@@ -1648,6 +1635,81 @@ where
         Ok(fetched)
     }
 
+    /// Fetch downward from a staged branch whose parent this node has not executed.
+    ///
+    /// The gap is a question about a *block*, not about a height. Asking whether the
+    /// lowest staged block sits above the executed tip reads as the same question and
+    /// is not: a branch that parted from this one has a block at every height this
+    /// node has already sealed, so its lowest block was `executed_height + 1` — no
+    /// gap by that measure — while its parent was a block this node never computed
+    /// and nothing above it could ever execute. Naming the parent answers both: a
+    /// tenure that straddles the tip points at a block this node executed and is left
+    /// alone, and a branch that parted points at one it did not and is followed down
+    /// to where the two agree
+    /// ([[096-cross-a-stacks-fork-inside-one-sortition-chain]]).
+    ///
+    /// Never while the round is already out of peers to ask: asking a pool with
+    /// nothing left to give answered `NoPeer`, an error, and the round returned it
+    /// instead of executing what it had just staged.
+    ///
+    /// Associated rather than a method, like every other awaiting half of a round:
+    /// a shared borrow of the executor held across an await makes the whole future
+    /// non-`Send`. `executed` answers what `ChainState::has_executed` would, over
+    /// the same bounded list.
+    async fn close_staged_gap(
+        history: &mut TenureSource,
+        staging: &Staging,
+        stop: Stop,
+        executed: &std::collections::HashSet<[u8; 32]>,
+        budget: usize,
+        round: &mut CatchUpRound,
+    ) -> Result<usize, NodeExecutionError> {
+        let Some(resume) = staging
+            .descent_resumes_at()?
+            .filter(|_| !round.rate_limited)
+            .filter(|(resume, _)| !executed.contains(resume.as_bytes()))
+            .map(|(resume, _)| resume)
+        else {
+            return Ok(0);
+        };
+        Self::descend(history, staging, resume, stop, executed, budget, round).await
+    }
+
+    /// Forget staged blocks this node's own chain has overtaken, keeping a branch
+    /// that parted from it.
+    ///
+    /// Named by *block* and not by height, and the difference is a stall. A branch
+    /// that parted `n` blocks back carries a block at every height this node has
+    /// sealed since, so a height floor at the executed tip throws the whole branch
+    /// away on every round and only a one-block fork ever survives — which is the
+    /// only depth the sibling rule
+    /// ([[096-cross-a-stacks-fork-inside-one-sortition-chain]]) was ever able to
+    /// reach. Measured on mainnet: the port-20492 node held every canonical block
+    /// from 8,831,604 upward, re-fetched the ninety-two joining them to the fork
+    /// point on every round, and dropped them again before anything could stand on
+    /// them; it executed nothing for a day with seven thousand blocks on disk.
+    ///
+    /// The blocks dropped are therefore the ones this node *executed*: those are on
+    /// its own chain and can never belong to a branch that parted from it. The
+    /// height floor keeps only what a retraction could still reach, which is what
+    /// [`nano_chainstate::ChainState::executed_blocks`] is bounded by — below it
+    /// there is nothing left to walk back to, so a block there is weight no round
+    /// can ever use.
+    fn forget_overtaken_staging(
+        &self,
+        staging: &Staging,
+        executed_height: u64,
+    ) -> Result<(), StagingError> {
+        let executed = self.chainstate.executed_blocks();
+        let reach = u64::try_from(executed.len()).unwrap_or(u64::MAX);
+        staging.remove_to(executed_height.saturating_sub(reach))?;
+        let executed: Vec<_> = executed
+            .into_iter()
+            .map(StacksBlockId::from_bytes)
+            .collect();
+        staging.remove_all(&executed)
+    }
+
     /// Walk back from `from`, staging each block, until this node's tip or a
     /// block already staged is reached, or the budget runs out.
     async fn descend(
@@ -1655,6 +1717,7 @@ where
         staging: &Staging,
         from: StacksBlockId,
         until: Stop,
+        executed: &std::collections::HashSet<[u8; 32]>,
         budget: usize,
         round: &mut CatchUpRound,
     ) -> Result<usize, NodeExecutionError> {
@@ -1706,8 +1769,18 @@ where
             fetched += blocks.len();
             // A tenure arrives whole, so a batch straddling the executed tip
             // never lands on it exactly — the cursor would step over it and
-            // descend forever into history this node already has.
-            if lowest.header.chain_length <= until.height {
+            // descend forever into history this node already has. So the walk
+            // stops where the branch rejoins ground this node executed: that
+            // parent *is* the fork point, and everything staged above it is the
+            // branch to weigh against the executed chain.
+            //
+            // Stopping at the executed tip's height instead only ever found a
+            // fork one block deep. A branch that parted further back has a block
+            // at every height since, so the descent broke on the first tenure it
+            // read and never reached the block both chains agree on — the
+            // mainnet stall that left the port-20492 node ninety-two blocks down
+            // an abandoned tenure with the whole canonical branch on disk.
+            if executed.contains(next.as_bytes()) || lowest.header.chain_length <= until.floor {
                 break;
             }
             // A peer that answers with only the block asked for still moves the

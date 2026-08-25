@@ -478,6 +478,34 @@ impl Staging {
         Ok(())
     }
 
+    /// Forget several blocks at once, which the per-round trim needs.
+    ///
+    /// One transaction and one selection invalidation rather than a pair of each
+    /// per block: the trim names every block the executed chain has overtaken,
+    /// which is bounded by how far a retraction reaches and so is hundreds of
+    /// blocks on every round.
+    pub fn remove_all(&self, block_ids: &[StacksBlockId]) -> Result<(), StagingError> {
+        if block_ids.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for block_id in block_ids {
+            transaction.execute(
+                "DELETE FROM staged WHERE block_id = ?1",
+                params![block_id.as_bytes().as_slice()],
+            )?;
+            transaction.execute(
+                "DELETE FROM downloaded WHERE block_id = ?1",
+                params![block_id.as_bytes().as_slice()],
+            )?;
+        }
+        transaction.commit()?;
+        self.invalidate_selection()?;
+        drop(connection);
+        Ok(())
+    }
+
     /// Forget a rejected block and every staged block that descends from it.
     pub fn remove_branch(&self, root: StacksBlockId) -> Result<usize, StagingError> {
         let mut connection = self.connection()?;

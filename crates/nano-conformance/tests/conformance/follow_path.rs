@@ -1214,40 +1214,52 @@ async fn a_burn_view_walk_reaches_past_one_answer() {
 /// lowest block staging holds, and whether this node executed that block's parent.
 /// The last assertion is the point — no peer was asked where the chains parted,
 /// because no peer could have been believed about it.
-fn execute_fixture_orphan(
+/// Execute `depth` locally orphaned blocks above the block both branches share.
+///
+/// `depth` is the fork's depth, and it is a parameter because one is the only
+/// depth the retention rule used to survive: a branch that parted further back
+/// has a block at every height sealed since, so a staging floor at the executed
+/// tip deleted the branch's lower half on every round.
+fn execute_fixture_orphans(
     directory: &Path,
     burnchain: MovableBurnchain,
     chain: &[NakamotoBlock],
     agreed: [u8; 32],
+    depth: usize,
 ) -> (CheckpointExecutor<MovableBurnchain>, Vec<[u8; 32]>) {
-    let mut orphan = chain[11].clone();
-    orphan.header.timestamp = orphan.header.timestamp.saturating_add(1);
-    let orphan_id = orphan.block_id();
-    assert_ne!(
-        orphan_id,
-        chain[11].block_id(),
-        "the orphan is not a sibling"
-    );
-    let orphan_bitcoin_height = snapshots()
-        .into_iter()
-        .find(|snapshot| snapshot.consensus_hash == orphan.header.consensus_hash.to_string())
-        .map(|snapshot| snapshot.block_height)
-        .expect("the captured burnchain names the orphan's canonical view");
     let (mut chainstate, _) = crate::restart::open(directory);
-    chainstate
-        .execute_unauthenticated_fixture_block_with_bitcoin_operations(
-            BitcoinBlockContext::at_height(orphan_bitcoin_height),
-            &[],
-            Some(agreed),
-            &orphan,
-        )
-        .expect("the fixture orphan executes");
-    let mut executor = CheckpointExecutor::resume(chainstate, orphan, burnchain);
+    let mut parent = agreed;
+    let mut tip = None;
+    for sibling in chain.iter().skip(11).take(depth) {
+        let mut orphan = sibling.clone();
+        orphan.header.timestamp = orphan.header.timestamp.saturating_add(1);
+        orphan.header.parent_block_id = nano_primitives::StacksBlockId::from_bytes(parent);
+        let orphan_id = orphan.block_id();
+        assert_ne!(orphan_id, sibling.block_id(), "the orphan is not a sibling");
+        let orphan_bitcoin_height = snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.consensus_hash == orphan.header.consensus_hash.to_string())
+            .map(|snapshot| snapshot.block_height)
+            .expect("the captured burnchain names the orphan's canonical view");
+        chainstate
+            .execute_unauthenticated_fixture_block_with_bitcoin_operations(
+                BitcoinBlockContext::at_height(orphan_bitcoin_height),
+                &[],
+                Some(parent),
+                &orphan,
+            )
+            .expect("the fixture orphan executes");
+        parent = *orphan_id.as_bytes();
+        tip = Some(orphan);
+    }
+    let tip = tip.expect("a fork is at least one block deep");
+    let tip_id = *tip.block_id().as_bytes();
+    let mut executor = CheckpointExecutor::resume(chainstate, tip, burnchain);
     nano_conformance::derive_sortitions(&mut executor, &fixtures(), directory);
     let executed = executor.chainstate_mut().executed_blocks();
     assert_eq!(
         executed.last().copied(),
-        Some(*orphan_id.as_bytes()),
+        Some(tip_id),
         "the executed chain does not end at the tip"
     );
     (executor, executed)
@@ -1304,7 +1316,7 @@ async fn a_branch_that_parts_at_a_block_is_followed_onto_the_fork() {
     // below is the byte-exact captured chain and goes through production signer,
     // tenure, VRF and state-root checks.
     let (mut executor, executed_before) =
-        execute_fixture_orphan(directory.path(), burnchain.clone(), &chain, agreed);
+        execute_fixture_orphans(directory.path(), burnchain.clone(), &chain, agreed, 1);
 
     // The branch: the same height as this node's orphan, a different block on it,
     // and four blocks above — all byte-exact captured blocks under burn views this
@@ -1387,6 +1399,104 @@ async fn a_branch_that_parts_at_a_block_is_followed_onto_the_fork() {
     branch_task.abort();
 }
 
+/// A fork deeper than one block is still followed onto.
+///
+/// The retention rule used to keep only what sat at or above the executed tip's
+/// height, which is exactly one block of a parted branch: its root, the sibling of
+/// this node's tip. A branch that parted further back carries a block at every
+/// height sealed since, so every round deleted its lower half, the descent
+/// re-fetched it, and nothing above the hole could ever stand on anything —
+/// `descent_resumes_at` kept naming a parent this node had not executed.
+///
+/// Measured on mainnet: the port-20492 node executed ninety-two blocks of a tenure
+/// the network built around, then held every canonical block from 8,831,604 up and
+/// executed none of them for a day.
+#[tokio::test]
+async fn a_branch_that_parts_several_blocks_back_is_followed_onto_the_fork() {
+    const DEPTH: usize = 3;
+
+    let chain = captured_chain();
+    let honest: Vec<_> = chain[..11].to_vec();
+    let (honest_client, honest_task) = serve(Served::honest(honest.clone(), snapshots())).await;
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let burnchain = MovableBurnchain::new(captured_burnchain());
+    let (mut executor, _) = node(directory.path(), burnchain.clone());
+    let staging = Staging::open(&directory.path().join("staging.sqlite")).expect("staging opens");
+    let budget = CatchUpBudget {
+        fetch: 64,
+        execute: 64,
+    };
+    let mut history = TenureSource::only(honest_client.clone());
+    executor
+        .catch_up(&honest_client, &mut history, &pox(), &staging, budget, &[])
+        .await
+        .expect("the captured chain executes");
+    let agreed = *executor.tip().block_id().as_bytes();
+    let agreed_height = executor.tip().header.chain_length;
+    drop(executor);
+
+    // Three locally executed orphans above the shared block, so the branch parts
+    // three blocks below this node's tip rather than one.
+    let (mut executor, executed_before) =
+        execute_fixture_orphans(directory.path(), burnchain.clone(), &chain, agreed, DEPTH);
+    assert_eq!(
+        executor.tip().header.chain_length,
+        agreed_height + DEPTH as u64,
+        "the orphan branch is not the depth this test is about"
+    );
+
+    let branch = chain[..16].to_vec();
+    let branch_tip = branch.last().expect("replacement tip").block_id();
+    let (branch_client, branch_task) = serve(Served::honest(branch, snapshots())).await;
+
+    let mut history = TenureSource::only(branch_client.clone());
+    let round = executor
+        .catch_up(&branch_client, &mut history, &pox(), &staging, budget, &[])
+        .await
+        .expect("a branch parting several blocks back is not an error");
+    assert_eq!(
+        round.reorganized,
+        Some(agreed),
+        "the round did not stand on the last block both branches descend from"
+    );
+    let executed_after = executor.chainstate_mut().executed_blocks();
+    assert_eq!(
+        executed_after.last().copied(),
+        Some(agreed),
+        "the chain does not end at the block the switch named"
+    );
+    assert!(
+        executed_before.starts_with(&executed_after),
+        "the surviving chain is not a prefix of the one that was executed"
+    );
+    assert!(
+        !staging.is_empty().expect("staging answers"),
+        "the switch threw away the branch it had just decided to execute"
+    );
+
+    drop(executor);
+    let agreed_block = honest
+        .iter()
+        .find(|block| *block.block_id().as_bytes() == agreed)
+        .expect("the common block is in the served chain")
+        .clone();
+    let mut executor = reopen_fixture_at(directory.path(), burnchain, agreed_block);
+    let next = executor
+        .catch_up(&branch_client, &mut history, &pox(), &staging, budget, &[])
+        .await
+        .expect("the retained replacement branch executes");
+    assert!(next.executed > 0, "the replacement branch made no progress");
+    assert_eq!(
+        executor.tip().block_id(),
+        branch_tip,
+        "the executor did not reach the replacement branch's tip"
+    );
+
+    honest_task.abort();
+    branch_task.abort();
+}
+
 /// Task 148: a fork retraction leaves the sortition chain able to answer for it.
 ///
 /// The retained snapshot window only closes upward, so a chain walked ahead of
@@ -1424,7 +1534,7 @@ async fn a_fork_retraction_leaves_a_chain_that_can_name_its_burn_view() {
     drop(executor);
 
     let (mut executor, _) =
-        execute_fixture_orphan(directory.path(), burnchain.clone(), &chain, agreed);
+        execute_fixture_orphans(directory.path(), burnchain.clone(), &chain, agreed, 1);
 
     // Seeded at the second executed tenure, for the reason
     // `a_bitcoin_reorganization_retracts_the_blocks_it_invalidated` states: the
