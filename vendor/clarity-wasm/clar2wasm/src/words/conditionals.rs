@@ -681,7 +681,29 @@ impl ComplexWord for Filter {
         // reserve space for the output list
         let (output_offset, _) = generator.create_call_stack_local(builder, &ty, false, true);
 
-        let mut loop_ = builder.dangling_instr_seq(None);
+        // An empty sequence filters to an empty sequence, and the loop below cannot
+        // be asked that question: it is a do-while, so its body always runs once and
+        // its end check subtracts an element size from the remaining length. At
+        // length zero that reads an element which is not there and leaves the length
+        // *negative*, so `br_if` keeps looping -- down through every multiple of the
+        // element size until the counter wraps back to zero, two hundred and
+        // sixty-eight million iterations later for a `uint`. In practice it does not
+        // get there: it walks off linear memory and traps, or it spends the whole
+        // tenure's cost budget first.
+        //
+        // Both were seen. `(filter f <empty stored list>)` traps with an
+        // out-of-bounds memory access where the interpreter answers the empty list,
+        // and mainnet block 8,832,029 charged `unstake-lp-tokens` 303,863
+        // `read_count` against a 30,000 limit for a filter over an empty
+        // `cycles-to-unstake`, where the network charged 7 ([[149]]).
+        //
+        // `fold` and `map` already guard their loops this way; this one did not.
+        let then = builder.dangling_instr_seq(None);
+        let then_id = then.id();
+        let mut else_ = builder.dangling_instr_seq(None);
+        let else_id = else_.id();
+
+        let mut loop_ = else_.dangling_instr_seq(None);
         let loop_id = loop_.id();
 
         // Load an element from the sequence
@@ -781,7 +803,15 @@ impl ComplexWord for Filter {
             .local_tee(input_len)
             .br_if(loop_id);
 
-        builder.instr(Loop { seq: loop_id });
+        else_.instr(Loop { seq: loop_id });
+
+        builder
+            .local_get(input_len)
+            .unop(UnaryOp::I32Eqz)
+            .instr(IfElse {
+                consequent: then_id,
+                alternative: else_id,
+            });
 
         if is_list {
             builder.i32_const(0);
@@ -1252,7 +1282,9 @@ mod tests {
     use clarity::vm::types::ResponseData;
     use clarity::vm::Value;
 
-    use crate::tools::{crosscheck, crosscheck_expect_failure, evaluate, interpret};
+    use crate::tools::{
+        crosscheck, crosscheck_cost, crosscheck_expect_failure, evaluate, interpret,
+    };
 
     #[test]
     fn trivial() {
@@ -2158,5 +2190,57 @@ mod tests {
         "#;
 
         crosscheck(snippet, Ok(Some(Value::err_uint(5555))));
+    }
+
+    /// `filter` over an empty sequence answers the empty sequence, and costs what
+    /// the interpreter costs for it.
+    ///
+    /// The loop is a do-while whose end check subtracts an element size from the
+    /// remaining length, so at length zero it read an element that was not there and
+    /// left the length negative -- and then kept looping. `(filter f <empty stored
+    /// list>)` trapped with an out-of-bounds memory access, and mainnet block
+    /// 8,832,029 charged a filter over an empty `(list 12000 uint)` 303,863
+    /// `read_count` against a 30,000 limit where the network charged 7. Both
+    /// dimensions are asserted here, because the value alone was already right
+    /// wherever the run happened to survive.
+    #[test]
+    fn a_filter_over_an_empty_stored_sequence_costs_what_it_answers() {
+        let list = r#"
+(define-data-var helper uint u486)
+(define-map holder uint {items: (list 12000 uint)})
+(define-private (le (v uint)) (<= v (var-get helper)))
+(map-set holder u1 {items: (list )})
+(define-public (run)
+  (let ((d (unwrap-panic (map-get? holder u1))))
+    (ok (len (filter le (get items d))))))
+"#;
+        crosscheck_cost(list, "run", &[]);
+
+        // The same for a buffer, whose element size is one byte: the wrap-around is
+        // longer and the trap is the same.
+        let buffer = r#"
+(define-map holder uint {items: (buff 1000)})
+(define-private (keep (b (buff 1))) (is-eq b 0x00))
+(map-set holder u1 {items: 0x})
+(define-public (run)
+  (let ((d (unwrap-panic (map-get? holder u1))))
+    (ok (len (filter keep (get items d))))))
+"#;
+        crosscheck_cost(buffer, "run", &[]);
+    }
+
+    /// A non-empty sequence is unchanged by the guard.
+    #[test]
+    fn a_filter_over_a_short_stored_sequence_is_unchanged() {
+        let snippet = r#"
+(define-data-var helper uint u486)
+(define-map holder uint {items: (list 12000 uint)})
+(define-private (le (v uint)) (<= v (var-get helper)))
+(map-set holder u1 {items: (list u1 u500 u3)})
+(define-public (run)
+  (let ((d (unwrap-panic (map-get? holder u1))))
+    (ok (filter le (get items d)))))
+"#;
+        crosscheck_cost(snippet, "run", &[]);
     }
 }
