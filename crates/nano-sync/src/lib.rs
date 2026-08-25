@@ -1267,13 +1267,30 @@ impl SyncClient {
     ///
     /// stacks-core's route names the older bound first and the newer cursor
     /// second, despite returning the entries in the opposite direction.
+    ///
+    /// Bounded as a *tenure* response and not as metadata, which is the same
+    /// bound [`Self::tenure_at`] gives this very route. Each entry carries its
+    /// tenure's whole `nakamoto_blocks` body hex-encoded, so a page is up to
+    /// `DEPTH_LIMIT` tenures of blocks rather than a list of hashes: a measured
+    /// mainnet page is 10.2 MB over eleven entries, two and a half times the
+    /// 4 MiB [`MAX_JSON_RESPONSE_BYTES`] the default `get` applies. The effect
+    /// was not a slow fork check but no fork check at all — every page failed on
+    /// the limit, [`crate::fork_point_of`] was never given anything to compare,
+    /// and a follower that had executed onto a losing branch could not discover
+    /// where it parted. Seen on mainnet: the port-20492 node held every
+    /// canonical block from 8,831,604 up and stayed on a 92-block abandoned
+    /// tenure for a day, printing only that a peer "could not say where its burn
+    /// view parted from this one".
     async fn fork_info_page(
         &self,
         start: ConsensusHash,
         stop: ConsensusHash,
     ) -> Result<Vec<ForkInfo>, SyncError> {
         let wire: Vec<ForkInfoWire> = self
-            .get(&format!("v3/tenures/fork_info/{stop}/{start}"))
+            .get_with_limit(
+                &format!("v3/tenures/fork_info/{stop}/{start}"),
+                MAX_TENURE_JSON_RESPONSE_BYTES,
+            )
             .await?;
         wire.into_iter()
             .map(|entry| {
@@ -3053,6 +3070,67 @@ mod tests {
         assert!(limited.is_rate_limited(), "{limited}");
         let missing = client.node_info().await.expect_err("the peer said 404");
         assert!(!missing.is_rate_limited(), "{missing}");
+    }
+
+    /// A fork check has to survive a page bigger than a metadata response.
+    ///
+    /// Every `fork_info` entry carries its tenure's whole block body hex-encoded,
+    /// so a page is tenures and not hashes: a measured mainnet page is 10.2 MB,
+    /// well past the 4 MiB [`MAX_JSON_RESPONSE_BYTES`] the default `get` applies.
+    /// Bounded as metadata, the walk did not degrade — it failed outright, which
+    /// left a follower that had executed onto a losing branch with no way to find
+    /// where it parted and no way off it.
+    #[tokio::test]
+    async fn a_fork_info_page_larger_than_a_json_response_is_still_read() {
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let address = peer.local_addr().expect("the bound address");
+        let stop = ConsensusHash::from_bytes([0x11; 20]);
+        let start = ConsensusHash::from_bytes([0x22; 20]);
+        // One entry per bound, and the padding is the tenure body a real answer
+        // carries: enough of it that the page cannot fit the metadata limit.
+        let padding = "ab".repeat(super::MAX_JSON_RESPONSE_BYTES);
+        let body = format!(
+            "[{{\"burn_block_height\":2,\"consensus_hash\":\"0x{start}\",\
+             \"was_sortition\":true,\"first_block_mined\":null,\
+             \"nakamoto_blocks\":\"0x{padding}\"}},\
+             {{\"burn_block_height\":1,\"consensus_hash\":\"0x{stop}\",\
+             \"was_sortition\":true,\"first_block_mined\":null}}]"
+        );
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = peer.accept().await.expect("a request");
+                // Drained before answering: a socket closed with the request still
+                // unread is reset rather than finished, and the client then sees a
+                // connection error instead of the body under test.
+                let mut request = [0_u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut request).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+                let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+            }
+        });
+        let client =
+            SyncClient::new(Url::parse(&format!("http://{address}/")).expect("a base url"))
+                .expect("a client");
+
+        let walked = client
+            .tenure_fork_info(start, stop)
+            .await
+            .expect("a fork_info page above the metadata limit is still a fork answer");
+        assert_eq!(
+            walked
+                .iter()
+                .map(|entry| entry.consensus_hash)
+                .collect::<Vec<_>>(),
+            vec![start, stop],
+            "the walk has to reach the stop it was given"
+        );
     }
 
     #[tokio::test]
