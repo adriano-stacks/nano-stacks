@@ -1451,7 +1451,12 @@ async fn a_fork_retraction_leaves_a_chain_that_can_name_its_burn_view() {
         "the capture does not reach above the executed tenure at burn {upto}, so the \
          chain cannot be walked ahead of execution"
     );
-    let tracker = derived_chain(seed, walked_ahead, &burnchain, &directory.path().join("capture"));
+    let tracker = derived_chain(
+        seed,
+        walked_ahead,
+        &burnchain,
+        &directory.path().join("capture"),
+    );
     // The same precondition that test names: a derived consensus hash which does
     // not match the executed tenure would make the retraction discard nothing, and
     // this test would then pass without exercising anything.
