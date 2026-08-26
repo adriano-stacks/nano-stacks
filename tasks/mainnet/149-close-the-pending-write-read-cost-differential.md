@@ -4,7 +4,7 @@ title: "Guard filter over an empty sequence and close the runtime gap it leaves"
 status: in-progress
 priority: critical
 effort: medium
-dependencies: []
+dependencies: ["150"]
 tags: ["mainnet", "vm", "costs", "liveness", "release"]
 created_at: 2026-08-25
 type: bug
@@ -97,14 +97,22 @@ and that a short stored list is unchanged. The whole `clar2wasm` suite is green
 
 ## What is left
 
-- [ ] **Close the `runtime` gap.** The compiler now charges 3,096,207 where the
-      interpreter and the canonical record charge 3,480,582 — 384,375 low. It is
-      not `filter`: crosschecks over `print` of a high-capacity empty list, a
-      `fold` with a wide accumulator over an empty list, `get` on a record
-      holding two `(list 12000 uint)` fields, and a big `print` tuple all match
-      on all five dimensions. Suspect the difference is charged at the
-      transaction/contract-call boundary rather than inside the body, since
-      `crosscheck_cost` excludes deployment and invokes the function directly.
+- [x] **Close the `runtime` gap that was `filter`'s.** 384,000 of the 384,375
+      was a second `filter` defect, traced with the dual-engine charge trace to
+      `cost_lookup_variable_size [192006] -> rt 384013` in the interpreter
+      against `[6]` in the compiler. The reference's `filter` mutates its
+      argument in place and returns the same value, so the result keeps the
+      input's `type_signature` — and a list is sized by `max_len`, not by its
+      length. The compiler rebuilt the result from the kept elements and sized
+      it by the kept count. Fixed by having the result inherit the input's list
+      type (capacity *and* entry type: an emptied list's own entry type is
+      `NoType`, sized 1 where a `uint` is 16), through a new
+      `save_filtered_runtime_shape` host call taken only when the input was
+      widened or something was dropped.
+- [ ] **The remaining 375 is [[150]]**, a different defect: a tuple constructed
+      from a widened field loses that field's capacity, so `print` of it
+      under-charges. Split out rather than folded in here, because the mechanism
+      and the sites are different and it predates 149.
 - [ ] **Regress the receipt, not only the root.** The canonical receipt for
       `8979c764…` should be a fixture, so a wrong error identity cannot pass on a
       matching root.
