@@ -2420,16 +2420,26 @@ mod tests {
         );
     }
 
-    /// `element-at?` on a list of widened elements over-charges by the element's
-    /// whole declared capacity.
+    /// An element extracted from a list is measured as what it holds.
     ///
-    /// The reference charges `print` with **6** for the extracted element — the
-    /// element it hands back is not the widened value the list was built from —
-    /// where the compiler charges the element's full width. Measured both with
-    /// and without the `list` capture above and identical either way, so it is
-    /// an extraction-side defect and not a consequence of that fix. It
-    /// over-charges, which is the direction that refuses a block the network
-    /// accepted, so it matters more than its size suggests.
+    /// The one place in this family where the reference *narrows*: `list_cons`
+    /// builds its result with `Value::cons_list`, the sanitizing constructor, so
+    /// each element is rebuilt against the derived entry type and any capacity
+    /// it was not using is dropped. An empty `(list 12000 uint)` element is
+    /// stored as `(list 0 NoType)` — `cost_print [6]`, not 192,006 — and
+    /// `element-at?` hands that back.
+    ///
+    /// The compiler kept the element's shape handle when writing it into the
+    /// list, so extraction returned the widened value and *over*-charged. That
+    /// is the direction that refuses a block the network accepted, which is why
+    /// this one mattered more than its size.
+    ///
+    /// Not fixed. Zeroing the stored element's handle is *not* the narrowing:
+    /// the reference keeps the widened entry type on the outer list while
+    /// narrowing what it stores, and one handle slot cannot say both — doing it
+    /// made `a_list_of_a_widened_element_is_measured_at_its_declared_width` fail
+    /// and broke `map_principal_destruct` with `InvalidNoTypeInValue`, because
+    /// the handle also carries what a `NoType` branch cannot represent inline.
     #[test]
     #[ignore = "task 150: element-at? over-charges an extracted widened element"]
     fn element_at_does_not_widen_the_element_it_extracts() {
