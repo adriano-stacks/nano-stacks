@@ -113,9 +113,13 @@ and that a short stored list is unchanged. The whole `clar2wasm` suite is green
       from a widened field loses that field's capacity, so `print` of it
       under-charges. Split out rather than folded in here, because the mechanism
       and the sites are different and it predates 149.
-- [ ] **Regress the receipt, not only the root.** The canonical receipt for
-      `8979c764…` should be a fixture, so a wrong error identity cannot pass on a
-      matching root.
+- [x] **Regressed the receipt, not only the root.**
+      `nano-conformance`'s `mainnet_filter_cost` holds block 8,832,029's bytes
+      beside the chain's own record for `8979c764…` and pins the abort kind
+      (`abort_by_post_condition`, `(ok u0)`) and all five dimensions. The
+      unconditional half needs no state and gates on every run; the replay half
+      executed the block at its exact prestate against a reflink clone of the
+      port-20492 node's state on 2026-08-26 and matched every dimension.
 - [x] **Deployed to the port-20492 node, by repinning its state.** Editing
       `vendor/clarity-wasm` moved the compatibility fingerprint from
       `6a83746edc16895eb6886c37474ab7693bc31272b5d350366fc4606663965a35` to
