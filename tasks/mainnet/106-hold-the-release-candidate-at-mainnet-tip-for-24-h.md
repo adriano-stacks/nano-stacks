@@ -421,3 +421,36 @@ task-082 waiter reads that exact path.
 - Selected, followed, and executed tips do not hide persistent lag.
 - Resource use has no unbounded trend.
 - All served data was validated and executed locally.
+
+## Third re-issue, 2026-08-26
+
+The subject and witness are re-cut again, for the same reason as the previous
+two: the runtime-shape audit (task 150) fixed four differentials in clarity-wasm,
+which moved `COMPILER_IDENTITY`, and a node refuses a bundle whose recorded
+compiler is not its own. Two imports at 11 and 6 GiB were stopped and discarded
+rather than carried forward — the guard exists precisely so that cannot be
+finessed.
+
+What is running now:
+
+| | |
+|---|---|
+| revision | `4a684f805913` |
+| compiler | `sha256:d8c185dab25343c3b14fb054f41c83c4c17bf8bc54b3cd3fa237a1f5ff298cea` |
+| profile | `27dcad619d4f86bee85cc4b022985b0ea682cf9d30d67f9211fe7ad80c2dad32` |
+| bundle content root | `7d72a7d46c441a68e6df84a430eaa3fcdac3194d1893b55c6a058fc8ece29e43` |
+| attestation | 2-of-2, `signatures-d8c185da`, both manifests byte-identical across independent builds |
+| subject | `release-subject-d8c185da`, the packaged follower artifact, health on 20478 |
+| witness | `witness-d8c185da`, the node artifact at the same revision, receipts to `hold-receipts-d8c185da` |
+
+One thing improved over the previous attempt: the ceremony's binary was the node
+derivation at this same revision, so **the binary that signed the attestation is
+the binary that runs it** rather than a local build of the same source.
+
+Timings measured on this host, so the next re-issue can be planned rather than
+watched: the bundle is 359 GB, its verification takes about thirteen minutes at
+roughly 500 MB/s of cached reads and writes nothing, and only then does the
+import begin. `run-hold-d8c185da.sh` drives the rest unattended — it waits for
+both nodes to reach the public tip, runs the committed interval harness for the
+24 hours, and verifies the receipts half afterwards.
+
