@@ -108,25 +108,40 @@ value in a newly constructed composite that loses it.
       transaction charges runtime 3,480,582, read_count 7, read_length 22,193,
       write_count 1, write_length 18 against the real state at 8,832,028 — the
       canonical record exactly, on every dimension, in both engines.
-- [ ] **Carry capacity through the three remaining constructors.** Each is
-      inventoried as a failing `#[ignore]`d test classed `semantic` against this
-      task in `ignored-tests.toml`:
-      `as_max_len_keeps_the_capacity_it_reduced`,
-      `an_appended_list_keeps_the_capacity_it_grew_from`,
-      `a_list_of_a_widened_element_keeps_its_capacity`.
-- [ ] **Preserve inner handles on arena read-back**, which is what the `list`
-      case needs and what makes this task `large` rather than `medium`: the
-      general statement is that run-time capacity has to survive every
-      sequence-producing word, not just the ones a mainnet block has hit.
+- [x] **`as-max-len?` and `append` are fixed.** One generalised host call
+      covers all three inheriting words, because they differ only in how they
+      adjust the capacity they inherit: `filter` keeps it, `append` adds one
+      (`special_append`: `new_list(next_entry_type, size + 1)`), and
+      `as-max-len?` reduces it (`special_as_max_len`:
+      `type_signature.reduce_max_len(expected)` — a ceiling on the inherited
+      value, not a replacement for it). Each has a regression that fails without
+      its own fix.
+- [x] **The `list` constructor was never wrong, and the read-back was never the
+      problem.** Both were premises this task opened with, and measuring
+      contradicted both: `read_from_wasm` reads each element through
+      `read_from_wasm_indirect`, which honours the element's own handle, so
+      inner capacity does survive the arena. A capture at `ListCons` was written
+      and then **reverted**, because no test could be made to fail without it.
+      `a_list_of_a_widened_element_is_measured_at_its_declared_width` asserts
+      the property instead.
+- [ ] **`element-at?` over-charges an extracted widened element**, which is what
+      the `list` audit case was really measuring. The reference charges
+      `print [6]` for the extracted element where the compiler charges its full
+      declared width. Inventoried as
+      `element_at_does_not_widen_the_element_it_extracts`, classed `semantic`
+      against this task. It over-charges, which is the direction that refuses a
+      block the network accepted — the same failure mode as 8,832,029 — so it is
+      the one left and the one that matters.
 
 ## Scope note
 
-The two sites a mainnet block actually reached — `filter` (in 149) and `tuple`
-— are fixed and exact. The three left are legal Clarity that no observed mainnet
-transaction has hit, so they do not stop a node; they are cost differentials all
-the same and therefore block [[053-pass-the-mainnet-node-release-gate]] under
-the plan's *STRENGTHENED — exact receipts and costs* amendment. They are
-recorded as open rather than green, which is what that amendment asks for.
+Five sites are fixed and regressed: `filter` twice (in 149), `tuple`, `append`
+and `as-max-len?`. One is left — `element-at?` — and it is the one that
+over-charges rather than under-charges, so it can refuse a block the network
+accepted. No observed mainnet transaction hits it, so it does not stop a node
+today; it blocks [[053-pass-the-mainnet-node-release-gate]] under the plan's
+*STRENGTHENED — exact receipts and costs* amendment, and is recorded as open
+rather than green, which is what that amendment asks for.
 
 ## Notes
 

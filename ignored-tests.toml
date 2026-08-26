@@ -63,42 +63,20 @@ gated even though this test cannot be.
 """
 
 [[ignored]]
-test = "a_list_of_a_widened_element_keeps_its_capacity"
+test = "element_at_does_not_widen_the_element_it_extracts"
 class = "semantic"
 owner = "150"
 measured = """
-A `list` built from an element that carries a widened runtime shape is measured
-over an entry type rebuilt from the element's run-time length, so the element's
-capacity is lost. Unlike the tuple case task 150 fixed, capturing the outer
-value is not enough: `read_from_wasm` rebuilds inner lists with
-`cons_list_unsanitized`, so the arena read-back path loses the inner handles as
-well. Cost only -- the value is right -- and no mainnet transaction observed so
-far reaches it, but it is a cost differential and therefore blocks 053.
-"""
+`element-at?` on a list whose elements carry a widened runtime shape charges the
+element's whole declared width, where the reference charges the extracted
+element as what it holds -- `cost_print [6]` against the compiler's 192,006 on a
+`(list 12000 uint)` holding nothing. Measured identically with and without the
+`list` constructor capture that was tried and reverted, so it is an
+extraction-side defect on its own.
 
-[[ignored]]
-test = "an_appended_list_keeps_the_capacity_it_grew_from"
-class = "semantic"
-owner = "150"
-measured = """
-`special_append` builds its result as `ListTypeData::new_list(next_entry_type,
-size + 1)`, where `size` is the input's `max_len` -- so the result inherits the
-input's capacity plus one, the way a `filter` result inherits it unchanged. The
-compiler sizes the result by its element count instead, so an `append` onto a
-list read from storage under a wider declared type under-charges every later
-measurement of the result.
-"""
-
-[[ignored]]
-test = "as_max_len_keeps_the_capacity_it_reduced"
-class = "semantic"
-owner = "150"
-measured = """
-`special_as_max_len` calls `type_signature.reduce_max_len(expected)`, so the
-result is sized by `min(input max_len, expected)` -- *reduced*, not replaced,
-and not the element count. The compiler drops the input's shape handle and sizes
-the result by its length, so `(as-max-len? <stored list> u12000)` on a
-`(list 12000 uint)` under-charges by the whole unfilled capacity.
+It *over*-charges, which is the direction that refuses a block the network
+accepted -- the same failure mode as block 8,832,029 -- so it matters more than
+its size suggests. Cost only; the value is right.
 """
 
 # ---------------------------------------------------------------------------
