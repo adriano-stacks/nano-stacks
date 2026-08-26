@@ -413,8 +413,16 @@ impl ComplexWord for RestrictAssets {
         // Thanks to static type check we know we have less than 128 allowances
         self.charge(generator, builder, allowance_list.len() as u32)?;
         // Register each allowance (e.g. with-stx, with-stacking).
+        //
+        // Through `traverse_allowance_expr`, as `as-contract?` does: the
+        // reference reads an allowance with `eval_allowance`, which matches the
+        // form and evaluates only its operands, so there is no name to look up
+        // and no `cost_lookup_function` to charge for it. Traversing it as an
+        // ordinary application charged 16 per allowance — the one difference
+        // between the two words' allowance handling, and `as-contract?` had it
+        // right.
         for allowance in allowance_list {
-            generator.traverse_expr(builder, allowance)?;
+            generator.traverse_allowance_expr(builder, allowance)?;
         }
 
         let result_offset = uses_packed_value(&return_ty).then(|| {

@@ -6419,6 +6419,14 @@ fn link_get_tenure_info_miner_spend_winner_property_fn(
         })
 }
 
+/// `Value::size()` as a `u64`, for arithmetic on argument sizes.
+fn value_size(value: &Value) -> Result<u64, VmExecutionError> {
+    let size = value
+        .size()
+        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+    Ok(u64::from(size))
+}
+
 fn sanitize_contract_call_result(
     epoch: &StacksEpochId,
     returns_constraint: Option<&TypeSignature>,
@@ -6736,6 +6744,46 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                         );
                     }
 
+                    // "sanitize contract-call inputs in epochs >= 2.4", in the
+                    // reference's own words: `inner_execute_contract` sanitizes
+                    // every argument against its *own* type before the callee
+                    // sees it, and only the sizes the caller measured — which
+                    // `special_contract_call` keeps for the short-circuit
+                    // decision — are the unsanitized ones. Sanitizing narrows
+                    // every capacity inside an argument to what the data holds,
+                    // so the callee charges `cost_inner_type_check_cost` over 54
+                    // where the caller measured 192,006 for three elements of a
+                    // stored `(list 12000 uint)`. Handing the caller's width
+                    // across charged that difference on every cross-contract
+                    // call whose argument came out of storage — invisible in a
+                    // state root and plainly visible in a receipt.
+                    //
+                    // The result is sanitized on the way back for the same
+                    // reason, by `sanitize_contract_call_result`.
+                    //
+                    // The callee's size is the caller's *adjusted by what
+                    // sanitizing removed*, rather than the sanitized value's own:
+                    // a trait reference erases to a bare principal on the way
+                    // through memory and materializes back carrying the callee's
+                    // declared trait, so its absolute size here is 276 where the
+                    // reference says 148. Differencing cancels that, because the
+                    // erasure is in both terms, and leaves exactly the capacity
+                    // the sanitize dropped.
+                    let mut sanitized = Vec::with_capacity(arguments.len());
+                    let mut sanitized_sizes = Vec::with_capacity(arguments.len());
+                    for (argument, measured) in arguments.into_iter().zip(&argument_sizes) {
+                        let argument_type = TypeSignature::type_of(&argument)?;
+                        let before = value_size(&argument)?;
+                        let (argument, _) = Value::sanitize_value(&epoch, &argument_type, argument)
+                            .ok_or(crate::error::wasm_error(WasmError::Expect(
+                                "a contract-call argument that cannot be sanitized".to_owned(),
+                            )))?;
+                        let dropped = before.saturating_sub(value_size(&argument)?);
+                        sanitized_sizes.push(measured.saturating_sub(dropped));
+                        sanitized.push(argument);
+                    }
+                    let arguments = sanitized;
+
                     let module = caller
                         .data()
                         .module_cache
@@ -6802,7 +6850,7 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                         call_function_with_argument_sizes(
                             function_name.as_str(),
                             &arguments,
-                            Some(&argument_sizes),
+                            Some(&sanitized_sizes),
                             &module,
                             context.global_context,
                             &contract,

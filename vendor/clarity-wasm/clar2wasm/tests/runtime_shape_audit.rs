@@ -18,7 +18,7 @@
 //! size and therefore reports a lost capacity immediately. Where a word charges
 //! by something else — a write length, a hash input — that is the sink instead.
 
-use clar2wasm::tools::crosscheck_cost;
+use clar2wasm::tools::{crosscheck_cost, crosscheck_cost_multi_contract};
 use clarity::vm::Value;
 
 /// A stored `(list 12000 uint)` holding nothing: the mainnet shape, and the
@@ -685,5 +685,164 @@ fn a_second_sweep_of_sources_and_nestings() {
         "(define-private (keep (v uint)) (< v u2))\n(define-public (run) (begin (var-set kept (items)) (print (filter keep (var-get kept))) (ok u0)))",
     ] {
         crosscheck_cost(&format!("{PRELUDE}{body}"), "run", &[]);
+    }
+}
+
+// ------------------------------------------------------- across a contract call
+
+/// A cross-contract argument is sanitized before the callee charges for it.
+///
+/// The reference says so in its own comment — "sanitize contract-call inputs in
+/// epochs >= 2.4" (`Environment::inner_execute_contract`) — and sanitizing
+/// narrows every capacity inside the argument to what its data holds. Only the
+/// sizes the *caller* measured stay unsanitized, and those are used for the
+/// short-circuit decision rather than for a charge.
+///
+/// Nano handed the caller's width across, so the callee charged
+/// `cost_inner_type_check_cost` at the declared width on every cross-contract
+/// call whose argument came out of storage: 192,006 against the reference's 54
+/// for three elements of a `(list 12000 uint)`. A state root cannot see that and
+/// a receipt can, which is the whole reason this file exists.
+#[test]
+fn a_cross_contract_argument_is_sanitized_before_the_callee_charges_it() {
+    const STORE: &str = r#"
+(define-map holder uint {items: (list 12000 uint)})
+(map-set holder u1 {items: (list u1 u2 u3)})
+"#;
+    const EMPTY_STORE: &str = r#"
+(define-map holder uint {items: (list 12000 uint)})
+(map-set holder u1 {items: (list )})
+"#;
+    const READ: &str = "(get items (unwrap-panic (map-get? holder u1)))";
+    let list_callee =
+        "(define-public (measure (l (list 12000 uint))) (begin (print l) (ok (len l))))";
+
+    // A stored list, and the same list emptied: the widest gap and the one that
+    // mainnet block 8,832,029 actually hit.
+    for store in [STORE, EMPTY_STORE] {
+        crosscheck_cost_multi_contract(
+            &[
+                ("provider", list_callee),
+                (
+                    "caller",
+                    &format!(
+                        "{store}(define-public (run) (contract-call? .provider measure {READ}))"
+                    ),
+                ),
+            ],
+            "run",
+            &[],
+        );
+    }
+
+    // A tuple argument, where the width is one level down.
+    crosscheck_cost_multi_contract(
+        &[
+            (
+                "provider",
+                "(define-public (measure (d {items: (list 12000 uint)})) (ok (len (get items d))))",
+            ),
+            (
+                "caller",
+                &format!(
+                    "{STORE}(define-public (run) (contract-call? .provider measure (unwrap-panic (map-get? holder u1))))"
+                ),
+            ),
+        ],
+        "run",
+        &[],
+    );
+
+    // Dynamic dispatch through a trait reference, a read-only callee, a second
+    // narrow argument beside the wide one, and two hops: each is a distinct host
+    // path to the same callee charge.
+    crosscheck_cost_multi_contract(
+        &[
+            ("measurer", "(define-trait measurer ((measure ((list 12000 uint)) (response uint uint))))"),
+            ("provider", "(impl-trait .measurer.measurer)\n(define-public (measure (l (list 12000 uint))) (ok (len l)))"),
+            ("caller", &format!("{STORE}(use-trait m .measurer.measurer)\n(define-public (run) (dispatch .provider))\n(define-private (dispatch (target <m>)) (contract-call? target measure {READ}))")),
+        ],
+        "run",
+        &[],
+    );
+    crosscheck_cost_multi_contract(
+        &[
+            (
+                "provider",
+                "(define-read-only (measure (l (list 12000 uint))) (len l))",
+            ),
+            (
+                "caller",
+                &format!(
+                    "{STORE}(define-public (run) (ok (contract-call? .provider measure {READ})))"
+                ),
+            ),
+        ],
+        "run",
+        &[],
+    );
+    crosscheck_cost_multi_contract(
+        &[
+            (
+                "provider",
+                "(define-public (measure (l (list 12000 uint)) (n uint)) (ok (+ (len l) n)))",
+            ),
+            (
+                "caller",
+                &format!(
+                    "{STORE}(define-public (run) (contract-call? .provider measure {READ} u7))"
+                ),
+            ),
+        ],
+        "run",
+        &[],
+    );
+    crosscheck_cost_multi_contract(
+        &[
+            (
+                "c",
+                "(define-public (measure (l (list 12000 uint))) (ok (len l)))",
+            ),
+            (
+                "b",
+                "(define-public (relay (l (list 12000 uint))) (contract-call? .c measure l))",
+            ),
+            (
+                "caller",
+                &format!("{STORE}(define-public (run) (contract-call? .b relay {READ}))"),
+            ),
+        ],
+        "run",
+        &[],
+    );
+}
+
+// --------------------------------------------------------- the allowance words
+
+/// An allowance costs the same inside `restrict-assets?` as inside
+/// `as-contract?`, because the reference reads both with `eval_allowance`.
+///
+/// `eval_allowance` matches the form and evaluates only its operands, so there
+/// is no name looked up and no `cost_lookup_function` charged for the allowance
+/// itself. `restrict-assets?` traversed each one as an ordinary application and
+/// charged 16 for it; `as-contract?` used `traverse_allowance_expr` and did not.
+/// Sixteen is small enough to hide and exact enough to prove, which is the
+/// argument for measuring every word against the reference rather than the
+/// interesting ones.
+#[test]
+fn an_allowance_costs_the_same_in_both_words_that_take_one() {
+    for body in [
+        "(define-public (run) (let ((r (restrict-assets? tx-sender () u1))) (ok u0)))",
+        "(define-public (run) (let ((r (restrict-assets? tx-sender ((with-stx u1)) u1))) (ok u0)))",
+        "(define-public (run) (let ((r (restrict-assets? tx-sender ((with-stx u1) (with-stx u2)) u1))) (ok u0)))",
+        "(define-data-var amount uint u5)\n(define-public (run) (let ((r (restrict-assets? tx-sender ((with-stx (var-get amount))) u1))) (ok u0)))",
+        "(define-public (run) (let ((r (restrict-assets? tx-sender ((with-staking u1)) u1))) (ok u0)))",
+        "(define-public (run) (let ((r (restrict-assets? tx-sender ((with-pox)) u1))) (ok u0)))",
+        "(define-public (run) (let ((r (as-contract? ((with-stx u1)) u1))) (ok u0)))",
+        "(define-public (run) (let ((r (as-contract? ((with-pox)) u1))) (ok u0)))",
+        // And one with a widened read in the body, so the two rules meet.
+        "(define-map holder uint {items: (list 12000 uint)})\n(map-set holder u1 {items: (list u1 u2 u3)})\n(define-public (run) (let ((r (restrict-assets? tx-sender ((with-stx u1)) (len (get items (unwrap-panic (map-get? holder u1))))))) (ok u0)))",
+    ] {
+        crosscheck_cost(body, "run", &[]);
     }
 }
