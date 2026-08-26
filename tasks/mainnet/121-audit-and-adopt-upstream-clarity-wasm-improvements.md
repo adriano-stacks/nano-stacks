@@ -141,3 +141,31 @@ compiler/runtime APIs.
   vectors, and 500/500 frozen mainnet receipt digests.
 - Repository formatting, `git diff --check`, strict task validation, and task
   ID deduplication: passed.
+
+## Re-audit, 2026-08-26
+
+The audit this task closed was a point-in-time one; keeping the vendored engine
+current is standing work, so this records the second pass rather than opening a
+task for it.
+
+Vendor base is `8354ef00` (2026-08-06). Upstream head is `f4fb08c2`
+(2026-08-25). Four merges since the base, and **nothing to import**:
+
+| Upstream | What | Why not |
+|---|---|---|
+| #841 `with-staking` / `with-pox` | the two new allowance words | already implemented here, and ahead: same `with_pox` host call and allowance push, plus a `with-stx` note on the reference reading its amount through `as_ref` that upstream has no equivalent of |
+| #829 `to_ascii_string_utf8` | the proptest expected the wrong answer for a non-printable byte | already corrected here, to the same rule — `Value::string_ascii_from_bytes`' — arrived at independently |
+| #830, `155f1031` | clarity dependency bumps and a clarity-1 test sync | the pinned revision `efc34a07` is deliberate; a bump is a rebase decision, not an import |
+| `443f2320` | a known-bug carve-out for a string ending in `\` under parser v1 | parser v1 is epoch < 2.1, which a 4.0-only node never runs |
+
+Worth noting that two of the four were things this project had already found and
+fixed on its own. That is the expected shape from here: the fork is ahead on
+epoch-4.0 behaviour and behind only on dependency bumps it declines on purpose.
+
+The recipe, so the next pass costs minutes: the GitHub API over
+`stx-labs/clarity-wasm` (`stacks-network/clarity-wasm` is a mirror with identical
+SHAs but needs `curl -L`), diffed against the recorded vendor base rather than
+tip. Batch any import *before* a checkpoint ceremony — every clarity-wasm edit
+moves `COMPILER_IDENTITY` and invalidates both the attestation and any running
+import.
+
