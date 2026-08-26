@@ -106,6 +106,27 @@ value in a newly constructed composite that loses it.
         compiler charged its element count.
       `err` and `slice?` were measured as well and are already right, which is
       now asserted rather than assumed.
+- [x] **The audit is now a measurement, not a list.**
+      `clar2wasm/tests/runtime_shape_audit.rs` walks every path a stored value
+      can take and asserts each against the interpreter: pass-through, function
+      borders, constructors, the sequence family, the other charges, buffers and
+      strings, contract calls, deserialization, other widening sources and
+      deeper nestings. Forty-four tests, and it found four more differentials —
+      *none* of them in a word:
+      - a **function parameter** kept its caller's width, so the argument's
+        192,006 was charged twice where the reference charges it once and then
+        binds a 54-byte value. A `fold` handing its accumulator back paid it
+        five times.
+      - the same where the handle is **not in the first slot**: a tuple's own
+        plus one per field, an optional's or a response's one slot along.
+      - a **constructed list did not sanitize its elements**, so `map` over a
+        list of stored tuples charged the declared width an iteration. It has to
+        *narrow* rather than forget: the analysed type of a list of `(response
+        principal NoType)` elements is a list of `(response principal
+        principal)`, so forgetting makes an element claim an arm it never had.
+      - `filter` handed the capacity fallback its own **loop counter**,
+        decremented to zero, so a filtered list measured as empty. That path
+        barely ran until the parameter fix made it the normal one.
 - [x] **The rest of the audit.** `some`, `ok` and `merge` are fine:
       `runtime_size` recurses through an optional's or response's inner locals,
       and `merge` already has `merge_runtime_shape`. Three sites are not, and
@@ -166,8 +187,12 @@ value in a newly constructed composite that loses it.
 
 ## Scope note
 
-Eight sites are fixed and regressed: `filter` twice (in 149), `tuple`, `append`,
-`as-max-len?`, `element-at?`, `concat` and `replace-at?`. `some`, `ok`, `merge`, `err`, `slice?` and the
+Twelve sites are fixed and regressed: `filter` three times (twice in 149, once
+for its capacity fallback), `tuple`, `append`, `as-max-len?`, `element-at?`,
+`concat`, `replace-at?`, the function-parameter binding, its nested handles, and
+a constructed list's elements. Only the first eight were words at all; the last
+four were the boundaries between them, which is why enumerating words could not
+have found them. `some`, `ok`, `merge`, `err`, `slice?` and the
 `list` constructor were measured and found already correct. `ignored-tests.toml` now
 lists **no** `semantic` and no `unclassified` entry, which is the state the
 plan's *STRENGTHENED — exact receipts and costs* amendment asks for.
