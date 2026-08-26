@@ -317,6 +317,20 @@ job = "release-qualification"
 requires = "NANO_146_SOURCE naming an immutable mainnet state that holds block 8,808,752 and its parent, and NANO_146_SCRATCH naming a fresh writable copy of it"
 
 [[ignored]]
+test = "the_block_8832029_receipt_matches_the_canonical_record"
+class = "infrastructure"
+owner = "149"
+job = "release-qualification"
+requires = "NANO_149_SOURCE naming an immutable mainnet state that holds block 8,832,029 and its parent, and NANO_149_SCRATCH naming a fresh writable copy of it"
+note = """
+Ran green on 2026-08-26 against a reflink clone of the port-20492 node's state:
+every cost dimension of the block's first transaction equals the canonical
+record. The unconditional half of this module,
+`the_canonical_cost_fixture_describes_the_filter_transaction_of_block_8832029`,
+pins the numbers and the abort kind with no state at all and gates on every run.
+"""
+
+[[ignored]]
 test = "the_mainnet_8815026_trait_registration_executes_at_its_exact_prestate"
 class = "infrastructure"
 owner = "147"

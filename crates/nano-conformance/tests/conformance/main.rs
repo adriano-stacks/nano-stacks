@@ -55,6 +55,7 @@ mod mainnet_codegen;
 mod mainnet_codegen_effects;
 mod mainnet_divergence;
 mod mainnet_envelope;
+mod mainnet_filter_cost;
 mod mainnet_receipts;
 mod mainnet_sortition;
 mod map_over_a_string;

@@ -1,0 +1,25 @@
+{
+  "source": "https://api.hiro.so/extended/v1/tx/0x8979c764c3503eca8ab58fc8b42d4eb7bb74d456e42f344acaf90017ca694cc2?event_limit=100",
+  "retrieved_at": "2026-08-26T09:40:00Z",
+  "txid": "8979c764c3503eca8ab58fc8b42d4eb7bb74d456e42f344acaf90017ca694cc2",
+  "block_height": 8832029,
+  "block_hash": "82f2323c281881415388340c1bc64059a613015ac5eca860e59e46753c44bc78",
+  "index_block_hash": "a0a5c8469970aeab701d44899a519daa877674f9c0856e574d1d1f2757674a40",
+  "parent_index_block_hash": "d8fd517396ba9f3a185dfd4c9708d59acae5c36db174f09c08ce665c2e0c0bd2",
+  "burn_block_height": 963864,
+  "tx_index": 0,
+  "canonical": true,
+  "status": "abort_by_post_condition",
+  "result": {
+    "hex": "070100000000000000000000000000000000",
+    "repr": "(ok u0)"
+  },
+  "cost": {
+    "read_count": 7,
+    "read_length": 22193,
+    "runtime": 3480582,
+    "write_count": 1,
+    "write_length": 18
+  },
+  "events": []
+}
