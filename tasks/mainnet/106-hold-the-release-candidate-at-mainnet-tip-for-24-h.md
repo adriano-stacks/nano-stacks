@@ -422,7 +422,7 @@ task-082 waiter reads that exact path.
 - Resource use has no unbounded trend.
 - All served data was validated and executed locally.
 
-## Third re-issue, 2026-08-26
+## Third re-issue, 2026-08-26 (superseded within the hour)
 
 The subject and witness are re-cut again, for the same reason as the previous
 two: the runtime-shape audit (task 150) fixed four differentials in clarity-wasm,
@@ -453,4 +453,29 @@ roughly 500 MB/s of cached reads and writes nothing, and only then does the
 import begin. `run-hold-d8c185da.sh` drives the rest unattended — it waits for
 both nodes to reach the public tip, runs the committed interval harness for the
 24 hours, and verifies the receipts half afterwards.
+
+## Fourth re-issue, 2026-08-26
+
+The third one was stopped 25 minutes into its import, because continuing to
+measure while it ran found two more differentials — a cross-contract argument
+charged at the caller's width, and an allowance name charged a function lookup.
+Both are consensus-visible in a receipt, so the run was worthless and stopping it
+cost 25 minutes instead of a day.
+
+That is the argument for measuring *before* the ceremony rather than during the
+hold, and it is now the sequencing: sweep until nothing new turns up, then attest,
+then import. Three imports discarded so far, at 11 GiB, 6 GiB and 6 GiB.
+
+| | |
+|---|---|
+| revision | `ca9829020e61` (artifact rebuilt at the final documentation commit, same compiler and profile) |
+| compiler | `sha256:ec1098d69f48a8dd3883a9992c7ef875e83a860a632602e0bfaad77248385950` |
+| profile | `537b58ec42a5132aceb55f272197a9c7ba5b3773c9d15a7b78bcc2e1ebdb4eaa` |
+
+One thing worth stating about the sequencing, because it is not obvious: an
+attestation binds the *compiler identity and profile*, not the source revision.
+A documentation commit therefore leaves the attested bundle valid and only
+requires rebuilding the artifact, which is three minutes; a clarity-wasm commit
+invalidates the bundle and costs a ceremony and a fresh import. That asymmetry is
+why the freeze is on `vendor/clarity-wasm` specifically.
 

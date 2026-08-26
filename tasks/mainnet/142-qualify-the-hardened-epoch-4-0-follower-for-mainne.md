@@ -120,3 +120,19 @@ subject started doing on 2026-08-23; the tip hold and full cycle follow it.
   operational assumption rather than imply independent corroboration.
 - The go/no-go record is signed and independently reproducible.
 - Only after these conditions hold may tasks 142 and 053 be completed.
+
+## A flaky gate, recorded rather than papered over, 2026-08-26
+
+`nano_rpc::tests::abandoned_read_only_calls_keep_their_worker_budget_until_done`
+failed once in a full-workspace run under heavy parallel load — it expected
+`503 SERVICE_UNAVAILABLE` from a saturated read-only pool and got `408`, because
+the probe request timed out before the semaphore reported saturation. It passes
+in isolation, twice, and nothing in that path changed.
+
+It is written down because a qualification run cannot rest on a gate that fails
+under load: a red CI run that is "probably the flake" is indistinguishable from
+a real regression at the moment it matters. The fix is to make the probe wait for
+saturation rather than race it. Not done here, deliberately: the tree is frozen
+for the release import, and this is nano-side test code rather than anything the
+running artifact contains.
+

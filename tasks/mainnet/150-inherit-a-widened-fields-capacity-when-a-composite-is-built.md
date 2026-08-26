@@ -127,6 +127,20 @@ value in a newly constructed composite that loses it.
       - `filter` handed the capacity fallback its own **loop counter**,
         decremented to zero, so a filtered list measured as empty. That path
         barely ran until the parameter fix made it the normal one.
+- [x] **Two more, past the words entirely, from extending the same sweep.**
+      - a **cross-contract argument** was charged at the caller's width. The
+        reference says what to do in its own comment — "sanitize contract-call
+        inputs in epochs >= 2.4" — and only the caller's own measurement stays
+        unsanitized, for the short-circuit decision. So the callee charged
+        192,006 where the reference charged 54, on every cross-contract call
+        whose argument came out of storage. The callee's size is the caller's
+        adjusted by what sanitizing removed, not the sanitized value's own: a
+        trait reference erases to a principal through memory and comes back
+        carrying the callee's trait, and differencing cancels that.
+      - **`restrict-assets?` charged 16 for each allowance name.** The reference
+        reads an allowance with `eval_allowance`, which matches the form and
+        evaluates only its operands, so there is no name to look up.
+        `as-contract?` already used `traverse_allowance_expr` and was right.
 - [x] **The rest of the audit.** `some`, `ok` and `merge` are fine:
       `runtime_size` recurses through an optional's or response's inner locals,
       and `merge` already has `merge_runtime_shape`. Three sites are not, and
@@ -187,12 +201,13 @@ value in a newly constructed composite that loses it.
 
 ## Scope note
 
-Twelve sites are fixed and regressed: `filter` three times (twice in 149, once
+Fourteen sites are fixed and regressed: `filter` three times (twice in 149, once
 for its capacity fallback), `tuple`, `append`, `as-max-len?`, `element-at?`,
 `concat`, `replace-at?`, the function-parameter binding, its nested handles, and
-a constructed list's elements. Only the first eight were words at all; the last
-four were the boundaries between them, which is why enumerating words could not
-have found them. `some`, `ok`, `merge`, `err`, `slice?` and the
+a constructed list's elements, the cross-contract argument boundary, and
+`restrict-assets?`'s allowance list. Only the first eight were words at all; the
+last six were the boundaries between them, which is why enumerating words could
+not have found them. The audit is 46 tests. `some`, `ok`, `merge`, `err`, `slice?` and the
 `list` constructor were measured and found already correct. `ignored-tests.toml` now
 lists **no** `semantic` and no `unclassified` entry, which is the state the
 plan's *STRENGTHENED — exact receipts and costs* amendment asks for.
