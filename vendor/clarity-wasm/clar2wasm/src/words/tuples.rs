@@ -113,6 +113,15 @@ impl ComplexWord for TupleCons {
             )
             .map_err(|error| GeneratorError::TypeError(error.to_string()))?,
         );
+        // The handle slot of every field that can carry one. A field that was
+        // itself widened has to widen the tuple built from it, or the tuple's
+        // zero handle claims a capacity nothing widened. See
+        // `WasmGenerator::capture_inherited_runtime_shape`.
+        let field_handles: Vec<_> = locals_map
+            .values()
+            .filter(|(ty, _)| carries_runtime_shape(ty))
+            .filter_map(|(_, locals)| locals.first().copied())
+            .collect();
         let locals: Vec<_> = locals_map
             .into_values()
             .flat_map(|(_, locals)| locals)
@@ -127,6 +136,8 @@ impl ComplexWord for TupleCons {
         if source_ty != result_ty || generator.type_for_serialization(&source_ty) != source_ty {
             generator.capture_runtime_shape(builder, &source_ty)?;
             generator.duck_type_preserve(builder, &source_ty, &result_ty, None)?;
+        } else {
+            generator.capture_inherited_runtime_shape(builder, &source_ty, &field_handles)?;
         }
 
         Ok(())

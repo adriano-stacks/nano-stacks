@@ -2305,4 +2305,55 @@ mod tests {
 "#;
         crosscheck_cost(stored, "run", &[]);
     }
+
+    /// A tuple built from a widened field keeps that field's capacity.
+    ///
+    /// `runtime_size` reads a zero shape handle as "nothing widened this value —
+    /// widening is a preservation or host crossing, and crossings assign
+    /// handles". A tuple constructed *out of* a widened field breaks that: the
+    /// constructor pushes a literal zero, the inline sum measures the field by
+    /// its run-time length, and the capacity it carried is gone. On mainnet
+    /// 8,832,029 that was `cost_print [192534]` against the compiler's `[534]`
+    /// — the whole declared size of one `(list 12000 uint)`.
+    #[test]
+    fn a_tuple_bound_from_a_widened_field_keeps_its_capacity() {
+        crosscheck_cost(
+            r#"
+(define-map holder uint {items: (list 12000 uint)})
+(map-set holder u1 {items: (list )})
+(define-public (run)
+  (let (
+    (d (unwrap-panic (map-get? holder u1)))
+    (items (get items d))
+    (t {n: u0, items: items})
+  )
+    (begin (print (get items t)) (ok u0))))
+"#,
+            "run",
+            &[],
+        );
+    }
+
+    /// The same through a `fold` accumulator, which is how the mainnet
+    /// transaction reached it: the fold ran zero times and handed its initial
+    /// tuple straight back.
+    #[test]
+    fn a_fold_accumulator_keeps_a_widened_fields_capacity() {
+        crosscheck_cost(
+            r#"
+(define-map holder uint {items: (list 12000 uint)})
+(map-set holder u1 {items: (list )})
+(define-private (f (v uint) (acc {n: uint, items: (list 12000 uint)})) acc)
+(define-public (run)
+  (let (
+    (d (unwrap-panic (map-get? holder u1)))
+    (items (get items d))
+    (acc (fold f items {n: u0, items: items}))
+  )
+    (begin (print (get items acc)) (ok u0))))
+"#,
+            "run",
+            &[],
+        );
+    }
 }

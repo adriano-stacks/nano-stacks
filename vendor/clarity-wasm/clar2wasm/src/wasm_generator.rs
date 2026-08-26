@@ -2451,6 +2451,68 @@ impl WasmGenerator {
         Ok(())
     }
 
+    /// Capture a composite that was *built* from parts, when one of those parts
+    /// was itself widened.
+    ///
+    /// `runtime_size`'s tuple arm reads a zero handle as "nothing widened this
+    /// value — widening is a preservation or host crossing, and crossings assign
+    /// handles". A composite constructed out of a widened field breaks that: the
+    /// constructor pushes a literal zero, the inline sum then measures the field
+    /// by its run-time length, and the capacity the field carried is gone. A
+    /// `print` of a tuple holding a `(list 12000 uint)` read from a map was
+    /// charged 534 where the reference charged 192,534 ([[150]]).
+    ///
+    /// `field_handles` are the handle slots of the fields that *can* carry one,
+    /// so a composite of scalars is skipped at compile time and pays nothing.
+    /// The rest is one runtime test: any handle set, and the value is captured.
+    pub(crate) fn capture_inherited_runtime_shape(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        ty: &TypeSignature,
+        field_handles: &[LocalId],
+    ) -> Result<(), GeneratorError> {
+        let Some((first, rest)) = field_handles.split_first() else {
+            return Ok(());
+        };
+        let locals = self.save_to_locals(builder, ty, true);
+        let handle = *locals.first().ok_or_else(|| {
+            GeneratorError::InternalError("composite value is missing its shape handle".to_owned())
+        })?;
+        let (type_offset, type_length) = self.serialized_runtime_type(ty)?;
+
+        let mut capture = builder.dangling_instr_seq(None);
+        for local in &locals {
+            capture.local_get(*local);
+        }
+        let (value_offset, _) = self.create_call_stack_local(&mut capture, ty, true, false);
+        self.write_to_memory(&mut capture, value_offset, 0, ty)?;
+        capture
+            .local_get(value_offset)
+            .i32_const(type_offset)
+            .i32_const(type_length)
+            .call(self.func_by_name("stdlib.save_runtime_shape"))
+            .local_set(handle);
+        let capture = capture.id();
+
+        builder.local_get(*first);
+        for other in rest {
+            builder.local_get(*other).binop(BinaryOp::I32Or);
+        }
+        builder.if_else(
+            None,
+            |then| {
+                then.instr(walrus::ir::Block { seq: capture });
+            },
+            |_| {},
+        );
+
+        for local in &locals {
+            builder.local_get(*local);
+        }
+        self.release_locals(locals);
+        Ok(())
+    }
+
     /// Materialize a composite stack value in the execution context's
     /// runtime-shape arena, then put the same projected value back on stack
     /// with its new handle.
