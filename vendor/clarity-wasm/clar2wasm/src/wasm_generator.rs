@@ -1311,8 +1311,13 @@ impl WasmGenerator {
         let (handle_size, _) =
             module.add_import_func("clarity", "runtime_shape_size", shape_size_ty);
         module.funcs.get_mut(handle_size).name = Some("stdlib.runtime_shape_size".to_owned());
+        let (list_capacity, _) =
+            module.add_import_func("clarity", "runtime_shape_list_capacity", shape_size_ty);
+        module.funcs.get_mut(list_capacity).name =
+            Some("stdlib.runtime_shape_list_capacity".to_owned());
         let save_filtered_shape_ty = module.types.add(
             &[
+                ValType::I32,
                 ValType::I32,
                 ValType::I32,
                 ValType::I32,
@@ -2408,7 +2413,47 @@ impl WasmGenerator {
             element_stride,
             0,
             -1,
+            None,
         )
+    }
+
+    /// Push the run-time capacity of a list held as `(handle, byte length)`.
+    ///
+    /// A widened list's capacity is the one its handle names; an unwidened one's
+    /// is its element count. `concat` needs this as a *number* for every
+    /// argument past the first, because `ListData::append` makes the result
+    /// capacity `self.max_len + other.max_len` and only the first argument is
+    /// the value being rebuilt.
+    pub(crate) fn list_capacity_on_stack(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        handle: LocalId,
+        length: LocalId,
+        element_stride: i32,
+        into: LocalId,
+    ) -> Result<(), GeneratorError> {
+        let handled = {
+            let mut handled = builder.dangling_instr_seq(None);
+            handled
+                .local_get(handle)
+                .call(self.func_by_name("stdlib.runtime_shape_list_capacity"))
+                .local_set(into);
+            handled.id()
+        };
+        let counted = {
+            let mut counted = builder.dangling_instr_seq(None);
+            counted
+                .local_get(length)
+                .i32_const(element_stride)
+                .binop(BinaryOp::I32DivU)
+                .local_set(into);
+            counted.id()
+        };
+        builder.local_get(handle).instr(walrus::ir::IfElse {
+            consequent: handled,
+            alternative: counted,
+        });
+        Ok(())
     }
 
     /// The general form: a list-producing word whose result is sized by the
@@ -2432,6 +2477,7 @@ impl WasmGenerator {
         element_stride: i32,
         delta: i32,
         cap: i32,
+        extra: Option<LocalId>,
     ) -> Result<(), GeneratorError> {
         let locals = self.save_to_locals(builder, ty, true);
         let handle = *locals.first().ok_or_else(|| {
@@ -2457,7 +2503,12 @@ impl WasmGenerator {
             .i32_const(element_stride)
             .binop(BinaryOp::I32DivU)
             .i32_const(delta)
-            .i32_const(cap)
+            .i32_const(cap);
+        match extra {
+            Some(extra) => capture.local_get(extra),
+            None => capture.i32_const(0),
+        };
+        capture
             .call(self.func_by_name("stdlib.save_filtered_runtime_shape"))
             .local_set(handle);
         let capture = capture.id();
@@ -2468,7 +2519,7 @@ impl WasmGenerator {
         // inline measurement already answers what the reference answers. A
         // widened input has to be asked even when nothing was dropped, because
         // its capacity is wider than its length.
-        let always = delta != 0 || cap >= 0;
+        let always = delta != 0 || cap >= 0 || extra.is_some();
         builder
             .local_get(input_handle)
             .local_get(input_length)

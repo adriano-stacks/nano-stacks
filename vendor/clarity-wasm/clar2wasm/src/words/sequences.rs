@@ -677,6 +677,7 @@ impl ComplexWord for Append {
             elem_size,
             1,
             -1,
+            None,
         )?;
 
         Ok(())
@@ -835,6 +836,7 @@ impl ComplexWord for AsMaxLen {
                     element_stride,
                     0,
                     cap,
+                    None,
                 )?;
             }
         } else {
@@ -886,6 +888,20 @@ impl ComplexWord for Concat {
         let length = generator.alloc_local(ValType::I32);
         builder.i32_const(0).local_set(length);
 
+        // `SequenceData::concat` on lists is `ListData::append`, whose result
+        // capacity is `self.max_len + other.max_len` -- the *sum* of the
+        // arguments' capacities, applied pairwise for more than two. So the
+        // first argument's shape is inherited and the rest contribute a number.
+        let element_stride = match &ty {
+            TypeSignature::SequenceType(SequenceSubtype::ListType(list)) => {
+                get_type_size(list.get_list_item_type())
+            }
+            _ => 1,
+        };
+        let mut first_list: Option<(LocalId, LocalId)> = None;
+        let extra_capacity = generator.alloc_local(ValType::I32);
+        builder.i32_const(0).local_set(extra_capacity);
+
         for arg in args {
             // WORKAROUND: typechecker issue for lists
             generator.set_expr_type(arg, ty.clone())?;
@@ -895,7 +911,25 @@ impl ComplexWord for Concat {
             let arg_offset = generator.alloc_local(ValType::I32);
             builder.local_set(arg_length).local_set(arg_offset);
             if is_list {
-                builder.drop();
+                let arg_handle = generator.alloc_local(ValType::I32);
+                builder.local_set(arg_handle);
+                if first_list.is_none() {
+                    first_list = Some((arg_handle, arg_length));
+                } else {
+                    let capacity = generator.alloc_local(ValType::I32);
+                    generator.list_capacity_on_stack(
+                        builder,
+                        arg_handle,
+                        arg_length,
+                        element_stride,
+                        capacity,
+                    )?;
+                    builder
+                        .local_get(extra_capacity)
+                        .local_get(capacity)
+                        .binop(BinaryOp::I32Add)
+                        .local_set(extra_capacity);
+                }
             }
 
             builder
@@ -913,10 +947,25 @@ impl ComplexWord for Concat {
                 .local_set(length);
         }
 
-        if is_list {
+        if let Some((first_handle, first_length)) = first_list {
             builder.i32_const(0);
+            builder.local_get(offset).local_get(length);
+            generator.capture_capacity_from(
+                builder,
+                &ty,
+                first_handle,
+                first_length,
+                element_stride,
+                0,
+                -1,
+                Some(extra_capacity),
+            )?;
+        } else {
+            if is_list {
+                builder.i32_const(0);
+            }
+            builder.local_get(offset).local_get(length);
         }
-        builder.local_get(offset).local_get(length);
 
         // we charge after the operation since that's the only time we have the
         // length of the resulting list
@@ -1764,9 +1813,16 @@ impl ComplexWord for ReplaceAt {
         // the memcpy arguments.
         let source_offset = generator.alloc_local(ValType::I32);
         builder.local_set(length).local_set(source_offset);
-        if matches!(&element_ty, SequenceElementType::Other(_)) {
-            builder.drop();
-        }
+        // Kept rather than dropped: `SequenceData::replace_at` writes one slot
+        // and leaves `type_signature` alone, so the result inherits the input's
+        // capacity unchanged -- the same rule as `filter`.
+        let source_handle = if matches!(&element_ty, SequenceElementType::Other(_)) {
+            let handle = generator.alloc_local(ValType::I32);
+            builder.local_set(handle);
+            Some(handle)
+        } else {
+            None
+        };
         builder.local_get(source_offset).local_get(length);
 
         // At this point, we can compute the cost of the function call using the number of elements in the list
@@ -1787,7 +1843,31 @@ impl ComplexWord for ReplaceAt {
             }
         }
         builder.local_set(number_of_elements);
-        self.charge(generator, builder, number_of_elements)?;
+        // `special_replace_at` charges `TypeSignature::type_of(&seq).size()` --
+        // the input *value's* size, which for a list is
+        // `type_signature_size + max_len * entry.size()` over the capacity the
+        // value carries. The element count is a different quantity, and on a
+        // list read from storage under a wider declared type it is a much
+        // smaller one. Buffers and strings are left on the count, which is what
+        // their `type_of` size already agrees with.
+        if let Some(source_handle) = source_handle {
+            let seq_ty = generator
+                .get_expr_type(seq)
+                .ok_or_else(|| {
+                    GeneratorError::TypeError("replace-at? sequence must be typed".to_owned())
+                })?
+                .clone();
+            let charged = generator.alloc_local(ValType::I32);
+            generator.runtime_size(
+                builder,
+                &seq_ty,
+                &[source_handle, source_offset, length],
+                charged,
+            )?;
+            self.charge(generator, builder, charged)?;
+        } else {
+            self.charge(generator, builder, number_of_elements)?;
+        }
 
         // Copy the input list to the new stack local
         builder.memory_copy(memory, memory);
@@ -2019,10 +2099,38 @@ impl ComplexWord for ReplaceAt {
 
         // Push the `some` indicator with destination offset/length.
         else_.i32_const(1);
-        if matches!(&element_ty, SequenceElementType::Other(_)) {
+        if let Some(source_handle) = source_handle {
             else_.i32_const(0);
+            else_.local_get(dest_offset).local_get(length);
+            let seq_ty = generator
+                .get_expr_type(seq)
+                .ok_or_else(|| {
+                    GeneratorError::TypeError("replace-at? sequence must be typed".to_owned())
+                })?
+                .clone();
+            let element_stride = match &seq_ty {
+                TypeSignature::SequenceType(SequenceSubtype::ListType(list)) => {
+                    get_type_size(list.get_list_item_type())
+                }
+                _ => {
+                    return Err(GeneratorError::TypeError(
+                        "replace-at? list must be a list".to_owned(),
+                    ))
+                }
+            };
+            generator.capture_capacity_from(
+                &mut else_,
+                &seq_ty,
+                source_handle,
+                length,
+                element_stride,
+                0,
+                -1,
+                None,
+            )?;
+        } else {
+            else_.local_get(dest_offset).local_get(length);
         }
-        else_.local_get(dest_offset).local_get(length);
 
         builder.instr(IfElse {
             consequent: then_id,

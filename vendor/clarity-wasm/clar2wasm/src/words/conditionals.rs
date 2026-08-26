@@ -2456,4 +2456,73 @@ mod tests {
             &[],
         );
     }
+
+    /// `concat` sums the capacities it joined.
+    ///
+    /// `SequenceData::concat` on lists is `ListData::append`, whose result is
+    /// `new_list(entry, self.max_len + other.max_len)` — the *sum*, applied
+    /// pairwise for more than two arguments. The compiler dropped every
+    /// argument's shape handle and sized the result by its own element count.
+    #[test]
+    fn a_concatenated_list_sums_the_capacities_it_joined() {
+        crosscheck_cost(
+            r#"
+(define-map holder uint {items: (list 12000 uint), n: uint})
+(map-set holder u1 {items: (list u1 u2), n: u0})
+(define-public (run)
+  (let ((d (unwrap-panic (map-get? holder u1))))
+    (begin (print (concat (get items d) (list u7))) (ok u0))))
+"#,
+            "run",
+            &[],
+        );
+    }
+
+    /// `replace-at?` keeps the capacity it wrote into, and is charged over it.
+    ///
+    /// Two separate things were wrong. `SequenceData::replace_at` writes one
+    /// slot and leaves `type_signature` alone, so the result inherits the
+    /// input's capacity — the same rule as `filter`. And
+    /// `special_replace_at` charges `TypeSignature::type_of(&seq).size()`, the
+    /// input *value's* size, where the compiler charged its element count: a
+    /// different quantity, and a much smaller one on a list read from storage
+    /// under a wider declared type.
+    #[test]
+    fn replace_at_keeps_the_capacity_it_wrote_into() {
+        crosscheck_cost(
+            r#"
+(define-map holder uint {items: (list 12000 uint), n: uint})
+(map-set holder u1 {items: (list u1 u2), n: u0})
+(define-public (run)
+  (let (
+    (d (unwrap-panic (map-get? holder u1)))
+    (r (unwrap-panic (replace-at? (get items d) u0 u9)))
+  ) (ok (len r))))
+"#,
+            "run",
+            &[],
+        );
+    }
+
+    /// `err` and `slice?` were measured and are already right.
+    ///
+    /// Asserted rather than assumed, because the rest of this family was not:
+    /// `runtime_size` recurses through a response's inner locals, so a widened
+    /// payload keeps its handle; and `slice?` builds a fresh list, whose
+    /// capacity the reference derives from what it holds.
+    #[test]
+    fn a_wrapped_or_sliced_widened_list_is_already_measured_correctly() {
+        let contract = r#"
+(define-map holder uint {items: (list 12000 uint), n: uint})
+(map-set holder u1 {items: (list u1 u2), n: u0})
+(define-public (wrapped)
+  (let ((d (unwrap-panic (map-get? holder u1))))
+    (begin (print (unwrap-err-panic (err (get items d)))) (ok u0))))
+(define-public (sliced)
+  (let ((d (unwrap-panic (map-get? holder u1))))
+    (begin (print (unwrap-panic (slice? (get items d) u0 u1))) (ok u0))))
+"#;
+        crosscheck_cost(contract, "wrapped", &[]);
+        crosscheck_cost(contract, "sliced", &[]);
+    }
 }

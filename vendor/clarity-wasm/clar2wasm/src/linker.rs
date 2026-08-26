@@ -276,6 +276,7 @@ pub fn link_host_functions(
 ) -> Result<(), VmExecutionError> {
     link_save_runtime_shape_fn(linker)?;
     link_save_filtered_runtime_shape_fn(linker)?;
+    link_runtime_shape_list_capacity_fn(linker)?;
     link_runtime_shape_size_fn(linker)?;
     link_runtime_shape_serialization_size_fn(linker)?;
     link_runtime_value_size_fn(linker)?;
@@ -509,7 +510,8 @@ fn link_save_filtered_runtime_shape_fn(
              input_handle: i32,
              input_count: i32,
              delta: i32,
-             cap: i32| {
+             cap: i32,
+             extra: i32| {
                 crate::phases::time(crate::phases::Phase::ShapeSave, || {
                     let memory = caller
                         .data()
@@ -546,9 +548,10 @@ fn link_save_filtered_runtime_shape_fn(
                     // A negative cap is "no cap", which is what `filter` and
                     // `append` pass; only `as-max-len?` names one.
                     let cap = u32::try_from(cap).ok();
-                    let handle = caller
-                        .data_mut()
-                        .save_runtime_shape_inheriting(value, inherited, max_len, delta, cap)?;
+                    let extra = u32::try_from(extra).unwrap_or(0);
+                    let handle = caller.data_mut().save_runtime_shape_inheriting(
+                        value, inherited, max_len, delta, cap, extra,
+                    )?;
                     Ok(handle)
                 })
             },
@@ -557,6 +560,35 @@ fn link_save_filtered_runtime_shape_fn(
         .map_err(|error| {
             crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
                 "save_filtered_runtime_shape".to_owned(),
+                error,
+            ))
+        })
+}
+
+/// Link `runtime_shape_list_capacity`: a handled list's `max_len` by handle.
+///
+/// `concat` sums its arguments' capacities, and only the first of them is the
+/// value being rebuilt -- the rest contribute a number and nothing else.
+fn link_runtime_shape_list_capacity_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "runtime_shape_list_capacity",
+            |caller: Caller<'_, ClarityWasmContext>, handle: i32| {
+                crate::phases::time(crate::phases::Phase::HostShape, || {
+                    let capacity = caller.data().runtime_shape_list_capacity(handle)?;
+                    let capacity = i32::try_from(capacity)
+                        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                    Ok(capacity)
+                })
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "runtime_shape_list_capacity".to_owned(),
                 error,
             ))
         })
@@ -8103,7 +8135,8 @@ pub fn dummy_linker<T: 'static>(engine: &Engine) -> Result<Linker<T>, wasmtime::
          _input_handle: i32,
          _input_count: i32,
          _delta: i32,
-         _cap: i32| Ok(0i32),
+         _cap: i32,
+         _extra: i32| Ok(0i32),
     )?;
 
     linker.func_wrap(
@@ -8113,6 +8146,10 @@ pub fn dummy_linker<T: 'static>(engine: &Engine) -> Result<Linker<T>, wasmtime::
     )?;
 
     linker.func_wrap("clarity", "runtime_shape_size", |_handle: i32| Ok(0i32))?;
+
+    linker.func_wrap("clarity", "runtime_shape_list_capacity", |_handle: i32| {
+        Ok(0i32)
+    })?;
 
     linker.func_wrap(
         "clarity",

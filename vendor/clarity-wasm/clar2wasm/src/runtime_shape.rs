@@ -148,7 +148,9 @@ pub trait RuntimeShapeStore {
     /// widened value and therefore carries one. Otherwise the input's capacity
     /// was its element count, `max_len`, and its entry type is the result's.
     ///
-    /// `delta` and `cap` are how the three words that inherit a capacity differ:
+    /// `extra` is a second capacity to add, which only `concat` has.
+    ///
+    /// `delta` and `cap` are how the words that inherit a capacity differ:
     /// `filter` keeps it (`0`, `None`), `append` adds one
     /// (`special_append`: `new_list(next_entry_type, size + 1)`), and
     /// `as-max-len?` reduces it (`special_as_max_len`:
@@ -164,6 +166,7 @@ pub trait RuntimeShapeStore {
         max_len: u32,
         delta: u32,
         cap: Option<u32>,
+        extra: u32,
     ) -> Result<i32, VmExecutionError> {
         let value = match value {
             Value::Sequence(SequenceData::List(mut list)) => {
@@ -174,7 +177,7 @@ pub trait RuntimeShapeStore {
                     }
                     _ => (list.type_signature.get_list_item_type().clone(), max_len),
                 };
-                let grown = base.saturating_add(delta);
+                let grown = base.saturating_add(delta).saturating_add(extra);
                 let capped = cap.map_or(grown, |cap| grown.min(cap));
                 list.type_signature = ListTypeData::new_list(entry, capped).map_err(|error| {
                     crate::error::wasm_error(WasmError::WasmGeneratorError(format!(
@@ -186,6 +189,18 @@ pub trait RuntimeShapeStore {
             other => other,
         };
         self.save_runtime_shape(value)
+    }
+
+    /// This entry's list capacity, for a caller that only needs the number.
+    ///
+    /// `concat` sums its arguments' capacities
+    /// (`ListData::append`: `max_len = self.max_len + other.max_len`), and only
+    /// the first of them is the value being rebuilt — the rest contribute a
+    /// number and nothing else.
+    fn runtime_shape_list_capacity(&self, handle: i32) -> Result<u32, VmExecutionError> {
+        Ok(self
+            .runtime_shape_list_type(handle)?
+            .map_or(0, |list| list.get_max_len()))
     }
 
     /// This entry's list type. See [`RuntimeShapeArena::list_type`].
