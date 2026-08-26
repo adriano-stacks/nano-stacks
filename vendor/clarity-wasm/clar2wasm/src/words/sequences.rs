@@ -30,6 +30,8 @@ struct ListEntryWriter<'a> {
     charged: LocalId,
     measured: bool,
     total_size: u32,
+    /// Byte offset of each element written, for the narrowing pass below.
+    entries: Vec<u32>,
 }
 
 impl ListEntryWriter<'_> {
@@ -55,6 +57,7 @@ impl ListEntryWriter<'_> {
                     .binop(BinaryOp::I32Add)
                     .local_set(self.charged);
             }
+            self.entries.push(self.total_size);
             let elem_size =
                 generator.write_to_memory(builder, self.offset, self.total_size, self.elem_ty)?;
             self.total_size += elem_size;
@@ -113,6 +116,7 @@ impl ComplexWord for ListCons {
             charged,
             measured,
             total_size: 0,
+            entries: Vec::with_capacity(list.len()),
         };
         if list.len() <= LIST_LITERAL_BLOCK_ENTRIES {
             writer.write(generator, builder, list)?;
@@ -143,6 +147,47 @@ impl ComplexWord for ListCons {
             .i32_const(0)
             .local_get(offset)
             .i32_const(writer.total_size as i32);
+
+        // `list_cons` builds its result with `Value::cons_list` -- the
+        // sanitizing constructor -- and the reference therefore says two things
+        // at once about a list built from widened elements. Its *entry type* is
+        // derived from the elements as they arrived, so the list is measured at
+        // their declared width; but each element it *stores* is rebuilt against
+        // that entry type, so any capacity it was not using is dropped and an
+        // element read back out again is only as big as what it holds.
+        //
+        // Nano has one shape handle per value and cannot say both in one slot,
+        // so it says them in order: capture the list while its elements still
+        // carry their handles, which fixes the entry type in the arena, and only
+        // then narrow what is left in memory for whoever extracts an element.
+        //
+        // Narrowed by zeroing the handle, which is the sanitized measurement
+        // exactly -- a handle-zero list is measured inline from its own byte
+        // length, and read back with `cons_list_unsanitized`, whose capacity is
+        // the element count. Only for *list* elements: a handle on a response or
+        // an optional also carries what a `NoType` branch cannot represent
+        // inline, and dropping it there loses the value, not just its width
+        // (`map_principal_destruct`, `InvalidNoTypeInValue`).
+        if has_runtime_shape(elem_ty) {
+            let ty = ty.clone();
+            generator.capture_runtime_shape(builder, &ty)?;
+        }
+        if matches!(
+            elem_ty,
+            TypeSignature::SequenceType(SequenceSubtype::ListType(_))
+        ) {
+            let memory = generator.get_memory()?;
+            for at in &writer.entries {
+                builder.local_get(offset).i32_const(0).store(
+                    memory,
+                    ir::StoreKind::I32 { atomic: false },
+                    ir::MemArg {
+                        align: 4,
+                        offset: *at,
+                    },
+                );
+            }
+        }
 
         Ok(())
     }

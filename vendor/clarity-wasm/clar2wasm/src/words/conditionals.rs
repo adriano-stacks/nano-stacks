@@ -2434,14 +2434,15 @@ mod tests {
     /// is the direction that refuses a block the network accepted, which is why
     /// this one mattered more than its size.
     ///
-    /// Not fixed. Zeroing the stored element's handle is *not* the narrowing:
-    /// the reference keeps the widened entry type on the outer list while
-    /// narrowing what it stores, and one handle slot cannot say both — doing it
-    /// made `a_list_of_a_widened_element_is_measured_at_its_declared_width` fail
-    /// and broke `map_principal_destruct` with `InvalidNoTypeInValue`, because
-    /// the handle also carries what a `NoType` branch cannot represent inline.
+    /// The reference says two things at once — the list is measured at its
+    /// elements' declared width, and an element read back out is only as big as
+    /// what it holds — and one shape handle cannot say both. `ListCons` says
+    /// them in order instead: capture the list while its elements still carry
+    /// their handles, then narrow what is left in memory. Narrowing only *list*
+    /// elements, because a handle on a response or an optional also carries what
+    /// a `NoType` branch cannot represent inline, and dropping it there loses the
+    /// value rather than its width.
     #[test]
-    #[ignore = "task 150: element-at? over-charges an extracted widened element"]
     fn element_at_does_not_widen_the_element_it_extracts() {
         crosscheck_cost(
             r#"
