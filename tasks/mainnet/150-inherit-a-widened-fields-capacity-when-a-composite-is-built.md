@@ -3,7 +3,7 @@ id: "150"
 title: "Inherit a widened field's capacity when a composite is constructed"
 status: pending
 priority: critical
-effort: medium
+effort: large
 dependencies: []
 tags: ["mainnet", "vm", "costs", "release"]
 created_at: 2026-08-26
@@ -84,22 +84,49 @@ value in a newly constructed composite that loses it.
 
 ## Tasks
 
-- [ ] Make a constructed composite inherit its fields' widening: if any field
-      carries a nonzero handle at run time, the composite has to be captured
-      too. The condition is a run-time OR over the fields' handle slots, which
-      is the same shape 149's `capture_filtered_runtime_shape` uses for
-      `filter`.
-- [ ] Audit every other site that builds a composite out of parts, and cover the
-      ones that can carry a widened part: `tuple`, the `list` constructor,
-      `append`, `concat`, `as-max-len?`, `merge` (which already has
-      `merge_runtime_shape` — confirm it is enough), and the `ok`/`some`/`err`
-      wrappers (whose `runtime_size` already recurses through the inner locals,
-      so these are expected to be fine — assert it rather than assume it).
-- [ ] Keep the arena out of the common case, as 149 does: capture only when a
-      field is actually widened, so a tuple of scalars still costs nothing.
-- [ ] Regress each covered site with `crosscheck_cost`, and check each new test
-      fails without the fix.
-- [ ] Re-measure `8979c764…` and close 149's five-dimension criterion with it.
+- [x] **`tuple` is fixed.** A constructed composite now inherits its fields'
+      widening: if any field carries a handle at run time, the composite is
+      captured too. Only fields whose *type* can carry one are considered, so a
+      tuple of scalars is skipped at compile time. Regressed two ways — a tuple
+      bound in a `let`, and a `fold` that ran zero times and handed its initial
+      accumulator back, which is how the mainnet transaction reached it.
+- [x] **The audit is done, by measurement.** `some`, `ok` and `merge` are fine:
+      `runtime_size` recurses through an optional's or response's inner locals,
+      and `merge` already has `merge_runtime_shape`. Three sites are not, and
+      each has a *different* reference rule:
+      - `as-max-len?` — `special_as_max_len` calls
+        `type_signature.reduce_max_len(expected)`, so the result is sized by
+        `min(input max_len, expected)`.
+      - `append` — `special_append` builds
+        `ListTypeData::new_list(next_entry_type, size + 1)`, so the result
+        inherits the input's capacity plus one.
+      - the `list` constructor — the outer `max_len` is right but the *entry
+        type* is not, and capturing the outer value cannot fix it:
+        `read_from_wasm` rebuilds inner lists with `cons_list_unsanitized`, so
+        the arena read-back path loses inner handles as well.
+- [x] **Re-measured `8979c764…`**: with 149's two fixes and `tuple`, the
+      transaction charges runtime 3,480,582, read_count 7, read_length 22,193,
+      write_count 1, write_length 18 against the real state at 8,832,028 — the
+      canonical record exactly, on every dimension, in both engines.
+- [ ] **Carry capacity through the three remaining constructors.** Each is
+      inventoried as a failing `#[ignore]`d test classed `semantic` against this
+      task in `ignored-tests.toml`:
+      `as_max_len_keeps_the_capacity_it_reduced`,
+      `an_appended_list_keeps_the_capacity_it_grew_from`,
+      `a_list_of_a_widened_element_keeps_its_capacity`.
+- [ ] **Preserve inner handles on arena read-back**, which is what the `list`
+      case needs and what makes this task `large` rather than `medium`: the
+      general statement is that run-time capacity has to survive every
+      sequence-producing word, not just the ones a mainnet block has hit.
+
+## Scope note
+
+The two sites a mainnet block actually reached — `filter` (in 149) and `tuple`
+— are fixed and exact. The three left are legal Clarity that no observed mainnet
+transaction has hit, so they do not stop a node; they are cost differentials all
+the same and therefore block [[053-pass-the-mainnet-node-release-gate]] under
+the plan's *STRENGTHENED — exact receipts and costs* amendment. They are
+recorded as open rather than green, which is what that amendment asks for.
 
 ## Notes
 
