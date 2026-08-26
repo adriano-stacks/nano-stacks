@@ -108,18 +108,48 @@ and that a short stored list is unchanged. The whole `clar2wasm` suite is green
 - [ ] **Regress the receipt, not only the root.** The canonical receipt for
       `8979c764…` should be a fixture, so a wrong error identity cannot pass on a
       matching root.
-- [ ] **Deploy.** Editing `vendor/clarity-wasm` moved the compatibility
-      fingerprint from `6a83746edc16895eb6886c37474ab7693bc31272b5d350366fc4606663965a35`
-      to `4741d57fb27317c3385ec1de364f92bd10688d315e1419efc77264ce17b30180`, so
-      both live nodes refuse their imported state until the checkpoint is
-      re-attested and re-imported — there is deliberately no repin. See
-      `/home/aldur/checkpoint-builder-keys/run-ceremony-*.sh`. **Until then
-      neither node can execute 8,832,029**, and the measurement above was taken
-      on a scratch reflink clone (`/home/aldur/scratch-149-state`) whose
-      `consensus_profile` row was repinned by hand. That clone is a diagnostic
-      only and must never be presented as release evidence.
+- [x] **Deployed to the port-20492 node, by repinning its state.** Editing
+      `vendor/clarity-wasm` moved the compatibility fingerprint from
+      `6a83746edc16895eb6886c37474ab7693bc31272b5d350366fc4606663965a35` to
+      `4741d57fb27317c3385ec1de364f92bd10688d315e1419efc77264ce17b30180`, and a
+      node refuses state pinned to the old one. Rather than re-import, the
+      20492 node's own pin was moved by hand — the `consensus_profile` row in
+      `chainstate/clarity.sqlite` and `profile_fingerprint` in
+      `chainstate/checkpoint-provenance.toml` (backup:
+      `/home/aldur/mainnet-tip/checkpoint-provenance.toml.bak-6a83746e`).
+      It then executed 8,832,029 and caught up to tip. See the caveat below.
+- [ ] **Re-attest and re-import for release evidence.** The repin above is the
+      operator shortcut, not the sanctioned path: the design has deliberately no
+      repin subcommand, because a compiler change means a fresh import. The
+      20492 node is therefore **no longer provably one compiler's continuation of
+      the attested checkpoint** and must not be presented as release evidence or
+      as a receipt witness. The release subject
+      (`/home/aldur/release-subject-88920833`) is untouched and still refuses
+      8,832,029; it needs the real ceremony
+      (`/home/aldur/checkpoint-builder-keys/run-ceremony-*.sh`, then a fresh
+      import from the re-issued bundle).
+
+      What makes the repin defensible *for a diagnostic node* and not for
+      release: every block this state executed sealed to the canonical
+      `state_index_root`, so its ledger is root-identical to the network's under
+      either compiler. The bug could only change a value where the garbage it
+      read passed the predicate, and such a block would have failed its root
+      check and been refused. Cost is not in the root, which is exactly why this
+      hid — and exactly why the argument is about this state and not a general
+      licence.
 - [ ] **Sweep for the same shape.** `filter` was the only unguarded loop of the
       three, but confirm nothing else emits a do-while over a sequence length.
+
+## Live result
+
+The port-20492 node (`nano-stacks 0.1.0-74e82b7bfbad`) executed **8,832,029**
+without a root mismatch, then caught up 11,201 blocks and reached chain tip on
+2026-08-26. At burn 964,103 it agreed exactly with three independent sources —
+two stock 4.0.1 peers and Hiro — on `stacks_tip_consensus_hash`
+`f7f64cc8de758fe830662eae0dbb5facd79482c4` and the same `pox_consensus`, and its
+tip block `0df975e4…` is confirmed canonical. It has tracked tip since, within
+the one-to-two blocks of ordinary propagation latency. Zero state-root mismatches
+across the whole 11,000-block run.
 
 ## Notes
 
