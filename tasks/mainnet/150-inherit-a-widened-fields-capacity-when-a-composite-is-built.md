@@ -91,7 +91,22 @@ value in a newly constructed composite that loses it.
       tuple of scalars is skipped at compile time. Regressed two ways — a tuple
       bound in a `let`, and a `fold` that ran zero times and handed its initial
       accumulator back, which is how the mainnet transaction reached it.
-- [x] **The audit is done, by measurement.** `some`, `ok` and `merge` are fine:
+- [x] **The audit is done, by measurement — and it had to be done twice.** The
+      first pass wrote itself up as complete while never measuring `concat`,
+      which its own task list named. Both it and `replace-at?` were wrong:
+      - `concat` — `SequenceData::concat` on lists is `ListData::append`, whose
+        result is `new_list(entry, self.max_len + other.max_len)`: the *sum* of
+        the arguments' capacities, pairwise for more than two. Fixed by
+        inheriting the first argument's shape and adding the rest as a number,
+        through a `runtime_shape_list_capacity` host call.
+      - `replace-at?` — two things. `SequenceData::replace_at` writes one slot
+        and leaves `type_signature` alone, so the result inherits the input's
+        capacity like `filter` does; *and* `special_replace_at` charges
+        `TypeSignature::type_of(&seq).size()`, the input value's size, where the
+        compiler charged its element count.
+      `err` and `slice?` were measured as well and are already right, which is
+      now asserted rather than assumed.
+- [x] **The rest of the audit.** `some`, `ok` and `merge` are fine:
       `runtime_size` recurses through an optional's or response's inner locals,
       and `merge` already has `merge_runtime_shape`. Three sites are not, and
       each has a *different* reference rule:
@@ -151,9 +166,9 @@ value in a newly constructed composite that loses it.
 
 ## Scope note
 
-Six sites are fixed and regressed: `filter` twice (in 149), `tuple`, `append`,
-`as-max-len?` and `element-at?`. `some`, `ok`, `merge` and the `list`
-constructor were measured and found already correct. `ignored-tests.toml` now
+Eight sites are fixed and regressed: `filter` twice (in 149), `tuple`, `append`,
+`as-max-len?`, `element-at?`, `concat` and `replace-at?`. `some`, `ok`, `merge`, `err`, `slice?` and the
+`list` constructor were measured and found already correct. `ignored-tests.toml` now
 lists **no** `semantic` and no `unclassified` entry, which is the state the
 plan's *STRENGTHENED — exact receipts and costs* amendment asks for.
 
@@ -167,10 +182,12 @@ the `list` constructor was not losing capacity, and the arena read-back was not
 dropping inner handles. A capture written for `ListCons` on that premise was
 reverted because no test could be made to fail without it.
 
-The family has one rule with one exception, and both are now stated by a test:
-a word that hands its argument back keeps the capacity that argument carried
-(`filter`, and `append`/`as-max-len?` with their own adjustments), while
-`list_cons` *sanitizes* and therefore narrows what it stores.
+The family has one rule with two exceptions, and all three are now stated by a
+test: a word that hands its argument back keeps the capacity that argument
+carried (`filter` and `replace-at?` unchanged, `append` plus one, `as-max-len?`
+reduced, `concat` summed), while `list_cons` *sanitizes* and therefore narrows
+what it stores. `replace-at?` also has to be *charged* over that capacity, not
+over the element count, which is a separate thing from carrying it.
 
 ## Notes
 
