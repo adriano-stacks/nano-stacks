@@ -632,12 +632,55 @@ fn type_size_plan(ty: &TypeSignature) -> TypeSizePlan {
     }
 }
 
-/// Whether a value of this type has a runtime-shape handle in its first slot.
-fn carries_runtime_shape(ty: &TypeSignature) -> bool {
-    matches!(
-        ty,
-        TypeSignature::TupleType(_) | TypeSignature::SequenceType(SequenceSubtype::ListType(_))
-    )
+/// Where every runtime-shape handle in this type's flattened representation sits.
+///
+/// A handle is reachable through an optional's or a response's arm and through
+/// a tuple's fields, so a parameter can carry one without carrying it in its
+/// own first slot: `(optional (list 12000 uint))` keeps it in slot 1, and
+/// `{items: (list 12000 uint)}` keeps one of its own plus the field's. Mirrors
+/// [`clar2wasm_ty`]'s slot order exactly, which is the order the bindings are
+/// in.
+fn runtime_shape_slots(ty: &TypeSignature, base: usize, out: &mut Vec<usize>) {
+    match ty {
+        TypeSignature::SequenceType(SequenceSubtype::ListType(_)) => out.push(base),
+        TypeSignature::TupleType(tuple) => {
+            out.push(base);
+            let mut slot = base + 1;
+            for field in tuple.get_type_map().values() {
+                runtime_shape_slots(field, slot, out);
+                slot += clar2wasm_ty(field).len();
+            }
+        }
+        TypeSignature::OptionalType(inner) => runtime_shape_slots(inner, base + 1, out),
+        TypeSignature::ResponseType(arms) => {
+            runtime_shape_slots(&arms.0, base + 1, out);
+            runtime_shape_slots(&arms.1, base + 1 + clar2wasm_ty(&arms.0).len(), out);
+        }
+        _ => {}
+    }
+}
+
+/// [`runtime_shape_slots`] for a value laid out in linear memory, in bytes.
+///
+/// Mirrors `read_from_memory`'s walk, which is what `get_type_size` measures.
+fn runtime_shape_offsets(ty: &TypeSignature, base: u32, out: &mut Vec<u32>) {
+    match ty {
+        TypeSignature::SequenceType(SequenceSubtype::ListType(_)) => out.push(base),
+        TypeSignature::TupleType(tuple) => {
+            out.push(base);
+            let mut offset = base + 4;
+            for field in tuple.get_type_map().values() {
+                runtime_shape_offsets(field, offset, out);
+                offset += get_type_size(field) as u32;
+            }
+        }
+        TypeSignature::OptionalType(inner) => runtime_shape_offsets(inner, base + 4, out),
+        TypeSignature::ResponseType(arms) => {
+            runtime_shape_offsets(&arms.0, base + 4, out);
+            runtime_shape_offsets(&arms.1, base + 4 + get_type_size(&arms.0) as u32, out);
+        }
+        _ => {}
+    }
 }
 
 /// Whether a binding of this type resolves through the callable context.
@@ -1315,6 +1358,13 @@ impl WasmGenerator {
             module.add_import_func("clarity", "runtime_shape_list_capacity", shape_size_ty);
         module.funcs.get_mut(list_capacity).name =
             Some("stdlib.runtime_shape_list_capacity".to_owned());
+        let (narrow_shape, _) =
+            module.add_import_func("clarity", "narrow_runtime_shape", shape_size_ty);
+        module.funcs.get_mut(narrow_shape).name = Some("stdlib.narrow_runtime_shape".to_owned());
+        let (sanitize_elements, _) =
+            module.add_import_func("clarity", "sanitize_runtime_shape_elements", shape_size_ty);
+        module.funcs.get_mut(sanitize_elements).name =
+            Some("stdlib.sanitize_runtime_shape_elements".to_owned());
         let save_filtered_shape_ty = module.types.add(
             &[
                 ValType::I32,
@@ -2134,6 +2184,14 @@ impl WasmGenerator {
                         id_length,
                         index,
                     )?;
+                } else {
+                    // Identity or not, the binding cannot keep the *caller's*
+                    // width. `cost_inner_type_check_cost` above is charged at
+                    // the declared width, which is the whole of what the caller's
+                    // width is owed; the reference then binds the cast value,
+                    // and every later reading of the binding — starting with
+                    // `cost_lookup_variable_size` — measures that.
+                    self.clear_binding_runtime_shape(&mut func_body, parameter_type, storage)?;
                 }
             }
         }
@@ -2613,6 +2671,28 @@ impl WasmGenerator {
         builder: &mut InstrSeqBuilder,
         ty: &TypeSignature,
     ) -> Result<(), GeneratorError> {
+        self.capture_shape(builder, ty, false)
+    }
+
+    /// [`Self::capture_runtime_shape`], with the entry's elements sanitized.
+    ///
+    /// Only the `list` constructor wants this, and it wants both halves of what
+    /// `Value::cons_list` says: the entry type from the elements as they
+    /// arrived, and the elements stored at their own width.
+    pub(crate) fn capture_runtime_shape_sanitizing_elements(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        ty: &TypeSignature,
+    ) -> Result<(), GeneratorError> {
+        self.capture_shape(builder, ty, true)
+    }
+
+    fn capture_shape(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        ty: &TypeSignature,
+        sanitize_elements: bool,
+    ) -> Result<(), GeneratorError> {
         if !matches!(
             ty,
             TypeSignature::TupleType(_) | TypeSignature::SequenceType(SequenceSubtype::ListType(_))
@@ -2637,8 +2717,11 @@ impl WasmGenerator {
             .local_get(value_offset)
             .i32_const(type_offset)
             .i32_const(type_length)
-            .call(self.func_by_name("stdlib.save_runtime_shape"))
-            .local_set(handle);
+            .call(self.func_by_name("stdlib.save_runtime_shape"));
+        if sanitize_elements {
+            capture.call(self.func_by_name("stdlib.sanitize_runtime_shape_elements"));
+        }
+        capture.local_set(handle);
         let capture = capture.id();
 
         builder.local_get(handle).unop(UnaryOp::I32Eqz).if_else(
@@ -4838,28 +4921,89 @@ impl WasmGenerator {
             }
         }
 
-        // The admitted value is the sanitised one, and the reference sanitises
-        // back to what the data says: a field that arrived carrying its
-        // parent's declared width is read inside the callee at its own. The
-        // representation now holds that value whole, so the arena entry it came
-        // with is both redundant and wrong to keep — measuring through it would
-        // answer the caller's width for the callee's binding.
-        if carries_runtime_shape(ty) {
-            match storage {
-                BindingStorage::Locals(locals) => {
-                    if let Some(handle) = locals.first() {
+        self.clear_binding_runtime_shape(builder, ty, storage)
+    }
+
+    /// Forget the width a parameter's argument arrived carrying.
+    ///
+    /// The reference charges the argument at the declared width — that is what
+    /// `cost_inner_type_check_cost` measures — and then binds the *cast* value,
+    /// which carries its own. Every later reading of the binding measures that
+    /// narrower thing, starting with `cost_lookup_variable_size`. Keeping the
+    /// caller's arena entry answers the caller's width instead, which double
+    /// charges the difference: a `(list 12000 uint)` parameter handed three
+    /// elements read out of storage charged 192,006 twice where the reference
+    /// charged it once and then 54.
+    ///
+    /// So this is not a detail of reconstruction, it is the rule for every
+    /// shape-carrying parameter, whether or not admitting one would have
+    /// rebuilt it.
+    /// Sanitize the capacities of every handle in a value held in memory.
+    ///
+    /// The handles stay: an entry says more than a width, and what it says
+    /// about a `NoType` arm has to survive. See
+    /// [`RuntimeShapeStore::narrow_runtime_shape`](crate::runtime_shape::RuntimeShapeStore::narrow_runtime_shape).
+    pub(crate) fn narrow_runtime_shapes_in_memory(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        base: LocalId,
+        ty: &TypeSignature,
+        at: u32,
+    ) -> Result<(), GeneratorError> {
+        let mut offsets = Vec::new();
+        runtime_shape_offsets(ty, at, &mut offsets);
+        if offsets.is_empty() {
+            return Ok(());
+        }
+        let memory = self.get_memory()?;
+        let narrow = self.func_by_name("stdlib.narrow_runtime_shape");
+        for offset in offsets {
+            builder
+                .local_get(base)
+                .local_get(base)
+                .load(
+                    memory,
+                    walrus::ir::LoadKind::I32 { atomic: false },
+                    walrus::ir::MemArg { align: 4, offset },
+                )
+                .call(narrow)
+                .store(
+                    memory,
+                    walrus::ir::StoreKind::I32 { atomic: false },
+                    walrus::ir::MemArg { align: 4, offset },
+                );
+        }
+        Ok(())
+    }
+
+    fn clear_binding_runtime_shape(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        ty: &TypeSignature,
+        storage: &BindingStorage,
+    ) -> Result<(), GeneratorError> {
+        match storage {
+            BindingStorage::Locals(locals) => {
+                let mut slots = Vec::new();
+                runtime_shape_slots(ty, 0, &mut slots);
+                for slot in slots {
+                    if let Some(handle) = locals.get(slot) {
                         builder.i32_const(0).local_set(*handle);
                     }
                 }
-                BindingStorage::Memory { base, delta } => {
-                    let memory = self.get_memory()?;
+            }
+            BindingStorage::Memory { base, delta } => {
+                let mut offsets = Vec::new();
+                runtime_shape_offsets(ty, *delta, &mut offsets);
+                if offsets.is_empty() {
+                    return Ok(());
+                }
+                let memory = self.get_memory()?;
+                for offset in offsets {
                     builder.local_get(*base).i32_const(0).store(
                         memory,
                         walrus::ir::StoreKind::I32 { atomic: false },
-                        walrus::ir::MemArg {
-                            align: 4,
-                            offset: *delta,
-                        },
+                        walrus::ir::MemArg { align: 4, offset },
                     );
                 }
             }

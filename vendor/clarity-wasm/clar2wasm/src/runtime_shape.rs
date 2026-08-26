@@ -1,7 +1,7 @@
 use std::cell::Cell;
 
 use clarity::vm::errors::VmExecutionError;
-use clarity::vm::types::{ListTypeData, SequenceData};
+use clarity::vm::types::{ListData, ListTypeData, SequenceData, TupleData};
 use clarity::vm::Value;
 
 use crate::error::WasmError;
@@ -226,6 +226,121 @@ pub trait RuntimeShapeStore {
             .ok_or_else(|| invalid_runtime_shape_handle(handle, 0))?
             .serialized_size(handle)
     }
+
+    /// Sanitize an entry's capacities, keeping everything else it says.
+    ///
+    /// `Value::cons_list` rebuilds each element it stores against the entry type
+    /// it derived, so an element keeps only the capacity it is using — every
+    /// list inside it included, however deep. What sanitizing does *not* do is
+    /// widen the element's own types to the list's: an element whose response
+    /// arm is `NoType` keeps that, and the list's entry type is the least
+    /// supertype of what the elements said.
+    ///
+    /// Which is why this narrows rather than forgetting. Dropping the entry
+    /// entirely would answer the *analysed* type for the value, and the analysed
+    /// type of a list of `(response principal NoType)` elements is a list of
+    /// `(response principal principal)`: every element would come back claiming
+    /// an arm it never had, which is a different value and not just a different
+    /// width.
+    fn narrow_runtime_shape(&mut self, handle: i32) -> Result<i32, VmExecutionError> {
+        if handle == 0 {
+            return Ok(0);
+        }
+        let value = self.load_runtime_shape(handle)?;
+        let narrowed = narrow_capacities(value.clone())?;
+        // By size, not by `==`: Clarity value equality is semantic and ignores
+        // the capacities entirely, so an emptied `(list 12000 uint)` and an
+        // emptied `(list 0 NoType)` compare equal — and comparing that way threw
+        // every narrowing away silently.
+        if measured_size(&narrowed)? == measured_size(&value)? {
+            return Ok(handle);
+        }
+        self.save_runtime_shape(narrowed)
+    }
+    /// Sanitize an entry's *elements*, keeping what the entry says about itself.
+    ///
+    /// `Value::cons_list` says two things at once, and they disagree: the list's
+    /// entry type is the least supertype of the elements *as they arrived*, so a
+    /// list built from a widened element is measured at that width; but each
+    /// element it stores is rebuilt against that entry type, so an element read
+    /// back out is only as big as what it holds. On mainnet the first is what a
+    /// `print` of the list charges and the second is what `map` charges per
+    /// iteration, so getting either one wrong is visible.
+    fn sanitize_runtime_shape_elements(&mut self, handle: i32) -> Result<i32, VmExecutionError> {
+        if handle == 0 {
+            return Ok(0);
+        }
+        let value = self.load_runtime_shape(handle)?;
+        let Value::Sequence(SequenceData::List(list)) = value else {
+            return Ok(handle);
+        };
+        let mut items = Vec::with_capacity(list.data.len());
+        let mut changed = false;
+        for item in list.data.iter() {
+            let narrowed = narrow_capacities(item.clone())?;
+            changed = changed || measured_size(&narrowed)? != measured_size(item)?;
+            items.push(narrowed);
+        }
+        if !changed {
+            return Ok(handle);
+        }
+        self.save_runtime_shape(Value::Sequence(SequenceData::List(ListData {
+            data: items,
+            type_signature: list.type_signature,
+        })))
+    }
+}
+
+/// Rebuild every sequence capacity in a value from what it holds.
+///
+/// The constructors do the deriving: `cons_list_unsanitized` takes the entry
+/// type from the elements and the capacity from their count, and
+/// `TupleData::from_data` takes each field's from the field. Buffers and strings
+/// carry no capacity apart from their own length, so they are already narrow.
+fn narrow_capacities(value: Value) -> Result<Value, VmExecutionError> {
+    let narrowed = match value {
+        Value::Sequence(SequenceData::List(list)) => {
+            let mut items = Vec::with_capacity(list.data.len());
+            for item in list.data {
+                items.push(narrow_capacities(item)?);
+            }
+            Value::cons_list_unsanitized(items).map_err(narrowing_failed)?
+        }
+        Value::Tuple(tuple) => {
+            let mut fields = Vec::with_capacity(tuple.data_map.len());
+            for (name, field) in tuple.data_map {
+                fields.push((name, narrow_capacities(field)?));
+            }
+            Value::Tuple(TupleData::from_data(fields).map_err(narrowing_failed)?)
+        }
+        Value::Optional(optional) => match optional.data {
+            Some(inner) => Value::some(narrow_capacities(*inner)?).map_err(narrowing_failed)?,
+            None => Value::none(),
+        },
+        Value::Response(response) => {
+            let inner = narrow_capacities(*response.data)?;
+            if response.committed {
+                Value::okay(inner).map_err(narrowing_failed)?
+            } else {
+                Value::error(inner).map_err(narrowing_failed)?
+            }
+        }
+        other => other,
+    };
+    Ok(narrowed)
+}
+
+/// `Value::size()`, which is the only thing a capacity changes.
+fn measured_size(value: &Value) -> Result<u32, VmExecutionError> {
+    value
+        .size()
+        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))
+}
+
+fn narrowing_failed(error: impl std::fmt::Display) -> VmExecutionError {
+    crate::error::wasm_error(WasmError::WasmGeneratorError(format!(
+        "cannot narrow a runtime shape's capacities: {error}"
+    )))
 }
 
 impl RuntimeShapeStore for () {

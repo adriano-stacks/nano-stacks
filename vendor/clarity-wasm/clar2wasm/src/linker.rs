@@ -277,6 +277,8 @@ pub fn link_host_functions(
     link_save_runtime_shape_fn(linker)?;
     link_save_filtered_runtime_shape_fn(linker)?;
     link_runtime_shape_list_capacity_fn(linker)?;
+    link_narrow_runtime_shape_fn(linker)?;
+    link_sanitize_runtime_shape_elements_fn(linker)?;
     link_runtime_shape_size_fn(linker)?;
     link_runtime_shape_serialization_size_fn(linker)?;
     link_runtime_value_size_fn(linker)?;
@@ -589,6 +591,63 @@ fn link_runtime_shape_list_capacity_fn(
         .map_err(|error| {
             crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
                 "runtime_shape_list_capacity".to_owned(),
+                error,
+            ))
+        })
+}
+
+/// Link `narrow_runtime_shape`: sanitize an entry's capacities in place.
+///
+/// A list's elements are stored sanitized, so each one keeps only the capacity
+/// it uses. Forgetting the entry instead would answer the analysed type, which
+/// for a `NoType` arm is a different value and not just a different width — see
+/// [`RuntimeShapeStore::narrow_runtime_shape`].
+fn link_narrow_runtime_shape_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "narrow_runtime_shape",
+            |mut caller: Caller<'_, ClarityWasmContext>, handle: i32| {
+                crate::phases::time(crate::phases::Phase::HostShape, || {
+                    let narrowed = caller.data_mut().narrow_runtime_shape(handle)?;
+                    Ok(narrowed)
+                })
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "narrow_runtime_shape".to_owned(),
+                error,
+            ))
+        })
+}
+
+/// Link `sanitize_runtime_shape_elements`: narrow an entry's elements only.
+///
+/// See [`RuntimeShapeStore::sanitize_runtime_shape_elements`]: a constructed
+/// list is measured at its elements' arriving width and stores them at their
+/// own, so the entry keeps its type and its elements are rebuilt.
+fn link_sanitize_runtime_shape_elements_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "sanitize_runtime_shape_elements",
+            |mut caller: Caller<'_, ClarityWasmContext>, handle: i32| {
+                crate::phases::time(crate::phases::Phase::HostShape, || {
+                    let sanitized = caller.data_mut().sanitize_runtime_shape_elements(handle)?;
+                    Ok(sanitized)
+                })
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "sanitize_runtime_shape_elements".to_owned(),
                 error,
             ))
         })
@@ -8150,6 +8209,14 @@ pub fn dummy_linker<T: 'static>(engine: &Engine) -> Result<Linker<T>, wasmtime::
     linker.func_wrap("clarity", "runtime_shape_list_capacity", |_handle: i32| {
         Ok(0i32)
     })?;
+
+    linker.func_wrap("clarity", "narrow_runtime_shape", |handle: i32| Ok(handle))?;
+
+    linker.func_wrap(
+        "clarity",
+        "sanitize_runtime_shape_elements",
+        |handle: i32| Ok(handle),
+    )?;
 
     linker.func_wrap(
         "clarity",

@@ -684,6 +684,12 @@ impl ComplexWord for Filter {
         } else {
             None
         };
+        // The loop below consumes `input_len` as its counter, so the length the
+        // input arrived with has to be kept separately: it is what the result
+        // inherits its capacity from when the input carried no handle of its
+        // own, and asking the counter afterwards always answers zero.
+        let input_original_len = generator.alloc_local(ValType::I32);
+        builder.local_get(input_len).local_set(input_original_len);
 
         // reserve space for the output list
         let (output_offset, _) = generator.create_call_stack_local(builder, &ty, false, true);
@@ -828,7 +834,7 @@ impl ComplexWord for Filter {
                 builder,
                 &ty,
                 input_handle,
-                input_len,
+                input_original_len,
                 elem_size,
             )?;
         } else {

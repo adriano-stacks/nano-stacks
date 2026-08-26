@@ -161,31 +161,21 @@ impl ComplexWord for ListCons {
         // carry their handles, which fixes the entry type in the arena, and only
         // then narrow what is left in memory for whoever extracts an element.
         //
-        // Narrowed by zeroing the handle, which is the sanitized measurement
-        // exactly -- a handle-zero list is measured inline from its own byte
-        // length, and read back with `cons_list_unsanitized`, whose capacity is
-        // the element count. Only for *list* elements: a handle on a response or
-        // an optional also carries what a `NoType` branch cannot represent
-        // inline, and dropping it there loses the value, not just its width
-        // (`map_principal_destruct`, `InvalidNoTypeInValue`).
+        // Narrowed by *sanitizing* each element's entry, not by forgetting it.
+        // Sanitizing reaches every list inside an element, a tuple field's
+        // included -- an element that kept its field's width made `map` charge
+        // the declared 192,006 an iteration where the reference charged what the
+        // field holds. And it keeps everything the entry says apart from those
+        // widths, which forgetting cannot: the analysed type of a list of
+        // `(response principal NoType)` elements is a list of `(response
+        // principal principal)`, so an element read back without its entry
+        // claims an arm it never had. That is a different value, not a different
+        // width (`append_value_to_list`).
         if has_runtime_shape(elem_ty) {
             let ty = ty.clone();
-            generator.capture_runtime_shape(builder, &ty)?;
-        }
-        if matches!(
-            elem_ty,
-            TypeSignature::SequenceType(SequenceSubtype::ListType(_))
-        ) {
-            let memory = generator.get_memory()?;
+            generator.capture_runtime_shape_sanitizing_elements(builder, &ty)?;
             for at in &writer.entries {
-                builder.local_get(offset).i32_const(0).store(
-                    memory,
-                    ir::StoreKind::I32 { atomic: false },
-                    ir::MemArg {
-                        align: 4,
-                        offset: *at,
-                    },
-                );
+                generator.narrow_runtime_shapes_in_memory(builder, offset, elem_ty, *at)?;
             }
         }
 
