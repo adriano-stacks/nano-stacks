@@ -674,9 +674,16 @@ impl ComplexWord for Filter {
 
         // save list (offset, length) to locals
         builder.local_set(input_len).local_set(input_offset);
-        if is_list {
-            builder.drop();
-        }
+        // The input's shape handle is kept rather than dropped: the result
+        // inherits the capacity it names. See
+        // `WasmGenerator::capture_filtered_runtime_shape`.
+        let input_handle = if is_list {
+            let handle = generator.alloc_local(ValType::I32);
+            builder.local_set(handle);
+            Some(handle)
+        } else {
+            None
+        };
 
         // reserve space for the output list
         let (output_offset, _) = generator.create_call_stack_local(builder, &ty, false, true);
@@ -813,11 +820,21 @@ impl ComplexWord for Filter {
                 alternative: else_id,
             });
 
-        if is_list {
+        if let Some(input_handle) = input_handle {
             builder.i32_const(0);
+            builder.local_get(output_offset);
+            builder.local_get(output_len);
+            generator.capture_filtered_runtime_shape(
+                builder,
+                &ty,
+                input_handle,
+                input_len,
+                elem_size,
+            )?;
+        } else {
+            builder.local_get(output_offset);
+            builder.local_get(output_len);
         }
-        builder.local_get(output_offset);
-        builder.local_get(output_len);
 
         Ok(())
     }
@@ -2242,5 +2259,50 @@ mod tests {
     (ok (filter le (get items d)))))
 "#;
         crosscheck_cost(snippet, "run", &[]);
+    }
+
+    /// A `filter` result is sized by the capacity it inherited, not by what it
+    /// kept.
+    ///
+    /// The reference's `filter` mutates its argument in place and returns the
+    /// same value (`special_filter` → `SequenceData::filter`), so the result
+    /// keeps the input's `type_signature`; and a list value's size is
+    /// `type_signature_size + max_len × entry.size()`. Rebuilding the result
+    /// from the kept elements sized it by the kept count instead, so every
+    /// filter that dropped anything under-charged every later measurement of
+    /// its result — silently, since the value was right.
+    #[test]
+    fn a_filter_result_is_sized_by_the_capacity_it_inherited() {
+        let snippet = r#"
+(define-data-var helper uint u1)
+(define-private (le (v uint)) (<= v (var-get helper)))
+(define-public (run (l (list 100 uint)))
+  (let ((f (filter le l))) (ok (len f))))
+"#;
+        let list =
+            Value::cons_list_unsanitized(vec![Value::UInt(1), Value::UInt(2), Value::UInt(3)])
+                .expect("three elements");
+        crosscheck_cost(snippet, "run", &[list]);
+    }
+
+    /// The same for a list read from storage, whose capacity is wider than its
+    /// length: the entry type has to come across too, because an emptied list's
+    /// own entry type is `NoType`, sized 1 where a `uint` is 16.
+    ///
+    /// Mainnet 8,832,029 is the case, on a `(list 12000 uint)` holding nothing.
+    #[test]
+    fn a_filter_result_inherits_a_stored_lists_capacity() {
+        let stored = r#"
+(define-data-var helper uint u486)
+(define-map holder uint {items: (list 12000 uint)})
+(define-private (le (v uint)) (<= v (var-get helper)))
+(map-set holder u1 {items: (list u1 u9999 u2)})
+(define-public (run)
+  (let (
+    (d (unwrap-panic (map-get? holder u1)))
+    (f (filter le (get items d)))
+  ) (ok (len f))))
+"#;
+        crosscheck_cost(stored, "run", &[]);
     }
 }

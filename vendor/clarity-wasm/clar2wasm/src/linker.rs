@@ -275,6 +275,7 @@ pub fn link_host_functions(
     linker: &mut Linker<ClarityWasmContext>,
 ) -> Result<(), VmExecutionError> {
     link_save_runtime_shape_fn(linker)?;
+    link_save_filtered_runtime_shape_fn(linker)?;
     link_runtime_shape_size_fn(linker)?;
     link_runtime_shape_serialization_size_fn(linker)?;
     link_runtime_value_size_fn(linker)?;
@@ -391,6 +392,37 @@ pub fn link_host_functions(
     link_debug_msg(linker)
 }
 
+/// One runtime-shape type text, parsed through the per-call cache.
+///
+/// The coordinates name one data-segment constant, so the encoding (JSON here,
+/// type text elsewhere) rides along with them.
+fn read_cached_runtime_type(
+    caller: &mut Caller<'_, ClarityWasmContext>,
+    memory: Memory,
+    serialized_ty_offset: i32,
+    serialized_ty_length: i32,
+) -> Result<TypeSignature, VmExecutionError> {
+    if let Some(known) = caller
+        .data()
+        .parsed_types
+        .get(&(serialized_ty_offset, serialized_ty_length))
+    {
+        return Ok(known.clone());
+    }
+    let serialized_ty =
+        read_identifier_from_wasm(memory, caller, serialized_ty_offset, serialized_ty_length)?;
+    let parsed: TypeSignature = serde_json::from_str(&serialized_ty).map_err(|error| {
+        crate::error::wasm_error(WasmError::Expect(format!(
+            "runtime-shape type cannot be decoded: {error}"
+        )))
+    })?;
+    caller
+        .data_mut()
+        .parsed_types
+        .insert((serialized_ty_offset, serialized_ty_length), parsed.clone());
+    Ok(parsed)
+}
+
 fn link_save_runtime_shape_fn(
     linker: &mut Linker<ClarityWasmContext>,
 ) -> Result<(), VmExecutionError> {
@@ -407,35 +439,12 @@ fn link_save_runtime_shape_fn(
                         .data()
                         .memory
                         .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
-                    // The same per-call parse cache the type-text host calls
-                    // use; the coordinates name one data-segment constant, so
-                    // the encoding (JSON here, type text elsewhere) rides
-                    // along with them.
-                    let value_ty = if let Some(known) = caller
-                        .data()
-                        .parsed_types
-                        .get(&(serialized_ty_offset, serialized_ty_length))
-                    {
-                        known.clone()
-                    } else {
-                        let serialized_ty = read_identifier_from_wasm(
-                            memory,
-                            &mut caller,
-                            serialized_ty_offset,
-                            serialized_ty_length,
-                        )?;
-                        let parsed: TypeSignature =
-                            serde_json::from_str(&serialized_ty).map_err(|error| {
-                                crate::error::wasm_error(WasmError::Expect(format!(
-                                    "runtime-shape type cannot be decoded: {error}"
-                                )))
-                            })?;
-                        caller
-                            .data_mut()
-                            .parsed_types
-                            .insert((serialized_ty_offset, serialized_ty_length), parsed.clone());
-                        parsed
-                    };
+                    let value_ty = read_cached_runtime_type(
+                        &mut caller,
+                        memory,
+                        serialized_ty_offset,
+                        serialized_ty_length,
+                    )?;
                     let epoch = caller.data().global_context.epoch_id;
                     // A shape this cannot read is a shape it cannot preserve, and
                     // the only representation that cannot be read is a
@@ -469,6 +478,78 @@ fn link_save_runtime_shape_fn(
         .map_err(|error| {
             crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
                 "save_runtime_shape".to_owned(),
+                error,
+            ))
+        })
+}
+
+/// Link `save_filtered_runtime_shape`: materialize a `filter` result that
+/// inherits its input's list capacity.
+///
+/// The reference's `filter` mutates its argument in place and hands the same
+/// value back, so the result keeps the `max_len` the input carried — and
+/// `Value::size()` is `type_signature_size + max_len * entry_size`. Rebuilding
+/// the list from the kept elements alone sizes it by the kept count instead,
+/// which under-charged every `filter` that dropped anything.
+///
+/// `input_handle` names the input when it already had a wider shape;
+/// `input_count` is its element count, which is its capacity whenever it did
+/// not. Zero handle and zero count together mean there is nothing to inherit.
+fn link_save_filtered_runtime_shape_fn(
+    linker: &mut Linker<ClarityWasmContext>,
+) -> Result<(), VmExecutionError> {
+    linker
+        .func_wrap(
+            "clarity",
+            "save_filtered_runtime_shape",
+            |mut caller: Caller<'_, ClarityWasmContext>,
+             value_offset: i32,
+             serialized_ty_offset: i32,
+             serialized_ty_length: i32,
+             input_handle: i32,
+             input_count: i32| {
+                crate::phases::time(crate::phases::Phase::ShapeSave, || {
+                    let memory = caller
+                        .data()
+                        .memory
+                        .ok_or(crate::error::wasm_error(WasmError::MemoryNotFound))?;
+                    let value_ty = read_cached_runtime_type(
+                        &mut caller,
+                        memory,
+                        serialized_ty_offset,
+                        serialized_ty_length,
+                    )?;
+                    let (inherited, max_len) = if input_handle != 0 {
+                        (caller.data().runtime_shape_list_type(input_handle)?, 0)
+                    } else {
+                        (
+                            None,
+                            u32::try_from(input_count).map_err(|_| {
+                                crate::error::wasm_error(WasmError::ValueTypeMismatch)
+                            })?,
+                        )
+                    };
+                    let epoch = caller.data().global_context.epoch_id;
+                    let Ok(value) = read_from_wasm_indirect(
+                        memory,
+                        &mut caller,
+                        &value_ty,
+                        value_offset,
+                        epoch,
+                    ) else {
+                        return Ok(0i32);
+                    };
+                    let handle = caller
+                        .data_mut()
+                        .save_runtime_shape_inheriting(value, inherited, max_len)?;
+                    Ok(handle)
+                })
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            crate::error::wasm_error(WasmError::UnableToLinkHostFunction(
+                "save_filtered_runtime_shape".to_owned(),
                 error,
             ))
         })
@@ -8004,6 +8085,16 @@ pub fn dummy_linker<T: 'static>(engine: &Engine) -> Result<Linker<T>, wasmtime::
         "clarity",
         "save_runtime_shape",
         |_value_offset: i32, _type_offset: i32, _type_length: i32| Ok(0i32),
+    )?;
+
+    linker.func_wrap(
+        "clarity",
+        "save_filtered_runtime_shape",
+        |_value_offset: i32,
+         _type_offset: i32,
+         _type_length: i32,
+         _input_handle: i32,
+         _input_count: i32| Ok(0i32),
     )?;
 
     linker.func_wrap(

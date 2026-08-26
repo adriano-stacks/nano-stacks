@@ -1311,6 +1311,23 @@ impl WasmGenerator {
         let (handle_size, _) =
             module.add_import_func("clarity", "runtime_shape_size", shape_size_ty);
         module.funcs.get_mut(handle_size).name = Some("stdlib.runtime_shape_size".to_owned());
+        let save_filtered_shape_ty = module.types.add(
+            &[
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+            ],
+            &[ValType::I32],
+        );
+        let (save_filtered_shape, _) = module.add_import_func(
+            "clarity",
+            "save_filtered_runtime_shape",
+            save_filtered_shape_ty,
+        );
+        module.funcs.get_mut(save_filtered_shape).name =
+            Some("stdlib.save_filtered_runtime_shape".to_owned());
         let admit_argument_ty = module.types.add(
             &[
                 ValType::I32,
@@ -2356,6 +2373,82 @@ impl WasmGenerator {
         let (offset, length) =
             self.add_clarity_string_literal(&CharType::ASCII(ASCIIData { data: serialized }))?;
         Ok((offset as i32, length as i32))
+    }
+
+    /// Give a `filter` result the list capacity its input carried.
+    ///
+    /// The reference's `filter` mutates its argument in place and returns the
+    /// same value, so the result keeps the input's `max_len` however many
+    /// elements it dropped — and a list value is sized by `max_len`, not by its
+    /// length. The compiler builds a fresh, compacted buffer instead, so its
+    /// size came out as the *kept* count and every filter that dropped anything
+    /// under-charged every later measurement of the result.
+    ///
+    /// Only when the two differ, which keeps the arena out of the common case:
+    /// a filter that keeps everything already measures identically, and a fold
+    /// that filters per iteration would otherwise materialize a value a round.
+    ///
+    /// Expects `[handle, offset, length]` for the result on the stack and leaves
+    /// the same triple, with the handle replaced when one was taken.
+    pub(crate) fn capture_filtered_runtime_shape(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        ty: &TypeSignature,
+        input_handle: LocalId,
+        input_length: LocalId,
+        element_stride: i32,
+    ) -> Result<(), GeneratorError> {
+        let locals = self.save_to_locals(builder, ty, true);
+        let handle = *locals.first().ok_or_else(|| {
+            GeneratorError::InternalError("filter result is missing its shape handle".to_owned())
+        })?;
+        let length = *locals.last().ok_or_else(|| {
+            GeneratorError::InternalError("filter result is missing its length".to_owned())
+        })?;
+        let (type_offset, type_length) = self.serialized_runtime_type(ty)?;
+
+        let mut capture = builder.dangling_instr_seq(None);
+        for local in &locals {
+            capture.local_get(*local);
+        }
+        let (value_offset, _) = self.create_call_stack_local(&mut capture, ty, true, false);
+        self.write_to_memory(&mut capture, value_offset, 0, ty)?;
+        capture
+            .local_get(value_offset)
+            .i32_const(type_offset)
+            .i32_const(type_length)
+            .local_get(input_handle)
+            .local_get(input_length)
+            .i32_const(element_stride)
+            .binop(BinaryOp::I32DivU)
+            .call(self.func_by_name("stdlib.save_filtered_runtime_shape"))
+            .local_set(handle);
+        let capture = capture.id();
+
+        // Nothing to inherit when the input was not itself widened *and* the
+        // result kept every element: then the input's capacity is its length,
+        // which is the result's, and the inline measurement already answers
+        // what the reference answers. A widened input has to be asked even when
+        // nothing was dropped, because its capacity is wider than its length.
+        builder
+            .local_get(input_handle)
+            .local_get(input_length)
+            .local_get(length)
+            .binop(BinaryOp::I32Ne)
+            .binop(BinaryOp::I32Or)
+            .if_else(
+                None,
+                |then| {
+                    then.instr(walrus::ir::Block { seq: capture });
+                },
+                |_| {},
+            );
+
+        for local in &locals {
+            builder.local_get(*local);
+        }
+        self.release_locals(locals);
+        Ok(())
     }
 
     /// Materialize a composite stack value in the execution context's
