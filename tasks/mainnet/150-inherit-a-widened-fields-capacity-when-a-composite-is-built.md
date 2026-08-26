@@ -1,7 +1,7 @@
 ---
 id: "150"
 title: "Inherit a widened field's capacity when a composite is constructed"
-status: pending
+status: in-progress
 priority: critical
 effort: large
 dependencies: []
@@ -124,24 +124,49 @@ value in a newly constructed composite that loses it.
       and then **reverted**, because no test could be made to fail without it.
       `a_list_of_a_widened_element_is_measured_at_its_declared_width` asserts
       the property instead.
-- [ ] **`element-at?` over-charges an extracted widened element**, which is what
-      the `list` audit case was really measuring. The reference charges
-      `print [6]` for the extracted element where the compiler charges its full
-      declared width. Inventoried as
-      `element_at_does_not_widen_the_element_it_extracts`, classed `semantic`
-      against this task. It over-charges, which is the direction that refuses a
-      block the network accepted — the same failure mode as 8,832,029 — so it is
-      the one left and the one that matters.
+- [ ] **`element-at?` is the one left, and it is the one place the reference
+      *narrows*.** `list_cons` builds its result with `Value::cons_list` — the
+      sanitizing constructor — so each element is rebuilt against the derived
+      entry type and any capacity it was not using is dropped: an empty
+      `(list 12000 uint)` element is stored as `(list 0 NoType)`, which is why
+      the reference charges `print [6]` and not 192,006. The compiler kept the
+      element's shape handle when writing it into the list, so extraction
+      returned the widened value and *over*-charged — the direction that refuses
+      a block the network accepted. Zeroing the handle slot on the stored
+      element is that narrowing exactly, because a handle-zero list is measured
+      inline from its own byte length — **except that it is not enough**, and
+      this is the finding. The reference keeps the *widened* entry type on the
+      outer list while narrowing what it stores, and nano's representation has
+      one handle slot per value, which cannot say both: zeroing the stored
+      element's handle made
+      `a_list_of_a_widened_element_is_measured_at_its_declared_width` fail in
+      the other direction, and broke `map_principal_destruct` with
+      `InvalidNoTypeInValue`, because the handle also carries what a `NoType`
+      branch cannot represent inline. The change was written and reverted.
+      Closing this needs the outer list captured *before* its elements are
+      narrowed, or a per-element narrowing that leaves a shape behind rather
+      than dropping one. The *charge* is untouched either way and has to be:
+      `list_cons` charges the sum of `a.size()` over the elements as they
+      arrived, before sanitization.
 
 ## Scope note
 
 Five sites are fixed and regressed: `filter` twice (in 149), `tuple`, `append`
-and `as-max-len?`. One is left — `element-at?` — and it is the one that
-over-charges rather than under-charges, so it can refuse a block the network
-accepted. No observed mainnet transaction hits it, so it does not stop a node
-today; it blocks [[053-pass-the-mainnet-node-release-gate]] under the plan's
-*STRENGTHENED — exact receipts and costs* amendment, and is recorded as open
-rather than green, which is what that amendment asks for.
+and `as-max-len?`. `some`, `ok`, `merge` and the `list` constructor were
+measured and found already correct. One is left, `element-at?`, and it is the
+only `semantic` entry in `ignored-tests.toml` — recorded as open rather than
+green, which is what the plan's *STRENGTHENED — exact receipts and costs*
+amendment asks for.
+
+Two of this task's opening premises were wrong, and measuring is what said so:
+the `list` constructor was not losing capacity, and the arena read-back was not
+dropping inner handles. A capture written for `ListCons` on that premise was
+reverted because no test could be made to fail without it.
+
+The family has one rule with one exception, and both are now stated by a test:
+a word that hands its argument back keeps the capacity that argument carried
+(`filter`, and `append`/`as-max-len?` with their own adjustments), while
+`list_cons` *sanitizes* and therefore narrows what it stores.
 
 ## Notes
 

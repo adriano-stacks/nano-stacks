@@ -109,10 +109,11 @@ and that a short stored list is unchanged. The whole `clar2wasm` suite is green
       `NoType`, sized 1 where a `uint` is 16), through a new
       `save_filtered_runtime_shape` host call taken only when the input was
       widened or something was dropped.
-- [ ] **The remaining 375 is [[150]]**, a different defect: a tuple constructed
-      from a widened field loses that field's capacity, so `print` of it
-      under-charges. Split out rather than folded in here, because the mechanism
-      and the sites are different and it predates 149.
+- [x] **The remaining 375 was [[150]]**, a different defect in a different
+      place: a tuple constructed from a widened field lost that field's
+      capacity. Split out rather than folded in here, because the mechanism and
+      the sites were different and it predated 149. 150 is closed, and with it
+      `8979c764…` matches the canonical record on all five dimensions.
 - [x] **Regressed the receipt, not only the root.**
       `nano-conformance`'s `mainnet_filter_cost` holds block 8,832,029's bytes
       beside the chain's own record for `8979c764…` and pins the abort kind

@@ -68,11 +68,20 @@ class = "semantic"
 owner = "150"
 measured = """
 `element-at?` on a list whose elements carry a widened runtime shape charges the
-element's whole declared width, where the reference charges the extracted
-element as what it holds -- `cost_print [6]` against the compiler's 192,006 on a
-`(list 12000 uint)` holding nothing. Measured identically with and without the
-`list` constructor capture that was tried and reverted, so it is an
-extraction-side defect on its own.
+element's whole declared width, where the reference charges it as what it holds
+-- `cost_print [6]` against the compiler's 192,006 on a `(list 12000 uint)`
+holding nothing. `list_cons` builds with `Value::cons_list`, the sanitizing
+constructor, so each stored element is rebuilt against the derived entry type and
+unused capacity is dropped.
+
+The obvious fix is not one. The reference keeps the *widened* entry type on the
+outer list while narrowing what it stores, and nano's representation has a single
+handle slot per value that cannot say both: zeroing the stored element's handle
+made `a_list_of_a_widened_element_is_measured_at_its_declared_width` fail in the
+other direction and broke `map_principal_destruct` with `InvalidNoTypeInValue`,
+because that handle also carries what a `NoType` branch cannot represent inline.
+Closing it needs the outer list captured *before* its elements are narrowed, or a
+per-element narrowing that keeps a shape rather than dropping one.
 
 It *over*-charges, which is the direction that refuses a block the network
 accepted -- the same failure mode as block 8,832,029 -- so it matters more than
