@@ -62,6 +62,45 @@ for every one of them, plus `miner-spend-total` beside it. So the *behaviour* is
 gated even though this test cannot be.
 """
 
+[[ignored]]
+test = "a_list_of_a_widened_element_keeps_its_capacity"
+class = "semantic"
+owner = "150"
+measured = """
+A `list` built from an element that carries a widened runtime shape is measured
+over an entry type rebuilt from the element's run-time length, so the element's
+capacity is lost. Unlike the tuple case task 150 fixed, capturing the outer
+value is not enough: `read_from_wasm` rebuilds inner lists with
+`cons_list_unsanitized`, so the arena read-back path loses the inner handles as
+well. Cost only -- the value is right -- and no mainnet transaction observed so
+far reaches it, but it is a cost differential and therefore blocks 053.
+"""
+
+[[ignored]]
+test = "an_appended_list_keeps_the_capacity_it_grew_from"
+class = "semantic"
+owner = "150"
+measured = """
+`special_append` builds its result as `ListTypeData::new_list(next_entry_type,
+size + 1)`, where `size` is the input's `max_len` -- so the result inherits the
+input's capacity plus one, the way a `filter` result inherits it unchanged. The
+compiler sizes the result by its element count instead, so an `append` onto a
+list read from storage under a wider declared type under-charges every later
+measurement of the result.
+"""
+
+[[ignored]]
+test = "as_max_len_keeps_the_capacity_it_reduced"
+class = "semantic"
+owner = "150"
+measured = """
+`special_as_max_len` calls `type_signature.reduce_max_len(expected)`, so the
+result is sized by `min(input max_len, expected)` -- *reduced*, not replaced,
+and not the element count. The compiler drops the input's shape handle and sizes
+the result by its length, so `(as-max-len? <stored list> u12000)` on a
+`(list 12000 uint)` under-charges by the whole unfilled capacity.
+"""
+
 # ---------------------------------------------------------------------------
 # out-of-scope: the word does not exist in Clarity 6, measured.
 # ---------------------------------------------------------------------------

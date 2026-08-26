@@ -2356,4 +2356,68 @@ mod tests {
             &[],
         );
     }
+
+    /// A `list` built from a widened element loses that element's capacity.
+    ///
+    /// The outer list's `max_len` is right, but its *entry type* is not: the
+    /// element carried a `(list 12000 uint)` and the outer list is measured over
+    /// an entry type rebuilt from the element's run-time length. Unlike the
+    /// tuple case this cannot be fixed by capturing the outer value alone —
+    /// `read_from_wasm` rebuilds inner lists with `cons_list_unsanitized`, so
+    /// the arena read-back path loses the inner handles too.
+    #[test]
+    #[ignore = "task 150: a list constructor does not carry its elements' capacity"]
+    fn a_list_of_a_widened_element_keeps_its_capacity() {
+        crosscheck_cost(
+            r#"
+(define-map holder uint {items: (list 12000 uint), n: uint})
+(map-set holder u1 {items: (list ), n: u0})
+(define-public (run)
+  (let ((d (unwrap-panic (map-get? holder u1))))
+    (begin (print (unwrap-panic (element-at? (list (get items d)) u0))) (ok u0))))
+"#,
+            "run",
+            &[],
+        );
+    }
+
+    /// `append`'s result is sized by `input max_len + 1`
+    /// (`special_append`: `ListTypeData::new_list(next_entry_type, size + 1)`),
+    /// so it inherits the input's capacity the way `filter` inherits it.
+    #[test]
+    #[ignore = "task 150: append does not carry the capacity it grew from"]
+    fn an_appended_list_keeps_the_capacity_it_grew_from() {
+        crosscheck_cost(
+            r#"
+(define-map holder uint {items: (list 12000 uint), n: uint})
+(map-set holder u1 {items: (list ), n: u0})
+(define-public (run)
+  (let ((d (unwrap-panic (map-get? holder u1))))
+    (begin
+      (print (unwrap-panic (element-at? (append (list (get items d)) (get items d)) u0)))
+      (ok u0))))
+"#,
+            "run",
+            &[],
+        );
+    }
+
+    /// `as-max-len?` reduces the capacity rather than replacing it
+    /// (`special_as_max_len`: `type_signature.reduce_max_len(expected)`), so its
+    /// result is sized by `min(input max_len, expected)` and not by its length.
+    #[test]
+    #[ignore = "task 150: as-max-len? does not carry the capacity it reduced"]
+    fn as_max_len_keeps_the_capacity_it_reduced() {
+        crosscheck_cost(
+            r#"
+(define-map holder uint {items: (list 12000 uint), n: uint})
+(map-set holder u1 {items: (list ), n: u0})
+(define-public (run)
+  (let ((d (unwrap-panic (map-get? holder u1))))
+    (begin (print (unwrap-panic (as-max-len? (get items d) u12000))) (ok u0))))
+"#,
+            "run",
+            &[],
+        );
+    }
 }
