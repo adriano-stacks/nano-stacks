@@ -507,7 +507,9 @@ fn link_save_filtered_runtime_shape_fn(
              serialized_ty_offset: i32,
              serialized_ty_length: i32,
              input_handle: i32,
-             input_count: i32| {
+             input_count: i32,
+             delta: i32,
+             cap: i32| {
                 crate::phases::time(crate::phases::Phase::ShapeSave, || {
                     let memory = caller
                         .data()
@@ -539,9 +541,14 @@ fn link_save_filtered_runtime_shape_fn(
                     ) else {
                         return Ok(0i32);
                     };
+                    let delta = u32::try_from(delta)
+                        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))?;
+                    // A negative cap is "no cap", which is what `filter` and
+                    // `append` pass; only `as-max-len?` names one.
+                    let cap = u32::try_from(cap).ok();
                     let handle = caller
                         .data_mut()
-                        .save_runtime_shape_inheriting(value, inherited, max_len)?;
+                        .save_runtime_shape_inheriting(value, inherited, max_len, delta, cap)?;
                     Ok(handle)
                 })
             },
@@ -8094,7 +8101,9 @@ pub fn dummy_linker<T: 'static>(engine: &Engine) -> Result<Linker<T>, wasmtime::
          _type_offset: i32,
          _type_length: i32,
          _input_handle: i32,
-         _input_count: i32| Ok(0i32),
+         _input_count: i32,
+         _delta: i32,
+         _cap: i32| Ok(0i32),
     )?;
 
     linker.func_wrap(

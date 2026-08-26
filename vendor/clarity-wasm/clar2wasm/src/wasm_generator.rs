@@ -1318,6 +1318,8 @@ impl WasmGenerator {
                 ValType::I32,
                 ValType::I32,
                 ValType::I32,
+                ValType::I32,
+                ValType::I32,
             ],
             &[ValType::I32],
         );
@@ -2398,6 +2400,39 @@ impl WasmGenerator {
         input_length: LocalId,
         element_stride: i32,
     ) -> Result<(), GeneratorError> {
+        self.capture_capacity_from(
+            builder,
+            ty,
+            input_handle,
+            input_length,
+            element_stride,
+            0,
+            -1,
+        )
+    }
+
+    /// The general form: a list-producing word whose result is sized by the
+    /// capacity its input carried, adjusted by that word's own rule.
+    ///
+    /// `delta` and `cap` are how the three differ. `filter` keeps the capacity
+    /// (`0`, `-1`); `append` adds one, because `special_append` builds
+    /// `new_list(next_entry_type, size + 1)` over the input's `size`; and
+    /// `as-max-len?` reduces it, because `special_as_max_len` calls
+    /// `type_signature.reduce_max_len(expected)` — a *reduction*, so the cap is
+    /// a ceiling on the inherited value rather than a replacement for it.
+    ///
+    /// A negative `cap` means no ceiling.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_capacity_from(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        ty: &TypeSignature,
+        input_handle: LocalId,
+        input_length: LocalId,
+        element_stride: i32,
+        delta: i32,
+        cap: i32,
+    ) -> Result<(), GeneratorError> {
         let locals = self.save_to_locals(builder, ty, true);
         let handle = *locals.first().ok_or_else(|| {
             GeneratorError::InternalError("filter result is missing its shape handle".to_owned())
@@ -2421,20 +2456,26 @@ impl WasmGenerator {
             .local_get(input_length)
             .i32_const(element_stride)
             .binop(BinaryOp::I32DivU)
+            .i32_const(delta)
+            .i32_const(cap)
             .call(self.func_by_name("stdlib.save_filtered_runtime_shape"))
             .local_set(handle);
         let capture = capture.id();
 
-        // Nothing to inherit when the input was not itself widened *and* the
-        // result kept every element: then the input's capacity is its length,
-        // which is the result's, and the inline measurement already answers
-        // what the reference answers. A widened input has to be asked even when
-        // nothing was dropped, because its capacity is wider than its length.
+        // Nothing to inherit when the input was not itself widened, the result
+        // kept every element, and this word does not adjust the capacity: then
+        // the input's capacity is its length, which is the result's, and the
+        // inline measurement already answers what the reference answers. A
+        // widened input has to be asked even when nothing was dropped, because
+        // its capacity is wider than its length.
+        let always = delta != 0 || cap >= 0;
         builder
             .local_get(input_handle)
             .local_get(input_length)
             .local_get(length)
             .binop(BinaryOp::I32Ne)
+            .binop(BinaryOp::I32Or)
+            .i32_const(i32::from(always))
             .binop(BinaryOp::I32Or)
             .if_else(
                 None,

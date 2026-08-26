@@ -2357,24 +2357,25 @@ mod tests {
         );
     }
 
-    /// A `list` built from a widened element loses that element's capacity.
+    /// A `list` built from a widened element is already measured correctly.
     ///
-    /// The outer list's `max_len` is right, but its *entry type* is not: the
-    /// element carried a `(list 12000 uint)` and the outer list is measured over
-    /// an entry type rebuilt from the element's run-time length. Unlike the
-    /// tuple case this cannot be fixed by capturing the outer value alone —
-    /// `read_from_wasm` rebuilds inner lists with `cons_list_unsanitized`, so
-    /// the arena read-back path loses the inner handles too.
+    /// Asserted rather than assumed: the audit for task 150 started from the
+    /// premise that a list constructor loses its elements' capacity, and
+    /// measuring said otherwise. The outer `max_len` is the element count,
+    /// which is what `cons_list_unsanitized` gives the reference, and the entry
+    /// type comes across because `read_from_wasm` reads each element through
+    /// `read_from_wasm_indirect`, which honours the element's own handle. What
+    /// *is* wrong is extracting one again — see
+    /// `element_at_does_not_widen_the_element_it_extracts`.
     #[test]
-    #[ignore = "task 150: a list constructor does not carry its elements' capacity"]
-    fn a_list_of_a_widened_element_keeps_its_capacity() {
+    fn a_list_of_a_widened_element_is_measured_at_its_declared_width() {
         crosscheck_cost(
             r#"
 (define-map holder uint {items: (list 12000 uint), n: uint})
 (map-set holder u1 {items: (list ), n: u0})
 (define-public (run)
   (let ((d (unwrap-panic (map-get? holder u1))))
-    (begin (print (unwrap-panic (element-at? (list (get items d)) u0))) (ok u0))))
+    (begin (print (list (get items d))) (ok u0))))
 "#,
             "run",
             &[],
@@ -2385,17 +2386,16 @@ mod tests {
     /// (`special_append`: `ListTypeData::new_list(next_entry_type, size + 1)`),
     /// so it inherits the input's capacity the way `filter` inherits it.
     #[test]
-    #[ignore = "task 150: append does not carry the capacity it grew from"]
     fn an_appended_list_keeps_the_capacity_it_grew_from() {
         crosscheck_cost(
             r#"
 (define-map holder uint {items: (list 12000 uint), n: uint})
-(map-set holder u1 {items: (list ), n: u0})
+(map-set holder u1 {items: (list u1 u2), n: u0})
 (define-public (run)
-  (let ((d (unwrap-panic (map-get? holder u1))))
-    (begin
-      (print (unwrap-panic (element-at? (append (list (get items d)) (get items d)) u0)))
-      (ok u0))))
+  (let (
+    (d (unwrap-panic (map-get? holder u1)))
+    (grown (append (get items d) u3))
+  ) (ok (len grown))))
 "#,
             "run",
             &[],
@@ -2406,7 +2406,6 @@ mod tests {
     /// (`special_as_max_len`: `type_signature.reduce_max_len(expected)`), so its
     /// result is sized by `min(input max_len, expected)` and not by its length.
     #[test]
-    #[ignore = "task 150: as-max-len? does not carry the capacity it reduced"]
     fn as_max_len_keeps_the_capacity_it_reduced() {
         crosscheck_cost(
             r#"
@@ -2415,6 +2414,32 @@ mod tests {
 (define-public (run)
   (let ((d (unwrap-panic (map-get? holder u1))))
     (begin (print (unwrap-panic (as-max-len? (get items d) u12000))) (ok u0))))
+"#,
+            "run",
+            &[],
+        );
+    }
+
+    /// `element-at?` on a list of widened elements over-charges by the element's
+    /// whole declared capacity.
+    ///
+    /// The reference charges `print` with **6** for the extracted element — the
+    /// element it hands back is not the widened value the list was built from —
+    /// where the compiler charges the element's full width. Measured both with
+    /// and without the `list` capture above and identical either way, so it is
+    /// an extraction-side defect and not a consequence of that fix. It
+    /// over-charges, which is the direction that refuses a block the network
+    /// accepted, so it matters more than its size suggests.
+    #[test]
+    #[ignore = "task 150: element-at? over-charges an extracted widened element"]
+    fn element_at_does_not_widen_the_element_it_extracts() {
+        crosscheck_cost(
+            r#"
+(define-map holder uint {items: (list 12000 uint), n: uint})
+(map-set holder u1 {items: (list ), n: u0})
+(define-public (run)
+  (let ((d (unwrap-panic (map-get? holder u1))))
+    (begin (print (unwrap-panic (element-at? (list (get items d)) u0))) (ok u0))))
 "#,
             "run",
             &[],

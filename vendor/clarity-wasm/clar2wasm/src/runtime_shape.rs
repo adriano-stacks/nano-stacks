@@ -147,25 +147,40 @@ pub trait RuntimeShapeStore {
     /// `inherited` is the input's own list type, when the input was itself a
     /// widened value and therefore carries one. Otherwise the input's capacity
     /// was its element count, `max_len`, and its entry type is the result's.
+    ///
+    /// `delta` and `cap` are how the three words that inherit a capacity differ:
+    /// `filter` keeps it (`0`, `None`), `append` adds one
+    /// (`special_append`: `new_list(next_entry_type, size + 1)`), and
+    /// `as-max-len?` reduces it (`special_as_max_len`:
+    /// `type_signature.reduce_max_len(expected)`).
+    ///
+    /// An inherited `NoType` entry is *not* carried: the reference rebuilds from
+    /// the element in that case (`special_append` returns `cons_list` when the
+    /// entry type is `NoType`), so the result is measured as what it holds.
     fn save_runtime_shape_inheriting(
         &mut self,
         value: Value,
         inherited: Option<ListTypeData>,
         max_len: u32,
+        delta: u32,
+        cap: Option<u32>,
     ) -> Result<i32, VmExecutionError> {
         let value = match value {
             Value::Sequence(SequenceData::List(mut list)) => {
-                list.type_signature = match inherited {
-                    Some(inherited) => inherited,
-                    None => {
-                        let entry = list.type_signature.get_list_item_type().clone();
-                        ListTypeData::new_list(entry, max_len).map_err(|error| {
-                            crate::error::wasm_error(WasmError::WasmGeneratorError(format!(
-                                "cannot inherit a list capacity of {max_len}: {error}"
-                            )))
-                        })?
+                let (entry, base) = match inherited {
+                    Some(inherited) if !inherited.get_list_item_type().is_no_type() => {
+                        let max_len = inherited.get_max_len();
+                        (inherited.get_list_item_type().clone(), max_len)
                     }
+                    _ => (list.type_signature.get_list_item_type().clone(), max_len),
                 };
+                let grown = base.saturating_add(delta);
+                let capped = cap.map_or(grown, |cap| grown.min(cap));
+                list.type_signature = ListTypeData::new_list(entry, capped).map_err(|error| {
+                    crate::error::wasm_error(WasmError::WasmGeneratorError(format!(
+                        "cannot inherit a list capacity of {capped}: {error}"
+                    )))
+                })?;
                 Value::Sequence(SequenceData::List(list))
             }
             other => other,

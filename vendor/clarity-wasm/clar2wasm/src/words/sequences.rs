@@ -620,6 +620,20 @@ impl ComplexWord for Append {
         // For the result, we already pushed the offset previously, so here is the length.
         builder.local_get(src_length);
 
+        // `special_append` builds its result as `new_list(next_entry_type, size
+        // + 1)` over the *input's* `size`, so the result inherits the input's
+        // capacity plus one -- not its own element count. See
+        // `WasmGenerator::capture_capacity_from`.
+        generator.capture_capacity_from(
+            builder,
+            &ty,
+            src_handle,
+            src_length_before_growth,
+            elem_size,
+            1,
+            -1,
+        )?;
+
         Ok(())
     }
 }
@@ -662,9 +676,15 @@ impl ComplexWord for AsMaxLen {
         builder.local_set(length_local);
         let offset_local = generator.alloc_local(ValType::I32);
         builder.local_set(offset_local);
-        if is_list {
-            builder.drop();
-        }
+        // The input's shape handle is kept rather than dropped: the result is
+        // sized by the capacity it names, reduced to the requested maximum.
+        let input_handle = if is_list {
+            let handle = generator.alloc_local(ValType::I32);
+            builder.local_set(handle);
+            Some(handle)
+        } else {
+            None
+        };
         builder.local_get(length_local);
 
         self.charge(generator, builder, 0)?;
@@ -732,10 +752,49 @@ impl ComplexWord for AsMaxLen {
         // Now, put the original offset and length back on the stack. In the
         // case where the result is `none`, these will be ignored, but it
         // doesn't hurt to have them there.
-        if is_list {
+        if let Some(input_handle) = input_handle {
             builder.i32_const(0);
+            builder.local_get(offset_local).local_get(length_local);
+            // `special_as_max_len` calls `type_signature.reduce_max_len(expected)`
+            // on the value it hands back, so the result is sized by
+            // `min(input capacity, expected)` -- reduced, not replaced, and not
+            // its own length. The bound has to be a literal for the reference to
+            // accept the call at all, so where it is not one there is nothing to
+            // inherit either.
+            let seq_ty = generator
+                .get_expr_type(seq)
+                .ok_or_else(|| {
+                    GeneratorError::TypeError("as-max-len? sequence must be typed".to_owned())
+                })?
+                .clone();
+            let element_stride = match &seq_ty {
+                TypeSignature::SequenceType(SequenceSubtype::ListType(list)) => {
+                    get_type_size(list.get_list_item_type())
+                }
+                _ => {
+                    return Err(GeneratorError::TypeError(
+                        "as-max-len? list must be a list".to_owned(),
+                    ))
+                }
+            };
+            let cap = match args.get_expr(1)?.match_literal_value() {
+                Some(clarity::vm::Value::UInt(expected)) => i32::try_from(*expected).ok(),
+                _ => None,
+            };
+            if let Some(cap) = cap {
+                generator.capture_capacity_from(
+                    builder,
+                    &seq_ty,
+                    input_handle,
+                    length_local,
+                    element_stride,
+                    0,
+                    cap,
+                )?;
+            }
+        } else {
+            builder.local_get(offset_local).local_get(length_local);
         }
-        builder.local_get(offset_local).local_get(length_local);
 
         Ok(())
     }
