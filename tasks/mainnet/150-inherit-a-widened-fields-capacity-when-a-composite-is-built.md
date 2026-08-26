@@ -1,12 +1,13 @@
 ---
 id: "150"
 title: "Inherit a widened field's capacity when a composite is constructed"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: []
 tags: ["mainnet", "vm", "costs", "release"]
 created_at: 2026-08-26
+completed_at: 2026-08-26
 type: bug
 ---
 
@@ -124,7 +125,7 @@ value in a newly constructed composite that loses it.
       and then **reverted**, because no test could be made to fail without it.
       `a_list_of_a_widened_element_is_measured_at_its_declared_width` asserts
       the property instead.
-- [ ] **`element-at?` is the one left, and it is the one place the reference
+- [x] **`element-at?` is fixed, and it is the one place the reference
       *narrows*.** `list_cons` builds its result with `Value::cons_list` — the
       sanitizing constructor — so each element is rebuilt against the derived
       entry type and any capacity it was not using is dropped: an empty
@@ -134,29 +135,32 @@ value in a newly constructed composite that loses it.
       returned the widened value and *over*-charged — the direction that refuses
       a block the network accepted. Zeroing the handle slot on the stored
       element is that narrowing exactly, because a handle-zero list is measured
-      inline from its own byte length — **except that it is not enough**, and
-      this is the finding. The reference keeps the *widened* entry type on the
-      outer list while narrowing what it stores, and nano's representation has
-      one handle slot per value, which cannot say both: zeroing the stored
-      element's handle made
-      `a_list_of_a_widened_element_is_measured_at_its_declared_width` fail in
-      the other direction, and broke `map_principal_destruct` with
-      `InvalidNoTypeInValue`, because the handle also carries what a `NoType`
-      branch cannot represent inline. The change was written and reverted.
-      Closing this needs the outer list captured *before* its elements are
-      narrowed, or a per-element narrowing that leaves a shape behind rather
-      than dropping one. The *charge* is untouched either way and has to be:
+      inline from its own byte length. The reference says two things at once —
+      the list is measured at its elements' declared width, and an element read
+      back out is only as big as what it holds — and one handle slot cannot say
+      both. `ListCons` says them **in order**: capture the list while its
+      elements still carry their handles, which fixes the entry type in the
+      arena, and only then narrow what is left in memory for whoever extracts an
+      element. Narrowing only *list* elements, because a handle on a response or
+      an optional also carries what a `NoType` branch cannot represent inline
+      and dropping it there loses the value rather than its width — the first
+      attempt did, and `map_principal_destruct` failed with
+      `InvalidNoTypeInValue`. The *charge* is untouched and has to be:
       `list_cons` charges the sum of `a.size()` over the elements as they
       arrived, before sanitization.
 
 ## Scope note
 
-Five sites are fixed and regressed: `filter` twice (in 149), `tuple`, `append`
-and `as-max-len?`. `some`, `ok`, `merge` and the `list` constructor were
-measured and found already correct. One is left, `element-at?`, and it is the
-only `semantic` entry in `ignored-tests.toml` — recorded as open rather than
-green, which is what the plan's *STRENGTHENED — exact receipts and costs*
-amendment asks for.
+Six sites are fixed and regressed: `filter` twice (in 149), `tuple`, `append`,
+`as-max-len?` and `element-at?`. `some`, `ok`, `merge` and the `list`
+constructor were measured and found already correct. `ignored-tests.toml` now
+lists **no** `semantic` and no `unclassified` entry, which is the state the
+plan's *STRENGTHENED — exact receipts and costs* amendment asks for.
+
+Re-verified after the last fix: `8979c764…` charges runtime 3,480,582,
+read_count 7, read_length 22,193, write_count 1 and write_length 18 against the
+real state at 8,832,028 in both engines, and the canonical receipt replay of
+block 8,832,029 is green.
 
 Two of this task's opening premises were wrong, and measuring is what said so:
 the `list` constructor was not losing capacity, and the arena read-back was not
