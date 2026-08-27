@@ -2,7 +2,7 @@
 id: "082"
 group: mainnet
 title: "Cross a reward cycle boundary with a locally derived sortition chain"
-status: blocked
+status: in-progress
 priority: critical
 effort: large
 dependencies: ["049", "077", "122"]
@@ -319,3 +319,64 @@ so the following-cycle comparison completes at burn **964,250**. Bitcoin stood a
 about the approach is unresolved: rerun the same rederiver with target 964,250 and
 the same comparison over the remainder. The task stays blocked on burn height
 alone.
+
+## A second way to get a boundary wrong, found on mainnet 2026-08-27
+
+The anchor bit is not the only per-cycle input to a consensus hash, and the other
+one bit the release run. Full evidence in
+`/home/aldur/task082-rollover-divergence.txt`.
+
+**Symptom.** The release witness stopped at Stacks 8,848,997 with 6,271 blocks
+staged, repeating `the local sortition chain cannot name burn view
+65675604adb8db531ecc012b4a245867c13c5f68, standing on burn 964359` 133 times.
+Two stock nodes place that hash at burn **964,250 — the first block of reward
+cycle 142**.
+
+**It was a real divergence, and it hid well.** Our Bitcoin view was byte-identical
+either side of the boundary, and at 964,249 every field matched the network:
+burn hash, `sortition_id`, `parent_sortition_id`, `consensus_hash`,
+`miner_pk_hash160`, `committed_block_hash`, `vrf_seed`. Above the boundary the
+`sortition_id` *still* matched at 964,300 and 964,360 — it mixes only the burn
+header and the PoX history, so the anchor bit this task is about was **correct** —
+while the `consensus_hash` differed, and `last_sortition_ch` still pointed at
+964,249. We had elected no winner in the whole cycle.
+
+**Cause.** Under the waterfall a commitment is admissible only if its first output
+pays the cycle's sBTC address. `SortitionTracker::payouts_at` resolves that as
+"the most recent address recorded at or below this height", so a chain deriving
+into a new cycle silently carries the *previous* cycle's address — and the new
+one is learned only by executing a block in the preceding prepare phase. The
+witness derived past burn 964,263 while its execution was still at burn ~960,300,
+so every commitment in cycle 142 was refused, the operations hash changed, and
+every consensus hash from the cycle's first block was wrong. A chain only walks
+forward, so it never took it back.
+
+**Proved by restart.** The saved chain stands on the *executed* burn view (964,248,
+below the divergence) and retains the cycle-142 address (observed at 964,151, also
+below it). Restarting re-seeded below the poisoned range and re-derived it:
+
+| burn | before | after | network |
+|---|---|---|---|
+| 964,300 | `0x0034fd34…` | `0x261f5bce…` | `0x261f5bce…` |
+| 964,360 | `0xa80e4af5…` | `0x83d05044…` | `0x83d05044…` |
+
+and the witness executed straight through the block it had refused 133 times.
+
+**Operationally:** any node catching up from far below a boundary poisons that
+cycle and stalls on its first block; one restart per boundary clears it. The
+release subject is below 8,848,998 and will need exactly that.
+
+**The fix is a design change, not a predicate.** Three attempts were made and
+reverted, each tripping the conformance suite including
+`pox_boundary::a_derived_chain_crosses_five_boundaries_and_stays_on_the_chain`:
+requiring an address recorded at or after the cycle start refuses replays where it
+legitimately did not change; requiring execution to have reached the prepare phase
+deadlocks, because an execution burn view can jump a whole prepare phase when no
+Stacks block sits in it; and requiring the held address to have been *observed* at
+or after the prepare phase fails the captures the same way. What is left is either
+gating the walk on execution across a boundary, or re-deriving a cycle when its
+address arrives late — the machinery for which exists as
+`reseed_sortitions_after_retraction`. Not landed half-verified in a consensus path.
+
+**Release impact:** 106's tip hold cannot start and 142/053 are blocked on this
+defect rather than on a clock.
