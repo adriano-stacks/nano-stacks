@@ -169,3 +169,44 @@ tip. Batch any import *before* a checkpoint ceremony — every clarity-wasm edit
 moves `COMPILER_IDENTITY` and invalidates both the attestation and any running
 import.
 
+## Re-check of the re-audit, 2026-08-27
+
+Upstream head is still `f4fb08c2`, so the pass above is current. Both of its
+"already here" findings verified independently: our tree carries the `WithStaking`
+and `WithPox` words, the `with_pox` linker function and its `standard.wat` import,
+and our `to-ascii?` proptest answers `Value::string_ascii_from_bytes`' rule with
+an exhaustive 128-byte test beside the word that cannot drift from Clarity's
+answer. Upstream's `Epoch40`/`Epoch41` cost arms are still `todo!()`, and our
+`link_stx_account_fn` already passes `v4_unlock_ht`, so the "ahead on epoch 4.0,
+behind only on declined bumps" reading holds.
+
+Two amendments to the table above.
+
+**`9a0b2a3b` is not a dependency bump.** It is `cfg` gating plus a new
+`crosscheck_expect_failure_with_clarity_version` helper we do not have, so the
+reason recorded for it is wrong even though the disposition is right. The real
+reason is stronger: nothing outside `vendor/` ever sets `test-clarity-v1`, `-v2`
+or `-v3`, so those matrices never run in this repo and their gates buy nothing
+here. We did already reach `crosscheck_multi_contract_with_env` independently.
+
+**One candidate is open, not closed.** #841 also shipped tests — `23b9a398`
+(+224) and `d76a98d8` (+121) in `src/words/contract.rs` — and the eight
+`with-pox` cases among them are gated `cfg(not(test-clarity-v4|v5))`, so they
+would run in our default configuration. They cover allowance violations and the
+*violation index* `as-contract?`/`restrict-assets?` report, which is
+consensus-visible. Our only `with-pox` coverage is a `runtime_shape_audit`
+snippet; `with-staking` is covered by delegating to `WithStacking`, whose tests
+we have. #820 was dispositioned "equivalent implementation; take tests" and this
+is the same shape, so #841 closing as code-only was one step short.
+
+**Why it was not imported on the spot.** Tests change no compiled output, so the
+import is behaviour-neutral and buys only regression cover — but
+`COMPILER_IDENTITY` hashes every file under `vendor/clarity-wasm` including
+tests, and it feeds `compatibility_profile_fingerprint()`, so a test-only edit
+still repins the profile, still makes existing state fail `check_profile`, and
+still needs a fresh import and a re-issued attestation rather than a restart. At
+the time of writing, task 106's hold was mid-flight (subject 8,717,601, witness
+8,721,601, network 8,851,428, 0/0 mismatches, 254 GiB free), and rebuilding for
+these eight tests would have cost that run. Land them in the batch immediately
+before the next import or ceremony, never during one.
+
