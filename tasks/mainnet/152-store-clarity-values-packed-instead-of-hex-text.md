@@ -68,7 +68,7 @@ reading the grammar now is cheap insurance either way.
 
 ## Two wins, separable — do them in this order
 
-1. **Hex text to `BLOB`.** Roughly 2x on the value column and on the key, needs
+1. **Hex text to `BLOB`. Done, 2026-08-27.** Roughly 2x on the value column and on the key, needs
    no format grammar, no shape descriptors and no reconstruction argument. This
    is a storage-encoding change to `write_value`/`data_from_side_store` and the
    import path, nothing more. Land and measure it on its own.
@@ -159,3 +159,46 @@ to attack first.
   `nano-conformance` only.
 - The read path is no slower, and `read_length` accounting still costs nothing
   to obtain.
+
+## Step 1 landed, 2026-08-27
+
+Measured first, on a mid-replay state at Stacks 8.7M:
+
+| `data_table` | |
+|---|---|
+| rows | 21,693,150 |
+| key bytes | 1,735,452,000 |
+| value bytes | 10,186,828,339 |
+
+So the values are 10.2 GB of a 20 GB `clarity.sqlite`, at 470 bytes a row, and
+every row is hexadecimal text. Storing the bytes halves that column: **about 5 GB
+a state**, which on a fresh import is 5 GB of the ~100 GB it costs.
+
+What landed:
+
+- `write_value` stores the decoded bytes when the text is hexadecimal, and the
+  text itself when it is not — the store is not the place to discover that
+  something is not a value.
+- the read path accepts either, reconstructing the text from bytes. Everything
+  downstream measures the text, `read_length` included, so it is reconstructed
+  there and nowhere later: **costs cannot change**, which is what makes this a
+  storage change rather than a consensus one.
+- the checkpoint import converts as it copies, `COALESCE(unhex(value), value)`,
+  so an imported state is packed from the first block rather than only from the
+  first block it executes. The linked SQLite is 3.45, which has `unhex`.
+- both representations are asserted to read the same, including a row written the
+  way a previous binary wrote it, so **nothing has to migrate**: a state stays
+  readable and gets smaller as it is written to.
+
+Keys stay text on purpose. They are the primary key, and a BLOB key would not
+match the text key of the same value, so halving them needs a migration rather
+than a dual read — 1.7 GB for a migration is a worse trade than 5 GB for none.
+
+Step 2, the packed payload, stays open and unstarted. Its risk is the one the
+section above names: `MARFValue` hashes the consensus serialization, so a
+reconstruction that tidies bytes is a silent fork. The four fixes from this month
+that this task cites were all in exactly that area, and two more landed after it
+was written — a cross-contract argument rebuilt rather than measured, and a
+capacity manufactured over a `NoType` entry. That is the argument for taking the
+2x that needs no grammar first and stopping to think about the rest.
+
