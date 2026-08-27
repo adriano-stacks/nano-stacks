@@ -1,13 +1,14 @@
 ---
 id: "149"
 title: "Guard filter over an empty sequence and close the runtime gap it leaves"
-status: in-progress
+status: completed
 priority: critical
 effort: medium
 dependencies: ["150"]
 tags: ["mainnet", "vm", "costs", "liveness", "release"]
 created_at: 2026-08-25
 type: bug
+completed_at: 2026-08-27
 ---
 
 # Guard filter over an empty sequence and close the runtime gap it leaves
@@ -132,7 +133,15 @@ and that a short stored list is unchanged. The whole `clar2wasm` suite is green
       `chainstate/checkpoint-provenance.toml` (backup:
       `/home/aldur/mainnet-tip/checkpoint-provenance.toml.bak-6a83746e`).
       It then executed 8,832,029 and caught up to tip. See the caveat below.
-- [~] **Re-attest and re-import for release evidence.** In flight. The ceremony
+- [x] **Re-attest and re-import for release evidence.** Closed 2026-08-27: the
+      release **witness** — a fresh import from the bundle attested for
+      `sha256:05aaf07c`, with no hand repin — has executed and sealed **8,832,029**
+      and continued past it. Evidence in `/home/aldur/task149-seal-evidence-witness.txt`
+      and summarised below. The release subject reaches the same block later in the
+      same catch-up and is being captured by `capture-149-seal.sh`; that is a second
+      instance of this demonstration rather than a separate claim.
+
+      What was in flight when this was written: The ceremony
       has been re-issued five times since this was written, each time because a
       clarity-wasm fix moved the compiler identity, and the current release
       subject was imported from the bundle attested for `sha256:05aaf07c` with no
@@ -197,3 +206,36 @@ across the whole 11,000-block run.
 - The transaction, its contract and the canonical costs are all fetchable
   offline; the reproduction needs only the state at 8,832,028.
 - Do not raise the block limit to make this pass. The limit printed is right.
+
+## A fresh import executes 8,832,029, 2026-08-27
+
+The witness state (`/home/aldur/witness-05aaf07c`) is an import, not a repin, and
+its own records say so: `checkpoint-provenance.toml` and the state's
+`consensus_profile` row both carry `7c11846f…`, which is the running artifact's
+own compatibility fingerprint. Nothing was edited by hand.
+
+```
+checkpoint_stacks_height    8665600
+source_state_id             a8733890…932d
+published_state_index_root  67596465…44ec
+bundle content_root         dfa6303b…a6e4
+builders                    aldur-host-primary, aldur-host-recovery
+signer weight / threshold   2708 / 2599
+compiler                    sha256:05aaf07c5d98937ce1125e2bd
+```
+
+The block that refused twenty restarts is sealed:
+
+```
+height 8832029  block_id A0A5C846…4A40  consensus_hash 376FE351…C93F
+receipts summary recorded (197 bytes)
+8832027 C99C3B8F…  8832028 D8FD5173…  8832029 A0A5C846…
+8832030 B2007BC1…  8832031 B034377E…
+executed tip at capture 8836356
+```
+
+`state root mismatch` appears **zero** times across all four run logs of that
+state. That is the closing argument rather than a side note: the original failure
+here *was* a state root mismatch, produced by charging `read_count` 303,863 where
+the network charged 7. A sealed root at that height is the differential closed on
+the block that exposed it, by a state no compiler's hand touched.
