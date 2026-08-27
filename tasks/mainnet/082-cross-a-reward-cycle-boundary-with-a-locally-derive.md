@@ -380,3 +380,22 @@ address arrives late — the machinery for which exists as
 
 **Release impact:** 106's tip hold cannot start and 142/053 are blocked on this
 defect rather than on a clock.
+
+## The 141 -> 142 boundary crossed and verified, 2026-08-28
+
+After the restart the witness reached the network tip — executed 8,855,468,
+`blocks_behind` 0, burn 964,363 — and its re-derived chain was compared across the
+boundary against two independent stock nodes:
+
+```
+162/162 compared heights agree over burn 964200..964361 (162 heights, 0 unanswered)
+```
+
+Locally derived from Bitcoin, no peer consensus input, agreeing hash for hash
+through the rollover that had just broken. Recorded in
+`/home/aldur/cycle142-boundary-crossing.jsonl`.
+
+So the derivation of a boundary is right; what is wrong is *when* the walk is
+allowed to cross one. This task's remaining work is that gate, and the whole-cycle
+comparison over 962,150..964,249 that `compare-cycle141-when-ready.sh` now has the
+history to run.
