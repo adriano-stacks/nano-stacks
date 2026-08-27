@@ -2785,7 +2785,7 @@ where
                 // having walked far enough clears itself on the next round; having
                 // derived the view and dropped its snapshot never does, because the
                 // window closed above it and a chain only walks forward. Saying
-                // which is which is what task 148 cost sixteen hours of a mainnet
+                // which is which is what cost sixteen hours of a mainnet
                 // catch-up to learn.
                 if let Some(dropped_at) = self
                     .sortition

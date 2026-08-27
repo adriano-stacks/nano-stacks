@@ -103,13 +103,10 @@ const fn max_sync_blocks() -> usize {
 
 /// How long startup waits for a peer that answers both `/v2/info` and `/v2/pox`.
 ///
-/// Ten minutes was enough while the answer came from a configured endpoint. It is
-/// not enough for a node discovering its peers over P2P: mainnet handed one start
-/// two endpoints, both of which never answered, and the process gave up while
-/// ninety-five other addresses sat in its peer database waiting to be tried. A
-/// discovering node has nothing to lose by waiting — it cannot execute a block
-/// without a peer either way — so it waits an hour before calling the network
-/// absent.
+/// Ten minutes is enough when the answer comes from a configured endpoint. A node
+/// discovering its peers over P2P may be handed a set that never answers while
+/// dozens of other addresses sit in its peer database untried, and it has nothing
+/// to lose by waiting: without a peer it cannot execute a block either way.
 const fn startup_peer_wait_secs() -> u64 {
     3_600
 }

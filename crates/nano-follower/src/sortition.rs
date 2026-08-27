@@ -427,7 +427,7 @@ impl SortitionTracker {
     /// round walks further. "I derived that view and threw the snapshot away" never
     /// clears, because the retained window closed above it and a chain only walks
     /// forward — the node then repeats one round forever while reporting itself
-    /// healthy. Task 148 cost sixteen hours of a mainnet catch-up to exactly that
+    /// healthy. Sixteen hours of a mainnet catch-up were lost to exactly that
     /// conflation, so the two are separated here rather than in a log message.
     ///
     /// The consensus-hash history is never front-pruned, so a view this chain
@@ -2205,7 +2205,7 @@ mod tests {
         SortitionTracker::new(seed, history).expect("the history ends at the seed")
     }
 
-    /// Task 148: a view this chain dropped is not a view it has not reached.
+    /// A view this chain dropped is not a view it has not reached.
     ///
     /// The stall those two being one answer produced ran sixteen hours on mainnet
     /// while `/health` said `ready: true`. A chain that has not walked far enough

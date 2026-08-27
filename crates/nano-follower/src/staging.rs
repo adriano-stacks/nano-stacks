@@ -150,12 +150,11 @@ impl Staging {
 
     /// Keep the cached branch when this block's arrival cannot have changed it.
     ///
-    /// Re-selecting reads every staged and downloaded row and rebuilds the whole
-    /// branch, which is what the execution loop pays for a block it already
-    /// holds: `put` of the authenticated form of a block the branch already
-    /// names changes bytes and nothing about the topology. On a mainnet
-    /// catch-up that is a 181,000-row scan per block, which measured as 50 ms of
-    /// execution inside 600 ms of wall clock.
+    /// Re-selecting reads every staged and downloaded row and rebuilds the branch
+    /// from the tip down, which on a deep catch-up is a six-figure row scan. The
+    /// execution loop pays it for a block it already holds: `put` of the
+    /// authenticated form of a block the branch already names changes bytes and
+    /// nothing about the topology.
     fn keep_selection_unless_new(&self, link: StagedLink) -> Result<(), StagingError> {
         let mut selected = self.selected.lock().map_err(|_| StagingError::Poisoned)?;
         let unchanged = selected
@@ -904,14 +903,11 @@ mod tests {
     /// The cached branch says what a fresh selection would say, block by block.
     ///
     /// The execution loop asks for the branch, puts the authenticated form of the
-    /// block it just took, executes it and removes it — three cache operations
-    /// per block. Re-selecting on each of them reads every staged and downloaded
-    /// row: on a mainnet catch-up with 181,000 blocks on disk that was 600 ms of
-    /// wall clock around 50 ms of execution, and the box sat idle for the rest.
-    ///
-    /// So the two the loop performs update the cache in place instead, and this
-    /// is the proof that they are equivalent: every step is compared against a
-    /// store reopened from the same file, which has no cache at all.
+    /// block it just took, executes it and removes it — three cache operations a
+    /// block, and re-selecting on each reads every staged and downloaded row. The
+    /// two the loop performs update the cache in place instead, and this is the
+    /// proof they are equivalent: every step is compared against a store reopened
+    /// from the same file, which has no cache at all.
     #[test]
     fn the_cached_branch_matches_a_reselection_at_every_step() {
         let directory = tempfile::tempdir().expect("a directory");

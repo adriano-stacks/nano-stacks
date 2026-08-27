@@ -271,12 +271,10 @@ impl History {
 
 /// Where the endpoints that have served this node are remembered across restarts.
 ///
-/// A peer's HTTP data URL comes from its P2P handshake, so a fresh start knows
-/// only what the peers it happens to connect to right now advertise. Mainnet gave
-/// one start four endpoints that never answered while the four that had served
-/// the previous eight hours were one file away from being asked. Losing them on a
-/// restart is the same conflation as losing them on a dropped session, one level
-/// up.
+/// A peer's HTTP data URL arrives in its P2P handshake, so a fresh start knows
+/// only what the peers it happens to connect to right now advertise. Remembering
+/// the ones that answered is what keeps a restart from having to rediscover a
+/// working data plane before it can fetch anything.
 const DATA_ENDPOINTS_FILE: &str = "data-endpoints.json";
 
 fn load_retained(config: &Config) -> Vec<String> {
@@ -308,18 +306,14 @@ const RETAINED_ENDPOINTS: usize = 32;
 /// named them.
 ///
 /// `Discovered::endpoints` reports the peers *currently connected*, because that
-/// is what a P2P swarm knows. Using only that conflates two different things: an
-/// HTTP data plane and a P2P session. Mainnet showed why — the two peers that
-/// had been serving tenures for hours dropped their P2P sessions on a timeout,
-/// their endpoints left the pool with them, and the follower spent 2,604 rounds
-/// answering "no peer left to ask" while both peers answered `curl` in under a
-/// second. On the next start only two endpoints were connected, both duds, and
-/// the process gave up at its startup deadline.
+/// is what a P2P swarm knows. Using only that conflates two relationships: an
+/// HTTP data plane and a P2P session. A peer whose session times out is still
+/// serving tenures, and dropping it leaves the pool empty while every member of
+/// it answers.
 ///
-/// So an endpoint that has been discovered is retained and keeps being asked.
-/// Nothing about it is trusted any more than before: a tenure is authenticated
+/// Nothing here is trusted any more than before. A tenure is authenticated
 /// against this node's own reward set and burn view whoever serves it, which is
-/// what makes asking a stranger safe in the first place.
+/// what makes asking a stranger safe at all.
 fn endpoints(
     config: &Config,
     discovered: &nano_p2p::Discovered,
