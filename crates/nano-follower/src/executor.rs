@@ -3472,6 +3472,20 @@ where
             // it: a burnchain that cannot be read is not news twice a minute.
             return (0, Vec::new());
         };
+        // The chain is walked ahead of execution on purpose — a staged block names
+        // a burn view by its hash, so the view has to be derived before the block
+        // can run — but only as far ahead as any reader can reach back. Left
+        // unbounded it runs to Bitcoin's tip while execution is still thousands of
+        // burn blocks below, and then a view execution asks for is one the chain
+        // says nothing about: not "not walked far enough", which clears itself,
+        // but a disagreement about a height already behind the tip, which does not.
+        // Bounding the lead puts any such disagreement at the frontier, where the
+        // block that disagrees is the one being executed.
+        let burnchain_tip = if executed > 0 {
+            burnchain_tip.min(executed.saturating_add(crate::sortition::LEAD_OVER_EXECUTION))
+        } else {
+            burnchain_tip
+        };
         if burnchain_tip <= tracker.tip().bitcoin_height {
             return (0, Vec::new());
         }

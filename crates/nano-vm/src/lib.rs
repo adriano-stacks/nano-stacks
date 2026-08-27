@@ -3174,9 +3174,13 @@ impl MarfStore {
     }
 
     fn write_value(&self, value_hash: MarfValue, value: &str) -> Result<(), MarfStoreError> {
-        self.side_store
-            .prepare_cached("INSERT OR REPLACE INTO data_table (key, value) VALUES (?1, ?2)")?
-            .execute(params![marf_value_key(value_hash), value])?;
+        let mut statement = self
+            .side_store
+            .prepare_cached("INSERT OR REPLACE INTO data_table (key, value) VALUES (?1, ?2)")?;
+        match packed_side_value(value) {
+            Some(bytes) => statement.execute(params![marf_value_key(value_hash), bytes])?,
+            None => statement.execute(params![marf_value_key(value_hash), value])?,
+        };
         Ok(())
     }
 
@@ -3434,6 +3438,18 @@ impl MarfStore {
         })
     }
 
+    /// How the row for this value is stored, for a test that cares.
+    #[cfg(test)]
+    fn stored_side_value_kind(&self, value: MarfValue) -> Option<String> {
+        self.side_store
+            .query_row(
+                "SELECT typeof(value) FROM data_table WHERE key = ?1",
+                params![marf_value_key(value)],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+    }
+
     fn data_from_side_store(&self, value: MarfValue) -> Result<Option<String>, VmExecutionError> {
         if let Some(known) = self.side_values.borrow_mut().get(value) {
             return Ok(Some(known));
@@ -3443,7 +3459,9 @@ impl MarfStore {
             .prepare_cached("SELECT value FROM data_table WHERE key = ?1")
             .and_then(|mut statement| {
                 statement
-                    .query_row(params![marf_value_key(value)], |row| row.get(0))
+                    .query_row(params![marf_value_key(value)], |row| {
+                        unpacked_side_value(row, 0)
+                    })
                     .optional()
             })
             .map_err(|error| VmInternalError::Expect(format!("side-store read failed: {error}")))?;
@@ -4066,7 +4084,7 @@ fn import_side_store(
     let Some(marf) = marf else {
         let copied = destination.execute_batch(
             "INSERT OR REPLACE INTO data_table (key, value) \
-                 SELECT key, value FROM checkpoint.data_table;
+                 SELECT key, COALESCE(unhex(value), value) FROM checkpoint.data_table;
              INSERT OR REPLACE INTO metadata_table (key, blockhash, value) \
                  SELECT key, blockhash, value FROM checkpoint.metadata_table;",
         );
@@ -4083,7 +4101,7 @@ fn import_side_store(
              SELECT lower(hex(substr(data, -40))) FROM imported.marf_node
              WHERE substr(data, 1, 1) = x'00';
          INSERT OR REPLACE INTO data_table (key, value)
-             SELECT key, value FROM checkpoint.data_table
+             SELECT key, COALESCE(unhex(value), value) FROM checkpoint.data_table
              WHERE key IN (SELECT key FROM needed_value);
          INSERT OR REPLACE INTO metadata_table (key, blockhash, value)
              SELECT key, blockhash, value FROM checkpoint.metadata_table;
@@ -4092,6 +4110,48 @@ fn import_side_store(
     destination.execute_batch("DETACH DATABASE checkpoint")?;
     destination.execute_batch("DETACH DATABASE imported")?;
     Ok(copied?)
+}
+
+/// A Clarity value's stored bytes, when the text it arrives as is hexadecimal.
+///
+/// The side store holds the consensus serialization, which is hexadecimal for
+/// every value the VM writes, so storing the bytes halves the column. `None`
+/// leaves anything else as the text it came as: the store is not the place to
+/// find out that something is not a value.
+fn packed_side_value(value: &str) -> Option<Vec<u8>> {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
+        return None;
+    }
+    hex_bytes_to_vec(value)
+}
+
+fn hex_bytes_to_vec(value: &str) -> Option<Vec<u8>> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        out.push(u8::try_from(high * 16 + low).ok()?);
+    }
+    Some(out)
+}
+
+/// A stored value as the VM expects it, whichever way the row holds it.
+///
+/// Rows written before values were stored as bytes are text and stay text, so
+/// both representations have to read the same. The text is what everything
+/// downstream measures — `read_length` included — so it is reconstructed here
+/// rather than anywhere later.
+fn unpacked_side_value(row: &rusqlite::Row<'_>, index: usize) -> Result<String, rusqlite::Error> {
+    match row.get_ref(index)? {
+        rusqlite::types::ValueRef::Text(bytes) => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        rusqlite::types::ValueRef::Blob(bytes) => Ok(hex_bytes(bytes)),
+        other => Err(rusqlite::Error::InvalidColumnType(
+            index,
+            "value".to_owned(),
+            other.data_type(),
+        )),
+    }
 }
 
 fn marf_value_key(value: MarfValue) -> String {
@@ -5734,6 +5794,62 @@ mod tests {
         open_side_store_with_journal, recorded_network, recorded_profile_fingerprint,
         reports_analysis_failure,
     };
+
+    /// A value written as hexadecimal text comes back as the same text, whether
+    /// the row holds bytes or the text a previous binary wrote.
+    #[test]
+    fn a_side_store_value_reads_the_same_from_bytes_or_text() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = MarfStore::open(Network::MAINNET, directory.path()).expect("open a store");
+        let hash = MarfValue::from_bytes([7; 40]);
+        let hex = "0100000000000000000000000000002a";
+        store.write_value(hash, hex).expect("write a value");
+        assert_eq!(
+            store.data_from_side_store(hash).expect("read"),
+            Some(hex.to_owned())
+        );
+        assert_eq!(
+            store.stored_side_value_kind(hash),
+            Some("blob".to_owned()),
+            "a hexadecimal value is stored as bytes"
+        );
+
+        // The same row as a previous binary would have written it.
+        let legacy = MarfValue::from_bytes([8; 40]);
+        store
+            .side_store
+            .execute(
+                "INSERT INTO data_table (key, value) VALUES (?1, ?2)",
+                params![super::marf_value_key(legacy), hex],
+            )
+            .expect("write a legacy row");
+        assert_eq!(
+            store.stored_side_value_kind(legacy),
+            Some("text".to_owned())
+        );
+        assert_eq!(
+            store.data_from_side_store(legacy).expect("read"),
+            Some(hex.to_owned()),
+            "a text row reads as the text it holds"
+        );
+    }
+
+    /// Anything that is not hexadecimal is stored as it arrived.
+    #[test]
+    fn a_side_store_value_that_is_not_hexadecimal_stays_text() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = MarfStore::open(Network::MAINNET, directory.path()).expect("open a store");
+        for value in ["not hex", "abc", ""] {
+            let hash = MarfValue::from_bytes([u8::try_from(value.len()).unwrap_or(0) + 1; 40]);
+            store.write_value(hash, value).expect("write a value");
+            assert_eq!(
+                store.data_from_side_store(hash).expect("read"),
+                Some(value.to_owned()),
+                "{value:?} must read back unchanged"
+            );
+            assert_eq!(store.stored_side_value_kind(hash), Some("text".to_owned()));
+        }
+    }
 
     #[test]
     fn an_empty_vm_reports_empty_resident_caches() {

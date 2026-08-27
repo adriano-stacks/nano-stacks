@@ -149,11 +149,15 @@ fn nano_reports_a_key_at_a_block() {
     let connection =
         rusqlite::Connection::open_with_flags(&clarity, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .expect("open the side store");
+    // The side store holds a value as bytes or, from an older binary, as text.
     let stored: Option<String> = connection
         .query_row(
             "SELECT value FROM data_table WHERE key = ?1",
             [&hex],
-            |row| row.get(0),
+            |row| match row.get_ref(0)? {
+                rusqlite::types::ValueRef::Blob(bytes) => Ok(hex::encode(bytes)),
+                other => other.as_str().map(str::to_owned).map_err(Into::into),
+            },
         )
         .ok();
     println!(

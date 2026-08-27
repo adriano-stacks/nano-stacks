@@ -49,6 +49,20 @@ const POX_HISTORY_SEARCH_LIMIT: usize = 1024;
 /// what it derived and the next one carries on.
 pub const CATCH_UP_LIMIT: u64 = 144;
 
+/// How far the derived chain may stand ahead of the burn view being executed.
+///
+/// Ahead is the design: a staged block names its burn view by hash, so the view
+/// has to be derived before the block can run, and a batch of blocks moves
+/// execution a dozen burn blocks while locating one view runs the walk further.
+/// Unbounded is the defect. Every reader below the tip reaches back a bounded
+/// distance — the view of the block being executed, a refused reorganization's
+/// fork point, the walk to the last electing burn block — so a lead wider than
+/// the deepest of those buys nothing and hides a disagreement: a chain that
+/// derived a different hash for a height execution has not reached yet reports
+/// only that it cannot name the view, and reports it thousands of blocks after
+/// the walk that caused it.
+pub const LEAD_OVER_EXECUTION: u64 = 256;
+
 fn execution_rollback_floor(bitcoin_height: u64) -> u64 {
     let rollback = u64::try_from(nano_sortition::MINING_COMMITMENT_WINDOW)
         .expect("the commitment window fits u64");
