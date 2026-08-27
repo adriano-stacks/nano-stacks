@@ -26,7 +26,7 @@ recomputation of things that did not change.
 |---|---|---|
 | Ceremony | ~55 min | reads the 384 GB payload **three times** — two manifest builds and one verify — at about 250 MB/s. Disk bound, not CPU bound: parallel hashing would not help. |
 | Import | ~3 h | rebuilds a 20 GB MARF and a 14 GB Clarity database from that payload. Its output is a pure function of the payload; nothing has executed yet. |
-| Sortition derivation | ~1 h | derives ~4,000 burn blocks forward before any Stacks block can execute. |
+| Sortition derivation | ~1 h *as observed* | derives ~4,000 burn blocks forward before any Stacks block can execute. **Measured later at ~8 min of actual work — see below; the rest was contention.** |
 | Fetch | ~1 h | ~180,000 blocks over HTTP from discovered peers. |
 | Catch-up | ~9 h | 240 blocks/min at 139 ms a block. This is the part that finds bugs. |
 
@@ -63,12 +63,10 @@ execution behind five hours of setup.
       compiler change costs a reflink and a repin instead of three hours, and the
       repin is no longer a hand edit but a checked operation. This is the large
       one and the one worth most.
-- [ ] **Stop re-deriving the sortition chain from the checkpoint's burn height on
-      every fresh import.** The derivation is a pure function of Bitcoin and the
-      checkpoint, so it is the same 4,000 burn blocks every time; a fresh state
-      could adopt a previously derived chain under the same verification as above.
-      **Measured and analysed below — the adoption has no anchor to verify against,
-      and neither of the two costs I expected to find is where the hour goes.**
+- [x] **Stop re-deriving the sortition chain from the checkpoint's burn height on
+      every fresh import.** Closed by measurement, not by code: the derivation
+      costs about **eight minutes** of work, not an hour, so there is nothing here
+      worth the risk of reusing an unverifiable chain. Breakdown below.
 - [~] Keep a warm burn-in state at a known height, refreshed as the release run
       advances, so `fast-mainnet-replay.sh` always has a recent starting point
       rather than only the checkpoint. **The mechanism exists and the automation
@@ -212,3 +210,32 @@ So the recipe stays manual and the trigger stays a planned stop: at the next
 restart, reflink the state aside before starting again, and adopt it when it is
 needed. On-demand costs seconds at a moment that already exists; standing costs
 gigabytes an hour at every other moment.
+
+## The derivation is eight minutes of work, 2026-08-27
+
+Three hypotheses, all measured, all wrong — so the item closes with no code.
+
+| Component | Measured | For 4,100 burn blocks |
+|---|---|---|
+| Bitcoin fetch | ~100 ms a block (`getblockhash` + `getblock`, ~3 MB, loopback) | **~7 min** |
+| Block parse | 6.9 ms a block on a real 4,370-tx mainnet block | **~28 s** |
+| History rewrite | 0.2–0.3 s, once per 144-block walk batch, from the node's own log | **~7 s** |
+
+That totals about eight minutes. The hour in the table above was real as *observed*
+and misattributed as *cost*: at the time, six node processes were hammering one
+bitcoind and the filesystem was absorbing 900 GiB/h of writes from three finished
+diagnostic arms. Retiring those took the disk drain from 45 GiB/h to 21 GiB/h, and
+the same contention is the honest explanation for the derivation's wall clock.
+
+The parse figure also found a real inefficiency that is **deliberately not being
+fixed**: `block_at` calls `get_block`, which deserializes every transaction, then
+re-serializes the block to bytes so that `decode_block_with_pre_stx` can
+deserialize it a second time. Two parses and a serialize where one parse would do,
+measured at 6.9 ms against 3.2 ms. Across a whole derivation that is **15 seconds**,
+and this is the code path that extracts burn operations — where a missed operation
+is a wrong sortition. Fifteen seconds does not buy a change there.
+
+The lesson worth keeping is about the method rather than the result: every cost in
+this task's first table was estimated, and two of the three I checked were out by
+one to two orders of magnitude. Measure on the box, under the load the box is
+actually carrying.
