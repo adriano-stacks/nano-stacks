@@ -10,7 +10,8 @@ there's nothing better than _no_ code.
 but if you really need code, then you should use vetted implementations instead of reinventing the wheel
 
 you don't stop until @plan.md is done.
-you use https://github.com/driangle/taskmd (at ~/go/bin/taskmd) for task management.
+you use https://github.com/driangle/taskmd for task management. it is packaged in
+github:aldur/dotfiles, so invoke `taskmd` from `PATH`.
 
 you use nix to bring any tool you need into scope
 
