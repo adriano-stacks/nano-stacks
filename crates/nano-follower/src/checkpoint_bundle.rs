@@ -35,21 +35,46 @@ where
     Ok(CheckpointBundleManifest::write_new(directory, claims)?)
 }
 
-/// Verify every bundle byte and independently recompute its signer/profile claims.
+/// Whether verification reads the payload or only the manifest committing to it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PayloadBytes {
+    /// Hash every payload byte and reject any file the manifest does not list.
+    ///
+    /// The only mode that may authenticate a payload before it is imported.
+    Verified,
+    /// Take the manifest's own per-file digests as given.
+    ///
+    /// The content root is still recomputed from those digests, so a manifest
+    /// whose entries were altered is refused, and the signatures are still
+    /// checked over that root. What goes unchecked is whether the files on disk
+    /// are the files the manifest describes — so this can establish that a
+    /// bundle *is attested*, never that a payload *is the attested one*.
+    Assumed,
+}
+
+/// Verify a bundle's signer/profile claims, and its bytes unless they are assumed.
 ///
 /// # Errors
 ///
 /// Returns an error for every content mismatch, malformed signer set, insufficient
 /// signature weight, or mismatch with this artifact's compiler/profile identity.
-pub fn verify_checkpoint_bundle<S: BitcoinSource>(
+pub fn verify_checkpoint_bundle_with<S: BitcoinSource>(
     directory: impl AsRef<Path>,
     bitcoin: &S,
+    payload: PayloadBytes,
 ) -> Result<CheckpointBundleManifest, CheckpointBundleError>
 where
     S::Error: Display,
 {
     let directory = directory.as_ref();
-    let manifest = CheckpointBundleManifest::verify(directory)?;
+    let manifest = match payload {
+        PayloadBytes::Verified => CheckpointBundleManifest::verify(directory)?,
+        PayloadBytes::Assumed => {
+            let manifest = CheckpointBundleManifest::load(directory)?;
+            manifest.validate_against(&CheckpointManifest::load(directory)?)?;
+            manifest
+        }
+    };
     let canonical = canonical_bitcoin_hash(bitcoin, manifest.checkpoint.bitcoin_height)?;
     if canonical != manifest.checkpoint.bitcoin_block_hash {
         return Err(CheckpointBundleError::Invalid(format!(
@@ -64,6 +89,21 @@ where
         ));
     }
     Ok(manifest)
+}
+
+/// Verify every bundle byte and independently recompute its signer/profile claims.
+///
+/// # Errors
+///
+/// As [`verify_checkpoint_bundle_with`] under [`PayloadBytes::Verified`].
+pub fn verify_checkpoint_bundle<S: BitcoinSource>(
+    directory: impl AsRef<Path>,
+    bitcoin: &S,
+) -> Result<CheckpointBundleManifest, CheckpointBundleError>
+where
+    S::Error: Display,
+{
+    verify_checkpoint_bundle_with(directory, bitcoin, PayloadBytes::Verified)
 }
 
 fn canonical_bitcoin_hash<S: BitcoinSource>(
@@ -331,10 +371,10 @@ mod tests {
     use nano_marf::CheckpointBundleManifest;
 
     use super::{
-        CHECKPOINT_REWARD_SET_FILE, CheckpointBundleError, build_checkpoint_bundle_manifest,
-        observed_claims,
+        CHECKPOINT_REWARD_SET_FILE, CheckpointBundleError, PayloadBytes,
+        build_checkpoint_bundle_manifest, observed_claims,
         test_support::{TestBitcoin, fixture},
-        verify_checkpoint_bundle,
+        verify_checkpoint_bundle, verify_checkpoint_bundle_with,
     };
 
     fn published_sample() -> std::path::PathBuf {
@@ -406,6 +446,50 @@ mod tests {
         assert_eq!(verified.content_root(), manifest.content_root());
         assert_eq!(verified.checkpoint.signer_weight, 2);
         assert_eq!(verified.checkpoint.approval_threshold, 2);
+    }
+
+    #[test]
+    fn an_assumed_payload_still_has_to_be_attested_and_self_consistent() {
+        let (root, _) = fixture(true);
+        let bitcoin = TestBitcoin(11, [6; 32]);
+        let manifest =
+            build_checkpoint_bundle_manifest(root.path(), &bitcoin).expect("build manifest");
+        let assumed = verify_checkpoint_bundle_with(root.path(), &bitcoin, PayloadBytes::Assumed)
+            .expect("verify without reading the payload");
+        assert_eq!(assumed.content_root(), manifest.content_root());
+        assert_eq!(assumed.checkpoint.signer_weight, 2);
+    }
+
+    #[test]
+    fn an_edited_manifest_entry_is_refused_without_reading_the_payload() {
+        let (root, _) = fixture(true);
+        let bitcoin = TestBitcoin(11, [6; 32]);
+        build_checkpoint_bundle_manifest(root.path(), &bitcoin).expect("build manifest");
+        let path = root.path().join(nano_marf::BUNDLE_MANIFEST_FILE);
+        let manifest = fs::read_to_string(&path).expect("manifest text");
+        // The content root is recomputed from the entries, so changing one is
+        // caught by arithmetic rather than by a read.
+        let edited = manifest.replacen("size = 11", "size = 12", 1);
+        assert_ne!(edited, manifest, "the fixture stopped recording that size");
+        fs::write(&path, edited).expect("edited manifest");
+        assert!(matches!(
+            verify_checkpoint_bundle_with(root.path(), &bitcoin, PayloadBytes::Assumed),
+            Err(CheckpointBundleError::Bundle(_))
+        ));
+    }
+
+    #[test]
+    fn a_changed_payload_byte_is_caught_only_by_reading_the_payload() {
+        let (root, _) = fixture(true);
+        let bitcoin = TestBitcoin(11, [6; 32]);
+        build_checkpoint_bundle_manifest(root.path(), &bitcoin).expect("build manifest");
+        fs::write(root.path().join("marf.sqlite"), b"other bytes").expect("swap the payload");
+        verify_checkpoint_bundle_with(root.path(), &bitcoin, PayloadBytes::Assumed)
+            .expect("an assumed payload is not read, so a swap passes");
+        assert!(
+            verify_checkpoint_bundle(root.path(), &bitcoin).is_err(),
+            "the default mode must read the bytes and refuse the swap"
+        );
     }
 
     #[test]

@@ -48,10 +48,11 @@ execution behind five hours of setup.
       `cmp` is that they agree without knowing about each other. Drafted in
       `run-ceremony-template.sh`; needs one ceremony to confirm the saving and
       that the manifests still match byte for byte.
-- [ ] **Let `verify-checkpoint` check a manifest without re-reading the payload.**
+- [x] **Let `verify-checkpoint` check a manifest without re-reading the payload.**
       The third pass proves nothing the second build has not already proved
       *within one ceremony* — it matters for a third party, which is why it stays
-      the default. A `--manifest-only` mode would cut ~20 min from a re-issue.
+      the default. Landed as `verify-checkpoint --manifest-only`, cutting ~20 min
+      from a re-issue; see the section below for what it does and does not say.
 - [x] **Reuse a pristine imported state across compiler changes, verifiably.**
       Landed as `stacks-node adopt-imported-state --state <dir> --checkpoint <bundle>`.
       The import is deterministic from the payload, so the same state can be
@@ -119,3 +120,30 @@ The acceptance path on real data will run the next time a compiler change lands,
 which is exactly the case it exists for: the unit test covers it on a real MARF
 with real provenance, and the mainnet demonstration above is the refusal.
 
+## `--manifest-only`, 2026-08-27
+
+The payload read is now a named choice rather than an implicit one:
+`PayloadBytes::{Verified, Assumed}`, threaded through
+`verify_checkpoint_bundle_with` and `verify_signed_checkpoint_bundle_with`.
+Verified stays the default and stays the only mode that may authenticate a
+payload before import — `runtime.rs` and `adoption.rs` both keep it, and signing
+has no assumed mode at all, because a builder attests bytes it has read.
+
+What the assumed mode still checks, all of it cheap:
+
+- the manifest's content root, **recomputed from its own per-file digests**, so an
+  altered entry is caught by arithmetic instead of by a read;
+- the builder signatures over that root, against local policy at that height;
+- the claims against `checkpoint.toml`;
+- that the checkpoint's Bitcoin block is locally canonical;
+- and the signer attestation, re-derived from the checkpoint block and reward set.
+
+What it does not check is whether the files on disk are the files the manifest
+describes. So it establishes that a bundle **is attested**, never that a payload
+**is the attested one**, and the command prints that distinction rather than
+letting the output look like the default's.
+
+Three tests pin exactly that boundary: an attested bundle verifies without a read,
+an edited manifest entry is refused without a read, and a swapped payload byte
+passes the assumed mode and is refused by the default — the last one being the
+honest statement of the trade rather than a claim to have avoided it.

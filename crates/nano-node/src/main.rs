@@ -96,6 +96,9 @@ enum Command {
         policy: PathBuf,
         #[arg(long)]
         signatures: PathBuf,
+        /// Check the manifest and its signatures without reading the payload.
+        #[arg(long)]
+        manifest_only: bool,
         #[command(flatten)]
         bitcoin: LocalBitcoin,
     },
@@ -141,8 +144,9 @@ async fn main() -> ExitCode {
             bundle,
             policy,
             signatures,
+            manifest_only,
             bitcoin,
-        } => verify_checkpoint(&bundle, &policy, &signatures, &bitcoin),
+        } => verify_checkpoint(&bundle, &policy, &signatures, manifest_only, &bitcoin),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -247,22 +251,44 @@ fn sign_checkpoint_manifest(
     Ok(())
 }
 
+/// Verify a bundle's builder signatures, and its payload unless asked not to.
+///
+/// Reading the payload is the default and the only mode that may authenticate one
+/// before import. `--manifest-only` answers the narrower question a re-issue asks
+/// — whether this manifest is attested and agrees with its own claims — without
+/// the read, and says so in its own output rather than looking like the default.
 fn verify_checkpoint(
     bundle: &Path,
     policy: &Path,
     signatures: &Path,
+    manifest_only: bool,
     bitcoin: &LocalBitcoin,
 ) -> Result<(), Box<dyn Error>> {
     let policy = nano_node::checkpoint_signatures::BuilderPolicy::load(policy)?;
     let bitcoin = bitcoin.open()?;
-    let verified = nano_node::checkpoint_signatures::verify_signed_checkpoint_bundle(
-        bundle, &bitcoin, &policy, signatures,
+    let payload = if manifest_only {
+        nano_node::checkpoint_bundle::PayloadBytes::Assumed
+    } else {
+        nano_node::checkpoint_bundle::PayloadBytes::Verified
+    };
+    let verified = nano_node::checkpoint_signatures::verify_signed_checkpoint_bundle_with(
+        bundle, &bitcoin, &policy, signatures, payload,
     )?;
     println!(
         "checkpoint content root {} verified by {}",
         verified.content_root,
         verified.names.join(", ")
     );
+    match payload {
+        nano_node::checkpoint_bundle::PayloadBytes::Verified => {
+            println!("  every payload byte was read and matches the manifest");
+        }
+        nano_node::checkpoint_bundle::PayloadBytes::Assumed => {
+            println!(
+                "  no payload byte was read: this says the manifest is attested, not that the payload is the attested one"
+            );
+        }
+    }
     Ok(())
 }
 

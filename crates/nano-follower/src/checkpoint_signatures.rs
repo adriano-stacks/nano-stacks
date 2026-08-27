@@ -13,7 +13,9 @@ use nano_crypto::{CryptoError, MessageSignature, StacksPrivateKey, StacksPublicK
 use nano_primitives::sha256;
 use serde::{Deserialize, Serialize};
 
-use crate::checkpoint_bundle::{CheckpointBundleError, verify_checkpoint_bundle};
+use crate::checkpoint_bundle::{
+    CheckpointBundleError, PayloadBytes, verify_checkpoint_bundle_with,
+};
 
 const POLICY_SCHEMA: &str = "nano-stacks/checkpoint-builder-policy/v1";
 const SIGNATURE_SCHEMA: &str = "nano-stacks/checkpoint-builder-signature/v1";
@@ -222,7 +224,8 @@ pub fn sign_checkpoint_bundle<S: BitcoinSource>(
 where
     S::Error: Display,
 {
-    let manifest = verify_checkpoint_bundle(bundle, bitcoin)?;
+    // A builder attests bytes it has read, so signing has no assumed mode.
+    let manifest = verify_checkpoint_bundle_with(bundle, bitcoin, PayloadBytes::Verified)?;
     let expected = policy.active_key(builder, manifest.checkpoint.checkpoint_stacks_height)?;
     if private_key.public_key() != expected {
         return Err(BuilderSignatureError::Invalid(format!(
@@ -266,7 +269,37 @@ pub fn verify_signed_checkpoint_bundle<S: BitcoinSource>(
 where
     S::Error: Display,
 {
-    let manifest = verify_checkpoint_bundle(bundle, bitcoin)?;
+    verify_signed_checkpoint_bundle_with(
+        bundle,
+        bitcoin,
+        policy,
+        signatures,
+        PayloadBytes::Verified,
+    )
+}
+
+/// Verify a bundle's signatures, reading its payload unless it is assumed.
+///
+/// [`PayloadBytes::Assumed`] answers a narrower question — whether this manifest
+/// is attested by the required builders and agrees with its own claims — for a
+/// re-issue that has not changed a payload byte, or a holder of the manifest
+/// alone. Import authenticates the payload itself and keeps
+/// [`PayloadBytes::Verified`].
+///
+/// # Errors
+///
+/// As [`verify_signed_checkpoint_bundle`], under the requested payload mode.
+pub fn verify_signed_checkpoint_bundle_with<S: BitcoinSource>(
+    bundle: impl AsRef<Path>,
+    bitcoin: &S,
+    policy: &BuilderPolicy,
+    signatures: impl AsRef<Path>,
+    payload: PayloadBytes,
+) -> Result<VerifiedBuilders, BuilderSignatureError>
+where
+    S::Error: Display,
+{
+    let manifest = verify_checkpoint_bundle_with(bundle, bitcoin, payload)?;
     verify_builder_signatures(
         manifest.content_root(),
         manifest.checkpoint.checkpoint_stacks_height,
