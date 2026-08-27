@@ -67,6 +67,8 @@ execution behind five hours of setup.
       every fresh import.** The derivation is a pure function of Bitcoin and the
       checkpoint, so it is the same 4,000 burn blocks every time; a fresh state
       could adopt a previously derived chain under the same verification as above.
+      **Measured and analysed below — the adoption has no anchor to verify against,
+      and neither of the two costs I expected to find is where the hour goes.**
 - [ ] Keep a warm burn-in state at a known height, refreshed as the release run
       advances, so `fast-mainnet-replay.sh` always has a recent starting point
       rather than only the checkpoint.
@@ -147,3 +149,44 @@ Three tests pin exactly that boundary: an attested bundle verifies without a rea
 an edited manifest entry is refused without a read, and a swapped payload byte
 passes the assumed mode and is refused by the default — the last one being the
 honest statement of the trade rather than a claim to have avoided it.
+
+## The sortition item, measured 2026-08-27 — and why it is not adoption
+
+Two things came out of looking, and both contradict the item as written.
+
+**There is nothing to verify an adopted forward chain against.** State adoption
+works because the checkpoint *publishes* a state root that a signed Nakamoto
+header endorses, so a state can prove it is the import. The sortition chain a
+fresh import derives runs from the checkpoint's burn height *forward*, and the
+bundle attests only the history up to that height (`sortition/history.bin`).
+Above it there is no published root, so copying a chain in and calling it verified
+would be a hand repin with extra steps — exactly what `adopt-imported-state`
+exists to stop being.
+
+The one sound corroboration available is signed headers: every Nakamoto block
+commits to its tenure's `consensus_hash`, so a chain that agrees with every
+signed header the node holds is not a fabrication. A fresh import holds no blocks
+yet, so that check cannot run at adopt time — but it already runs, per block, as
+the executor validates each one. So an adopted chain's errors surface at the first
+block of the affected tenure rather than at adoption, which is a worse place to
+find them and not a proof.
+
+**Neither expected cost is the hour.** Measured against this host's own bitcoind:
+
+| Component | Measured | Notes |
+|---|---|---|
+| Bitcoin fetch | ~100 ms per burn block, so **~7 min** for 4,100 | `getblockhash` + `getblock` over loopback, ~3 MB a block |
+| History rewrite | **~28 writes** per derivation, ~100 ms each | 12.7 MB of JSON, but written per *walk batch*, not per burn block: observed once every ~5 min on the live follower, growing 1.4 KB |
+
+I expected the 12.7 MB rewrite to dominate — one write per burn block would have
+been 52 GB and ~20 min per import — and went looking to throttle it. It is
+already batched by the bounded walk, so there was nothing to fix and the throttle
+would have been unjustified complexity. Recorded because the wrong hypothesis is
+worth as much as the right one here: the remaining time is in parsing 4,100
+mainnet blocks and classifying their operations, about 12 million transactions,
+which is where any future work on this belongs.
+
+So this item stays open, and its honest form is no longer "adopt a chain" but
+"make the derivation cheaper" — the parse, not the fetch and not the write. A
+reflinked state already carries its derived chain, which is why
+`adopt-imported-state` meets the ten-minute criterion without this.
