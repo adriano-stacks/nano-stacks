@@ -1,7 +1,7 @@
 ---
 id: "151"
 title: "Import upstream's with-pox allowance tests"
-status: pending
+status: completed
 priority: high
 effort: small
 dependencies: []
@@ -54,16 +54,16 @@ that run.
 
 ## Tasks
 
-- [ ] Confirm upstream head and re-diff `src/words/contract.rs` against the
+- [x] Confirm upstream head and re-diff `src/words/contract.rs` against the
       recorded vendor base before porting, in case #841's tests moved.
-- [ ] Port the eight `with-pox` cases, adapting them to nano's helper names and
+- [x] Port the eight `with-pox` cases, adapting them to nano's helper names and
       exact-cost expectations rather than pasting them.
-- [ ] Check each ported case actually bites — a violation-index assertion that
+- [x] Check each ported case actually bites — a violation-index assertion that
       passes against a deliberately wrong index proves nothing.
-- [ ] Take any `d76a98d8` `with-staking` case not already covered here.
-- [ ] Run the vendored suite and clippy through Nix, then the repository
+- [x] Take any `d76a98d8` `with-staking` case not already covered here.
+- [x] Run the vendored suite and clippy through Nix, then the repository
       scoreboard.
-- [ ] Record the new `COMPILER_IDENTITY` and re-issue the attestation, or hand
+- [x] Record the new `COMPILER_IDENTITY` and re-issue the attestation, or hand
       the batch to whoever is running the ceremony.
 
 ## Acceptance Criteria
@@ -74,3 +74,29 @@ that run.
   unchanged by the import.
 - The compiler identity change is accounted for — either a re-issued attestation
   or an explicit note that the affected states need re-import.
+
+## Imported and passing, 2026-08-27
+
+All eight upstream cases are in, and all eight pass: the arity refusal, the two
+`as-contract?` PoX-only cases, `with-pox` alongside `with-stx` both under and
+over its allowance, the **violation index** when an amount-less `with-pox`
+precedes an exceeded `with-stx`, the pox-4 delegation under
+`with-staking`+`with-pox`, and the two `restrict-assets?` cases.
+
+So `with-pox` was already right here, including the index that lands in a
+receipt. The value of the import is that this is now asserted rather than assumed
+— which was the argument for taking tests from an equivalent implementation.
+
+One adaptation was needed and is worth recording for the next import. The
+allowance tests in `words/contract.rs` live in a module that runs at **Clarity
+4**, where the reference has `with-stacking` and does *not* have `with-pox` or
+`with-staking` (`with-stacking` is Clarity 4 deprecated at 5; both of the others
+are Clarity 6). Dropped in beside them the new tests failed with
+`UnknownFunction("with-pox")` from both engines — correctly. They now live in
+`clarity_v6_allowances`, which pins Epoch 4.0 / Clarity 6 for itself, and
+upstream's `cfg(not(test-clarity-v4|v5))` gates are removed because that module
+decides its own version.
+
+`with-staking` needed nothing, as expected: `WithStaking` delegates to
+`WithStacking`, whose cases were already here.
+
