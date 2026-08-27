@@ -126,10 +126,12 @@ import os, re, sys
 source, scratch = sys.argv[1], sys.argv[2]
 text = open(os.path.join(os.path.dirname(source), "config.toml")).read()
 text = text.replace(source, scratch + "/state")
-# Shift every loopback port by 200 so a diagnostic never collides with the run.
+# Shift the loopback *listeners* by 200 so a diagnostic never collides with the
+# run. Only the binds: the burnchain RPC is somebody else's port and moving it
+# points the copy at nothing.
 def shift(match):
-    return f"{match.group(1)}{int(match.group(2)) + 200}"
-text = re.sub(r"(127\.0\.0\.1:)(\d+)", shift, text)
+    return f"{match.group(1)}{match.group(2)}{int(match.group(3)) + 200}"
+text = re.sub(r"^(\w*bind = ")(127\.0\.0\.1:)(\d+)", shift, text, flags=re.M)
 text = re.sub(r"^event_observers = .*$", "event_observers = []", text, flags=re.M)
 print(text)
 PY

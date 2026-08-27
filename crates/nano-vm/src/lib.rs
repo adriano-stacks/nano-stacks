@@ -4922,10 +4922,8 @@ fn call_contract_values_in_context(
     // mainnet passes `.native-pool-signer`, which is not deployed anywhere, and
     // gets a value back.
     let probe = clar2wasm::phases::start();
-    if eager_argument_probe() {
-        for argument in arguments.iter().filter_map(contract_argument) {
-            let _ = needed_module(store, bitcoin_context, modules, argument, cost_tracker);
-        }
+    for argument in arguments.iter().filter_map(contract_argument) {
+        let _ = needed_module(store, bitcoin_context, modules, argument, cost_tracker);
     }
     let failed = needed_module(store, bitcoin_context, modules, contract, cost_tracker);
     clar2wasm::phases::finish(clar2wasm::phases::Phase::ModuleProbe, probe);
@@ -4968,11 +4966,6 @@ fn call_contract_values_in_context(
                     return Err(error);
                 };
                 attempts += 1;
-                // A line per call whose dispatch reached a module no literal
-                // named, which is what the eager probe above exists to avoid.
-                if std::env::var_os("NANO_COUNT_LAZY_MODULES").is_some() {
-                    eprintln!("lazy-module {missing}");
-                }
                 // A contract that cannot be compiled is not the reason the
                 // run stopped — report what stopped it, not what the repair
                 // ran into. Say what the repair ran into all the same, because
@@ -5001,19 +4994,6 @@ fn call_contract_values_in_context(
 }
 
 /// How many contracts one call may turn out to need compiling.
-/// Whether a contract-typed *argument* is compiled before the call runs.
-///
-/// Compiling one ahead of the call buys avoiding a re-execution when a dispatch
-/// turns out to reach it, and costs compiling a module most calls never use. The
-/// retry path below covers the case either way, so this is a scheduling choice
-/// and not a semantic one, and it is measured rather than assumed.
-fn eager_argument_probe() -> bool {
-    static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EAGER.get_or_init(|| {
-        std::env::var("NANO_EAGER_ARGUMENT_PROBE").map_or(true, |value| value != "0")
-    })
-}
-
 const MISSING_MODULE_ATTEMPTS: usize = 64;
 
 /// The contract a run stopped for want of, if that is why it stopped.

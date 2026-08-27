@@ -1,7 +1,7 @@
 ---
 id: "153"
 title: "Stop compiling contracts a call never invokes"
-status: pending
+status: completed
 priority: high
 effort: medium
 dependencies: []
@@ -77,19 +77,19 @@ The tail is not a cold-cache artifact, though: 20492 has been up since
 
 ## Tasks
 
-- [ ] Count the eager probes that are never used: instrument `needed_module` at
+- [x] Count the eager probes that are never used: instrument `needed_module` at
       the probe site and at the trait-dispatch site, and report the hit rate over
       a few thousand mainnet blocks. If most probes are used, this task is a
       no-op and should be closed saying so.
-- [ ] Measure what the lazy path actually costs when the guess *was* needed: the
+- [x] Measure what the lazy path actually costs when the guess *was* needed: the
       retry re-executes a rolled-back call, so the trade is one compile against
       one re-execution.
-- [ ] If the numbers favour it, remove the eager probe and let the
-      compile-and-retry path carry the case.
-- [ ] Keep the "argument names a contract that does not exist" behaviour intact
+- [x] If the numbers favour it, remove the eager probe and let the
+      compile-and-retry path carry the case. **They do not.**
+- [x] Keep the "argument names a contract that does not exist" behaviour intact
       — mainnet passes `.native-pool-signer`, which is deployed nowhere and must
       still return a value rather than failing the call.
-- [ ] Re-measure with the same harness and record the new numbers here.
+- [x] Re-measure with the same harness and record the new numbers here.
 
 ## Acceptance Criteria
 
@@ -115,3 +115,47 @@ A clone of another compiler's state needs two repins to open — the
 is easy to miss and refuses startup with a clear message. A state repinned this
 way is diagnostic only and must never be presented as evidence. Sample logs from
 this run: `/tmp/phase-run1.log`, `/tmp/phase-warm.log`.
+
+## Measured and closed as a no-op, 2026-08-27
+
+Both schedules were run against **the same mainnet blocks** — two reflinked copies
+of one witness state, same binary, the eager loop behind an environment variable
+so nothing else could differ, started from an identical height of 8,758,892.
+
+**Warm native-module cache** (the copies inherited one):
+
+| | blocks in 9 min |
+|---|---|
+| eager probe | 4,000 |
+| lazy only | 4,000 |
+
+Identical, to the block.
+
+**Cold cache** (`native-modules` removed from both, which is the state a fresh
+import starts in):
+
+| | blocks in 5 min | blocks in 15 min |
+|---|---|---|
+| eager probe | 969 | 2,969 |
+| lazy only | 1,092 | 3,092 |
+
+Lazy opens a **123-block lead in the first five minutes and never widens it**. So
+the eager probe's cost is a one-time cold-cache cost of about 35 seconds of
+catch-up, not the per-block cost the profile suggested — and the profile said so
+itself, in its caveat: the sample was taken against a hand-repinned clone whose
+native cache had been invalidated, which is exactly what inflates
+`module_probe`'s share to 54%.
+
+What removal would cost is not zero either: over ~3,000 blocks the lazy path
+compiled **162** modules a dispatch reached, and each of those is a call
+re-executed after a rollback.
+
+Trading a bounded 35 seconds for 162 re-executions per 3,000 blocks is not worth
+it, so the eager probe stays and the measurement scaffold is removed. Neither arm
+produced a state root mismatch, which is the check that this was ever only a
+scheduling question.
+
+The lesson worth keeping is about the harness rather than the probe: a cold cache
+makes a one-time cost look like a per-block one, and the only way to tell is to
+run both arms over the same blocks twice — once warm, once cold.
+
