@@ -52,7 +52,8 @@ execution behind five hours of setup.
       The third pass proves nothing the second build has not already proved
       *within one ceremony* — it matters for a third party, which is why it stays
       the default. A `--manifest-only` mode would cut ~20 min from a re-issue.
-- [ ] **Reuse a pristine imported state across compiler changes, verifiably.**
+- [x] **Reuse a pristine imported state across compiler changes, verifiably.**
+      Landed as `stacks-node adopt-imported-state --state <dir> --checkpoint <bundle>`.
       The import is deterministic from the payload, so the same state can be
       adopted under a new compiler *if* it is checked rather than trusted: the
       state's root at the checkpoint height must equal the attested
@@ -79,3 +80,42 @@ execution behind five hours of setup.
   state that cannot prove its provenance is refused exactly as it is today.
 - The diagnostic paths remain unable to produce release evidence: task 053's
   claims still require an import nothing hand-edited.
+
+## The three-hour item is done, 2026-08-27
+
+`adopt-imported-state` lets an artifact use a state another compiler imported,
+and it is a proof rather than a repin. Four checks, all before anything is
+written, and a state that fails any of them is left untouched:
+
+- the recorded checkpoint matches the one offered field by field — format,
+  height, state identifier, state root, Bitcoin height — with the profile
+  fingerprint the single exception, because it is the thing being changed;
+- the state seals the checkpoint's own block, so nothing has executed past it and
+  no compiler's decisions are in it;
+- the root it seals at that block is the root the checkpoint claims, which a
+  signed Nakamoto header endorsed;
+- and only then are the two records rewritten, together.
+
+Each refusal is its own typed variant with its own message, and each is tested:
+no record at all, another checkpoint (three ways), a state that has executed, and
+a root that disagrees with what both records claim. Demonstrated against real
+mainnet state as well — the release run's own mid-replay copy is refused with
+"the state is sealed at be28458d… and the checkpoint ends at a8733890…; a state
+that has executed is one compiler's continuation, not an import", exit code 1.
+
+`CheckpointProvenance::rewrite` is new beside `record`, which refuses a directory
+naming a different checkpoint. That refusal is what keeps one chain's state from
+being extended under another chain's blocks and it stays; adoption is the single
+case where the record must change and the state must not, and the caller proves
+that before asking.
+
+What this replaces: a hand edit to `checkpoint-provenance.toml` and the
+`consensus_profile` row, which is what `fast-mainnet-replay.sh` had been doing
+and what made every copy it produced diagnostic-only. That script now tries the
+adoption first and falls back to the hand repin only for a state that has already
+executed — so a pristine copy carries a proof and a dirty one carries a label.
+
+The acceptance path on real data will run the next time a compiler change lands,
+which is exactly the case it exists for: the unit test covers it on a real MARF
+with real provenance, and the mainnet demonstration above is the refusal.
+

@@ -3758,6 +3758,188 @@ pub fn recorded_engine_identities(directory: &Path) -> Vec<(String, u64)> {
     rows.filter_map(Result::ok).collect()
 }
 
+/// Why a state cannot be adopted under this artifact's profile.
+#[derive(Debug)]
+pub enum AdoptionRefusal {
+    /// The directory carries no record of where its state came from.
+    NoProvenance,
+    /// The checkpoint the state names is not the checkpoint offered.
+    DifferentCheckpoint {
+        field: &'static str,
+        recorded: String,
+        offered: String,
+    },
+    /// The state has executed past the checkpoint, so it is one compiler's
+    /// continuation rather than an import.
+    NotPristine { tip: String, checkpoint: String },
+    /// The state's own root at the checkpoint is not the root the checkpoint
+    /// claims and a signed header endorsed.
+    RootMismatch { sealed: String, claimed: String },
+    /// The state could not be read, or the new fingerprint could not be written.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for AdoptionRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoProvenance => formatter.write_str(
+                "this directory records no checkpoint, so nothing says what its state is",
+            ),
+            Self::DifferentCheckpoint {
+                field,
+                recorded,
+                offered,
+            } => write!(
+                formatter,
+                "the state was imported from a checkpoint whose {field} is {recorded}, not the {offered} offered"
+            ),
+            Self::NotPristine { tip, checkpoint } => write!(
+                formatter,
+                "the state is sealed at {tip} and the checkpoint ends at {checkpoint}; a state that has executed is one compiler's continuation, not an import"
+            ),
+            Self::RootMismatch { sealed, claimed } => write!(
+                formatter,
+                "the state seals {sealed} at the checkpoint block where the checkpoint claims {claimed}"
+            ),
+            Self::Unreadable(detail) => write!(formatter, "{detail}"),
+        }
+    }
+}
+
+impl std::error::Error for AdoptionRefusal {}
+
+/// What adopting a state established, for the operator to read back.
+#[derive(Debug)]
+pub struct Adopted {
+    pub stacks_height: u64,
+    pub state_index_root: TrieHash,
+    pub was: Option<String>,
+    pub now: String,
+}
+
+/// Let this artifact use a state another compiler imported, if it can prove it.
+///
+/// An import is a pure function of the bundle: nothing has executed, so the
+/// state a compiler writes at the checkpoint is the state any compiler writes.
+/// That makes re-importing for a compiler change three hours spent reproducing a
+/// known answer — but only while the state really is that import, which is what
+/// this checks rather than assumes:
+///
+/// * the recorded checkpoint matches the bundle offered, field by field, with the
+///   profile fingerprint the single exception because it is the thing being changed;
+/// * nothing has been executed past the checkpoint, so no compiler's decisions are
+///   sealed into it;
+/// * and the state's own root at that height is the root the checkpoint claims,
+///   which a signed Nakamoto header endorsed.
+///
+/// A state that fails any of those is refused untouched. A hand edit to the two
+/// records this writes proves none of them, which is why it is a diagnostic
+/// shortcut and this is not.
+pub fn adopt_state_under_active_profile(
+    directory: &Path,
+    checkpoint: &nano_marf::CheckpointManifest,
+) -> Result<Adopted, AdoptionRefusal> {
+    let unreadable = |error: &dyn std::fmt::Display| AdoptionRefusal::Unreadable(error.to_string());
+
+    let recorded = nano_marf::CheckpointProvenance::load(directory)
+        .map_err(|error| unreadable(&error))?
+        .ok_or(AdoptionRefusal::NoProvenance)?;
+    let mine = &recorded.checkpoint;
+    let differs = |field: &'static str, recorded: String, offered: String| {
+        (recorded != offered).then_some(AdoptionRefusal::DifferentCheckpoint {
+            field,
+            recorded,
+            offered,
+        })
+    };
+    let mismatch = differs("format", mine.format.clone(), checkpoint.format.clone())
+        .or_else(|| {
+            differs(
+                "height",
+                mine.stacks_height.to_string(),
+                checkpoint.stacks_height.to_string(),
+            )
+        })
+        .or_else(|| {
+            differs(
+                "state identifier",
+                hex::encode(mine.source_state_id),
+                hex::encode(checkpoint.source_state_id),
+            )
+        })
+        .or_else(|| {
+            differs(
+                "state root",
+                mine.state_index_root.to_string(),
+                checkpoint.state_index_root.to_string(),
+            )
+        })
+        .or_else(|| {
+            differs(
+                "Bitcoin height",
+                mine.first_bitcoin_height.to_string(),
+                checkpoint.first_bitcoin_height.to_string(),
+            )
+        });
+    if let Some(mismatch) = mismatch {
+        return Err(mismatch);
+    }
+
+    // Read-only, and before anything is written: the two questions left are about
+    // this state rather than about its paperwork.
+    let marf = nano_marf::VersionedMarf::open_existing(directory.join(MARF_FILE))
+        .map_err(|error| unreadable(&error))?;
+    let tip = marf
+        .tip()
+        .map_err(|error| unreadable(&error))?
+        .ok_or_else(|| AdoptionRefusal::Unreadable("the state seals no block".to_owned()))?;
+    if tip != checkpoint.source_state_id {
+        return Err(AdoptionRefusal::NotPristine {
+            tip: hex::encode(tip),
+            checkpoint: hex::encode(checkpoint.source_state_id),
+        });
+    }
+    let sealed = marf
+        .root(tip)
+        .map_err(|error| unreadable(&error))?
+        .ok_or_else(|| AdoptionRefusal::Unreadable("the sealed tip has no root".to_owned()))?;
+    if sealed != checkpoint.state_index_root {
+        return Err(AdoptionRefusal::RootMismatch {
+            sealed: sealed.to_string(),
+            claimed: checkpoint.state_index_root.to_string(),
+        });
+    }
+    drop(marf);
+
+    let active = compatibility_profile_fingerprint().to_string();
+    let was = recorded_profile_fingerprint(directory);
+    let connection = rusqlite::Connection::open(directory.join(CLARITY_FILE))
+        .map_err(|error| unreadable(&error))?;
+    connection
+        .execute(
+            "UPDATE consensus_profile SET fingerprint = ?1 WHERE only_row = 0",
+            rusqlite::params![active],
+        )
+        .map_err(|error| unreadable(&error))?;
+    drop(connection);
+    let adopted = nano_marf::CheckpointProvenance {
+        checkpoint: nano_marf::CheckpointManifest {
+            profile_fingerprint: Some(compatibility_profile_fingerprint()),
+            ..mine.clone()
+        },
+        ..recorded
+    };
+    adopted
+        .rewrite(directory)
+        .map_err(|error| unreadable(&error))?;
+    Ok(Adopted {
+        stacks_height: checkpoint.stacks_height,
+        state_index_root: checkpoint.state_index_root,
+        was,
+        now: active,
+    })
+}
+
 /// The executable profile a durable state names, without opening it.
 #[must_use]
 pub fn recorded_profile_fingerprint(directory: &Path) -> Option<String> {
@@ -5849,6 +6031,194 @@ mod tests {
             );
             assert_eq!(store.stored_side_value_kind(hash), Some("text".to_owned()));
         }
+    }
+
+    /// Build a state directory sealed at one block, and the record that says it
+    /// came from a checkpoint there.
+    fn imported_state(directory: &Path, height: u64) -> ([u8; 32], TrieHash) {
+        let tip = [9; 32];
+        let mut store = MarfStore::open(Network::MAINNET, directory).expect("open a store");
+        store.begin(None, tip).expect("begin");
+        store.put("counter", "one").expect("write");
+        let root = store.seal().expect("seal");
+        drop(store);
+        let provenance = nano_marf::CheckpointProvenance {
+            checkpoint: nano_marf::CheckpointManifest {
+                format: "stacks-core-marf-sqlite-v2".to_owned(),
+                stacks_height: height,
+                source_state_id: tip,
+                state_index_root: TrieHash::from_bytes(root.0),
+                first_bitcoin_height: 960_231,
+                profile_fingerprint: None,
+            },
+            attestation: None,
+            bundle: None,
+        };
+        provenance.record(directory).expect("record provenance");
+        (tip, TrieHash::from_bytes(root.0))
+    }
+
+    /// An untouched import is adopted, and the record it leaves names this
+    /// artifact.
+    #[test]
+    fn an_untouched_import_is_adopted_under_the_active_profile() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let (tip, root) = imported_state(directory.path(), 8_665_600);
+        let manifest = nano_marf::CheckpointManifest {
+            format: "stacks-core-marf-sqlite-v2".to_owned(),
+            stacks_height: 8_665_600,
+            source_state_id: tip,
+            state_index_root: root,
+            first_bitcoin_height: 960_231,
+            profile_fingerprint: None,
+        };
+        let adopted = super::adopt_state_under_active_profile(directory.path(), &manifest)
+            .expect("an untouched import is adoptable");
+        assert_eq!(adopted.state_index_root, root);
+        assert_eq!(adopted.now, compatibility_profile_fingerprint().to_string());
+        assert_eq!(
+            recorded_profile_fingerprint(directory.path()).as_deref(),
+            Some(adopted.now.as_str()),
+            "the state's own row names this artifact now"
+        );
+        let recorded = nano_marf::CheckpointProvenance::load(directory.path())
+            .expect("read provenance")
+            .expect("provenance is there");
+        assert_eq!(
+            recorded.checkpoint.profile_fingerprint,
+            Some(compatibility_profile_fingerprint())
+        );
+        assert_eq!(recorded.checkpoint.stacks_height, 8_665_600);
+    }
+
+    /// A state whose root is not the root the checkpoint claims is refused, and
+    /// left as it was.
+    #[test]
+    fn a_state_whose_root_is_not_the_claimed_one_is_refused() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let (tip, root) = imported_state(directory.path(), 8_665_600);
+        // Both records agree with each other and neither agrees with the trie.
+        let claimed = TrieHash::from_bytes([0xcd; 32]);
+        let provenance = nano_marf::CheckpointProvenance {
+            checkpoint: nano_marf::CheckpointManifest {
+                format: "stacks-core-marf-sqlite-v2".to_owned(),
+                stacks_height: 8_665_600,
+                source_state_id: tip,
+                state_index_root: claimed,
+                first_bitcoin_height: 960_231,
+                profile_fingerprint: None,
+            },
+            attestation: None,
+            bundle: None,
+        };
+        provenance.rewrite(directory.path()).expect("rewrite");
+        let manifest = provenance.checkpoint;
+        let refusal = super::adopt_state_under_active_profile(directory.path(), &manifest)
+            .expect_err("a root that is not the claimed one is refused");
+        assert!(
+            matches!(refusal, super::AdoptionRefusal::RootMismatch { .. }),
+            "{refusal}"
+        );
+        assert_ne!(root, claimed);
+        let after = nano_marf::CheckpointProvenance::load(directory.path())
+            .expect("read provenance")
+            .expect("provenance is there");
+        assert_eq!(
+            after.checkpoint.profile_fingerprint, None,
+            "a refused state keeps the record it had"
+        );
+    }
+
+    /// A state that has executed past the checkpoint carries one compiler's
+    /// decisions and cannot be adopted by another.
+    #[test]
+    fn a_state_that_has_executed_is_refused() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let (tip, root) = imported_state(directory.path(), 8_665_600);
+        let mut store = MarfStore::open(Network::MAINNET, directory.path()).expect("reopen");
+        store.begin(Some(tip), [10; 32]).expect("begin a child");
+        store.put("counter", "two").expect("write");
+        store.seal().expect("seal the child");
+        drop(store);
+        let manifest = nano_marf::CheckpointManifest {
+            format: "stacks-core-marf-sqlite-v2".to_owned(),
+            stacks_height: 8_665_600,
+            source_state_id: tip,
+            state_index_root: root,
+            first_bitcoin_height: 960_231,
+            profile_fingerprint: None,
+        };
+        let refusal = super::adopt_state_under_active_profile(directory.path(), &manifest)
+            .expect_err("an executed state is refused");
+        assert!(
+            matches!(refusal, super::AdoptionRefusal::NotPristine { .. }),
+            "{refusal}"
+        );
+    }
+
+    /// A state from a different checkpoint is refused before anything is read.
+    #[test]
+    fn a_state_from_another_checkpoint_is_refused() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let (tip, root) = imported_state(directory.path(), 8_665_600);
+        for wrong in [
+            nano_marf::CheckpointManifest {
+                stacks_height: 8_665_601,
+                format: "stacks-core-marf-sqlite-v2".to_owned(),
+                source_state_id: tip,
+                state_index_root: root,
+                first_bitcoin_height: 960_231,
+                profile_fingerprint: None,
+            },
+            nano_marf::CheckpointManifest {
+                stacks_height: 8_665_600,
+                format: "stacks-core-marf-sqlite-v2".to_owned(),
+                source_state_id: [0xab; 32],
+                state_index_root: root,
+                first_bitcoin_height: 960_231,
+                profile_fingerprint: None,
+            },
+            nano_marf::CheckpointManifest {
+                stacks_height: 8_665_600,
+                format: "stacks-core-marf-sqlite-v2".to_owned(),
+                source_state_id: tip,
+                state_index_root: root,
+                first_bitcoin_height: 960_232,
+                profile_fingerprint: None,
+            },
+        ] {
+            let refusal = super::adopt_state_under_active_profile(directory.path(), &wrong)
+                .expect_err("another checkpoint is refused");
+            assert!(
+                matches!(refusal, super::AdoptionRefusal::DifferentCheckpoint { .. }),
+                "{refusal}"
+            );
+        }
+    }
+
+    /// A directory that records nothing cannot be adopted: nothing says what it is.
+    #[test]
+    fn a_state_without_provenance_is_refused() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let mut store = MarfStore::open(Network::MAINNET, directory.path()).expect("open");
+        store.begin(None, [9; 32]).expect("begin");
+        store.put("counter", "one").expect("write");
+        let root = store.seal().expect("seal");
+        drop(store);
+        let manifest = nano_marf::CheckpointManifest {
+            format: "stacks-core-marf-sqlite-v2".to_owned(),
+            stacks_height: 8_665_600,
+            source_state_id: [9; 32],
+            state_index_root: TrieHash::from_bytes(root.0),
+            first_bitcoin_height: 960_231,
+            profile_fingerprint: None,
+        };
+        let refusal = super::adopt_state_under_active_profile(directory.path(), &manifest)
+            .expect_err("a directory with no record is refused");
+        assert!(
+            matches!(refusal, super::AdoptionRefusal::NoProvenance),
+            "{refusal}"
+        );
     }
 
     #[test]

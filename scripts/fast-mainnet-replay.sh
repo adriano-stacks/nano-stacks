@@ -84,18 +84,35 @@ clarity=$scratch/state/chainstate/clarity.sqlite
 test -s "$provenance"
 test -s "$clarity"
 
-echo "== repinning the profile in both records"
-python3 - "$provenance" "$profile" <<'PY'
-import re, sys
-path, profile = sys.argv[1], sys.argv[2]
-text = open(path).read()
-new, count = re.subn(r'profile_fingerprint = "[0-9a-f]+"',
-                     f'profile_fingerprint = "{profile}"', text)
-assert count == 1, f"expected one profile_fingerprint in {path}, found {count}"
-open(path, "w").write(new)
+# A state that has executed nothing past its checkpoint needs no repin at all:
+# `adopt-imported-state` proves it is that import and changes the record with a
+# proof. Only a state that has executed falls through to the hand repin below,
+# and that is the part that makes this diagnostic.
+if [ -n "${NANO_ADOPT_CHECKPOINT:-}" ] \
+    && "$binary" adopt-imported-state \
+        --state "$scratch/state/chainstate" \
+        --checkpoint "$NANO_ADOPT_CHECKPOINT" 2>/dev/null; then
+    echo "== adopted under the active profile, with no hand repin"
+    adopted=yes
+else
+    adopted=no
+fi
+
+if [ "$adopted" = no ]; then
+    echo "== repinning the profile in both records"
+    python3 - "$provenance" "$profile" <<'PY'
+    import re, sys
+    path, profile = sys.argv[1], sys.argv[2]
+    text = open(path).read()
+    new, count = re.subn(r'profile_fingerprint = "[0-9a-f]+"',
+                         f'profile_fingerprint = "{profile}"', text)
+    assert count == 1, f"expected one profile_fingerprint in {path}, found {count}"
+    open(path, "w").write(new)
 PY
-sqlite3 "$clarity" "UPDATE consensus_profile SET fingerprint = '$profile' WHERE only_row = 0;"
-test "$(sqlite3 "$clarity" 'SELECT fingerprint FROM consensus_profile;')" = "$profile"
+    sqlite3 "$clarity" "UPDATE consensus_profile SET fingerprint = '$profile' WHERE only_row = 0;"
+    test "$(sqlite3 "$clarity" 'SELECT fingerprint FROM consensus_profile;')" = "$profile"
+
+fi
 
 if [ -n "$peers" ] && [ -s "$peers" ]; then
     cp -- "$peers" "$scratch/state/data-endpoints.json"

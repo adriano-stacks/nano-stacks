@@ -181,6 +181,33 @@ impl CheckpointProvenance {
         fs::File::open(directory)?.sync_all()?;
         Ok(())
     }
+
+    /// Replace the record, for the one field a state is allowed to change.
+    ///
+    /// [`Self::record`] refuses a directory that already names something else,
+    /// which is what keeps one chain's state from being extended under another
+    /// chain's blocks. Adopting an untouched import under a different compiler is
+    /// the single case where the record must change and the state must not, so it
+    /// writes rather than refuses — and the caller proves the state is that import
+    /// before calling. See `nano_vm::adopt_state_under_active_profile`.
+    pub fn rewrite(&self, directory: impl AsRef<Path>) -> Result<(), CheckpointError> {
+        let directory = directory.as_ref();
+        let contents = toml::to_string(&ProvenanceWire::encode(self))
+            .map_err(|error| CheckpointError::InvalidManifest(error.to_string()))?;
+        let path = directory.join(PROVENANCE_FILE);
+        let temporary = directory.join(format!("{PROVENANCE_FILE}.new"));
+        let mut file = fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &path)?;
+        fs::File::open(directory)?.sync_all()?;
+        Ok(())
+    }
 }
 
 /// The mark an import leaves in a state directory while it runs.

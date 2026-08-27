@@ -81,6 +81,13 @@ enum Command {
         #[command(flatten)]
         bitcoin: LocalBitcoin,
     },
+    /// Let this artifact use a state another compiler imported, if it can prove it.
+    AdoptImportedState {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        checkpoint: PathBuf,
+    },
     /// Verify a checkpoint bundle without opening or writing node state.
     VerifyCheckpoint {
         #[arg(long)]
@@ -127,6 +134,9 @@ async fn main() -> ExitCode {
             &private_key,
             &bitcoin,
         ),
+        Command::AdoptImportedState { state, checkpoint } => {
+            adopt_imported_state(&state, &checkpoint)
+        }
         Command::VerifyCheckpoint {
             bundle,
             policy,
@@ -141,6 +151,33 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Adopt an untouched import under this artifact's profile.
+///
+/// A compiler change makes a node refuse a state another compiler imported, and
+/// the sanctioned answer is a fresh import — three hours reproducing a state that
+/// is a pure function of the bundle, because nothing has executed yet. This is
+/// that answer without the three hours, and it is a proof rather than a repin:
+/// the checks are in `nano_vm::adopt_state_under_active_profile`, and a state that
+/// fails any of them is refused untouched.
+fn adopt_imported_state(state: &Path, checkpoint: &Path) -> Result<(), Box<dyn Error>> {
+    let manifest = nano_marf::CheckpointManifest::load(checkpoint)?;
+    let adopted = nano_vm::adopt_state_under_active_profile(state, &manifest)?;
+    println!(
+        "adopted {} at height {} sealing {}",
+        state.display(),
+        adopted.stacks_height,
+        adopted.state_index_root
+    );
+    match adopted.was {
+        Some(was) => println!("  profile {was} -> {}", adopted.now),
+        None => println!("  profile <none recorded> -> {}", adopted.now),
+    }
+    println!(
+        "  the state root it seals is the one the checkpoint claims and a signed header endorsed"
+    );
+    Ok(())
 }
 
 fn config_schema() -> Result<(), Box<dyn Error>> {
