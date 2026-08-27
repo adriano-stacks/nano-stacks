@@ -178,6 +178,22 @@ pub trait RuntimeShapeStore {
                     }
                     _ => (list.type_signature.get_list_item_type().clone(), max_len),
                 };
+                // A `NoType` entry means the list holds nothing, and the
+                // reference then answers with what the value says about itself
+                // rather than with a width: `special_append` returns `cons_list`
+                // over the element in that case, and no word in this family
+                // manufactures a capacity over an entry type that describes no
+                // element. Writing one anyway made an emptied
+                // `(list 12000 uint)` come back as `(list 1 UnknownType)` and
+                // fail the type check its own map declared — mainnet block
+                // 8,667,169, whose transaction the chain records as succeeding.
+                //
+                // The path is reachable at all because a function parameter no
+                // longer carries its caller's arena entry, so `inherited` is
+                // `None` where it used to be `Some`.
+                if entry.is_no_type() {
+                    return self.save_runtime_shape(Value::Sequence(SequenceData::List(list)));
+                }
                 let grown = base.saturating_add(delta).saturating_add(extra);
                 let capped = cap.map_or(grown, |cap| grown.min(cap));
                 list.type_signature = ListTypeData::new_list(entry, capped).map_err(|error| {
