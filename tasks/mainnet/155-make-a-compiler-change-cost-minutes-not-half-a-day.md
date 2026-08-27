@@ -1,7 +1,7 @@
 ---
 id: "155"
 title: "Make a compiler change cost minutes, not half a day"
-status: pending
+status: in-progress
 priority: high
 effort: medium
 dependencies: []
@@ -69,9 +69,10 @@ execution behind five hours of setup.
       could adopt a previously derived chain under the same verification as above.
       **Measured and analysed below — the adoption has no anchor to verify against,
       and neither of the two costs I expected to find is where the hour goes.**
-- [ ] Keep a warm burn-in state at a known height, refreshed as the release run
+- [~] Keep a warm burn-in state at a known height, refreshed as the release run
       advances, so `fast-mainnet-replay.sh` always has a recent starting point
-      rather than only the checkpoint.
+      rather than only the checkpoint. **The mechanism exists and the automation
+      is deliberately not built — see below.**
 
 ## Acceptance Criteria
 
@@ -190,3 +191,24 @@ So this item stays open, and its honest form is no longer "adopt a chain" but
 "make the derivation cheaper" — the parse, not the fetch and not the write. A
 reflinked state already carries its derived chain, which is why
 `adopt-imported-state` meets the ten-minute criterion without this.
+
+## The warm state stays on demand, 2026-08-27
+
+Every piece of it already works: `fast-mainnet-replay.sh` reflinks a stopped
+state in seconds and `adopt-imported-state` now repins it with a proof. What is
+missing is a *stopped recent source*, because the script refuses a live one — a
+state directory with a live writer has a WAL a copy cannot interpret.
+
+Keeping one warm permanently is the part not to automate, and today is the
+evidence why. A reflink is free at creation and stops being free as both sides are
+written: the copy pins the extents the original overwrites. This filesystem lost
+**45 GiB an hour** while three finished diagnostic copies were still running, and
+reclaiming them took the release run's headroom from 179 GiB back to 291 GiB with
+the drain down to 21 GiB/h. A warm copy refreshed automatically as the run
+advances would rebuild exactly that, against the one resource that has actually
+threatened the release run.
+
+So the recipe stays manual and the trigger stays a planned stop: at the next
+restart, reflink the state aside before starting again, and adopt it when it is
+needed. On-demand costs seconds at a moment that already exists; standing costs
+gigabytes an hour at every other moment.
