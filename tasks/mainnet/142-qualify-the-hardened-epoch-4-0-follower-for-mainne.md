@@ -151,3 +151,40 @@ deliberately loaded — 70 passed, 0 failed each time. The `entered` wait also w
 from a one-second to a ten-second budget, since a loaded box is exactly when it
 must not be the thing that fails.
 
+## The gate re-run, 2026-08-27
+
+Run again rather than reasoned about, now that the tree carries no uncommitted
+build-relevant change:
+
+```text
+revision
+  nano-stacks          f6ba0120a49e0e051d1833d41d0cd5904969656f
+  branch               main (clean)
+release candidate
+  FAIL: qualification requires --candidate and --public-key
+```
+
+Two things changed since 2026-08-23 and one did not.
+
+The tree-cleanliness prerequisite is **satisfied**, and satisfied on `main`
+itself rather than in a side worktree: the two task-147 files that blocked it are
+committed, so `release-tree-status` is clean and the report clears its revision
+section in place. That was recorded as a hard predecessor of this gate; it is no
+longer outstanding.
+
+The report stops at exactly the same line as before, and that line is still
+correct behaviour rather than a defect. No minisign key material exists on this
+host, `release/README.md` names the public key as arriving from a trusted
+channel, and minting a release identity here would fabricate the thing the
+channel exists to establish.
+
+So the three prerequisites are now one satisfied and two outstanding: the
+operator's key material, and the full-cycle interval that 106 and 082 feed. The
+report's own disclaimer still forecloses using it as a substitute for either —
+it says in its own output that it is not evidence for a 24-hour tip hold, a live
+Bitcoin reorganization or a stock signer run.
+
+053 itself reconciles to **two unchecked items**, both clocks and both fed by the
+run in flight: the tip hold under 106 and the reward-cycle crossing under 082.
+Every other box is checked, which is what the line-by-line reconciliation above
+has to keep honest rather than inherit.
