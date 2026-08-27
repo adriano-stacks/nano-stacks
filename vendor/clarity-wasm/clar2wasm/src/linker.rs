@@ -6758,6 +6758,18 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                     // call whose argument came out of storage — invisible in a
                     // state root and plainly visible in a receipt.
                     //
+                    // Only the *size* is taken from the sanitized form, never the
+                    // value: nano materializes an argument from the caller's
+                    // memory under the callee's declared types, and rebuilding
+                    // that materialization changes what the callee is handed
+                    // rather than only what it is charged. Mainnet block
+                    // 8,667,169 is the proof — passing the rebuilt value made a
+                    // `{cycles-to-unstake: (list 12000 uint)}` argument arrive as
+                    // `(list 1 UnknownType)` and the call fail a type check the
+                    // chain says it passed. The reference sanitizes its own
+                    // values, which carry their own types and need no
+                    // reconstruction to cross.
+                    //
                     // The result is sanitized on the way back for the same
                     // reason, by `sanitize_contract_call_result`.
                     //
@@ -6769,20 +6781,19 @@ fn link_contract_call_fn(linker: &mut Linker<ClarityWasmContext>) -> Result<(), 
                     // reference says 148. Differencing cancels that, because the
                     // erasure is in both terms, and leaves exactly the capacity
                     // the sanitize dropped.
-                    let mut sanitized = Vec::with_capacity(arguments.len());
                     let mut sanitized_sizes = Vec::with_capacity(arguments.len());
-                    for (argument, measured) in arguments.into_iter().zip(&argument_sizes) {
-                        let argument_type = TypeSignature::type_of(&argument)?;
-                        let before = value_size(&argument)?;
-                        let (argument, _) = Value::sanitize_value(&epoch, &argument_type, argument)
-                            .ok_or(crate::error::wasm_error(WasmError::Expect(
-                                "a contract-call argument that cannot be sanitized".to_owned(),
-                            )))?;
-                        let dropped = before.saturating_sub(value_size(&argument)?);
+                    for (argument, measured) in arguments.iter().zip(&argument_sizes) {
+                        let argument_type = TypeSignature::type_of(argument)?;
+                        let before = value_size(argument)?;
+                        let (sanitized, _) =
+                            Value::sanitize_value(&epoch, &argument_type, argument.clone()).ok_or(
+                                crate::error::wasm_error(WasmError::Expect(
+                                    "a contract-call argument that cannot be sanitized".to_owned(),
+                                )),
+                            )?;
+                        let dropped = before.saturating_sub(value_size(&sanitized)?);
                         sanitized_sizes.push(measured.saturating_sub(dropped));
-                        sanitized.push(argument);
                     }
-                    let arguments = sanitized;
 
                     let module = caller
                         .data()
