@@ -1,7 +1,8 @@
 use std::cell::Cell;
 
+use clarity::types::StacksEpochId;
 use clarity::vm::errors::VmExecutionError;
-use clarity::vm::types::{ListData, ListTypeData, SequenceData, TupleData};
+use clarity::vm::types::{ListData, ListTypeData, SequenceData, TypeSignature};
 use clarity::vm::Value;
 
 use crate::error::WasmError;
@@ -242,12 +243,21 @@ pub trait RuntimeShapeStore {
     /// `(response principal principal)`: every element would come back claiming
     /// an arm it never had, which is a different value and not just a different
     /// width.
-    fn narrow_runtime_shape(&mut self, handle: i32) -> Result<i32, VmExecutionError> {
+    fn narrow_runtime_shape(
+        &mut self,
+        handle: i32,
+        epoch: StacksEpochId,
+    ) -> Result<i32, VmExecutionError> {
         if handle == 0 {
             return Ok(0);
         }
         let value = self.load_runtime_shape(handle)?;
-        let narrowed = narrow_capacities(value.clone())?;
+        let (narrowed, _) = Value::sanitize_value(&epoch, &value_type(&value)?, value.clone())
+            .ok_or_else(|| {
+                crate::error::wasm_error(WasmError::WasmGeneratorError(
+                    "a runtime shape that cannot be sanitized".to_owned(),
+                ))
+            })?;
         // By size, not by `==`: Clarity value equality is semantic and ignores
         // the capacities entirely, so an emptied `(list 12000 uint)` and an
         // emptied `(list 0 NoType)` compare equal — and comparing that way threw
@@ -266,7 +276,11 @@ pub trait RuntimeShapeStore {
     /// back out is only as big as what it holds. On mainnet the first is what a
     /// `print` of the list charges and the second is what `map` charges per
     /// iteration, so getting either one wrong is visible.
-    fn sanitize_runtime_shape_elements(&mut self, handle: i32) -> Result<i32, VmExecutionError> {
+    fn sanitize_runtime_shape_elements(
+        &mut self,
+        handle: i32,
+        epoch: StacksEpochId,
+    ) -> Result<i32, VmExecutionError> {
         if handle == 0 {
             return Ok(0);
         }
@@ -274,12 +288,24 @@ pub trait RuntimeShapeStore {
         let Value::Sequence(SequenceData::List(list)) = value else {
             return Ok(handle);
         };
+        // Through the reference's own `sanitize_value`, against the entry type
+        // this list derived, which is exactly what `Value::cons_list` stores.
+        // A narrowing written here instead would be a second implementation of
+        // the same rule, and the one place a difference between the two showed
+        // up on mainnet — a contract-call argument rebuilt rather than measured
+        // — cost a state root at block 8,667,169.
+        let entry = list.type_signature.get_list_item_type().clone();
         let mut items = Vec::with_capacity(list.data.len());
         let mut changed = false;
         for item in list.data.iter() {
-            let narrowed = narrow_capacities(item.clone())?;
-            changed = changed || measured_size(&narrowed)? != measured_size(item)?;
-            items.push(narrowed);
+            let (sanitized, did_sanitize) = Value::sanitize_value(&epoch, &entry, item.clone())
+                .ok_or_else(|| {
+                    crate::error::wasm_error(WasmError::WasmGeneratorError(
+                        "a constructed list element cannot be sanitized".to_owned(),
+                    ))
+                })?;
+            changed = changed || did_sanitize || measured_size(&sanitized)? != measured_size(item)?;
+            items.push(sanitized);
         }
         if !changed {
             return Ok(handle);
@@ -291,43 +317,10 @@ pub trait RuntimeShapeStore {
     }
 }
 
-/// Rebuild every sequence capacity in a value from what it holds.
-///
-/// The constructors do the deriving: `cons_list_unsanitized` takes the entry
-/// type from the elements and the capacity from their count, and
-/// `TupleData::from_data` takes each field's from the field. Buffers and strings
-/// carry no capacity apart from their own length, so they are already narrow.
-fn narrow_capacities(value: Value) -> Result<Value, VmExecutionError> {
-    let narrowed = match value {
-        Value::Sequence(SequenceData::List(list)) => {
-            let mut items = Vec::with_capacity(list.data.len());
-            for item in list.data {
-                items.push(narrow_capacities(item)?);
-            }
-            Value::cons_list_unsanitized(items).map_err(narrowing_failed)?
-        }
-        Value::Tuple(tuple) => {
-            let mut fields = Vec::with_capacity(tuple.data_map.len());
-            for (name, field) in tuple.data_map {
-                fields.push((name, narrow_capacities(field)?));
-            }
-            Value::Tuple(TupleData::from_data(fields).map_err(narrowing_failed)?)
-        }
-        Value::Optional(optional) => match optional.data {
-            Some(inner) => Value::some(narrow_capacities(*inner)?).map_err(narrowing_failed)?,
-            None => Value::none(),
-        },
-        Value::Response(response) => {
-            let inner = narrow_capacities(*response.data)?;
-            if response.committed {
-                Value::okay(inner).map_err(narrowing_failed)?
-            } else {
-                Value::error(inner).map_err(narrowing_failed)?
-            }
-        }
-        other => other,
-    };
-    Ok(narrowed)
+/// The value's own type, which is what the reference sanitizes against.
+fn value_type(value: &Value) -> Result<TypeSignature, VmExecutionError> {
+    TypeSignature::type_of(value)
+        .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))
 }
 
 /// `Value::size()`, which is the only thing a capacity changes.
@@ -335,12 +328,6 @@ fn measured_size(value: &Value) -> Result<u32, VmExecutionError> {
     value
         .size()
         .map_err(|_| crate::error::wasm_error(WasmError::ValueTypeMismatch))
-}
-
-fn narrowing_failed(error: impl std::fmt::Display) -> VmExecutionError {
-    crate::error::wasm_error(WasmError::WasmGeneratorError(format!(
-        "cannot narrow a runtime shape's capacities: {error}"
-    )))
 }
 
 impl RuntimeShapeStore for () {

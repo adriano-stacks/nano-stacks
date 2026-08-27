@@ -611,7 +611,8 @@ fn link_narrow_runtime_shape_fn(
             "narrow_runtime_shape",
             |mut caller: Caller<'_, ClarityWasmContext>, handle: i32| {
                 crate::phases::time(crate::phases::Phase::HostShape, || {
-                    let narrowed = caller.data_mut().narrow_runtime_shape(handle)?;
+                    let epoch = caller.data().global_context.epoch_id;
+                    let narrowed = caller.data_mut().narrow_runtime_shape(handle, epoch)?;
                     Ok(narrowed)
                 })
             },
@@ -639,7 +640,10 @@ fn link_sanitize_runtime_shape_elements_fn(
             "sanitize_runtime_shape_elements",
             |mut caller: Caller<'_, ClarityWasmContext>, handle: i32| {
                 crate::phases::time(crate::phases::Phase::HostShape, || {
-                    let sanitized = caller.data_mut().sanitize_runtime_shape_elements(handle)?;
+                    let epoch = caller.data().global_context.epoch_id;
+                    let sanitized = caller
+                        .data_mut()
+                        .sanitize_runtime_shape_elements(handle, epoch)?;
                     Ok(sanitized)
                 })
             },
