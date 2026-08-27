@@ -132,7 +132,16 @@ and that a short stored list is unchanged. The whole `clar2wasm` suite is green
       `chainstate/checkpoint-provenance.toml` (backup:
       `/home/aldur/mainnet-tip/checkpoint-provenance.toml.bak-6a83746e`).
       It then executed 8,832,029 and caught up to tip. See the caveat below.
-- [ ] **Re-attest and re-import for release evidence.** The repin above is the
+- [~] **Re-attest and re-import for release evidence.** In flight. The ceremony
+      has been re-issued five times since this was written, each time because a
+      clarity-wasm fix moved the compiler identity, and the current release
+      subject was imported from the bundle attested for `sha256:05aaf07c` with no
+      hand repin anywhere in its provenance. It is replaying from 8,665,601 and
+      will reach 8,832,029 during catch-up; until it seals that block this item
+      is not closed, because the whole point of it is a fresh state executing the
+      block the repinned node executed.
+
+      What the original item said, kept because it is still the rule: The repin above is the
       operator shortcut, not the sanctioned path: the design has deliberately no
       repin subcommand, because a compiler change means a fresh import. The
       20492 node is therefore **no longer provably one compiler's continuation of
@@ -151,8 +160,26 @@ and that a short stored list is unchanged. The whole `clar2wasm` suite is green
       check and been refused. Cost is not in the root, which is exactly why this
       hid — and exactly why the argument is about this state and not a general
       licence.
-- [ ] **Sweep for the same shape.** `filter` was the only unguarded loop of the
-      three, but confirm nothing else emits a do-while over a sequence length.
+- [x] **Sweep for the same shape.** Confirmed: `filter` was the only unguarded
+      one. Every generated back-edge was classified, and the ones that subtract a
+      length are all guarded at entry:
+
+      | loop | shape | what stops it at zero |
+      |---|---|---|
+      | `filter` | length subtraction | `if_else` on the length — the fix |
+      | `equal.rs` byte compare | length subtraction | `I32Eqz` branches out of the block before the loop |
+      | `copy.rs` element copy | length subtraction | `if_else` on the length |
+      | `duck_type.rs` widening | length subtraction | `if_else` on the length |
+      | `map` | element-count subtraction | `if_else` on the count |
+      | `serialize.rs` list serialize | length subtraction | inside the non-zero arm of an `I32Eqz` branch |
+      | `serialize.rs` shaped serialize | length subtraction | `if_else` on the length |
+      | `sequences.rs` element walk, `serialize.rs` buffer walk, `to_ascii.rs` scan | comparison (`I32LtU`/`I32GtU`) | the condition is tested each pass, so zero exits |
+      | `to_ascii.rs` digit loops | value loop (`hi != 0`) | not a sequence walk |
+      | `deserialize.rs` | branch to a done block | not a do-while over a length |
+
+      The distinction that matters: a loop whose condition *subtracts* needs an
+      entry guard, because at zero it reads an element that is not there and the
+      counter goes negative; a loop whose condition *compares* does not.
 
 ## Live result
 
