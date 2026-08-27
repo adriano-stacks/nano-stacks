@@ -59,6 +59,9 @@ where
 struct Follower {
     transport: OutboundNetwork,
     discovered: nano_p2p::Discovered,
+    /// Data endpoints kept past the P2P sessions that named them. See
+    /// [`endpoints`].
+    retained: Vec<String>,
     peer: SyncClient,
     pox: PoxInfo,
     history: History,
@@ -88,7 +91,8 @@ impl Follower {
             Some(peer) => peer,
             None => await_peer(config, Some(&discovered), false).await?,
         };
-        let initial_endpoints = endpoints(config, &discovered);
+        let mut retained = Vec::new();
+        let initial_endpoints = endpoints(config, &discovered, &mut retained);
         let mut history = History::new(&initial_endpoints);
         let mut executor =
             startup::open_executor(config, network, &pox, &mut history.source).await?;
@@ -105,6 +109,7 @@ impl Follower {
         Ok(Self {
             transport,
             discovered,
+            retained,
             peer,
             pox,
             history,
@@ -115,7 +120,7 @@ impl Follower {
     }
 
     async fn follow_round(&mut self, config: &Config, observation: &Observation) {
-        let current_endpoints = endpoints(config, &self.discovered);
+        let current_endpoints = endpoints(config, &self.discovered, &mut self.retained);
         self.history.refresh(&current_endpoints);
         let pool = PeerPool::from_endpoints(&self.history.endpoints);
         if let Some((_, selected)) = select_peer(&pool, config, &self.pox, &mut self.executor).await
@@ -264,11 +269,47 @@ impl History {
     }
 }
 
-fn endpoints(config: &Config, discovered: &nano_p2p::Discovered) -> Vec<String> {
-    let mut endpoints = config.follower.peers.clone();
+/// How many endpoints a node keeps asking after their P2P session has gone.
+///
+/// A dead one costs a connect attempt a round, which the round already forgives
+/// and retries, so the cap is about bounding that cost rather than about trust.
+const RETAINED_ENDPOINTS: usize = 32;
+
+/// The HTTP data endpoints worth asking, which outlive the P2P sessions that
+/// named them.
+///
+/// `Discovered::endpoints` reports the peers *currently connected*, because that
+/// is what a P2P swarm knows. Using only that conflates two different things: an
+/// HTTP data plane and a P2P session. Mainnet showed why — the two peers that
+/// had been serving tenures for hours dropped their P2P sessions on a timeout,
+/// their endpoints left the pool with them, and the follower spent 2,604 rounds
+/// answering "no peer left to ask" while both peers answered `curl` in under a
+/// second. On the next start only two endpoints were connected, both duds, and
+/// the process gave up at its startup deadline.
+///
+/// So an endpoint that has been discovered is retained and keeps being asked.
+/// Nothing about it is trusted any more than before: a tenure is authenticated
+/// against this node's own reward set and burn view whoever serves it, which is
+/// what makes asking a stranger safe in the first place.
+fn endpoints(
+    config: &Config,
+    discovered: &nano_p2p::Discovered,
+    retained: &mut Vec<String>,
+) -> Vec<String> {
     for endpoint in discovered.endpoints() {
-        if !endpoints.contains(&endpoint) {
-            endpoints.push(endpoint);
+        if !retained.contains(&endpoint) {
+            retained.push(endpoint);
+        }
+    }
+    // Oldest first out: a peer discovered long ago and never seen since is the
+    // one worth dropping when the cap is reached.
+    while retained.len() > RETAINED_ENDPOINTS {
+        retained.remove(0);
+    }
+    let mut endpoints = config.follower.peers.clone();
+    for endpoint in retained.iter() {
+        if !endpoints.contains(endpoint) {
+            endpoints.push(endpoint.clone());
         }
     }
     endpoints
@@ -287,7 +328,7 @@ async fn await_peer(
         } else {
             discovered.map_or_else(
                 || config.follower.peers.clone(),
-                |discovered| endpoints(config, discovered),
+                |discovered| endpoints(config, discovered, &mut Vec::new()),
             )
         };
         if configured_only && candidates.is_empty() {
