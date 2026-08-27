@@ -118,6 +118,7 @@ impl CompiledContract {
     /// The native module for this contract, built at most once.
     pub fn native(&self, cache: &ModuleCache) -> Result<&wasmtime::Module, VmExecutionError> {
         if let Some(native) = self.native.get() {
+            count(|counters| counters.native_hits += 1);
             return Ok(native);
         }
         let native = cache.native_module(&self.wasm)?;
@@ -134,12 +135,15 @@ impl CompiledContract {
         cache: &ModuleCache,
     ) -> Result<wasmtime::InstancePre<initialize::StaticClarityWasmContext>, VmExecutionError> {
         if self.instance_pre.get().is_none() {
+            count(|counters| counters.instance_pre_misses += 1);
             let native = self.native(cache)?.clone();
             let linker = cache.host_linker()?;
             let pre = linker
                 .instantiate_pre(&native)
                 .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
             let _ = self.instance_pre.set(pre);
+        } else {
+            count(|counters| counters.instance_pre_hits += 1);
         }
         let pre = self
             .instance_pre
@@ -176,6 +180,44 @@ pub trait NativeModuleStore: std::fmt::Debug + Send + Sync {
 /// way to an OOM kill through it. Eviction costs a recompilation on the next
 /// call, never a wrong answer, so the budget only has to keep the hot set.
 const MODULE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Where obtaining native code goes, when asked.
+///
+/// `instance_pre` memoizes per contract, so its hit rate says whether the memo
+/// survives the frames of a call, and splitting a miss into a deserialize and a
+/// compile says which half of the cache answered. Off unless
+/// `NANO_COUNT_NATIVE` is set, and reported every two thousand asks.
+#[derive(Debug, Default)]
+struct NativeCounters {
+    instance_pre_hits: u64,
+    instance_pre_misses: u64,
+    native_hits: u64,
+    native_from_disk: u64,
+    native_compiled: u64,
+    evictions: u64,
+    inserts: u64,
+}
+
+static NATIVE_COUNTERS: std::sync::Mutex<Option<NativeCounters>> = std::sync::Mutex::new(None);
+
+fn counting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NANO_COUNT_NATIVE").is_some())
+}
+
+fn count(field: impl Fn(&mut NativeCounters)) {
+    if !counting() {
+        return;
+    }
+    if let Ok(mut guard) = NATIVE_COUNTERS.lock() {
+        let counters = guard.get_or_insert_with(NativeCounters::default);
+        field(counters);
+        let asked = counters.instance_pre_hits + counters.instance_pre_misses;
+        if asked > 0 && asked % 2_000 == 0 {
+            eprintln!("native-counters {counters:?}");
+        }
+    }
+}
 
 /// What keeping a compiled contract costs, estimated.
 ///
@@ -255,6 +297,7 @@ impl ModuleCache {
     }
 
     pub fn insert(&mut self, contract: QualifiedContractIdentifier, module: CompiledContract) {
+        count(|counters| counters.inserts += 1);
         self.bytes += entry_weight(&module);
         let stamped = (Arc::new(module), Cell::new(self.tick()));
         if let Some((prior, _)) = self.contracts.insert(contract, stamped) {
@@ -273,6 +316,7 @@ impl ModuleCache {
             };
             if let Some((evicted, _)) = self.contracts.remove(&oldest) {
                 self.bytes -= entry_weight(&evicted);
+                count(|counters| counters.evictions += 1);
             }
         }
     }
@@ -330,8 +374,10 @@ impl ModuleCache {
             .as_ref()
             .and_then(|store| store.load(&self.engine, wasm))
         {
+            count(|counters| counters.native_from_disk += 1);
             return Ok(stored);
         }
+        count(|counters| counters.native_compiled += 1);
         let module = wasmtime::Module::from_binary(&self.engine, wasm)
             .map_err(|error| crate::error::wasm_error(WasmError::UnableToLoadModule(error)))?;
         if let Some(store) = self.persistent.as_ref() {

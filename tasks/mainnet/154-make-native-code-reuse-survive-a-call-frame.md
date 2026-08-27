@@ -1,7 +1,7 @@
 ---
 id: "154"
 title: "Make native code reuse survive a call frame"
-status: pending
+status: completed
 priority: high
 effort: medium
 dependencies: []
@@ -66,22 +66,22 @@ block seals slower than a stacks-core one.
 
 ## Tasks
 
-- [ ] Instrument the miss: count `OnceCell` misses separately from hits, and
+- [x] Instrument the miss: count `OnceCell` misses separately from hits, and
       split a miss into on-disk deserialize versus full compile. Without that
       split the 4.3 ms mean cannot be acted on.
-- [ ] Find out how long a `CompiledContract` lives. If a frame gets a fresh
+- [x] Find out how long a `CompiledContract` lives. If a frame gets a fresh
       object rather than the cached one, the memo is defeated by construction
       and the fix is ownership, not caching.
-- [ ] Check the `ModuleCache` eviction policy against mainnet's working set. The
+- [x] Check the `ModuleCache` eviction policy against mainnet's working set. The
       20492 node holds 539 modules in 268 MB; if the set of contracts a tenure
       touches exceeds the cap, misses recur forever and a bigger cap is the
       cheapest fix available.
-- [ ] Confirm the on-disk cache is actually being read on a warm start. A key
+- [x] Confirm the on-disk cache is actually being read on a warm start. A key
       derived from compiled wasm bytes plus `ENGINE_CONFIG_ID`
       (`crates/nano-wasm-cache/src/lib.rs:103`) is correct but unforgiving: any
       compiler change orphans every entry, and a node that silently recompiles
       everything looks exactly like a node with a small cache.
-- [ ] Fix whichever of the above the measurement indicts, then re-measure with
+- [x] Fix whichever of the above the measurement indicts, then re-measure with
       the harness in 153.
 
 ## Acceptance Criteria
@@ -102,3 +102,48 @@ the same constraint on a much smaller change.
 
 If the indicted code turns out to be the `ModuleCache` cap or the on-disk cache
 in `crates/`, none of that applies and it can land on its own.
+
+## Measured and closed, 2026-08-27
+
+Counters added to the two memos (`NANO_COUNT_NATIVE`), then run over ~1,500
+mainnet blocks from a reflinked witness state:
+
+| | 256 MiB cap | 1 GiB cap |
+|---|---|---|
+| `instance_pre` hits | 107,678 | 105,681 |
+| `instance_pre` misses | 322 | 319 |
+| native from disk | 273 | 270 |
+| native compiled | 57 | 57 |
+| evictions | 96 | **0** |
+| inserts | 666 | 662 |
+
+Four answers, in the order the tasks asked:
+
+**The memo holds.** 99.7% of asks are hits, so it survives the frames of a call
+and the blocks after it. The `CompiledContract` lives as long as the
+`ModuleCache`, which is built once when the chainstate is opened — the ownership
+was never the problem.
+
+**Evictions do not cause the misses.** Quadrupling the budget removes every
+eviction and leaves the miss count unchanged, 322 against 319. The evicted
+contracts are simply not touched again in the window, so the cap is not what a
+miss is waiting for, and paying 4x the resident memory buys nothing measurable.
+
+**The on-disk cache is being read.** 273 of 330 native fetches — 83% — are
+deserialized from it rather than compiled, which is what a warm start should look
+like.
+
+**So `linker_setup`'s 27% was a cold-cache artifact**, exactly as
+`module_probe`'s 54% was in [[153]]. Both shares came from the same profiling
+run, whose clone had been repinned by hand, which orphans every on-disk entry
+because the key derives from the compiled wasm bytes. With the cache warm the
+misses are first-touch and few: about 0.2 a block, mostly a deserialize.
+
+The headline that "roughly 80% of VM wall time goes to obtaining compiled native
+code rather than running it" does not survive the measurement. What is left is
+execution itself, at about 139 ms a block on this host, and that is where a
+node's block time actually goes.
+
+The counters stay, off by default: "is the cache working" is worth being able to
+ask of any node in one run. The cap override used for the A/B does not.
+

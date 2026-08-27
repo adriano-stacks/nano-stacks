@@ -40,7 +40,8 @@ if [ "$#" -lt 2 ]; then
 fi
 
 source_state=${1%/}
-binary=$2
+# Resolved before any `cd`, so a relative path still names the same file.
+binary=$(readlink -f -- "$2")
 scratch=${3:-}
 peers=${4:-}
 
@@ -121,17 +122,17 @@ EOF
 # The node's own configuration, pointed at the copy and off every port the
 # release deployment uses.
 config=$scratch/config.toml
-python3 - "$source_state" "$scratch" > "$config" <<'PY'
+python3 - "$source_state" "$scratch" "${NANO_PORT_SHIFT:-200}" > "$config" <<'PY'
 import os, re, sys
-source, scratch = sys.argv[1], sys.argv[2]
+source, scratch, shift_by = sys.argv[1], sys.argv[2], int(sys.argv[3])
 text = open(os.path.join(os.path.dirname(source), "config.toml")).read()
 text = text.replace(source, scratch + "/state")
 # Shift the loopback *listeners* by 200 so a diagnostic never collides with the
 # run. Only the binds: the burnchain RPC is somebody else's port and moving it
 # points the copy at nothing.
 def shift(match):
-    return f"{match.group(1)}{match.group(2)}{int(match.group(3)) + 200}"
-text = re.sub(r"^(\w*bind = ")(127\.0\.0\.1:)(\d+)", shift, text, flags=re.M)
+    return f"{match.group(1)}{match.group(2)}{int(match.group(3)) + shift_by}"
+text = re.sub(r'^(\w*bind = ")(127\.0\.0\.1:)(\d+)', shift, text, flags=re.M)
 text = re.sub(r"^event_observers = .*$", "event_observers = []", text, flags=re.M)
 print(text)
 PY
