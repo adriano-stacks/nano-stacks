@@ -132,7 +132,22 @@ in isolation, twice, and nothing in that path changed.
 It is written down because a qualification run cannot rest on a gate that fails
 under load: a red CI run that is "probably the flake" is indistinguishable from
 a real regression at the moment it matters. The fix is to make the probe wait for
-saturation rather than race it. Not done here, deliberately: the tree is frozen
-for the release import, and this is nano-side test code rather than anything the
-running artifact contains.
+saturation rather than race it. Deferred on 2026-08-26 because the tree was frozen
+for the release import.
+
+**Fixed 2026-08-27**, once the tree was no longer frozen. The race was in the
+test's precondition, not in the pool: it waited for *one* worker to enter the
+chain and then probed, but one worker in the chain does not mean the pool is full.
+A probe arriving while a permit was still free took that permit, blocked on the
+chain mutex the first worker holds, and answered `408` on its own timeout instead
+of the `503` saturation refusal. Under parallel load that is the likely
+interleaving rather than a rare one, which is why it passed in isolation twice.
+
+So saturation is now a precondition rather than a sample: the test waits for
+`available_permits() == 0` before aborting anything, and the abort still leaves
+the permits held, which is the property under test. Verified 20 for 20 in
+sequence, and three full `nano-rpc` suite runs at 16 test threads with the box
+deliberately loaded — 70 passed, 0 failed each time. The `entered` wait also went
+from a one-second to a ten-second budget, since a loaded box is exactly when it
+must not be the thing that fails.
 

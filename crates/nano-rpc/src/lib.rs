@@ -3524,10 +3524,24 @@ mod tests {
         let requests = (0..super::READ_ONLY_WORKERS)
             .map(|_| tokio::spawn(app.clone().oneshot(request())))
             .collect::<Vec<_>>();
-        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(1)))
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
             .await
             .expect("join the worker notification")
             .expect("one worker entered the chain");
+        // Saturation is a precondition of the refusal below, not something to
+        // sample. One worker in the chain does not mean the pool is full: a probe
+        // that arrives while a permit is free takes it and then blocks on the
+        // chain the first worker holds, so it answers 408 instead of 503. Under
+        // parallel load that is the likely interleaving rather than a rare one.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while workers.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the read-only pool saturates");
+        // Aborting does not return the permits -- that is the property under test,
+        // so the refusal stays deterministic across the abort.
         for request in requests {
             request.abort();
         }
