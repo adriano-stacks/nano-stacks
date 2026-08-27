@@ -91,7 +91,7 @@ impl Follower {
             Some(peer) => peer,
             None => await_peer(config, Some(&discovered), false).await?,
         };
-        let mut retained = Vec::new();
+        let mut retained = load_retained(config);
         let initial_endpoints = endpoints(config, &discovered, &mut retained);
         let mut history = History::new(&initial_endpoints);
         let mut executor =
@@ -269,6 +269,35 @@ impl History {
     }
 }
 
+/// Where the endpoints that have served this node are remembered across restarts.
+///
+/// A peer's HTTP data URL comes from its P2P handshake, so a fresh start knows
+/// only what the peers it happens to connect to right now advertise. Mainnet gave
+/// one start four endpoints that never answered while the four that had served
+/// the previous eight hours were one file away from being asked. Losing them on a
+/// restart is the same conflation as losing them on a dropped session, one level
+/// up.
+const DATA_ENDPOINTS_FILE: &str = "data-endpoints.json";
+
+fn load_retained(config: &Config) -> Vec<String> {
+    let path = config.follower.working_dir.join(DATA_ENDPOINTS_FILE);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<String>>(&bytes).unwrap_or_default()
+}
+
+/// Best effort: a node that cannot write this still runs, it just forgets.
+fn save_retained(config: &Config, retained: &[String]) {
+    let path = config.follower.working_dir.join(DATA_ENDPOINTS_FILE);
+    if let Ok(bytes) = serde_json::to_vec(retained) {
+        let temporary = path.with_extension("json.new");
+        if std::fs::write(&temporary, &bytes).is_ok() {
+            let _ = std::fs::rename(&temporary, &path);
+        }
+    }
+}
+
 /// How many endpoints a node keeps asking after their P2P session has gone.
 ///
 /// A dead one costs a connect attempt a round, which the round already forgives
@@ -296,15 +325,20 @@ fn endpoints(
     discovered: &nano_p2p::Discovered,
     retained: &mut Vec<String>,
 ) -> Vec<String> {
+    let before = retained.len();
     for endpoint in discovered.endpoints() {
         if !retained.contains(&endpoint) {
             retained.push(endpoint);
         }
     }
+    let grew = retained.len() != before;
     // Oldest first out: a peer discovered long ago and never seen since is the
     // one worth dropping when the cap is reached.
     while retained.len() > RETAINED_ENDPOINTS {
         retained.remove(0);
+    }
+    if grew {
+        save_retained(config, retained);
     }
     let mut endpoints = config.follower.peers.clone();
     for endpoint in retained.iter() {
@@ -328,7 +362,7 @@ async fn await_peer(
         } else {
             discovered.map_or_else(
                 || config.follower.peers.clone(),
-                |discovered| endpoints(config, discovered, &mut Vec::new()),
+                |discovered| endpoints(config, discovered, &mut load_retained(config)),
             )
         };
         if configured_only && candidates.is_empty() {
