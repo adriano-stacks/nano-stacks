@@ -3707,13 +3707,12 @@ mod tests {
     /// are not yet functions and `with-stacking` still is.
     mod clarity_v6_allowances {
         use clarity::vm::errors::VmExecutionError;
-        use clarity::vm::types::TupleData;
         use clarity::vm::{ClarityVersion, Value};
         use clarity_types::ClarityName;
         use stacks_common::types::StacksEpochId;
 
         use super::*;
-        use crate::tools::{crosscheck_multi_contract_with_env, evaluate, TestEnvironment};
+        use crate::tools::{crosscheck_multi_contract_with_env, TestEnvironment};
 
         fn clarity6_multi_contract(
             contracts: &[(ContractName, &str)],
