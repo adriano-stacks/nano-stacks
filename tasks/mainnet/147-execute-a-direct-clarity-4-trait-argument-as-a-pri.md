@@ -3,6 +3,7 @@ title: "Execute a direct Clarity 4 trait argument as a principal"
 id: "147"
 status: completed
 priority: critical
+effort: medium
 type: bug
 tags: ["mainnet", "vm", "clarity-wasm", "consensus", "liveness", "release"]
 created_at: "2026-08-22"
