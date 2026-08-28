@@ -2,13 +2,14 @@
 id: "082"
 group: mainnet
 title: "Cross a reward cycle boundary with a locally derived sortition chain"
-status: in-progress
+status: completed
 priority: critical
 effort: large
 dependencies: ["049", "077", "122"]
 tags: ["mainnet", "sortition", "consensus", "release"]
 created_at: 2026-08-07
 type: bug
+completed_at: 2026-08-28
 ---
 
 # Cross a reward cycle boundary with a locally derived sortition chain
@@ -446,10 +447,39 @@ Covered by two tests and one demonstration:
   to `0x83d05044…`, both matching the network, on two independently imported
   states.
 
-**What is still owed:** the automatic path has not yet run against a real boundary
-— the artifact in the release hold predates it, and the next mainnet boundary is
-burn 966,350, roughly two weeks out. The demonstration is a diagnostic replay from
-a state whose execution sits below a prepare phase, and it is deliberately *not*
-being run during 106's 24-hour interval: it is disk and CPU heavy, and the one
-thing that interval cannot survive is the follower falling off the tip. It runs
-when the hold does.
+## The automatic path, demonstrated on mainnet data 2026-08-28
+
+Run against a state chosen because it sits inside the window the defect needs:
+`release-subject-88920833`, sealed at 8,832,028, saved chain stopping at burn
+963,863 — below the 964,250 boundary — and holding no payout entry for cycle 142.
+A reflinked copy under the fixed binary, diagnostic only and labelled so.
+
+**The race reproduced.** The tracker walked to burn 964,379, past the boundary,
+while execution was still below burn 964,151, so cycle 142 was derived under cycle
+141's address exactly as it was on both release states:
+
+```
+deriving sortitions locally from burn 963863
+derived 84 sortitions locally as Bitcoin advanced, from burn 964295 to 964379
+```
+
+**The repair, with no operator involved:**
+
+```
+the derived sortition chain is re-seeded at burn 964119 for the reward cycle
+beginning at burn 964250, which was derived before its sBTC payout address was known
+```
+
+**The block that stalled everything else:** 8,848,998, refused 133 times by the
+witness and again by the subject, both needing a restart. This node executed
+straight through it — `followed 8850028 -> 8852028` — with
+
+```
+"cannot name burn view" lines : 0
+"re-seeded at burn" lines     : 1
+"state root mismatch" lines   : 0
+```
+
+Evidence in `/home/aldur/task082-fix-demonstration.txt`. Not release evidence: the
+copy carries a hand-repinned profile. What it establishes is precisely what was
+open — that the automatic path does on its own what the restart did by hand.

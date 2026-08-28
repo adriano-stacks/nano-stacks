@@ -101,13 +101,13 @@ fi
 if [ "$adopted" = no ]; then
     echo "== repinning the profile in both records"
     python3 - "$provenance" "$profile" <<'PY'
-    import re, sys
-    path, profile = sys.argv[1], sys.argv[2]
-    text = open(path).read()
-    new, count = re.subn(r'profile_fingerprint = "[0-9a-f]+"',
-                         f'profile_fingerprint = "{profile}"', text)
-    assert count == 1, f"expected one profile_fingerprint in {path}, found {count}"
-    open(path, "w").write(new)
+import re, sys
+path, profile = sys.argv[1], sys.argv[2]
+text = open(path).read()
+new, count = re.subn(r'profile_fingerprint = "[0-9a-f]+"',
+                     f'profile_fingerprint = "{profile}"', text)
+assert count == 1, f"expected one profile_fingerprint in {path}, found {count}"
+open(path, "w").write(new)
 PY
     sqlite3 "$clarity" "UPDATE consensus_profile SET fingerprint = '$profile' WHERE only_row = 0;"
     test "$(sqlite3 "$clarity" 'SELECT fingerprint FROM consensus_profile;')" = "$profile"
