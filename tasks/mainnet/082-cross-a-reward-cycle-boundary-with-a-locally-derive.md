@@ -399,3 +399,23 @@ So the derivation of a boundary is right; what is wrong is *when* the walk is
 allowed to cross one. This task's remaining work is that gate, and the whole-cycle
 comparison over 962,150..964,249 that `compare-cycle141-when-ready.sh` now has the
 history to run.
+
+## The whole cycle after the boundary, 2026-08-28
+
+```
+2100/2100 compared heights agree over burn 962150..964249 (2100 heights, 0 unanswered)
+exit 0
+```
+
+Reward cycle 141 entire, derived locally from Bitcoin with no peer consensus
+input, compared height by height against two independent stock nodes, every height
+answered by both. Recorded in `/home/aldur/cycle141-whole-cycle.jsonl`.
+
+With the 162/162 crossing of the 141 → 142 rollover above, **the original question
+this task asked is answered**: a locally derived chain crosses a reward cycle
+boundary and holds through the whole cycle after it, and the anchor bit that the
+task opens with is right.
+
+The task stays open on what the same boundary revealed instead — the walk being
+allowed to cross a boundary before the cycle's sBTC address can be known. That
+gate is the remaining work, and it is what 106, 142 and 053 are now waiting on.
