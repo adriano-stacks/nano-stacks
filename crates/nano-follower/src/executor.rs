@@ -1097,10 +1097,37 @@ where
             }
             return;
         };
-        if let Some(tracker) = self.sortition.as_mut() {
-            tracker.record_waterfall_payout(start, observed_at, recipient);
-        } else {
+        let Some(tracker) = self.sortition.as_mut() else {
             self.pending_waterfall_payout = Some((start, observed_at, recipient));
+            return;
+        };
+        // A cycle's address is learned by executing into the prepare phase before
+        // it, and a chain walked ahead of execution has usually derived that cycle
+        // already -- under whichever address it held at the time, which for a node
+        // catching up is the previous cycle's. Under the waterfall a commitment is
+        // admissible only if its first output pays this address, so a cycle derived
+        // under the wrong one elects nobody: the operations hash changes and every
+        // consensus hash from the cycle's first block is wrong, while the sortition
+        // identifier still matches the network's. Nothing reports it until a block
+        // cannot be placed under any burn view, thousands of blocks later.
+        //
+        // A chain only walks forward, so the derived cycle cannot be corrected in
+        // place; it is re-seeded below the cycle and walked again, which is what an
+        // operator restart does and the only reason a restart cured it.
+        let derived_under_another_address = tracker.tip().bitcoin_height >= start
+            && tracker.waterfall_recipient_at(start) != Some(recipient);
+        tracker.record_waterfall_payout(start, observed_at, recipient);
+        if derived_under_another_address {
+            // Carried across the re-seed: the address was learned from a block this
+            // node just executed, and the saved chain it seeds from predates it.
+            self.pending_waterfall_payout = Some((start, observed_at, recipient));
+            self.reseed_sortitions_below(
+                start.saturating_sub(1),
+                &format!(
+                    "the reward cycle beginning at burn {start}, which was derived before its \
+                     sBTC payout address was known"
+                ),
+            );
         }
     }
 
@@ -1138,19 +1165,35 @@ where
     ///
     /// The re-derivation is slow and correct, and it happens only on a retraction.
     fn reseed_sortitions_after_retraction(&mut self) {
+        let executed = self.bitcoin_height();
+        self.reseed_sortitions_below(
+            executed,
+            &format!("the retracted execution standing on burn {executed}"),
+        );
+    }
+
+    /// Re-seed the derived chain at or below a burn height, in this process.
+    ///
+    /// Two things invalidate a chain that has already been walked, and neither can
+    /// be walked away from: execution moving *back* under it, and an input to a
+    /// burn block arriving after that block was derived. Both are repaired the same
+    /// way a restart repairs them, which is to seed below the affected height from
+    /// the saved chain -- or from the checkpoint when the saved one no longer sits
+    /// low enough -- and derive forward again.
+    fn reseed_sortitions_below(&mut self, bitcoin_height: u64, because: &str) {
         let (Some(state), Some(capture)) =
             (self.sortition_state.clone(), self.sortition_capture.clone())
         else {
             return;
         };
-        let executed = self.bitcoin_height();
         match crate::sortition::SortitionTracker::resume_or_capture_below(
-            &state, &capture, executed,
+            &state,
+            &capture,
+            bitcoin_height,
         ) {
             Ok(tracker) => {
                 println!(
-                    "the derived sortition chain is re-seeded at burn {} for the retracted \
-                     execution standing on burn {executed}",
+                    "the derived sortition chain is re-seeded at burn {} for {because}",
                     tracker.tip().bitcoin_height
                 );
                 self.track_sortitions(tracker, state);
@@ -1158,9 +1201,9 @@ where
             }
             Err(error) => {
                 eprintln!(
-                    "the derived sortition chain could not be re-seeded after retracting to \
-                     burn {executed}, so this node may refuse the branch it just adopted \
-                     until it is restarted: {error}"
+                    "the derived sortition chain could not be re-seeded at or below burn \
+                     {bitcoin_height} for {because}, so this node may refuse blocks it \
+                     cannot place until it is restarted: {error}"
                 );
             }
         }
@@ -3631,6 +3674,37 @@ mod peer_boundary_tests {
     /// So the assertion is on the two functions that build a block's execution
     /// context, and it is deliberately about *names*: a peer's sortition and its
     /// coinbase walk have no business being mentioned in either of them.
+    /// A cycle's address arriving after that cycle was derived has to re-seed.
+    ///
+    /// Reachable only with a checkpoint, an executor and a burnchain, like its
+    /// neighbour above, and the failure it guards is silent for thousands of
+    /// blocks: a cycle derived under the previous cycle's sBTC address admits no
+    /// commitment, so it elects nobody and every consensus hash in it is wrong
+    /// while the sortition identifier still matches the network's. A chain only
+    /// walks forward, so recording the address without re-seeding leaves the wrong
+    /// cycle derived for the life of the process — which is why the only cure was
+    /// an operator restart.
+    #[test]
+    fn a_late_cycle_address_re_seeds_the_chain_below_that_cycle() {
+        let source = include_str!("executor.rs");
+        let start = source
+            .find("fn remember_waterfall_payout")
+            .expect("remember_waterfall_payout is gone; this guard has to move with it");
+        let body = &source[start..];
+        let end = body[1..].find("\n    /// ").map_or(body.len(), |at| at + 1);
+        let body = &body[..end];
+        assert!(
+            body.contains("waterfall_recipient_at"),
+            "the late address is recorded without comparing it to the one the cycle \
+             was derived under, so a wrong cycle is never noticed"
+        );
+        assert!(
+            body.contains("reseed_sortitions_below"),
+            "a cycle derived under another address is not re-seeded, so it stays \
+             wrong until the process is restarted"
+        );
+    }
+
     #[test]
     fn no_peer_answer_reaches_a_block_s_execution_context() {
         let source = include_str!("executor.rs");

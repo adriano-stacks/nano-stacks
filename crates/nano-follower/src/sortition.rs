@@ -287,6 +287,19 @@ impl SortitionTracker {
         );
     }
 
+    /// The sBTC address this chain would pay a waterfall commitment at a height.
+    ///
+    /// The same lookup derivation makes, asked from outside so a caller learning a
+    /// cycle's address late can tell whether the chain already derived that cycle
+    /// under a different one.
+    #[must_use]
+    pub fn waterfall_recipient_at(&self, bitcoin_height: u64) -> Option<PoxAddress> {
+        self.waterfall_payouts
+            .range(..=bitcoin_height)
+            .next_back()
+            .map(|(_, payout)| payout.recipient)
+    }
+
     fn payouts_at(
         &self,
         payouts: PayoutSchedule,
@@ -2574,6 +2587,37 @@ mod tests {
             .expect("a torn saved generation falls back to the checkpoint capture");
             assert_eq!(resumed.tip().bitcoin_height, prior_height);
         }
+    }
+
+    #[test]
+    fn a_late_address_is_visible_as_different_from_the_one_a_cycle_was_derived_under() {
+        let mut tracker = tracker(1_000);
+        let carried = PoxAddress::Addr32 {
+            mainnet: true,
+            address_type: PoxAddressType32::P2tr,
+            bytes: [0x11; 32],
+        };
+        tracker.record_waterfall_payout(100, 100, carried);
+        // What the chain would pay at a later cycle's first block before that
+        // cycle's own address is known: the previous one, which admits no
+        // commitment in it.
+        assert_eq!(tracker.waterfall_recipient_at(200), Some(carried));
+
+        let settled = PoxAddress::Addr32 {
+            mainnet: true,
+            address_type: PoxAddressType32::P2tr,
+            bytes: [0x22; 32],
+        };
+        assert_ne!(
+            tracker.waterfall_recipient_at(200),
+            Some(settled),
+            "a cycle derived under the carried address has to be distinguishable \
+             from one derived under the address that cycle actually pays"
+        );
+        tracker.record_waterfall_payout(200, 150, settled);
+        assert_eq!(tracker.waterfall_recipient_at(200), Some(settled));
+        // Below it, nothing changed.
+        assert_eq!(tracker.waterfall_recipient_at(199), Some(carried));
     }
 
     #[test]
