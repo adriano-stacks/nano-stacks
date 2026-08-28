@@ -41,9 +41,18 @@ are finished.
       evidence.
 - [ ] Reconcile [[053-pass-the-mainnet-node-release-gate]] line by line; a stale
       checked box is not evidence and an unexecuted gate is not a pass.
-- [ ] Publish a signed go/no-go record naming residual operational assumptions,
+- [~] Publish a signed go/no-go record naming residual operational assumptions,
       supported platforms, resource floors, rollback procedure and incident
-      contacts.
+      contacts. **Drafted** at `release/go-no-go-75189867bf3d.md`: everything
+      except the decision and the signature can be written before the run
+      finishes, and writing it early means it is reviewed on its content rather
+      than assembled under time pressure afterwards. It carries measured floors
+      rather than guesses (1.25 GB resident at tip, 135 GiB of chainstate, ~24
+      GiB/h while replaying, the 20 GiB guard), names the single-operator
+      assumption and the 2-of-2 custody caveat the acceptance criteria require,
+      and leaves incident contacts blank because inventing one is worse than a
+      gap. Unsigned and with no decision recorded, pending the two outstanding
+      inputs below.
 - [ ] Tag and publish exactly the qualified artifact without rebuilding or
       changing any input.
 
