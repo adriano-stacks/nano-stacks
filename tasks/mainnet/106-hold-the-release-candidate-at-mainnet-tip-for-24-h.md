@@ -510,3 +510,44 @@ Two caveats recorded rather than glossed:
    but the defect is open and it is 142's to weigh.
 2. The next cycle boundary is burn 966,350, about two thousand burn blocks out, so
    nothing in this interval crosses one.
+
+## That interval died, and the one running now is on a fixed artifact
+
+**The 02:19 interval did not survive.** It started, and then the harness died
+inside `verify_block` on `xxd: command not found` — `xxd` ships with vim and is
+not on this host's PATH, and it is the only script here that used it. Found by
+reading the hold's own log rather than trusting that it was running. Replaced with
+`python3`, which these scripts already depend on.
+
+**The artifact was rebuilt to contain [[082]]'s fix, and it kept the attested
+identity.** That was the open question when the first interval started: the
+artifact predated the fix, so a hold on it could not certify a shippable binary,
+and a rebuild normally costs a ceremony and a fresh import because
+`COMPILER_IDENTITY` hashes every file under `vendor/clarity-wasm`.
+
+It does not here. The fix touches `crates/nano-follower` only, and `main`'s drift
+from the artifact's revision is two test-only vendor files from tasks 151 and 154.
+Built from the artifact's own revision with the fix cherry-picked
+(`release/082-fix`, `75189867bf3d`):
+
+```
+compiler  sha256:05aaf07c5d98937ce1125e2bd5b78401801b2c9a2c37d2f169dfbf1177041078
+profile   7c11846f8f91f10323586b6b9b433830d8a69748980d528195c60e5854f99d23
+```
+
+byte-identical to the identity the states were imported under. Both nodes resumed
+on it and **reauthenticated the bundle from persisted provenance with no repin** —
+the system's own test of whether a binary may continue a state, passed rather than
+asserted.
+
+**The interval now running:**
+
+```
+04:33:45Z subject at tip, witness at tip, behind 0
+== subject pid 597894, exe fd2ae84c2b49cff0ee8b9ecaa1bc3b6699d536faae28f7339821edb8a097578b
+== holding for 24 hours
+```
+
+so it certifies a binary that contains the consensus fix, on states that accept it
+without a hand edit, with the verification path that killed the last attempt
+repaired.
