@@ -479,3 +479,34 @@ requires rebuilding the artifact, which is three minutes; a clarity-wasm commit
 invalidates the bundle and costs a ceremony and a fresh import. That asymmetry is
 why the freeze is on `vendor/clarity-wasm` specifically.
 
+## The interval started 2026-08-28T02:19:29Z
+
+Both states reached the public tip and `run-hold-05aaf07c.sh` began the interval:
+
+```
+02:19:27Z subject at 8856243, network 8856244, behind 1
+02:19:27Z subject is at the tip
+02:19:29Z witness is at the tip
+== holding for 24 hours
+```
+
+State entering the hold:
+
+- **subject** `release-subject-05aaf07c`, the packaged follower artifact
+  `nano-stacks-follower-0.1.0-924b6276d698`, imported from the bundle attested for
+  `sha256:05aaf07c` with no hand repin;
+- **witness** `witness-05aaf07c`, same revision, separately imported, at tip and
+  emitting `new_block` payloads for the receipt half;
+- **zero** `state root mismatch` lines in either state, across every run log;
+- `peers = []` with 25 retained data endpoints, all peer addresses discovered over
+  P2P — no hosted Stacks service configured;
+- 165 GiB free, and the growth at tip is a fraction of the catch-up rate.
+
+Two caveats recorded rather than glossed:
+
+1. Both states needed **one operator restart** to cross the reward-cycle 141 → 142
+   boundary, for the defect diagnosed in [[082]]. The restart is the documented
+   cure and the crossing afterwards agrees with two stock nodes at every height,
+   but the defect is open and it is 142's to weigh.
+2. The next cycle boundary is burn 966,350, about two thousand burn blocks out, so
+   nothing in this interval crosses one.
