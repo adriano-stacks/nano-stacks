@@ -239,3 +239,17 @@ state. That is the closing argument rather than a side note: the original failur
 here *was* a state root mismatch, produced by charging `read_count` 303,863 where
 the network charged 7. A sealed root at that height is the differential closed on
 the block that exposed it, by a state no compiler's hand touched.
+
+### The subject confirmed it independently, 2026-08-28T00:59Z
+
+`capture-149-seal.sh` caught the release subject crossing the same height from its
+own separate import:
+
+```
+8832029  A0A5C8469970AEAB701D44899A519DAA877674F9C0856E574D1D1F2757674A40
+         consensus_hash 376FE351B4A1B00AB2500062978764423830C93F
+         receipts summary recorded (197 bytes), state root mismatch lines: 0
+```
+
+Byte-identical block id and consensus hash to the witness's, from a second state
+imported separately under the same artifact. Two independent imports, one answer.
