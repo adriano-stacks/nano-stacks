@@ -419,3 +419,37 @@ task opens with is right.
 The task stays open on what the same boundary revealed instead — the walk being
 allowed to cross a boundary before the cycle's sBTC address can be known. That
 gate is the remaining work, and it is what 106, 142 and 053 are now waiting on.
+
+## The fix landed, 2026-08-28
+
+`remember_waterfall_payout` now compares an arriving cycle address with the one the
+cycle was derived under, and where they differ it seeds the chain below that cycle
+and derives it again. `reseed_sortitions_after_retraction` became a caller of the
+same helper, since a retraction is the other way a walked chain is invalidated.
+
+That is deliberately the *same* repair an operator restart performs — which is the
+only reason a restart cured this — rather than a new rule about when a chain may
+derive. **No derivation predicate changed**, which is why the captures are
+untouched: 306 conformance tests pass, including
+`pox_boundary::a_derived_chain_crosses_five_boundaries_and_stays_on_the_chain`,
+the test that rejected all three earlier attempts to gate the walk.
+
+Covered by two tests and one demonstration:
+
+- `a_late_address_is_visible_as_different_from_the_one_a_cycle_was_derived_under`
+  pins the detection, which is the part that can fail silently;
+- `a_late_cycle_address_re_seeds_the_chain_below_that_cycle` guards the wiring, in
+  the idiom this file already uses for behaviour a unit test cannot reach
+  ("it needs a checkpoint, an executor and a burnchain");
+- and the mainnet before/after above, where the manual form of exactly this repair
+  took 964,300 from `0x0034fd34…` to `0x261f5bce…` and 964,360 from `0xa80e4af5…`
+  to `0x83d05044…`, both matching the network, on two independently imported
+  states.
+
+**What is still owed:** the automatic path has not yet run against a real boundary
+— the artifact in the release hold predates it, and the next mainnet boundary is
+burn 966,350, roughly two weeks out. The demonstration is a diagnostic replay from
+a state whose execution sits below a prepare phase, and it is deliberately *not*
+being run during 106's 24-hour interval: it is disk and CPU heavy, and the one
+thing that interval cannot survive is the follower falling off the tip. It runs
+when the hold does.
