@@ -117,8 +117,13 @@ check_process() {
 verify_block() {
     local height="$1" block_id="$2"
     local follower_block="$work/follower.bin"
+    # Hex to bytes through python rather than `xxd`, which ships with vim and is
+    # absent from this host's PATH: the first hold attempt died here, after the
+    # interval had already started, on a tool the rest of these scripts never use.
     executed_query "SELECT lower(hex(bytes)) FROM executed
-                    WHERE block_id = x'$block_id'" | xxd -r -p > "$follower_block"
+                    WHERE block_id = x'$block_id'" \
+        | python3 -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.stdin.read().strip()))' \
+        > "$follower_block"
     [ -s "$follower_block" ] || fail "block $height left the archive before verification"
     local follower_identity
     follower_identity="$("$block_identity_bin" "$follower_block")" || \
