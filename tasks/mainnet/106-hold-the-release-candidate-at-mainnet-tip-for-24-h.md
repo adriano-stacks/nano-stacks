@@ -551,3 +551,28 @@ asserted.
 so it certifies a binary that contains the consensus fix, on states that accept it
 without a hand edit, with the verification path that killed the last attempt
 repaired.
+
+## The verification halves are proven while the interval runs, not after it
+
+Past intervals have died in their own tooling — one on `xxd`, and the task's own
+notes record a fifth dying on oracle unavailability. Both halves are now exercised
+before hour 24 rather than discovered at it.
+
+**Per-block verification** runs inside the interval, so it is already proving
+itself: 112 block commitments recorded and verified in the first twenty minutes,
+each one decoded from the archive and compared with two independent stock oracles.
+That is the `xxd` path that killed the 02:19 attempt, now running in production.
+
+**The deferred receipt half** was dry-run against a copy of the live record rather
+than left until the end:
+
+```
+verify-hold-receipts.sh <4-block extract> hold-receipts-05aaf07c https://api.hiro.so
+verified 4 blocks against the witness and the receipt oracle
+```
+
+Each block's archived receipt commitment matched an independently executing
+same-revision witness's `new_block` payload digest, and that payload matched the
+receipt oracle field by field — `state_index_root`, `block_hash`,
+`index_block_hash`, transaction and event counts. So the command that runs at hour
+24 is known to work on this data, with these binaries, on this host.
